@@ -97,6 +97,72 @@ struct OwnedBytes {
     length: usize,
 }
 
+// An owning, validated mapping of a QIPACK1 artifact. TensorData values are
+// borrowed views and must not outlive this File.
+struct File {
+    _mapping: mapped::MappedFile,
+}
+
+struct TensorData {
+    opaque weights: *u8,
+    opaque scales: *u8,
+    opaque zeros: *u8,
+    weights_offset: u64,
+    scales_offset: u64,
+    zeros_offset: u64,
+    weights_length: u64,
+    scales_length: u64,
+    zeros_length: u64,
+    output: u64,
+    input: u64,
+    scheme: u32,
+    group_size: u32,
+}
+
+enum LoadResult {
+    Ok(File),
+    Err,
+}
+
+impl File {
+    fn pointer(this) -> *u8 {
+        return this._mapping.pointer();
+    }
+
+    fn length(this) -> usize {
+        return this._mapping.length();
+    }
+
+    fn tensor(this, name: str) -> option::Option[TensorData] {
+        let header: *PackedHeader = this._mapping.pointer() as *PackedHeader;
+        let records: *PackedRecord =
+            (this._mapping.pointer() + (*header).directory_offset as usize) as *PackedRecord;
+        var index: usize = 0 as usize;
+        while index < (*header).tensor_count as usize {
+            let record: *PackedRecord = records + index;
+            if fixed_matches(#addr_of((*record).name[0]), 128 as usize, name) {
+                return option::Option[TensorData]::Some(TensorData {
+                    weights: this._mapping.pointer() + (*record).weights_offset as usize,
+                    scales: this._mapping.pointer() + (*record).scales_offset as usize,
+                    zeros: this._mapping.pointer() + (*record).zeros_offset as usize,
+                    weights_offset: (*record).weights_offset,
+                    scales_offset: (*record).scales_offset,
+                    zeros_offset: (*record).zeros_offset,
+                    weights_length: (*record).weights_length,
+                    scales_length: (*record).scales_length,
+                    zeros_length: (*record).zeros_length,
+                    output: (*record).dimensions[0],
+                    input: (*record).dimensions[1],
+                    scheme: (*record).scheme,
+                    group_size: (*record).group_size,
+                });
+            }
+            index = index +% (1 as usize);
+        }
+        return option::Option[TensorData]::None;
+    }
+}
+
 impl OwnedBytes {
     fn allocate(length: usize) -> option::Option[OwnedBytes] {
         if length == (0 as usize) {
@@ -455,6 +521,16 @@ fn verify_packed(path: str, quiet: bool = false) -> i32 {
         io::println("packed block0: verified");
     }
     return 0;
+}
+
+fn load(path: str) -> LoadResult {
+    if verify_packed(path, true) != (0 as i32) {
+        return LoadResult::Err;
+    }
+    guard let mapped::MapResult::Ok(mapping) = mapped::map_readonly(path) else {
+        return LoadResult::Err;
+    };
+    return LoadResult::Ok(File { _mapping: mapping });
 }
 
 fn verify_against_source(

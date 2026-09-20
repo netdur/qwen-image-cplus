@@ -33,7 +33,10 @@
     "final_normalized_rms_error": 0.008322597620091974,
     "cplus_packed_file_bytes": 228332032,
     "cplus_packed_final_max_absolute_error": 0.3529815673828125,
-    "cplus_packed_final_normalized_rms_error": 0.008302551459422058
+    "cplus_packed_final_normalized_rms_error": 0.008302551459422058,
+    "metal_final_max_absolute_error": 0.352509,
+    "metal_final_normalized_rms_error": 0.00837237,
+    "metal_block_gpu_ms": 33.35186
   },
   "q4_decision": {
     "accepted": false,

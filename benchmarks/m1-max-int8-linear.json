@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "device": "Apple M1 Max",
+  "cpc_version": "0.0.28",
+  "kernel": "qi_int8_affine_linear_16x16",
+  "weight_storage": "affine U8, K-group 64",
+  "scale_storage": "FP16",
+  "zero_point_storage": "U8",
+  "tile_storage": "FP16",
+  "accumulation_dtype": "FP32",
+  "output_dtype": "FP32",
+  "fast_math": false,
+  "storage_mode": "shared",
+  "warmup_dispatches": 1,
+  "measured_dispatches": 3,
+  "measurements": [
+    {
+      "name": "attention_projection",
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "average_gpu_ms": 118.473,
+      "gflops": 1160.08,
+      "buffer_mib": 144,
+      "dense_bf16_gpu_ms": 121.729,
+      "speedup_vs_dense": 1.02748
+    },
+    {
+      "name": "mlp_gate_or_projection",
+      "m": 4096,
+      "n": 12288,
+      "k": 4096,
+      "average_gpu_ms": 355.622,
+      "gflops": 1159.42,
+      "buffer_mib": 306,
+      "dense_bf16_gpu_ms": 365.387,
+      "speedup_vs_dense": 1.02746
+    },
+    {
+      "name": "mlp_output",
+      "m": 4096,
+      "n": 4096,
+      "k": 12288,
+      "average_gpu_ms": 370.487,
+      "gflops": 1112.91,
+      "buffer_mib": 306,
+      "dense_bf16_gpu_ms": 370.633,
+      "speedup_vs_dense": 1.00039
+    }
+  ],
+  "notes": "The CPU oracle reproduces FP16 activation/weight tiles and FP16 products with FP32 accumulation. Dense comparison values come from benchmarks/m1-max-linear.json. Total buffer memory falls by 10.0% for the square projection and 13.1% for each MLP shape."
+}

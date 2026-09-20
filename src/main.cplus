@@ -1,6 +1,7 @@
 import "./metal_probe" as metal_probe;
 import "./metal_primitives" as metal_primitives;
 import "./metal_linear" as metal_linear;
+import "./metal_int8_linear" as metal_int8_linear;
 import "./transformer_block" as transformer_block;
 import "./packed_model" as packed_model;
 import "./model_inventory" as model_inventory;
@@ -16,7 +17,7 @@ import "stdlib/text" as text;
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-transformer-block MODEL_DIR [FIXTURE_DIR] | quantize-block0 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | quantize-block0 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -41,6 +42,12 @@ fn main() -> i32 {
     if command == "benchmark-linear" {
         return metal_linear::run_benchmark();
     }
+    if command == "test-metal-int8-linear" {
+        return metal_int8_linear::run_validation();
+    }
+    if command == "benchmark-int8-linear" {
+        return metal_int8_linear::run_benchmark();
+    }
     if command == "test-transformer-block" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
             io::eprintln("usage: qwen-image-cplus test-transformer-block MODEL_DIR [FIXTURE_DIR]");
@@ -52,6 +59,20 @@ fn main() -> i32 {
             }
             option::Option[text::Text]::None => {
                 return transformer_block::run(path.view());
+            }
+        }
+    }
+    if command == "test-transformer-block-int8" {
+        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-transformer-block-int8 PACKED [FIXTURE_DIR]");
+            return 2;
+        };
+        match env::arg(3 as usize) {
+            option::Option[text::Text]::Some(fixtures) => {
+                return transformer_block::run_packed(path.view(), fixtures.view());
+            }
+            option::Option[text::Text]::None => {
+                return transformer_block::run_packed(path.view());
             }
         }
     }

@@ -27,10 +27,13 @@ cpc test
 ./target/debug/qwen-image-cplus test-metal-primitives
 ./target/debug/qwen-image-cplus test-metal-linear
 ./target/debug/qwen-image-cplus benchmark-linear
+./target/debug/qwen-image-cplus test-metal-int8-linear
+./target/debug/qwen-image-cplus benchmark-int8-linear
 ./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
 ./target/debug/qwen-image-cplus verify-packed block0.qipack
 ./target/debug/qwen-image-cplus verify-packed-source block0.qipack /path/to/model/snapshot
+./target/debug/qwen-image-cplus test-transformer-block-int8 block0.qipack
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -76,6 +79,15 @@ Inspect a shard, optionally filtering tensor names:
   per-tensor and payload checksums, exact source round-trip validation, and
   atomic temp-file installation. The format is documented in
   `docs/packed-format-v1.md`.
+- An affine INT8/group-64 Metal linear kernel that consumes packed U8 weights,
+  FP16 scales, and U8 zero points without materializing a dense weight matrix.
+  It uses FP16 tiles with FP32 accumulation, matches its CPU oracle exactly,
+  and is measured on all three model matrix shapes in
+  `benchmarks/m1-max-int8-linear.json`.
+- A complete packed block-0 Metal validation path. All seven matrix roles run
+  through the INT8 kernel and finish at 0.837% normalized RMS error. Repeated
+  M1 Max measurements and every intermediate error boundary are recorded in
+  `benchmarks/m1-max-block0-int8.json`.
 
 Image generation is not implemented yet. The block-0 quantization policy must
 still be calibrated across real prompts/timesteps before it is generalized to
