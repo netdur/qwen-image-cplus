@@ -35,12 +35,15 @@ class SafeTensorFile:
         self.mapping = np.memmap(path, mode="r", dtype=np.uint8)
 
     def bf16(self, name: str, shape: tuple[int, ...]) -> np.ndarray:
+        bits = self.bf16_bits(name, shape)
+        return (bits.astype(np.uint32) << np.uint32(16)).view("<f4").reshape(shape)
+
+    def bf16_bits(self, name: str, shape: tuple[int, ...]) -> np.ndarray:
         info = self.header[name]
         if info["dtype"] != "BF16" or tuple(info["shape"]) != shape:
             raise ValueError(f"unexpected tensor metadata for {name}: {info}")
         begin, end = info["data_offsets"]
-        bits = self.mapping[self.data_start + begin : self.data_start + end].view("<u2")
-        return (bits.astype(np.uint32) << np.uint32(16)).view("<f4").reshape(shape)
+        return self.mapping[self.data_start + begin : self.data_start + end].view("<u2").reshape(shape)
 
 
 def layer_norm(value: np.ndarray) -> np.ndarray:

@@ -47,6 +47,47 @@ fn f32_to_bf16(value: f32) -> u16 {
     return ((bits +% rounding_bias) >> (16 as u32)) as u16;
 }
 
+fn f32_to_fp16(value: f32) -> u16 {
+    let bits: u32 = f32_bits(value);
+    let sign: u32 = (bits >> (16 as u32)) & (0x8000 as u32);
+    let exponent: u32 = (bits >> (23 as u32)) & (0xFF as u32);
+    let mantissa: u32 = bits & (0x7FFFFF as u32);
+    if exponent == (0xFF as u32) {
+        if mantissa == (0 as u32) {
+            return (sign | (0x7C00 as u32)) as u16;
+        }
+        return (sign | (0x7E00 as u32)) as u16;
+    }
+
+    let half_exponent: i32 = exponent as i32 -% (127 as i32) +% (15 as i32);
+    if half_exponent >= (31 as i32) {
+        return (sign | (0x7C00 as u32)) as u16;
+    }
+    if half_exponent <= (0 as i32) {
+        if half_exponent < (0 -% (10 as i32)) {
+            return sign as u16;
+        }
+        let significand: u32 = mantissa | (0x800000 as u32);
+        let shift: u32 = (14 as i32 -% half_exponent) as u32;
+        var rounded: u32 = significand >> shift;
+        let mask: u32 = ((1 as u32) << shift) -% (1 as u32);
+        let remainder: u32 = significand & mask;
+        let halfway: u32 = (1 as u32) << (shift -% (1 as u32));
+        if remainder > halfway || (remainder == halfway && (rounded & (1 as u32)) != (0 as u32)) {
+            rounded = rounded +% (1 as u32);
+        }
+        return (sign | rounded) as u16;
+    }
+
+    var encoded: u32 = sign | ((half_exponent as u32) << (10 as u32)) | (mantissa >> (13 as u32));
+    let remainder: u32 = mantissa & (0x1FFF as u32);
+    if remainder > (0x1000 as u32)
+        || (remainder == (0x1000 as u32) && (encoded & (1 as u32)) != (0 as u32)) {
+        encoded = encoded +% (1 as u32);
+    }
+    return encoded as u16;
+}
+
 fn silu(value: f32) -> f32 {
     return value / (1.0f32 + (0.0f32 - value).exp());
 }
@@ -196,6 +237,14 @@ fn fp16_decodes_normal_and_subnormal_values() {
     assert fp16_to_f32(0x3C00 as u16) == 1.0f32;
     assert fp16_to_f32(0xC100 as u16) == (0.0f32 - 2.5f32);
     assert close(fp16_to_f32(0x0001 as u16), 0.000000059604645f32, 0.00000000000001f32);
+}
+
+#[test]
+fn fp16_encoding_rounds_and_handles_special_values() {
+    assert f32_to_fp16(1.0f32) == (0x3C00 as u16);
+    assert f32_to_fp16(0.0f32 - 2.5f32) == (0xC100 as u16);
+    assert f32_to_fp16(fp16_to_f32(0x0001 as u16)) == (0x0001 as u16);
+    assert f32_to_fp16(fp16_to_f32(0x7BFF as u16)) == (0x7BFF as u16);
 }
 
 #[test]

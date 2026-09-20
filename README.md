@@ -28,6 +28,9 @@ cpc test
 ./target/debug/qwen-image-cplus test-metal-linear
 ./target/debug/qwen-image-cplus benchmark-linear
 ./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
+./target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
+./target/debug/qwen-image-cplus verify-packed block0.qipack
+./target/debug/qwen-image-cplus verify-packed-source block0.qipack /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -63,7 +66,18 @@ Inspect a shard, optionally filtering tensor names:
   attention output projection, tanh-gated residuals, and SwiGLU MLP. Fifteen
   named boundaries are checked against the committed FP32 oracle, and the M1
   Max result is recorded in `benchmarks/m1-max-block0.json`.
+- Measured symmetric and affine INT4/INT8 candidates at K-group sizes 32, 64,
+  and 128. No INT4 role met the provisional complete-block error budget; the
+  current block-0 policy is affine INT8 group-64. The full measurements are in
+  `benchmarks/m1-max-quantization.json` and the deliberately provisional policy
+  is in `manifests/block0-quantization-policy.json`.
+- A C+ block-0 packed writer/reader with fixed little-endian metadata,
+  256-byte tensor alignment, a page-aligned data section, source identity,
+  per-tensor and payload checksums, exact source round-trip validation, and
+  atomic temp-file installation. The format is documented in
+  `docs/packed-format-v1.md`.
 
-Image generation is not implemented yet. The full 32-block streaming runtime,
-quantized packed format, native prompt encoder, and causal 3D VAE are tracked
-in `plan.md`.
+Image generation is not implemented yet. The block-0 quantization policy must
+still be calibrated across real prompts/timesteps before it is generalized to
+the full 32-block runtime. The native prompt encoder and causal 3D VAE are also
+tracked in `plan.md`.

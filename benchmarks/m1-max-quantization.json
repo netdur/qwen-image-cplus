@@ -1,0 +1,1336 @@
+{
+  "calibration": {
+    "block": 0,
+    "fixture": "tests/fixtures/block0_fp32",
+    "limitation": "One deterministic four-token model-width block fixture; policy is provisional until prompt/timestep/resolution calibration is available.",
+    "tokens": 4
+  },
+  "complete_block": {
+    "int4_affine_g128": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 16.813514709472656,
+          "mean_abs": 0.6904551073764651,
+          "normalized_rms": 0.12145136363933343,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.9390729476938122
+        },
+        "mlp_projected": {
+          "max_abs": 170.3162841796875,
+          "mean_abs": 7.337368881665498,
+          "normalized_rms": 0.1675961800969208,
+          "reference_rms": 61.74657353510192,
+          "rms": 10.348489858556706
+        },
+        "output": {
+          "max_abs": 11.215446472167969,
+          "mean_abs": 0.36435727370391646,
+          "normalized_rms": 0.1724708716908519,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.5584367976470614
+        },
+        "residual1": {
+          "max_abs": 0.8222367763519287,
+          "mean_abs": 0.03480103593959427,
+          "normalized_rms": 0.11681042948463177,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.05154519038063369
+        }
+      }
+    },
+    "int4_affine_g32": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 22.369953155517578,
+          "mean_abs": 0.5518946314973618,
+          "normalized_rms": 0.10235471461505555,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.7914159271966381
+        },
+        "mlp_projected": {
+          "max_abs": 170.24359130859375,
+          "mean_abs": 5.897955029860896,
+          "normalized_rms": 0.13401001128864828,
+          "reference_rms": 61.74657353510192,
+          "rms": 8.27465901647436
+        },
+        "output": {
+          "max_abs": 9.574745178222656,
+          "mean_abs": 0.29144561261674085,
+          "normalized_rms": 0.136813646540535,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.4429836406547587
+        },
+        "residual1": {
+          "max_abs": 1.280994176864624,
+          "mean_abs": 0.027792662297031256,
+          "normalized_rms": 0.10032215060651463,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.04426937196637688
+        }
+      }
+    },
+    "int4_affine_g64": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 9.880996704101562,
+          "mean_abs": 0.6189227677042481,
+          "normalized_rms": 0.10491306119398588,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.8111972947425223
+        },
+        "mlp_projected": {
+          "max_abs": 175.0242919921875,
+          "mean_abs": 6.314894666004875,
+          "normalized_rms": 0.14423202780625008,
+          "reference_rms": 61.74657353510192,
+          "rms": 8.905833511055485
+        },
+        "output": {
+          "max_abs": 10.985305786132812,
+          "mean_abs": 0.3125160671259266,
+          "normalized_rms": 0.15054705911911184,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.4874505286919061
+        },
+        "residual1": {
+          "max_abs": 0.5555133819580078,
+          "mean_abs": 0.030876408438089697,
+          "normalized_rms": 0.10095416223391018,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.04454826110153895
+        }
+      }
+    },
+    "int4_symmetric_g128": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 15.52020263671875,
+          "mean_abs": 0.8043026789131318,
+          "normalized_rms": 0.1363867901784425,
+          "reference_rms": 7.732090604453967,
+          "rms": 1.0545550189103698
+        },
+        "mlp_projected": {
+          "max_abs": 121.1949462890625,
+          "mean_abs": 8.359071558392316,
+          "normalized_rms": 0.1744816915317734,
+          "reference_rms": 61.74657353510192,
+          "rms": 10.773646596695617
+        },
+        "output": {
+          "max_abs": 5.288330078125,
+          "mean_abs": 0.4125198385201827,
+          "normalized_rms": 0.18204647650167619,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.5894412799324846
+        },
+        "residual1": {
+          "max_abs": 0.4549980163574219,
+          "mean_abs": 0.0404231289967214,
+          "normalized_rms": 0.13196565957200557,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.05823277147730936
+        }
+      }
+    },
+    "int4_symmetric_g32": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 9.442375183105469,
+          "mean_abs": 0.6724277893331418,
+          "normalized_rms": 0.11393853523558942,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.8809830777803482
+        },
+        "mlp_projected": {
+          "max_abs": 156.8076629638672,
+          "mean_abs": 6.919281348864388,
+          "normalized_rms": 0.14958527195756116,
+          "reference_rms": 61.74657353510192,
+          "rms": 9.23637799469577
+        },
+        "output": {
+          "max_abs": 11.513794898986816,
+          "mean_abs": 0.34191315269103484,
+          "normalized_rms": 0.15769032643228967,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.5105794390058646
+        },
+        "residual1": {
+          "max_abs": 0.5002031326293945,
+          "mean_abs": 0.033997867524362846,
+          "normalized_rms": 0.11170490543232695,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.049292264760635175
+        }
+      }
+    },
+    "int4_symmetric_g64": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 13.044082641601562,
+          "mean_abs": 0.756340077958555,
+          "normalized_rms": 0.12932534296398235,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.999955269249595
+        },
+        "mlp_projected": {
+          "max_abs": 101.06523132324219,
+          "mean_abs": 7.864768532305675,
+          "normalized_rms": 0.16498462238245795,
+          "reference_rms": 61.74657353510192,
+          "rms": 10.187235118099462
+        },
+        "output": {
+          "max_abs": 5.240553855895996,
+          "mean_abs": 0.38952697130625324,
+          "normalized_rms": 0.1738673917536998,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.5629585362113829
+        },
+        "residual1": {
+          "max_abs": 0.6764187812805176,
+          "mean_abs": 0.03800053985384011,
+          "normalized_rms": 0.12431899840221279,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.05485851279585297
+        }
+      }
+    },
+    "int8_affine_g128": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 0.7416458129882812,
+          "mean_abs": 0.042150253485488065,
+          "normalized_rms": 0.007195018096888632,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.055632531825828856
+        },
+        "mlp_projected": {
+          "max_abs": 10.15655517578125,
+          "mean_abs": 0.4376967188591152,
+          "normalized_rms": 0.0096175783870599,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.5938525111062011
+        },
+        "output": {
+          "max_abs": 0.6991348266601562,
+          "mean_abs": 0.021782787953355864,
+          "normalized_rms": 0.010189260334881569,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.03299141388931298
+        },
+        "residual1": {
+          "max_abs": 0.046190738677978516,
+          "mean_abs": 0.0021200981867650626,
+          "normalized_rms": 0.007010936227234134,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.0030937309636962706
+        }
+      }
+    },
+    "int8_affine_g32": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 0.757781982421875,
+          "mean_abs": 0.03323336503507335,
+          "normalized_rms": 0.0057111464896327764,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.04415910211314985
+        },
+        "mlp_projected": {
+          "max_abs": 6.43487548828125,
+          "mean_abs": 0.3475742336031544,
+          "normalized_rms": 0.00751773544547683,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.4641944045015773
+        },
+        "output": {
+          "max_abs": 0.4087555408477783,
+          "mean_abs": 0.017153650925735064,
+          "normalized_rms": 0.007855112814522978,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.025433767466319812
+        },
+        "residual1": {
+          "max_abs": 0.033753037452697754,
+          "mean_abs": 0.0016765890064149858,
+          "normalized_rms": 0.005524663849307937,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.0024378803430309113
+        }
+      }
+    },
+    "int8_affine_g64": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 1.0016593933105469,
+          "mean_abs": 0.0356201008453354,
+          "normalized_rms": 0.0062860532568414255,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.048604333326320845
+        },
+        "mlp_projected": {
+          "max_abs": 5.034454345703125,
+          "mean_abs": 0.37376701148969005,
+          "normalized_rms": 0.00792085462737331,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.48908563270995836
+        },
+        "output": {
+          "max_abs": 0.355621337890625,
+          "mean_abs": 0.018671925288145985,
+          "normalized_rms": 0.008322597620091974,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.026947418526416217
+        },
+        "residual1": {
+          "max_abs": 0.05050015449523926,
+          "mean_abs": 0.0017847681953213623,
+          "normalized_rms": 0.0060042107465399916,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.002649491037583836
+        }
+      }
+    },
+    "int8_symmetric_g128": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 1.535888671875,
+          "mean_abs": 0.04325987352012817,
+          "normalized_rms": 0.007468968623571363,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.057750742119277616
+        },
+        "mlp_projected": {
+          "max_abs": 13.8927001953125,
+          "mean_abs": 0.4873687699096081,
+          "normalized_rms": 0.01173637409863294,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.7246808863167044
+        },
+        "output": {
+          "max_abs": 0.8695602416992188,
+          "mean_abs": 0.024005223134651033,
+          "normalized_rms": 0.011948716063497464,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.038688287877699935
+        },
+        "residual1": {
+          "max_abs": 0.08006620407104492,
+          "mean_abs": 0.0021929865439460627,
+          "normalized_rms": 0.007352358138610055,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.003244390947566179
+        }
+      }
+    },
+    "int8_symmetric_g32": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 0.7742156982421875,
+          "mean_abs": 0.03642208233372912,
+          "normalized_rms": 0.0061449195835818005,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.047513074977338025
+        },
+        "mlp_projected": {
+          "max_abs": 10.164596557617188,
+          "mean_abs": 0.3913153105186211,
+          "normalized_rms": 0.00899982800971608,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.5557085420052039
+        },
+        "output": {
+          "max_abs": 0.5590400695800781,
+          "mean_abs": 0.01932836221595835,
+          "normalized_rms": 0.008995992072896121,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.02912777650855303
+        },
+        "residual1": {
+          "max_abs": 0.03130531311035156,
+          "mean_abs": 0.0018349796454657508,
+          "normalized_rms": 0.0059990846916625875,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.0026472290522823257
+        }
+      }
+    },
+    "int8_symmetric_g64": {
+      "boundaries": {
+        "attention_projected": {
+          "max_abs": 0.6886215209960938,
+          "mean_abs": 0.040488690697770835,
+          "normalized_rms": 0.0068956791768641995,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.05331801617476054
+        },
+        "mlp_projected": {
+          "max_abs": 10.09814453125,
+          "mean_abs": 0.44555213561852725,
+          "normalized_rms": 0.010494936674345033,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.6480263791086835
+        },
+        "output": {
+          "max_abs": 0.6675033569335938,
+          "mean_abs": 0.022047046762480704,
+          "normalized_rms": 0.010628689448946911,
+          "reference_rms": 3.2378615134968425,
+          "rms": 0.034414224505655164
+        },
+        "residual1": {
+          "max_abs": 0.0426403284072876,
+          "mean_abs": 0.002050072066495545,
+          "normalized_rms": 0.006767756843815554,
+          "reference_rms": 0.44127215872804626,
+          "rms": 0.0029864226722169985
+        }
+      }
+    }
+  },
+  "cplus_packed_artifact_validation": {
+    "file_bytes": 228332032,
+    "max_abs": 0.3529815673828125,
+    "mean_abs": 0.018644450715186167,
+    "normalized_rms": 0.008302551459422058,
+    "reference_rms": 3.2378615134968425,
+    "rms": 0.026882511834289722
+  },
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "direct_linear": {
+    "int4_affine_g128": {
+      "block_weight_bytes": 114163712,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 3.8208955223880596,
+          "max_abs": 7.988182067871094,
+          "mean_abs": 0.43030188518039836,
+          "normalized_rms": 0.07289218791489623,
+          "packed_bytes": 8781824,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.5636090013148621
+        },
+        "k": {
+          "compression_vs_bf16": 3.8208955223880596,
+          "max_abs": 2.1330513954162598,
+          "mean_abs": 0.2674894438640081,
+          "normalized_rms": 0.10263226377104454,
+          "packed_bytes": 8781824,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.34696087651064483
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 3.8208955223880596,
+          "max_abs": 1.9090946912765503,
+          "mean_abs": 0.2618062636202249,
+          "normalized_rms": 0.1051706469852763,
+          "packed_bytes": 26345472,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.3293186109333225
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 3.8208955223880596,
+          "max_abs": 65.77294921875,
+          "mean_abs": 2.9355645944979187,
+          "normalized_rms": 0.0647946639380132,
+          "packed_bytes": 26345472,
+          "reference_rms": 61.74657353510192,
+          "rms": 4.000848481530749
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 3.8208955223880596,
+          "max_abs": 1.4167766571044922,
+          "mean_abs": 0.25586610097943446,
+          "normalized_rms": 0.10615424802599062,
+          "packed_bytes": 26345472,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.3213423392889979
+        },
+        "q": {
+          "compression_vs_bf16": 3.8208955223880596,
+          "max_abs": 2.5418543815612793,
+          "mean_abs": 0.2617093127297494,
+          "normalized_rms": 0.09513801632727284,
+          "packed_bytes": 8781824,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.34008259786498823
+        },
+        "v": {
+          "compression_vs_bf16": 3.8208955223880596,
+          "max_abs": 1.42360121011734,
+          "mean_abs": 0.21371447580145286,
+          "normalized_rms": 0.10631561139546808,
+          "packed_bytes": 8781824,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.27086310668029906
+        }
+      }
+    },
+    "int4_affine_g32": {
+      "block_weight_bytes": 129499136,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 3.3684210526315788,
+          "max_abs": 9.758087158203125,
+          "mean_abs": 0.3431262067128955,
+          "normalized_rms": 0.05979761062778212,
+          "packed_bytes": 9961472,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.46236054330387083
+        },
+        "k": {
+          "compression_vs_bf16": 3.3684210526315788,
+          "max_abs": 1.8117928504943848,
+          "mean_abs": 0.21344272356998317,
+          "normalized_rms": 0.08177009127239454,
+          "packed_bytes": 9961472,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.27643375969487
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 3.3684210526315788,
+          "max_abs": 1.9958337545394897,
+          "mean_abs": 0.20782778336589067,
+          "normalized_rms": 0.08362680766127926,
+          "packed_bytes": 29884416,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.26185884488907013
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 3.3684210526315788,
+          "max_abs": 56.03912353515625,
+          "mean_abs": 2.3055053085818145,
+          "normalized_rms": 0.05066866342741797,
+          "packed_bytes": 29884416,
+          "reference_rms": 61.74657353510192,
+          "rms": 3.1286163522463935
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 3.3684210526315788,
+          "max_abs": 1.2275991439819336,
+          "mean_abs": 0.20389751886936125,
+          "normalized_rms": 0.08450619274513725,
+          "packed_bytes": 29884416,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.2558109370666039
+        },
+        "q": {
+          "compression_vs_bf16": 3.3684210526315788,
+          "max_abs": 1.8467812538146973,
+          "mean_abs": 0.20875923540324948,
+          "normalized_rms": 0.07470290197584085,
+          "packed_bytes": 9961472,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.26703475595501486
+        },
+        "v": {
+          "compression_vs_bf16": 3.3684210526315788,
+          "max_abs": 0.9020886421203613,
+          "mean_abs": 0.17045474195572297,
+          "normalized_rms": 0.08457145624622228,
+          "packed_bytes": 9961472,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.21546494512569034
+        }
+      }
+    },
+    "int4_affine_g64": {
+      "block_weight_bytes": 119275520,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 3.657142857142857,
+          "max_abs": 4.0928192138671875,
+          "mean_abs": 0.3839380252599085,
+          "normalized_rms": 0.06407531996642518,
+          "packed_bytes": 9175040,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.49543617948977786
+        },
+        "k": {
+          "compression_vs_bf16": 3.657142857142857,
+          "max_abs": 1.8484516143798828,
+          "mean_abs": 0.24186753813944506,
+          "normalized_rms": 0.09250455576397842,
+          "packed_bytes": 9175040,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.31272292522649014
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 3.657142857142857,
+          "max_abs": 3.3403035402297974,
+          "mean_abs": 0.2354002327543867,
+          "normalized_rms": 0.09489908719017362,
+          "packed_bytes": 27525120,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.2971554941245485
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 3.657142857142857,
+          "max_abs": 60.763671875,
+          "mean_abs": 2.6153335035141936,
+          "normalized_rms": 0.05675200671912503,
+          "packed_bytes": 27525120,
+          "reference_rms": 61.74657353510192,
+          "rms": 3.504241956147052
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 3.657142857142857,
+          "max_abs": 1.3604600429534912,
+          "mean_abs": 0.22934721538242067,
+          "normalized_rms": 0.0952042356243532,
+          "packed_bytes": 27525120,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.2881952663661678
+        },
+        "q": {
+          "compression_vs_bf16": 3.657142857142857,
+          "max_abs": 1.6886520385742188,
+          "mean_abs": 0.23236416055368636,
+          "normalized_rms": 0.08353779520078426,
+          "packed_bytes": 9175040,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.29861617372877625
+        },
+        "v": {
+          "compression_vs_bf16": 3.657142857142857,
+          "max_abs": 1.0846987962722778,
+          "mean_abs": 0.19256097108137737,
+          "normalized_rms": 0.09531129695179723,
+          "packed_bytes": 9175040,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.24282712251977687
+        }
+      }
+    },
+    "int4_symmetric_g128": {
+      "block_weight_bytes": 112459776,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 3.878787878787879,
+          "max_abs": 7.4686126708984375,
+          "mean_abs": 0.49931829226306945,
+          "normalized_rms": 0.0849475506850837,
+          "packed_bytes": 8650752,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.6568221585235128
+        },
+        "k": {
+          "compression_vs_bf16": 3.878787878787879,
+          "max_abs": 3.6766529083251953,
+          "mean_abs": 0.31660117672191745,
+          "normalized_rms": 0.12197562604879938,
+          "packed_bytes": 8650752,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.41235347026191155
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 3.878787878787879,
+          "max_abs": 1.7640166282653809,
+          "mean_abs": 0.30984129972489427,
+          "normalized_rms": 0.1241460393046185,
+          "packed_bytes": 25952256,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.38873585347815015
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 3.878787878787879,
+          "max_abs": 108.9002685546875,
+          "mean_abs": 3.49793958834789,
+          "normalized_rms": 0.07800018746980253,
+          "packed_bytes": 25952256,
+          "reference_rms": 61.74657353510192,
+          "rms": 4.816244311355898
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 3.878787878787879,
+          "max_abs": 1.9327510595321655,
+          "mean_abs": 0.30077717318048985,
+          "normalized_rms": 0.12439836324911126,
+          "packed_bytes": 25952256,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.3765695842940232
+        },
+        "q": {
+          "compression_vs_bf16": 3.878787878787879,
+          "max_abs": 3.9771900177001953,
+          "mean_abs": 0.3082851666181341,
+          "normalized_rms": 0.11283516933488688,
+          "packed_bytes": 8650752,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.4033432585554537
+        },
+        "v": {
+          "compression_vs_bf16": 3.878787878787879,
+          "max_abs": 1.3620909452438354,
+          "mean_abs": 0.2502113460845692,
+          "normalized_rms": 0.1252186697817059,
+          "packed_bytes": 8650752,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.3190229305579964
+        }
+      }
+    },
+    "int4_symmetric_g32": {
+      "block_weight_bytes": 122683392,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 3.5555555555555554,
+          "max_abs": 9.54229736328125,
+          "mean_abs": 0.42144302316683024,
+          "normalized_rms": 0.07278388671412538,
+          "packed_bytes": 9437184,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.5627716066179308
+        },
+        "k": {
+          "compression_vs_bf16": 3.5555555555555554,
+          "max_abs": 1.9836540222167969,
+          "mean_abs": 0.2515145858371284,
+          "normalized_rms": 0.09589973876538387,
+          "packed_bytes": 9437184,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.324200755168053
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 3.5555555555555554,
+          "max_abs": 1.9876298904418945,
+          "mean_abs": 0.25266373092698774,
+          "normalized_rms": 0.10160155084233757,
+          "packed_bytes": 28311552,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.3181427760614061
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 3.5555555555555554,
+          "max_abs": 71.245361328125,
+          "mean_abs": 2.844074569093209,
+          "normalized_rms": 0.0629839462411735,
+          "packed_bytes": 28311552,
+          "reference_rms": 61.74657353510192,
+          "rms": 3.889042868111526
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 3.5555555555555554,
+          "max_abs": 1.5725054740905762,
+          "mean_abs": 0.24406431530434483,
+          "normalized_rms": 0.10152657185418405,
+          "packed_bytes": 28311552,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.307333778028631
+        },
+        "q": {
+          "compression_vs_bf16": 3.5555555555555554,
+          "max_abs": 2.7326602935791016,
+          "mean_abs": 0.24654277061212326,
+          "normalized_rms": 0.08882130746308003,
+          "packed_bytes": 9437184,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.31750274132160905
+        },
+        "v": {
+          "compression_vs_bf16": 3.5555555555555554,
+          "max_abs": 1.1153279542922974,
+          "mean_abs": 0.19870624944002202,
+          "normalized_rms": 0.09875757609962452,
+          "packed_bytes": 9437184,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.2516072994309151
+        }
+      }
+    },
+    "int4_symmetric_g64": {
+      "block_weight_bytes": 115867648,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 3.764705882352941,
+          "max_abs": 9.097274780273438,
+          "mean_abs": 0.46076651310306715,
+          "normalized_rms": 0.07847375244253146,
+          "packed_bytes": 8912896,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.6067661639571441
+        },
+        "k": {
+          "compression_vs_bf16": 3.764705882352941,
+          "max_abs": 3.1430091857910156,
+          "mean_abs": 0.2860271158261867,
+          "normalized_rms": 0.10927903676138344,
+          "packed_bytes": 8912896,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.36943110271397545
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 3.764705882352941,
+          "max_abs": 2.658683657646179,
+          "mean_abs": 0.2828871596874289,
+          "normalized_rms": 0.11357570697759456,
+          "packed_bytes": 26738688,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.35563719659219933
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 3.764705882352941,
+          "max_abs": 85.867431640625,
+          "mean_abs": 3.1952539323203837,
+          "normalized_rms": 0.06993544207805513,
+          "packed_bytes": 26738688,
+          "reference_rms": 61.74657353510192,
+          "rms": 4.318273916982492
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 3.764705882352941,
+          "max_abs": 2.1957489252090454,
+          "mean_abs": 0.27335072228293456,
+          "normalized_rms": 0.11370813353142196,
+          "packed_bytes": 26738688,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.3442089064229128
+        },
+        "q": {
+          "compression_vs_bf16": 3.764705882352941,
+          "max_abs": 2.623443603515625,
+          "mean_abs": 0.2791581607149851,
+          "normalized_rms": 0.10070406454796489,
+          "packed_bytes": 8912896,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.3599791251609028
+        },
+        "v": {
+          "compression_vs_bf16": 3.764705882352941,
+          "max_abs": 1.0884532928466797,
+          "mean_abs": 0.22226156166067312,
+          "normalized_rms": 0.11028024952891835,
+          "packed_bytes": 8912896,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.2809639205456774
+        }
+      }
+    },
+    "int8_affine_g128": {
+      "block_weight_bytes": 223215616,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 1.9541984732824427,
+          "max_abs": 0.301513671875,
+          "mean_abs": 0.025147434675524494,
+          "normalized_rms": 0.004239282281726453,
+          "packed_bytes": 17170432,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.03277851470016529
+        },
+        "k": {
+          "compression_vs_bf16": 1.9541984732824427,
+          "max_abs": 0.22395992279052734,
+          "mean_abs": 0.01564002015072674,
+          "normalized_rms": 0.006004085708410634,
+          "packed_bytes": 17170432,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.020297543515969043
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 1.9541984732824427,
+          "max_abs": 0.08937239646911621,
+          "mean_abs": 0.015465949346946672,
+          "normalized_rms": 0.006210106293495406,
+          "packed_bytes": 51511296,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.019445573807380892
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 1.9541984732824427,
+          "max_abs": 3.6816482543945312,
+          "mean_abs": 0.17062106714911351,
+          "normalized_rms": 0.00369109017465776,
+          "packed_bytes": 51511296,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.2279121708941976
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 1.9541984732824427,
+          "max_abs": 0.08609175682067871,
+          "mean_abs": 0.014987322638909006,
+          "normalized_rms": 0.006221164419121493,
+          "packed_bytes": 51511296,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.018832251791303902
+        },
+        "q": {
+          "compression_vs_bf16": 1.9541984732824427,
+          "max_abs": 0.1575946807861328,
+          "mean_abs": 0.015537704404778196,
+          "normalized_rms": 0.005655526257459427,
+          "packed_bytes": 17170432,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.02021637759730227
+        },
+        "v": {
+          "compression_vs_bf16": 1.9541984732824427,
+          "max_abs": 0.07325315475463867,
+          "mean_abs": 0.012622035795118336,
+          "normalized_rms": 0.006257624394618507,
+          "packed_bytes": 17170432,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.015942715860043914
+        }
+      }
+    },
+    "int8_affine_g32": {
+      "block_weight_bytes": 238551040,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 1.8285714285714285,
+          "max_abs": 0.4122428894042969,
+          "mean_abs": 0.02049712851388108,
+          "normalized_rms": 0.0035524586516637244,
+          "packed_bytes": 18350080,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.027467932163240293
+        },
+        "k": {
+          "compression_vs_bf16": 1.8285714285714285,
+          "max_abs": 0.10651731491088867,
+          "mean_abs": 0.012549154469297719,
+          "normalized_rms": 0.004773763138026476,
+          "packed_bytes": 18350080,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.016138288114922825
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 1.8285714285714285,
+          "max_abs": 0.07476949691772461,
+          "mean_abs": 0.012155635212555657,
+          "normalized_rms": 0.004874148238802092,
+          "packed_bytes": 55050240,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.015262316753743305
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 1.8285714285714285,
+          "max_abs": 3.119384765625,
+          "mean_abs": 0.13595446292401903,
+          "normalized_rms": 0.00296469407925684,
+          "packed_bytes": 55050240,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.18305970097391377
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 1.8285714285714285,
+          "max_abs": 0.06761646270751953,
+          "mean_abs": 0.011794642770456202,
+          "normalized_rms": 0.00489911153901422,
+          "packed_bytes": 55050240,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.01483023045859743
+        },
+        "q": {
+          "compression_vs_bf16": 1.8285714285714285,
+          "max_abs": 0.1265869140625,
+          "mean_abs": 0.012222535095588682,
+          "normalized_rms": 0.004442248793049223,
+          "packed_bytes": 18350080,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.015879367346759706
+        },
+        "v": {
+          "compression_vs_bf16": 1.8285714285714285,
+          "max_abs": 0.055712223052978516,
+          "mean_abs": 0.009963564374061207,
+          "normalized_rms": 0.004945613489645674,
+          "packed_bytes": 18350080,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.012600070833082982
+        }
+      }
+    },
+    "int8_affine_g64": {
+      "block_weight_bytes": 228327424,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 1.9104477611940298,
+          "max_abs": 0.5195350646972656,
+          "mean_abs": 0.022605753976620235,
+          "normalized_rms": 0.0039734636939110154,
+          "packed_bytes": 17563648,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.03072318129482832
+        },
+        "k": {
+          "compression_vs_bf16": 1.9104477611940298,
+          "max_abs": 0.11885106563568115,
+          "mean_abs": 0.014128522974942825,
+          "normalized_rms": 0.005395746417480511,
+          "packed_bytes": 17563648,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.018240978398513956
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 1.9104477611940298,
+          "max_abs": 0.0897831916809082,
+          "mean_abs": 0.013927793393705201,
+          "normalized_rms": 0.005599083648102667,
+          "packed_bytes": 52690944,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.017532291588458048
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 1.9104477611940298,
+          "max_abs": 3.00323486328125,
+          "mean_abs": 0.1546366209495318,
+          "normalized_rms": 0.0033344398217295223,
+          "packed_bytes": 52690944,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.2058902336507941
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 1.9104477611940298,
+          "max_abs": 0.0764458179473877,
+          "mean_abs": 0.013502944958164656,
+          "normalized_rms": 0.0055976754251700084,
+          "packed_bytes": 52690944,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.016944871723496725
+        },
+        "q": {
+          "compression_vs_bf16": 1.9104477611940298,
+          "max_abs": 0.17693805694580078,
+          "mean_abs": 0.013536747988325715,
+          "normalized_rms": 0.004880919602449973,
+          "packed_bytes": 17563648,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.01744745037211261
+        },
+        "v": {
+          "compression_vs_bf16": 1.9104477611940298,
+          "max_abs": 0.06248044967651367,
+          "mean_abs": 0.011334421664685124,
+          "normalized_rms": 0.005610652802763235,
+          "packed_bytes": 17563648,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.014294409153214522
+        }
+      }
+    },
+    "int8_symmetric_g128": {
+      "block_weight_bytes": 221511680,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 1.9692307692307693,
+          "max_abs": 0.49840545654296875,
+          "mean_abs": 0.027682430175104855,
+          "normalized_rms": 0.0047217147347991435,
+          "packed_bytes": 17039360,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.03650872613785231
+        },
+        "k": {
+          "compression_vs_bf16": 1.9692307692307693,
+          "max_abs": 0.20234298706054688,
+          "mean_abs": 0.017852053799629175,
+          "normalized_rms": 0.006911707656770421,
+          "packed_bytes": 17039360,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.02336587013347132
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 1.9692307692307693,
+          "max_abs": 0.16469120979309082,
+          "mean_abs": 0.0169819437473393,
+          "normalized_rms": 0.006840899438654961,
+          "packed_bytes": 51118080,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.02142076297189453
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 1.9692307692307693,
+          "max_abs": 5.0233001708984375,
+          "mean_abs": 0.1952036671937094,
+          "normalized_rms": 0.004341291792697808,
+          "packed_bytes": 51118080,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.26805989291514964
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 1.9692307692307693,
+          "max_abs": 0.12178677320480347,
+          "mean_abs": 0.016547946646618072,
+          "normalized_rms": 0.006877888879178174,
+          "packed_bytes": 51118080,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.020820239819924754
+        },
+        "q": {
+          "compression_vs_bf16": 1.9692307692307693,
+          "max_abs": 0.3901710510253906,
+          "mean_abs": 0.017092538497877285,
+          "normalized_rms": 0.0063013176259072105,
+          "packed_bytes": 17039360,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.02252483865986018
+        },
+        "v": {
+          "compression_vs_bf16": 1.9692307692307693,
+          "max_abs": 0.07599377632141113,
+          "mean_abs": 0.013868412227168392,
+          "normalized_rms": 0.0068502065158400766,
+          "packed_bytes": 17039360,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.017452453068065255
+        }
+      }
+    },
+    "int8_symmetric_g32": {
+      "block_weight_bytes": 231735296,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 1.8823529411764706,
+          "max_abs": 0.45361328125,
+          "mean_abs": 0.02255322075939148,
+          "normalized_rms": 0.003820802306772113,
+          "packed_bytes": 17825792,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.029542789617668697
+        },
+        "k": {
+          "compression_vs_bf16": 1.8823529411764706,
+          "max_abs": 0.09807014465332031,
+          "mean_abs": 0.014062775940942629,
+          "normalized_rms": 0.005358265974297313,
+          "packed_bytes": 17825792,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.01811427119221224
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 1.8823529411764706,
+          "max_abs": 0.13544511795043945,
+          "mean_abs": 0.013962108247900082,
+          "normalized_rms": 0.00560549303564984,
+          "packed_bytes": 53477376,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.017552361167418266
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 1.8823529411764706,
+          "max_abs": 3.0844802856445312,
+          "mean_abs": 0.15462802099864348,
+          "normalized_rms": 0.003347375610031267,
+          "packed_bytes": 53477376,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.20668897425440227
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 1.8823529411764706,
+          "max_abs": 0.08188676834106445,
+          "mean_abs": 0.013553182269842997,
+          "normalized_rms": 0.005623562480481005,
+          "packed_bytes": 53477376,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.01702323511512381
+        },
+        "q": {
+          "compression_vs_bf16": 1.8823529411764706,
+          "max_abs": 0.1297626495361328,
+          "mean_abs": 0.013442994562922195,
+          "normalized_rms": 0.0048701143494052435,
+          "packed_bytes": 17825792,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.017408825659638062
+        },
+        "v": {
+          "compression_vs_bf16": 1.8823529411764706,
+          "max_abs": 0.06396210193634033,
+          "mean_abs": 0.011071025656278266,
+          "normalized_rms": 0.005507560333178345,
+          "packed_bytes": 17825792,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.014031757730525174
+        }
+      }
+    },
+    "int8_symmetric_g64": {
+      "block_weight_bytes": 224919552,
+      "roles": {
+        "attention_output": {
+          "compression_vs_bf16": 1.9393939393939394,
+          "max_abs": 0.374298095703125,
+          "mean_abs": 0.025701174266032467,
+          "normalized_rms": 0.0043505471939253556,
+          "packed_bytes": 17301504,
+          "reference_rms": 7.732090604453967,
+          "rms": 0.03363882508238381
+        },
+        "k": {
+          "compression_vs_bf16": 1.9393939393939394,
+          "max_abs": 0.14029502868652344,
+          "mean_abs": 0.015841126156487917,
+          "normalized_rms": 0.00607170346997686,
+          "packed_bytes": 17301504,
+          "reference_rms": 3.3806218801200436,
+          "rms": 0.020526133600204565
+        },
+        "mlp_gate": {
+          "compression_vs_bf16": 1.9393939393939394,
+          "max_abs": 0.13825321197509766,
+          "mean_abs": 0.015567917577413937,
+          "normalized_rms": 0.00623482142832921,
+          "packed_bytes": 51904512,
+          "reference_rms": 3.131278739584311,
+          "rms": 0.019522963783631945
+        },
+        "mlp_output": {
+          "compression_vs_bf16": 1.9393939393939394,
+          "max_abs": 3.72479248046875,
+          "mean_abs": 0.17357171194998955,
+          "normalized_rms": 0.0037598155920227265,
+          "packed_bytes": 51904512,
+          "reference_rms": 61.74657353510192,
+          "rms": 0.23215572993125405
+        },
+        "mlp_projection": {
+          "compression_vs_bf16": 1.9393939393939394,
+          "max_abs": 0.08738136291503906,
+          "mean_abs": 0.015033062941917308,
+          "normalized_rms": 0.0062455698980687455,
+          "packed_bytes": 51904512,
+          "reference_rms": 3.0271265188588687,
+          "rms": 0.018906130263830583
+        },
+        "q": {
+          "compression_vs_bf16": 1.9393939393939394,
+          "max_abs": 0.17066574096679688,
+          "mean_abs": 0.015221566034256284,
+          "normalized_rms": 0.005579919510091107,
+          "packed_bytes": 17301504,
+          "reference_rms": 3.5746235941593634,
+          "rms": 0.019946111934281828
+        },
+        "v": {
+          "compression_vs_bf16": 1.9393939393939394,
+          "max_abs": 0.0709906816482544,
+          "mean_abs": 0.012619093257342229,
+          "normalized_rms": 0.006272751945815996,
+          "packed_bytes": 17301504,
+          "reference_rms": 2.5477265579817296,
+          "rms": 0.015981256723986984
+        }
+      }
+    }
+  },
+  "elapsed_seconds": 28.158379500033334,
+  "isolated_q4_affine_g32": {
+    "attention_output": {
+      "max_abs": 2.817567825317383,
+      "mean_abs": 0.12708567031496898,
+      "normalized_rms": 0.05871052175970213,
+      "reference_rms": 3.2378615134968425,
+      "rms": 0.19009653884305844
+    },
+    "k": {
+      "max_abs": 1.4647636413574219,
+      "mean_abs": 0.05118761843716868,
+      "normalized_rms": 0.02818588500782927,
+      "reference_rms": 3.2378615134968425,
+      "rms": 0.09126199229069804
+    },
+    "mlp_gate": {
+      "max_abs": 1.7648401260375977,
+      "mean_abs": 0.11515311403401896,
+      "normalized_rms": 0.0509890051188218,
+      "reference_rms": 3.2378615134968425,
+      "rms": 0.1650953372857266
+    },
+    "mlp_output": {
+      "max_abs": 3.886188507080078,
+      "mean_abs": 0.11327019220715329,
+      "normalized_rms": 0.052672358713907665,
+      "reference_rms": 3.2378615134968425,
+      "rms": 0.17054580310486167
+    },
+    "mlp_projection": {
+      "max_abs": 3.2040481567382812,
+      "mean_abs": 0.11603939320545464,
+      "normalized_rms": 0.05588441104802457,
+      "reference_rms": 3.2378615134968425,
+      "rms": 0.1809459837368365
+    },
+    "q": {
+      "max_abs": 2.5254554748535156,
+      "mean_abs": 0.05159457233640552,
+      "normalized_rms": 0.03085529274232485,
+      "reference_rms": 3.2378615134968425,
+      "rms": 0.09990516485805208
+    },
+    "v": {
+      "max_abs": 3.952564239501953,
+      "mean_abs": 0.13329770988774214,
+      "normalized_rms": 0.06106436433819861,
+      "reference_rms": 3.2378615134968425,
+      "rms": 0.19771795513680238
+    }
+  },
+  "mixed_candidate": {
+    "block_weight_bytes": 228327424,
+    "boundaries": {
+      "attention_projected": {
+        "max_abs": 1.0016593933105469,
+        "mean_abs": 0.0356201008453354,
+        "normalized_rms": 0.0062860532568414255,
+        "reference_rms": 7.732090604453967,
+        "rms": 0.048604333326320845
+      },
+      "mlp_projected": {
+        "max_abs": 5.034454345703125,
+        "mean_abs": 0.37376701148969005,
+        "normalized_rms": 0.00792085462737331,
+        "reference_rms": 61.74657353510192,
+        "rms": 0.48908563270995836
+      },
+      "output": {
+        "max_abs": 0.355621337890625,
+        "mean_abs": 0.018671925288145985,
+        "normalized_rms": 0.008322597620091974,
+        "reference_rms": 3.2378615134968425,
+        "rms": 0.026947418526416217
+      },
+      "residual1": {
+        "max_abs": 0.05050015449523926,
+        "mean_abs": 0.0017847681953213623,
+        "normalized_rms": 0.0060042107465399916,
+        "reference_rms": 0.44127215872804626,
+        "rms": 0.002649491037583836
+      }
+    },
+    "policies": {
+      "attention_output": "int8_affine_g64",
+      "k": "int8_affine_g64",
+      "mlp_gate": "int8_affine_g64",
+      "mlp_output": "int8_affine_g64",
+      "mlp_projection": "int8_affine_g64",
+      "q": "int8_affine_g64",
+      "v": "int8_affine_g64"
+    }
+  },
+  "model": "Qwen/Qwen-Image-2.1",
+  "schema_version": 1,
+  "selection": {
+    "criterion": "smallest block storage with final normalized RMS <= 0.01",
+    "provisional_candidate": "int8_affine_g64"
+  },
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "storage": {
+    "affine_levels": [
+      0,
+      15
+    ],
+    "affine_zero_point": "U8 per output-row K-group",
+    "int8_candidates": "same scale/zero-point representation with one byte per weight",
+    "nibbles": "two little-endian logical K values per byte, low nibble first",
+    "scale": "FP16 per output-row K-group",
+    "symmetric_levels": [
+      -7,
+      7
+    ]
+  }
+}
