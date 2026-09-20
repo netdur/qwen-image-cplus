@@ -37,6 +37,7 @@ cpc test
 ./target/debug/qwen-image-cplus verify-packed-source block0.qipack /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-packed-source transformer.qipack /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-transformer-block-int8 block0.qipack
+./target/debug/qwen-image-cplus test-transformer-mixed transformer.qipack
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -112,6 +113,14 @@ Inspect a shard, optionally filtering tensor names:
   payload, per-tensor, and exact source round-trip checks; and produced a
   verified 13,334,843,392-byte artifact from the pinned snapshot. The layout
   and scope compatibility rules are documented in `docs/packed-format-v1.md`.
+- Native execution of all 32 blocks directly from one read-only, page-aligned
+  no-copy QIPACK1 Metal buffer. Kernel selection comes from each tensor record,
+  not a second hard-coded policy: blocks 0-23 discover zero Q8 matrices,
+  blocks 24-27 discover four, and blocks 28-31 discover six. A compact
+  four-token FP32 oracle checks blocks 0, 23, 24, 27, 28, and 31 around both
+  precision transitions. The final native mixed output measured 0.1300%
+  nRMSE, with 581.5 ms summed GPU kernel time on the M1 Max; repeated results
+  are recorded in `benchmarks/m1-max-transformer-mixed-native.json`.
 
 ## Quantization decision log
 
@@ -157,7 +166,14 @@ role search showed that exchanging projection/output for the gate crossed the
 1% error threshold. QIPACK1 still accepts the original block-0 scope so the
 existing isolated Metal fixture remains reproducible.
 
+The native validation fixture is intentionally four tokens, not a speed claim
+for production image-token counts. Its purpose is high-coverage correctness:
+it runs every real block weight, crosses both mixed-policy boundaries, and
+checks accumulated error without requiring the not-yet-native prompt encoder.
+The packed mapping is exposed to Metal without copying 12.42 GiB of weights;
+only small activation workspaces and 128-element Q/K norm vectors are copied.
+
 Image generation is not implemented yet. The next transformer step is native
-execution directly from the full mixed artifact, followed by native Metal
-boundary comparisons and denoising-state replay. The native prompt encoder and
-causal 3D VAE are also tracked in `plan.md`.
+execution of the global input/modulation/output layers and realistic variable
+token layouts, followed by denoising-state replay. The native prompt encoder
+and causal 3D VAE are also tracked in `plan.md`.

@@ -1,0 +1,134 @@
+{
+  "acceptance": {
+    "final_limit": 0.01,
+    "metric": "normalized RMS versus the dense FP32 oracle"
+  },
+  "capture_blocks": [
+    0,
+    23,
+    24,
+    27,
+    28,
+    31
+  ],
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "operation": "QwenImage21TransformerBlock chain, blocks 0-31, FP32 reference",
+  "reference": "Pinned Diffusers equations transcribed to NumPy; BF16 checkpoint weights decoded to FP32",
+  "schema_version": 1,
+  "shape": {
+    "blocks": 32,
+    "head_dim": 128,
+    "heads": 32,
+    "mlp": 12288,
+    "rows": 4,
+    "width": 4096
+  },
+  "tensors": {
+    "block_00_output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "block_00_output.f32",
+      "sha256": "0f52ce56365129f38b1045e32641331bdf9526001f010ef336d72a6114278c30",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "block_23_output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "block_23_output.f32",
+      "sha256": "115344c4e0158323fbd7037fe434c7780a3367fc6daa62384c32beddaca9885b",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "block_24_output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "block_24_output.f32",
+      "sha256": "9e75691c259080afb427aeb3d66a3b870f39789683e38fb91fecf35b78329512",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "block_27_output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "block_27_output.f32",
+      "sha256": "0c36b7ab622be2059a4e8816b22b9cd654a24a6256f1c9e2b7c12a5e0d0d42a4",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "block_28_output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "block_28_output.f32",
+      "sha256": "d8a910fa28e055c2f71c3eeeab7b54e67176e2a286c2059e15a1f18f11181a66",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "block_31_output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "block_31_output.f32",
+      "sha256": "ea50c62a4b29c82e728d600977a582d79aea7c4539769f9cca8a9c4844c1a85a",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "hidden": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "hidden.f32",
+      "sha256": "69fd9b980d640155171e66409f39a691c378938f1d8dc626cf9d6b68ac6d564a",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "modulation": {
+      "bytes": 131072,
+      "dtype": "F32",
+      "file": "modulation.f32",
+      "sha256": "ac43682d42b3e0ba5dd2ca8ad0481a3fb052f44db681aa88a553ad881f4c558b",
+      "shape": [
+        2,
+        4,
+        4096
+      ]
+    },
+    "rope": {
+      "bytes": 2048,
+      "dtype": "F32",
+      "file": "rope.f32",
+      "sha256": "336e6b281688d0f923b3f8e8c73fc7e1505796054b2fe9d124c15326ac801274",
+      "shape": [
+        4,
+        128
+      ]
+    }
+  },
+  "tokens": {
+    "image_ids": [
+      -1,
+      -1,
+      0,
+      0
+    ],
+    "target_mask": [
+      false,
+      false,
+      true,
+      true
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "status": "mixed_policy_provisional",
+  "status": "mixed_policy_native_compact_validated",
   "scope": "seven matrix roles in 32 transformer blocks",
   "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
   "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
@@ -65,11 +65,23 @@
     "block_matrix_mixed_bytes": 13127122944,
     "worst_final_normalized_rms_error": 0.00905720935461897
   },
+  "native_validation": {
+    "report": "benchmarks/m1-max-transformer-mixed-native.json",
+    "artifact_tensor_count": 297,
+    "artifact_quantized_matrix_count": 40,
+    "execution": "all 32 blocks directly from a read-only no-copy QIPACK1 Metal buffer",
+    "fixture_rows": 4,
+    "capture_blocks": [0, 23, 24, 27, 28, 31],
+    "final_normalized_rms_error": 0.00130011,
+    "gate_passed": true,
+    "repeated": true
+  },
   "limitations": [
     "The search is broad but not an exhaustive enumeration of every per-matrix assignment.",
     "Latent inputs are deterministic Gaussian samples, not states replayed from a complete denoising trajectory.",
     "The packed values and FP16 linear inputs match the native path, but PyTorch MPS matmul is not a bit-exact emulation of the Metal kernel's product rounding.",
-    "The selected policy has a narrow 0.000150923604746698 margin below the acceptance limit and must remain provisional until native validation."
+    "The selected policy has a narrow 0.000150923604746698 margin in prompt/resolution calibration and remains provisional for end-to-end inference until native denoising-state replay.",
+    "Native Metal validation currently covers every block on a compact four-token fixture, not realistic prompt and image token counts."
   ],
-  "next": "Implement mixed BF16/Q8 full-transformer packing and execution, validate native Metal outputs, then repeat calibration on replayed denoising states."
+  "next": "Implement native global transformer layers and realistic variable-token layouts, then repeat calibration on replayed denoising states."
 }

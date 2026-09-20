@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "command": "test-transformer-mixed",
+  "artifact": {
+    "format": "QIPACK1 version 1 scope 2",
+    "bytes": 13334843392,
+    "metal_mapping": "read-only page-aligned no-copy",
+    "mapped_buffer_bytes": 13334855680,
+    "tensor_count": 297,
+    "quantized_matrix_count": 40
+  },
+  "fixture": {
+    "path": "tests/fixtures/transformer32_fp32",
+    "rows": 4,
+    "text_tokens": 2,
+    "image_tokens": 2,
+    "blocks": 32,
+    "reference": "independent NumPy FP32 equations with decoded BF16 checkpoint weights",
+    "capture_blocks": [0, 23, 24, 27, 28, 31]
+  },
+  "policy_observed_from_records": [
+    {"blocks": [0, 23], "q8_matrices_per_block": 0},
+    {"blocks": [24, 27], "q8_matrices_per_block": 4},
+    {"blocks": [28, 31], "q8_matrices_per_block": 6}
+  ],
+  "runs": [
+    {
+      "summed_gpu_ms": 581.534,
+      "captures": {
+        "0": {"gpu_ms": 30.4732, "normalized_rms_error": 0.00000864461},
+        "23": {"gpu_ms": 17.8617, "normalized_rms_error": 0.0000138232},
+        "24": {"gpu_ms": 17.6696, "normalized_rms_error": 0.000318408},
+        "27": {"gpu_ms": 17.6018, "normalized_rms_error": 0.00070892},
+        "28": {"gpu_ms": 17.5728, "normalized_rms_error": 0.000954156},
+        "31": {"gpu_ms": 17.6042, "normalized_rms_error": 0.00130011}
+      }
+    },
+    {
+      "summed_gpu_ms": 584.75,
+      "captures": {
+        "0": {"gpu_ms": 34.7573, "normalized_rms_error": 0.00000864461},
+        "23": {"gpu_ms": 17.797, "normalized_rms_error": 0.0000138232},
+        "24": {"gpu_ms": 17.7324, "normalized_rms_error": 0.000318408},
+        "27": {"gpu_ms": 17.7161, "normalized_rms_error": 0.00070892},
+        "28": {"gpu_ms": 17.6418, "normalized_rms_error": 0.000954156},
+        "31": {"gpu_ms": 17.5605, "normalized_rms_error": 0.00130011}
+      }
+    }
+  ],
+  "acceptance": {
+    "metric": "block-31 normalized RMS versus dense FP32 oracle",
+    "limit": 0.01,
+    "measured": 0.00130011,
+    "passed": true,
+    "repeat_bit_stable_at_reported_precision": true
+  },
+  "limitations": [
+    "The four-token fixture is a correctness workload, not a production-token performance benchmark.",
+    "Global input, timestep/modulation, final normalization, and output projection layers are not executed by this command.",
+    "The fixture uses deterministic synthetic hidden states rather than states replayed from a denoising trajectory.",
+    "Each correctness kernel uses its own command buffer and wait, so summed GPU time is not an optimized end-to-end latency claim."
+  ]
+}

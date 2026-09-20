@@ -18,6 +18,9 @@ const HEADS: usize = 32;
 const HEAD_DIMENSION: usize = 128;
 const MLP_WIDTH: usize = 12288;
 const TILE: usize = 16;
+const PACKED_SCHEME_BF16: u32 = 0;
+const PACKED_SCHEME_INT8_AFFINE: u32 = 3;
+const VM_PAGE_BYTES: usize = 16384;
 
 struct OwnedObjc {
     opaque pointer: *u8,
@@ -58,6 +61,7 @@ struct Int8LinearParams {
 
 struct LinearWeight {
     storage: metal::Buffer,
+    scheme: u32,
     weights_offset: u64,
     scales_offset: u64,
     zeros_offset: u64,
@@ -83,6 +87,29 @@ struct Pipelines {
     attention: metal::ComputePipelineState,
     residual: metal::ComputePipelineState,
     swiglu: metal::ComputePipelineState,
+}
+
+struct BlockWorkspace {
+    modulation: metal::Buffer,
+    rope: metal::Buffer,
+    target_mask: metal::Buffer,
+    image_ids: metal::Buffer,
+    key_valid: metal::Buffer,
+    dummy: metal::Buffer,
+    norm1: metal::Buffer,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    query_rope: metal::Buffer,
+    key_rope: metal::Buffer,
+    attended: metal::Buffer,
+    attention_projected: metal::Buffer,
+    residual1: metal::Buffer,
+    norm2: metal::Buffer,
+    gate: metal::Buffer,
+    projected: metal::Buffer,
+    swiglu: metal::Buffer,
+    mlp_projected: metal::Buffer,
 }
 
 #[repr(C)]
@@ -230,9 +257,8 @@ fn dispatch_weighted_linear(
     output: metal::Buffer,
     output_columns: usize,
     input_columns: usize,
-    quantized: bool,
 ) -> option::Option[f64] {
-    if quantized {
+    if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
         return dispatch_int8_linear(
             queue,
             pipelines.int8_linear,
@@ -307,6 +333,28 @@ fn new_buffer(device: metal::Device, bytes: u64) -> option::Option[metal::Buffer
     return device.new_buffer_with_length(
         bytes,
         metal::resource_options_m_t_l_resource_storage_mode_shared,
+    );
+}
+
+fn keep_external_mapping(_context: *u8, _pointer: *u8, _length: u64) {}
+
+fn packed_storage_buffer(
+    device: metal::Device,
+    file: packed::File,
+) -> option::Option[metal::Buffer] {
+    let mapped_bytes: usize = round_up(file.length(), VM_PAGE_BYTES);
+    if mapped_bytes as u64 > device.max_buffer_length() {
+        io::eprintln(
+            "transformer block: packed mapping ${mapped_bytes} exceeds Metal buffer limit ${device.max_buffer_length()}",
+        );
+        return option::Option[metal::Buffer]::None;
+    }
+    return device.new_buffer_with_bytes_no_copy(
+        file.pointer(),
+        mapped_bytes as u64,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+        keep_external_mapping,
+        0 as *u8,
     );
 }
 
@@ -390,17 +438,22 @@ fn packed_linear_weight(
         io::eprintln("transformer block: missing packed matrix ${name}");
         return option::Option[LinearWeight]::None;
     };
+    let elements: u64 = output_columns *% input_columns;
     let groups: u64 = output_columns *% (input_columns / (64 as u64));
-    if tensor.scheme != (3 as u32) || tensor.group_size != (64 as u32)
-        || tensor.output != output_columns || tensor.input != input_columns
-        || tensor.weights_length != output_columns *% input_columns
-        || tensor.scales_length != groups *% (2 as u64)
-        || tensor.zeros_length != groups {
+    let dense_ok: bool = tensor.scheme == PACKED_SCHEME_BF16
+        && tensor.weights_length == elements *% (2 as u64)
+        && tensor.scales_length == (0 as u64) && tensor.zeros_length == (0 as u64);
+    let int8_ok: bool = tensor.scheme == PACKED_SCHEME_INT8_AFFINE
+        && tensor.group_size == (64 as u32) && tensor.weights_length == elements
+        && tensor.scales_length == groups *% (2 as u64) && tensor.zeros_length == groups;
+    if tensor.output != output_columns || tensor.input != input_columns
+        || !(dense_ok || int8_ok) {
         io::eprintln("transformer block: invalid packed matrix ${name}");
         return option::Option[LinearWeight]::None;
     }
     return option::Option[LinearWeight]::Some(LinearWeight {
         storage: storage,
+        scheme: tensor.scheme,
         weights_offset: tensor.weights_offset,
         scales_offset: tensor.scales_offset,
         zeros_offset: tensor.zeros_offset,
@@ -537,9 +590,9 @@ fn execute_block(
     total_ms = total_ms + elapsed;
     all_ok = compare_fixture("block0 norm1 + scale1", norm1, fixture_directory, "norm1", ROWS *% WIDTH, 0.00005f64, 0.00005f64) && all_ok;
 
-    guard let option::Option[f64]::Some(q_ms) = dispatch_weighted_linear(queue, pipelines, norm1, weights.q, query, WIDTH, WIDTH, quantized) else { return 1; }; total_ms = total_ms + q_ms;
-    guard let option::Option[f64]::Some(k_ms) = dispatch_weighted_linear(queue, pipelines, norm1, weights.k, key, WIDTH, WIDTH, quantized) else { return 1; }; total_ms = total_ms + k_ms;
-    guard let option::Option[f64]::Some(v_ms) = dispatch_weighted_linear(queue, pipelines, norm1, weights.v, value, WIDTH, WIDTH, quantized) else { return 1; }; total_ms = total_ms + v_ms;
+    guard let option::Option[f64]::Some(q_ms) = dispatch_weighted_linear(queue, pipelines, norm1, weights.q, query, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + q_ms;
+    guard let option::Option[f64]::Some(k_ms) = dispatch_weighted_linear(queue, pipelines, norm1, weights.k, key, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + k_ms;
+    guard let option::Option[f64]::Some(v_ms) = dispatch_weighted_linear(queue, pipelines, norm1, weights.v, value, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + v_ms;
     all_ok = compare_fixture("block0 Q projection", query, fixture_directory, "query", ROWS *% WIDTH, if quantized { 0.25f64 } else { 0.0002f64 }, 0.0f64) && all_ok;
     all_ok = compare_fixture("block0 K projection", key, fixture_directory, "key", ROWS *% WIDTH, if quantized { 0.2f64 } else { 0.0002f64 }, 0.0f64) && all_ok;
     all_ok = compare_fixture("block0 V projection", value, fixture_directory, "value", ROWS *% WIDTH, if quantized { 0.1f64 } else { 0.0002f64 }, 0.0f64) && all_ok;
@@ -552,7 +605,7 @@ fn execute_block(
     guard let option::Option[f64]::Some(attention_ms) = dispatch_1d(queue, pipelines.attention, query_rope, key_rope, attended, value, image_ids, key_valid, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + attention_ms;
     all_ok = compare_fixture("block0 block-causal attention", attended, fixture_directory, "attention", ROWS *% WIDTH, if quantized { 0.2f64 } else { 0.0005f64 }, 0.0f64) && all_ok;
 
-    guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_weighted_linear(queue, pipelines, attended, weights.attention_output, attention_projected, WIDTH, WIDTH, quantized) else { return 1; }; total_ms = total_ms + attention_projection_ms;
+    guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_weighted_linear(queue, pipelines, attended, weights.attention_output, attention_projected, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + attention_projection_ms;
     all_ok = compare_fixture("block0 attention output projection", attention_projected, fixture_directory, "attention_projected", ROWS *% WIDTH, if quantized { 1.2f64 } else { 0.0005f64 }, 0.0f64) && all_ok;
 
     params.slot = 1 as u32;
@@ -563,15 +616,15 @@ fn execute_block(
     guard let option::Option[f64]::Some(norm2_ms) = dispatch_1d(queue, pipelines.norm, residual1, modulation, norm2, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; }; total_ms = total_ms + norm2_ms;
     all_ok = compare_fixture("block0 norm2 + scale2", norm2, fixture_directory, "norm2", ROWS *% WIDTH, if quantized { 0.2f64 } else { 0.0005f64 }, 0.0f64) && all_ok;
 
-    guard let option::Option[f64]::Some(gate_ms) = dispatch_weighted_linear(queue, pipelines, norm2, weights.gate, gate, MLP_WIDTH, WIDTH, quantized) else { return 1; }; total_ms = total_ms + gate_ms;
-    guard let option::Option[f64]::Some(projected_ms) = dispatch_weighted_linear(queue, pipelines, norm2, weights.projected, projected, MLP_WIDTH, WIDTH, quantized) else { return 1; }; total_ms = total_ms + projected_ms;
+    guard let option::Option[f64]::Some(gate_ms) = dispatch_weighted_linear(queue, pipelines, norm2, weights.gate, gate, MLP_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + gate_ms;
+    guard let option::Option[f64]::Some(projected_ms) = dispatch_weighted_linear(queue, pipelines, norm2, weights.projected, projected, MLP_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + projected_ms;
     all_ok = compare_fixture("block0 MLP gate projection", gate, fixture_directory, "gate", ROWS *% MLP_WIDTH, if quantized { 0.2f64 } else { 0.0008f64 }, 0.0f64) && all_ok;
     all_ok = compare_fixture("block0 MLP value projection", projected, fixture_directory, "projected", ROWS *% MLP_WIDTH, if quantized { 0.2f64 } else { 0.0008f64 }, 0.0f64) && all_ok;
 
     guard let option::Option[f64]::Some(swiglu_ms) = dispatch_1d(queue, pipelines.swiglu, gate, projected, swiglu, dummy, dummy, dummy, #addr_of(params), ROWS *% MLP_WIDTH) else { return 1; }; total_ms = total_ms + swiglu_ms;
     all_ok = compare_fixture("block0 SwiGLU", swiglu, fixture_directory, "swiglu", ROWS *% MLP_WIDTH, if quantized { 1.2f64 } else { 0.001f64 }, 0.0f64) && all_ok;
 
-    guard let option::Option[f64]::Some(mlp_projection_ms) = dispatch_weighted_linear(queue, pipelines, swiglu, weights.mlp_output, mlp_projected, WIDTH, MLP_WIDTH, quantized) else { return 1; }; total_ms = total_ms + mlp_projection_ms;
+    guard let option::Option[f64]::Some(mlp_projection_ms) = dispatch_weighted_linear(queue, pipelines, swiglu, weights.mlp_output, mlp_projected, WIDTH, MLP_WIDTH) else { return 1; }; total_ms = total_ms + mlp_projection_ms;
     all_ok = compare_fixture("block0 MLP output projection", mlp_projected, fixture_directory, "mlp_projected", ROWS *% WIDTH, if quantized { 6.0f64 } else { 0.002f64 }, 0.0f64) && all_ok;
 
     params.slot = 3 as u32;
@@ -590,6 +643,190 @@ fn execute_block(
         return 0;
     }
     return 1;
+}
+
+fn execute_runtime_block(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    weights: BlockWeights,
+    workspace: BlockWorkspace,
+    hidden: metal::Buffer,
+    output: metal::Buffer,
+) -> option::Option[f64] {
+    var params: BlockParams = BlockParams {
+        rows: ROWS as u32,
+        width: WIDTH as u32,
+        heads: HEADS as u32,
+        head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32,
+        slot: 0 as u32,
+    };
+    var total_ms: f64 = 0.0f64;
+    guard let option::Option[f64]::Some(norm1_ms) = dispatch_1d(
+        queue,
+        pipelines.norm,
+        hidden,
+        workspace.modulation,
+        workspace.norm1,
+        workspace.target_mask,
+        workspace.dummy,
+        workspace.dummy,
+        #addr_of(params),
+        ROWS,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + norm1_ms;
+    guard let option::Option[f64]::Some(q_ms) = dispatch_weighted_linear(
+        queue, pipelines, workspace.norm1, weights.q, workspace.query, WIDTH, WIDTH,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(k_ms) = dispatch_weighted_linear(
+        queue, pipelines, workspace.norm1, weights.k, workspace.key, WIDTH, WIDTH,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(v_ms) = dispatch_weighted_linear(
+        queue, pipelines, workspace.norm1, weights.v, workspace.value, WIDTH, WIDTH,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + q_ms + k_ms + v_ms;
+    guard let option::Option[f64]::Some(q_norm_ms) = dispatch_1d(
+        queue,
+        pipelines.qk,
+        workspace.query,
+        weights.norm_q,
+        workspace.query_rope,
+        workspace.rope,
+        workspace.dummy,
+        workspace.dummy,
+        #addr_of(params),
+        ROWS *% HEADS,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(k_norm_ms) = dispatch_1d(
+        queue,
+        pipelines.qk,
+        workspace.key,
+        weights.norm_k,
+        workspace.key_rope,
+        workspace.rope,
+        workspace.dummy,
+        workspace.dummy,
+        #addr_of(params),
+        ROWS *% HEADS,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + q_norm_ms + k_norm_ms;
+    guard let option::Option[f64]::Some(attention_ms) = dispatch_1d(
+        queue,
+        pipelines.attention,
+        workspace.query_rope,
+        workspace.key_rope,
+        workspace.attended,
+        workspace.value,
+        workspace.image_ids,
+        workspace.key_valid,
+        #addr_of(params),
+        ROWS *% HEADS,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + attention_ms;
+    guard let option::Option[f64]::Some(attention_output_ms) = dispatch_weighted_linear(
+        queue,
+        pipelines,
+        workspace.attended,
+        weights.attention_output,
+        workspace.attention_projected,
+        WIDTH,
+        WIDTH,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + attention_output_ms;
+    params.slot = 1 as u32;
+    guard let option::Option[f64]::Some(residual1_ms) = dispatch_1d(
+        queue,
+        pipelines.residual,
+        hidden,
+        workspace.modulation,
+        workspace.residual1,
+        workspace.attention_projected,
+        workspace.target_mask,
+        workspace.dummy,
+        #addr_of(params),
+        ROWS *% WIDTH,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + residual1_ms;
+    params.slot = 2 as u32;
+    guard let option::Option[f64]::Some(norm2_ms) = dispatch_1d(
+        queue,
+        pipelines.norm,
+        workspace.residual1,
+        workspace.modulation,
+        workspace.norm2,
+        workspace.target_mask,
+        workspace.dummy,
+        workspace.dummy,
+        #addr_of(params),
+        ROWS,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + norm2_ms;
+    guard let option::Option[f64]::Some(gate_ms) = dispatch_weighted_linear(
+        queue,
+        pipelines,
+        workspace.norm2,
+        weights.gate,
+        workspace.gate,
+        MLP_WIDTH,
+        WIDTH,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(projected_ms) = dispatch_weighted_linear(
+        queue,
+        pipelines,
+        workspace.norm2,
+        weights.projected,
+        workspace.projected,
+        MLP_WIDTH,
+        WIDTH,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + gate_ms + projected_ms;
+    guard let option::Option[f64]::Some(swiglu_ms) = dispatch_1d(
+        queue,
+        pipelines.swiglu,
+        workspace.gate,
+        workspace.projected,
+        workspace.swiglu,
+        workspace.dummy,
+        workspace.dummy,
+        workspace.dummy,
+        #addr_of(params),
+        ROWS *% MLP_WIDTH,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + swiglu_ms;
+    guard let option::Option[f64]::Some(mlp_output_ms) = dispatch_weighted_linear(
+        queue,
+        pipelines,
+        workspace.swiglu,
+        weights.mlp_output,
+        workspace.mlp_projected,
+        WIDTH,
+        MLP_WIDTH,
+    ) else { return option::Option[f64]::None; };
+    total_ms = total_ms + mlp_output_ms;
+    params.slot = 3 as u32;
+    guard let option::Option[f64]::Some(output_ms) = dispatch_1d(
+        queue,
+        pipelines.residual,
+        workspace.residual1,
+        workspace.modulation,
+        output,
+        workspace.mlp_projected,
+        workspace.target_mask,
+        workspace.dummy,
+        #addr_of(params),
+        ROWS *% WIDTH,
+    ) else { return option::Option[f64]::None; };
+    return option::Option[f64]::Some(total_ms + output_ms);
+}
+
+fn captured_block_name(block: usize) -> str {
+    if block == (0 as usize) { return "block_00_output"; }
+    if block == (23 as usize) { return "block_23_output"; }
+    if block == (24 as usize) { return "block_24_output"; }
+    if block == (27 as usize) { return "block_27_output"; }
+    if block == (28 as usize) { return "block_28_output"; }
+    if block == (31 as usize) { return "block_31_output"; }
+    return "";
 }
 
 fn run(model_directory: str, fixture_directory: str = "tests/fixtures/block0_fp32") -> i32 {
@@ -843,11 +1080,8 @@ fn run_packed(packed_path: str, fixture_directory: str = "tests/fixtures/block0_
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
 
-    guard let option::Option[metal::Buffer]::Some(storage) = device.new_buffer_with_bytes(
-        weight_file.pointer(),
-        weight_file.length() as u64,
-        metal::resource_options_m_t_l_resource_storage_mode_shared,
-    ) else { return 1; };
+    guard let option::Option[metal::Buffer]::Some(storage) =
+        packed_storage_buffer(device, weight_file) else { return 1; };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
     guard let option::Option[metal::Buffer]::Some(norm_q) = packed_vector_buffer(device, weight_file, "transformer_blocks.0.attn.norm_q.weight", HEAD_DIMENSION as u64) else { return 1; };
     let norm_q_owner: OwnedObjc = OwnedObjc::new(norm_q.raw());
@@ -878,6 +1112,289 @@ fn run_packed(packed_path: str, fixture_directory: str = "tests/fixtures/block0_
         fixture_directory,
         true,
     );
+}
+
+fn run_full_packed(
+    packed_path: str,
+    fixture_directory: str = "tests/fixtures/transformer32_fp32",
+) -> i32 {
+    guard let packed::LoadResult::Ok(weight_file) = packed::load(packed_path) else {
+        io::eprintln("transformer runtime: could not load validated packed file ${packed_path}");
+        return 1;
+    };
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return 1; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() {
+        io::eprintln("transformer runtime: no Metal device");
+        return 1;
+    }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else {
+        return 1;
+    };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() { return 1; }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        #include_str("../kernels/transformer_block.metal"),
+        options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 =
+                rt::msg_id(compile_error, rt::sel(#str_ptr("localizedDescription\0")));
+            io::eprintln("transformer runtime Metal compile: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[OwnedObjc]::Some(dense_owner) =
+        pipeline(device, library, "qi_block_linear_16x16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(int8_owner) =
+        pipeline(device, library, "qi_block_int8_affine_linear_16x16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(norm_owner) =
+        pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(qk_owner) =
+        pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(attention_owner) =
+        pipeline(device, library, "qi_block_attention") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(residual_owner) =
+        pipeline(device, library, "qi_block_residual") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(swiglu_owner) =
+        pipeline(device, library, "qi_block_swiglu") else { return 1; };
+    let pipelines: Pipelines = Pipelines {
+        dense_linear: metal::ComputePipelineState::from_raw(dense_owner.raw()),
+        int8_linear: metal::ComputePipelineState::from_raw(int8_owner.raw()),
+        norm: metal::ComputePipelineState::from_raw(norm_owner.raw()),
+        qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
+        attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
+        residual: metal::ComputePipelineState::from_raw(residual_owner.raw()),
+        swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
+    };
+    guard let option::Option[metal::Buffer]::Some(storage) =
+        packed_storage_buffer(device, weight_file) else {
+        io::eprintln("transformer runtime: could not create no-copy packed buffer");
+        return 1;
+    };
+    let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
+    io::println(
+        "transformer runtime: no-copy packed buffer bytes=${round_up(weight_file.length(), VM_PAGE_BYTES)}",
+    );
+
+    let activation_bytes: u64 = (ROWS *% WIDTH *% #size_of::[f32]()) as u64;
+    let mlp_bytes: u64 = (ROWS *% MLP_WIDTH *% #size_of::[f32]()) as u64;
+    guard let option::Option[metal::Buffer]::Some(first_hidden) =
+        fixture_buffer(device, fixture_directory, "hidden", activation_bytes) else { return 1; };
+    let first_hidden_owner: OwnedObjc = OwnedObjc::new(first_hidden.raw());
+    guard let option::Option[metal::Buffer]::Some(second_hidden) =
+        new_buffer(device, activation_bytes) else { return 1; };
+    let second_hidden_owner: OwnedObjc = OwnedObjc::new(second_hidden.raw());
+    guard let option::Option[metal::Buffer]::Some(modulation) = fixture_buffer(
+        device,
+        fixture_directory,
+        "modulation",
+        ((2 as usize) *% (4 as usize) *% WIDTH *% #size_of::[f32]()) as u64,
+    ) else { return 1; };
+    let modulation_owner: OwnedObjc = OwnedObjc::new(modulation.raw());
+    guard let option::Option[metal::Buffer]::Some(rope) = fixture_buffer(
+        device,
+        fixture_directory,
+        "rope",
+        (ROWS *% HEAD_DIMENSION *% #size_of::[f32]()) as u64,
+    ) else { return 1; };
+    let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
+    guard let option::Option[metal::Buffer]::Some(target_mask) =
+        new_buffer(device, ROWS as u64) else { return 1; };
+    let target_mask_owner: OwnedObjc = OwnedObjc::new(target_mask.raw());
+    let target_values: *u8 = target_mask.contents();
+    target_values[0] = 0 as u8;
+    target_values[1] = 0 as u8;
+    target_values[2] = 1 as u8;
+    target_values[3] = 1 as u8;
+    guard let option::Option[metal::Buffer]::Some(image_ids) =
+        new_buffer(device, (ROWS *% #size_of::[i32]()) as u64) else { return 1; };
+    let image_ids_owner: OwnedObjc = OwnedObjc::new(image_ids.raw());
+    let image_values: *i32 = image_ids.contents() as *i32;
+    image_values[0] = 0 -% (1 as i32);
+    image_values[1] = 0 -% (1 as i32);
+    image_values[2] = 0 as i32;
+    image_values[3] = 0 as i32;
+    guard let option::Option[metal::Buffer]::Some(key_valid) =
+        new_buffer(device, ROWS as u64) else { return 1; };
+    let key_valid_owner: OwnedObjc = OwnedObjc::new(key_valid.raw());
+    var row: usize = 0 as usize;
+    while row < ROWS {
+        (key_valid.contents())[row] = 1 as u8;
+        row = row +% (1 as usize);
+    }
+    guard let option::Option[metal::Buffer]::Some(dummy) = new_buffer(device, 4 as u64) else {
+        return 1;
+    };
+    let dummy_owner: OwnedObjc = OwnedObjc::new(dummy.raw());
+
+    guard let option::Option[metal::Buffer]::Some(norm1) = new_buffer(device, activation_bytes) else { return 1; };
+    let norm1_owner: OwnedObjc = OwnedObjc::new(norm1.raw());
+    guard let option::Option[metal::Buffer]::Some(query) = new_buffer(device, activation_bytes) else { return 1; };
+    let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
+    guard let option::Option[metal::Buffer]::Some(key) = new_buffer(device, activation_bytes) else { return 1; };
+    let key_owner: OwnedObjc = OwnedObjc::new(key.raw());
+    guard let option::Option[metal::Buffer]::Some(value) = new_buffer(device, activation_bytes) else { return 1; };
+    let value_owner: OwnedObjc = OwnedObjc::new(value.raw());
+    guard let option::Option[metal::Buffer]::Some(query_rope) = new_buffer(device, activation_bytes) else { return 1; };
+    let query_rope_owner: OwnedObjc = OwnedObjc::new(query_rope.raw());
+    guard let option::Option[metal::Buffer]::Some(key_rope) = new_buffer(device, activation_bytes) else { return 1; };
+    let key_rope_owner: OwnedObjc = OwnedObjc::new(key_rope.raw());
+    guard let option::Option[metal::Buffer]::Some(attended) = new_buffer(device, activation_bytes) else { return 1; };
+    let attended_owner: OwnedObjc = OwnedObjc::new(attended.raw());
+    guard let option::Option[metal::Buffer]::Some(attention_projected) = new_buffer(device, activation_bytes) else { return 1; };
+    let attention_projected_owner: OwnedObjc = OwnedObjc::new(attention_projected.raw());
+    guard let option::Option[metal::Buffer]::Some(residual1) = new_buffer(device, activation_bytes) else { return 1; };
+    let residual1_owner: OwnedObjc = OwnedObjc::new(residual1.raw());
+    guard let option::Option[metal::Buffer]::Some(norm2) = new_buffer(device, activation_bytes) else { return 1; };
+    let norm2_owner: OwnedObjc = OwnedObjc::new(norm2.raw());
+    guard let option::Option[metal::Buffer]::Some(gate) = new_buffer(device, mlp_bytes) else { return 1; };
+    let gate_owner: OwnedObjc = OwnedObjc::new(gate.raw());
+    guard let option::Option[metal::Buffer]::Some(projected) = new_buffer(device, mlp_bytes) else { return 1; };
+    let projected_owner: OwnedObjc = OwnedObjc::new(projected.raw());
+    guard let option::Option[metal::Buffer]::Some(swiglu) = new_buffer(device, mlp_bytes) else { return 1; };
+    let swiglu_buffer_owner: OwnedObjc = OwnedObjc::new(swiglu.raw());
+    guard let option::Option[metal::Buffer]::Some(mlp_projected) = new_buffer(device, activation_bytes) else { return 1; };
+    let mlp_projected_owner: OwnedObjc = OwnedObjc::new(mlp_projected.raw());
+    let workspace: BlockWorkspace = BlockWorkspace {
+        modulation: modulation,
+        rope: rope,
+        target_mask: target_mask,
+        image_ids: image_ids,
+        key_valid: key_valid,
+        dummy: dummy,
+        norm1: norm1,
+        query: query,
+        key: key,
+        value: value,
+        query_rope: query_rope,
+        key_rope: key_rope,
+        attended: attended,
+        attention_projected: attention_projected,
+        residual1: residual1,
+        norm2: norm2,
+        gate: gate,
+        projected: projected,
+        swiglu: swiglu,
+        mlp_projected: mlp_projected,
+    };
+
+    var current: metal::Buffer = first_hidden;
+    var next: metal::Buffer = second_hidden;
+    var total_ms: f64 = 0.0f64;
+    var quantized_matrices: usize = 0 as usize;
+    var all_ok: bool = true;
+    var block: usize = 0 as usize;
+    while block < (32 as usize) {
+        let norm_q_name: text::Text = "transformer_blocks.${block}.attn.norm_q.weight";
+        let norm_k_name: text::Text = "transformer_blocks.${block}.attn.norm_k.weight";
+        let q_name: text::Text = "transformer_blocks.${block}.attn.to_q.weight";
+        let k_name: text::Text = "transformer_blocks.${block}.attn.to_k.weight";
+        let v_name: text::Text = "transformer_blocks.${block}.attn.to_v.weight";
+        let attention_output_name: text::Text =
+            "transformer_blocks.${block}.attn.to_out.0.weight";
+        let gate_name: text::Text = "transformer_blocks.${block}.img_mlp.gate_layer.weight";
+        let projected_name: text::Text = "transformer_blocks.${block}.img_mlp.proj.weight";
+        let mlp_output_name: text::Text = "transformer_blocks.${block}.img_mlp.out.weight";
+        guard let option::Option[metal::Buffer]::Some(norm_q) = packed_vector_buffer(
+            device, weight_file, norm_q_name.view(), HEAD_DIMENSION as u64,
+        ) else { return 1; };
+        let norm_q_owner: OwnedObjc = OwnedObjc::new(norm_q.raw());
+        guard let option::Option[metal::Buffer]::Some(norm_k) = packed_vector_buffer(
+            device, weight_file, norm_k_name.view(), HEAD_DIMENSION as u64,
+        ) else { return 1; };
+        let norm_k_owner: OwnedObjc = OwnedObjc::new(norm_k.raw());
+        guard let option::Option[LinearWeight]::Some(q) = packed_linear_weight(
+            weight_file, storage, q_name.view(), WIDTH as u64, WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[LinearWeight]::Some(k) = packed_linear_weight(
+            weight_file, storage, k_name.view(), WIDTH as u64, WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[LinearWeight]::Some(v) = packed_linear_weight(
+            weight_file, storage, v_name.view(), WIDTH as u64, WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[LinearWeight]::Some(attention_output) = packed_linear_weight(
+            weight_file, storage, attention_output_name.view(), WIDTH as u64, WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[LinearWeight]::Some(gate_weight) = packed_linear_weight(
+            weight_file, storage, gate_name.view(), MLP_WIDTH as u64, WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[LinearWeight]::Some(projected_weight) = packed_linear_weight(
+            weight_file, storage, projected_name.view(), MLP_WIDTH as u64, WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[LinearWeight]::Some(mlp_output) = packed_linear_weight(
+            weight_file, storage, mlp_output_name.view(), WIDTH as u64, MLP_WIDTH as u64,
+        ) else { return 1; };
+        let block_quantized: usize =
+            (if q.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize })
+            +% (if k.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize })
+            +% (if v.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize })
+            +% (if attention_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize })
+            +% (if gate_weight.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize })
+            +% (if projected_weight.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize })
+            +% (if mlp_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize });
+        quantized_matrices = quantized_matrices +% block_quantized;
+        guard let option::Option[f64]::Some(block_ms) = execute_runtime_block(
+            queue,
+            pipelines,
+            BlockWeights {
+                norm_q: norm_q,
+                norm_k: norm_k,
+                q: q,
+                k: k,
+                v: v,
+                attention_output: attention_output,
+                gate: gate_weight,
+                projected: projected_weight,
+                mlp_output: mlp_output,
+            },
+            workspace,
+            current,
+            next,
+        ) else { return 1; };
+        total_ms = total_ms + block_ms;
+        all_ok = finite("transformer block ${block} output", next, ROWS *% WIDTH) && all_ok;
+        let capture_name: str = captured_block_name(block);
+        if capture_name.count() > (0 as usize) {
+            guard let option::Option[f64]::Some(error) = normalized_rms_fixture(
+                next,
+                fixture_directory,
+                capture_name,
+                ROWS *% WIDTH,
+            ) else { return 1; };
+            io::println(
+                "transformer block ${block}: q8=${block_quantized} gpu_ms=${block_ms} nRMSE=${error}",
+            );
+            if block == (31 as usize) { all_ok = error <= 0.01f64 && all_ok; }
+        }
+        let swap: metal::Buffer = current;
+        current = next;
+        next = swap;
+        block = block +% (1 as usize);
+    }
+    if quantized_matrices != (40 as usize) {
+        io::eprintln("transformer runtime: expected 40 Q8 matrices, found ${quantized_matrices}");
+        return 1;
+    }
+    io::println(
+        "transformer runtime: blocks=32 q8=${quantized_matrices} tokens=${ROWS} total_gpu_ms=${total_ms}",
+    );
+    if all_ok {
+        io::println("Qwen-Image-2.1 full mixed transformer path: verified");
+        return 0;
+    }
+    return 1;
 }
 
 #[test]
