@@ -43,5 +43,12 @@
     "target_output_limit": 0.012,
     "passed": true
   },
-  "interpretation": "This is an end-to-end transformer-boundary correctness measurement, not a production-token throughput claim. The official pipeline consumes only the trailing target-image rows, so target_output_nrmse is the acceptance metric. The current attention kernel remains a scalar correctness path and must be replaced or cached before realistic resolutions are practical."
+  "online_attention_repeat": {
+    "summed_gpu_kernel_ms": 362.683,
+    "final_norm_nrmse": 0.00281551,
+    "all_output_nrmse": 0.0044845,
+    "target_output_nrmse": 0.00334899,
+    "passed": true
+  },
+  "interpretation": "This is an end-to-end transformer-boundary correctness measurement, not a production-token throughput claim. The official pipeline consumes only the trailing target-image rows, so target_output_nrmse is the acceptance metric. The original timings preserve the scalar correctness baseline; online-softmax attention reduces the repeat to 362.683 ms while preserving the target error. Production-size complete-transformer gates remain outstanding."
 }

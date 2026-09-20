@@ -1,0 +1,155 @@
+{
+  "adjacent_condition_blocks": [
+    [
+      0,
+      2
+    ],
+    [
+      2,
+      4
+    ]
+  ],
+  "cache_point": "post-RoPE K and raw V",
+  "image_ids": [
+    0,
+    0,
+    1,
+    1,
+    -1,
+    2,
+    2
+  ],
+  "key_valid": [
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true
+  ],
+  "operation": "Tiled online-softmax block-causal prefill and cached target decode",
+  "schema_version": 1,
+  "shape": {
+    "head_dim": 128,
+    "heads": 32,
+    "prefix_rows": 5,
+    "rows": 7
+  },
+  "tensors": {
+    "key": {
+      "bytes": 114688,
+      "dtype": "F32",
+      "file": "key.f32",
+      "sha256": "570a1251b39f29d68158b2975e564f507c7d59b38ed350a7e901e03c731ea7ac",
+      "shape": [
+        7,
+        32,
+        128
+      ]
+    },
+    "output": {
+      "bytes": 114688,
+      "dtype": "F32",
+      "file": "output.f32",
+      "sha256": "e4559002b39aae4b9a7f103ee51adf15b2e70858bda8715406e8bb7f4e4a193c",
+      "shape": [
+        7,
+        32,
+        128
+      ]
+    },
+    "prefix_key": {
+      "bytes": 81920,
+      "dtype": "F32",
+      "file": "prefix_key.f32",
+      "sha256": "2ae312ccbbbf3934e883f55fca67380c6991db1b4f0edaf89a0a7f3d929a1c87",
+      "shape": [
+        5,
+        32,
+        128
+      ]
+    },
+    "prefix_value": {
+      "bytes": 81920,
+      "dtype": "F32",
+      "file": "prefix_value.f32",
+      "sha256": "72bbbadcb26148d1b0c47e418f05e74156bce5c4faa0505682d5984807cc7172",
+      "shape": [
+        5,
+        32,
+        128
+      ]
+    },
+    "query": {
+      "bytes": 114688,
+      "dtype": "F32",
+      "file": "query.f32",
+      "sha256": "15d2a47c74c02ec8d04c45bf614b6dbf623259822019942490d0dfa75be54767",
+      "shape": [
+        7,
+        32,
+        128
+      ]
+    },
+    "target_key": {
+      "bytes": 32768,
+      "dtype": "F32",
+      "file": "target_key.f32",
+      "sha256": "5aa9a4a8684f4b752ca557474b6d327962b49494d89a86fcf12002c1019f0281",
+      "shape": [
+        2,
+        32,
+        128
+      ]
+    },
+    "target_output": {
+      "bytes": 32768,
+      "dtype": "F32",
+      "file": "target_output.f32",
+      "sha256": "c5fbba22641d1cf8ab2d9afe4cb6fd49cc32c386d6d79ff8b3b7e7ae0da38f6f",
+      "shape": [
+        2,
+        32,
+        128
+      ]
+    },
+    "target_query": {
+      "bytes": 32768,
+      "dtype": "F32",
+      "file": "target_query.f32",
+      "sha256": "bfbb8f8464432db626edca820318c10afdf7c0e984d4f497ba7ff8ca533f0a78",
+      "shape": [
+        2,
+        32,
+        128
+      ]
+    },
+    "target_value": {
+      "bytes": 32768,
+      "dtype": "F32",
+      "file": "target_value.f32",
+      "sha256": "54737de359ead1bb07b4f081046a1de8d095abb707e4bcfc8d4a6009601f44dc",
+      "shape": [
+        2,
+        32,
+        128
+      ]
+    },
+    "value": {
+      "bytes": 114688,
+      "dtype": "F32",
+      "file": "value.f32",
+      "sha256": "549d5d4936ad33f2e51210cef38ca4f3d56214ce076245ffa035925b0b451be1",
+      "shape": [
+        7,
+        32,
+        128
+      ]
+    }
+  },
+  "tolerance": {
+    "max_abs": 1e-05,
+    "max_rel": 1e-05
+  }
+}

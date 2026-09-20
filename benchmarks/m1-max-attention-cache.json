@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "kernel": {
+    "name": "qi_block_attention",
+    "fast_math": false,
+    "threads_per_query_head": 128,
+    "algorithm": "streaming online softmax with one Q.K reduction per key",
+    "temporary_storage": "128-float reduction plus four-float state per threadgroup",
+    "score_tensor_allocated": false
+  },
+  "correctness_fixture": {
+    "path": "tests/fixtures/attention_cache_fp32",
+    "rows": 7,
+    "prefix_rows": 5,
+    "target_rows": 2,
+    "adjacent_condition_image_blocks": 2,
+    "invalid_interleaved_text_keys": 1,
+    "cache_point": "post-RoPE K and raw V",
+    "prefill": {
+      "max_absolute_error": 4.47035e-8,
+      "rms_error": 9.7055e-9,
+      "gpu_ms": 0.0722499
+    },
+    "cache_copy": {
+      "key_max_absolute_error": 0.0,
+      "value_max_absolute_error": 0.0,
+      "gpu_ms": 0.014375,
+      "bytes": 163840
+    },
+    "cached_target": {
+      "max_absolute_error": 4.47035e-8,
+      "rms_error": 9.42375e-9,
+      "gpu_ms": 0.06675
+    },
+    "passed": true
+  },
+  "complete_transformer_cache": {
+    "fixture": "tests/fixtures/transformer_model_fp32",
+    "layers": 32,
+    "prefix_rows": 7,
+    "target_rows": 8,
+    "key_and_value_cache_bytes": 7340032,
+    "cached_blocks_and_final_projection_gpu_ms": 335.311,
+    "cached_vs_uncached_target_nrmse": 0.0,
+    "captured_block_nrmse": {
+      "0": 0.0,
+      "23": 0.0,
+      "24": 0.0,
+      "27": 0.0,
+      "28": 0.0,
+      "31": 0.0
+    },
+    "uncached_complete_boundary_gpu_ms": 362.683,
+    "uncached_target_vs_fp32_oracle_nrmse": 0.00334899,
+    "passed": true
+  },
+  "scale_gate": {
+    "tokens": 4096,
+    "heads": 32,
+    "head_dimension": 128,
+    "gpu_ms": 2546.05,
+    "qkv_and_output_bytes": 268435456,
+    "avoided_fp32_score_bytes": 2147483648,
+    "output_finite": true,
+    "passed": true
+  },
+  "limitations": [
+    "The 4096-token gate measures attention alone, not the complete transformer.",
+    "GPU times sum isolated command buffers and exclude pipeline compilation, allocation, and CPU validation.",
+    "The complete cached and uncached passes share one timestep; a replayed multi-step denoising trajectory is the next validation boundary."
+  ]
+}

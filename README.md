@@ -31,6 +31,8 @@ cpc test
 ./target/debug/qwen-image-cplus benchmark-linear
 ./target/debug/qwen-image-cplus test-metal-int8-linear
 ./target/debug/qwen-image-cplus benchmark-int8-linear
+./target/debug/qwen-image-cplus test-attention-cache
+./target/debug/qwen-image-cplus benchmark-attention
 ./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
 ./target/debug/qwen-image-cplus quantize-transformer /path/to/model/snapshot transformer.qipack
@@ -152,6 +154,33 @@ Inspect a shard, optionally filtering tensor names:
   on the helper's stack survives execution but crashes during buffer teardown.
   The dedicated mapping path now releases cleanly, including the short-lived
   block-0 validation command.
+- Scalable block-causal attention now assigns one 128-thread group to each
+  query/head pair. The group reduces each Q.K dot product once and all lanes
+  update one output channel with online softmax. Compute remains necessarily
+  quadratic in sequence length, but temporary storage is constant per group:
+  no `[heads, queries, keys]` score or probability tensor is allocated. This
+  also removes the old correctness kernel's repeated dot product per output
+  channel, reducing its work from O(S^2 D^2) to O(S^2 D) per head.
+- The attention path has both block-causal prefill and target-only cached
+  execution. Each of the 32 layer caches stores the prefix K after learned
+  RMSNorm and RoPE, plus the raw prefix V, matching the pinned transformer.
+  Target queries use their global row offset for token metadata, combine the
+  cached prefix with the current bidirectional target block, and continue to
+  apply the text key-valid mask. Adjacent condition-image blocks remain
+  distinct; equality is based on image ID, not merely on image/text type.
+- Two independent gates cover these semantics. A committed seven-row FP32
+  oracle includes two adjacent condition blocks, an invalid interleaved text
+  key, and a two-row target block; prefill and cached decode both agree within
+  4.48e-8 maximum absolute error. The complete 32-block mixed transformer also
+  runs its eight target rows through a 7,340,032-byte two-arena prefix cache;
+  every captured block and final target output are bit-identical to the
+  uncached target slice. Measurements are in
+  `benchmarks/m1-max-attention-cache.json`.
+- A 4,096-token M1 Max gate completes with finite output in 2,546.05 ms. Its
+  Q/K/V/output activations occupy 256 MiB and the online implementation avoids
+  the 2 GiB FP32 score tensor that `[32,4096,4096]` would require. This is an
+  attention memory/feasibility gate, not a production throughput claim; each
+  dispatch still uses its own command buffer and CPU wait.
 
 ## Quantization decision log
 
@@ -200,15 +229,14 @@ existing isolated Metal fixture remains reproducible.
 The original four-token fixture remains useful as a cheap block-chain
 regression. The newer 15-token fixture proves the whole transformer boundary
 and the real interleaved token semantics, but it is still not a throughput
-claim: the correctness attention kernel is scalar over query/head and repeats
-dot products while streaming keys. The packed mapping is exposed to Metal
-without copying 12.42 GiB of weights; only activations and 128-element Q/K norm
-vectors are copied.
+claim. The packed mapping is exposed to Metal without copying 12.42 GiB of
+weights; only activations, cache arenas, and 128-element Q/K norm vectors are
+copied.
 
 Image generation is not implemented yet. The next phase is a scalable
-block-causal attention path plus prefix KV-cache extract/decode, because the
-current O(S^2) correctness kernel makes 256/512/1024-pixel token layouts
-impractical. Once that path matches the complete oracle, the transformer can
-run a replayed 40-step denoising trajectory with scheduler updates. The native
+production-size transformer/noise-prediction gate at 256, 512, and then 1024
+pixels, using the now-validated attention and cache path. That separates model-
+scale memory/runtime failures from scheduler-state failures before the runtime
+adds a replayed 40-step denoising trajectory and Euler updates. The native
 prompt encoder and causal 3D VAE remain later independent boundaries tracked
 in `plan.md`.

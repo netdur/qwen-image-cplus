@@ -17,6 +17,16 @@ struct Int8LinearParams {
     uint group_size;
 };
 
+struct AttentionParams {
+    uint query_rows;
+    uint key_rows;
+    uint heads;
+    uint head_dimension;
+    uint query_position_offset;
+    uint block_causal;
+    uint cached_prefix_rows;
+};
+
 struct BlockParams {
     uint rows;
     uint width;
@@ -140,6 +150,21 @@ kernel void qi_final_layernorm_modulate(
     for (uint column = 0; column < params.width; ++column) {
         output[start + column] =
             (input[start + column] - mean) * inverse_std * (1.0f + scale[scale_start + column]);
+    }
+}
+
+kernel void qi_copy_prefix_kv(
+    device const float *key [[buffer(0)]],
+    device const float *value [[buffer(1)]],
+    device float *cache_key [[buffer(2)]],
+    device float *cache_value [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        // K reaches this point after learned RMSNorm and RoPE; V is raw.
+        cache_key[index] = key[index];
+        cache_value[index] = value[index];
     }
 }
 
@@ -289,8 +314,9 @@ kernel void qi_block_qk_norm_rope(
     }
 }
 
-// Correctness path: segmented/block-causal scaled dot-product attention without
-// materializing the score matrix. One thread owns one [query, head].
+// One 128-thread group owns one [query, head]. Each Q.K score is reduced once,
+// then every lane updates one output channel with online softmax. Temporary
+// storage is constant per group and no [heads,S,S] score matrix is formed.
 kernel void qi_block_attention(
     device const float *query [[buffer(0)]],
     device const float *key [[buffer(1)]],
@@ -298,63 +324,66 @@ kernel void qi_block_attention(
     device const float *value [[buffer(3)]],
     device const int *image_ids [[buffer(5)]],
     device const uchar *key_valid [[buffer(6)]],
-    constant BlockParams &params [[buffer(4)]],
-    uint index [[thread_position_in_grid]]) {
-    const uint count = params.rows * params.heads;
-    if (index >= count) {
+    device const float *cache_key [[buffer(7)]],
+    device const float *cache_value [[buffer(8)]],
+    constant AttentionParams &params [[buffer(4)]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float reduction[128];
+    threadgroup float state[4]; // maximum, denominator, old scale, new weight
+
+    const uint query_row = group / params.heads;
+    const uint head = group % params.heads;
+    if (query_row >= params.query_rows || lane >= params.head_dimension) {
         return;
     }
-    const uint query_row = index / params.heads;
-    const uint head = index % params.heads;
+    const uint global_query_row = query_row + params.query_position_offset;
     const uint query_start = (query_row * params.heads + head) * params.head_dimension;
     const float scale = rsqrt(float(params.head_dimension));
+    if (lane == 0) {
+        state[0] = -INFINITY;
+        state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float maximum = -INFINITY;
-    for (uint key_row = 0; key_row < params.rows; ++key_row) {
-        const bool same_image = image_ids[query_row] >= 0 && image_ids[query_row] == image_ids[key_row];
-        if (key_valid[key_row] == 0 || !(query_row >= key_row || same_image)) {
+    float accumulator = 0.0f;
+    for (uint key_row = 0; key_row < params.key_rows; ++key_row) {
+        const bool same_image = image_ids[global_query_row] >= 0 &&
+            image_ids[global_query_row] == image_ids[key_row];
+        const bool allowed = key_valid[key_row] != 0 &&
+            (params.block_causal == 0 || global_query_row >= key_row || same_image);
+        if (!allowed) {
             continue;
         }
-        const uint key_start = (key_row * params.heads + head) * params.head_dimension;
-        float score = 0.0f;
-        for (uint column = 0; column < params.head_dimension; ++column) {
-            score = fma(query[query_start + column], key[key_start + column], score);
-        }
-        maximum = max(maximum, score * scale);
-    }
-
-    float denominator = 0.0f;
-    for (uint key_row = 0; key_row < params.rows; ++key_row) {
-        const bool same_image = image_ids[query_row] >= 0 && image_ids[query_row] == image_ids[key_row];
-        if (key_valid[key_row] == 0 || !(query_row >= key_row || same_image)) {
-            continue;
-        }
-        const uint key_start = (key_row * params.heads + head) * params.head_dimension;
-        float score = 0.0f;
-        for (uint column = 0; column < params.head_dimension; ++column) {
-            score = fma(query[query_start + column], key[key_start + column], score);
-        }
-        denominator += exp(score * scale - maximum);
-    }
-
-    for (uint column = 0; column < params.head_dimension; ++column) {
-        float sum = 0.0f;
-        for (uint key_row = 0; key_row < params.rows; ++key_row) {
-            const bool same_image = image_ids[query_row] >= 0 && image_ids[query_row] == image_ids[key_row];
-            if (key_valid[key_row] == 0 || !(query_row >= key_row || same_image)) {
-                continue;
+        const bool from_cache = key_row < params.cached_prefix_rows;
+        const uint local_key_row = from_cache ? key_row : key_row - params.cached_prefix_rows;
+        const uint key_start = (local_key_row * params.heads + head) * params.head_dimension;
+        const float key_element = from_cache ? cache_key[key_start + lane] : key[key_start + lane];
+        reduction[lane] = query[query_start + lane] * key_element;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = params.head_dimension / 2; stride > 0; stride /= 2) {
+            if (lane < stride) {
+                reduction[lane] += reduction[lane + stride];
             }
-            const uint key_start = (key_row * params.heads + head) * params.head_dimension;
-            float score = 0.0f;
-            for (uint inner = 0; inner < params.head_dimension; ++inner) {
-                score = fma(query[query_start + inner], key[key_start + inner], score);
-            }
-            const float probability = exp(score * scale - maximum) / denominator;
-            const uint value_index = (key_row * params.heads + head) * params.head_dimension + column;
-            sum = fma(probability, value[value_index], sum);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        output[query_start + column] = sum;
+        if (lane == 0) {
+            const float score = reduction[0] * scale;
+            const float next_maximum = max(state[0], score);
+            const float old_scale = isinf(state[0]) ? 0.0f : exp(state[0] - next_maximum);
+            const float new_weight = exp(score - next_maximum);
+            state[0] = next_maximum;
+            state[1] = state[1] * old_scale + new_weight;
+            state[2] = old_scale;
+            state[3] = new_weight;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint value_index = key_start + lane;
+        const float value_element = from_cache ? cache_value[value_index] : value[value_index];
+        accumulator = fma(accumulator, state[2], state[3] * value_element);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    output[query_start + lane] = accumulator / state[1];
 }
 
 kernel void qi_block_residual(
