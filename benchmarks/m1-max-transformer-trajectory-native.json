@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "artifact": {
+    "path_used_for_measurement": "/private/tmp/qwen-image-2.1-mixed.qipack",
+    "logical_bytes": 13334843392,
+    "mapped_bytes": 13334855680,
+    "q8_matrices_per_model_evaluation": 40
+  },
+  "method": {
+    "pixels": 256,
+    "prompt_case": "short-256-early",
+    "latent_seed": 1101,
+    "text_rows": 22,
+    "target_rows": 256,
+    "steps": 40,
+    "scheduler": "Pinned FlowMatchEulerDiscreteScheduler with dynamic exponential shift and terminal sigma 0.02",
+    "reference": "Pinned official Diffusers BF16 transformer on MPS; FP32 Euler update cast back to BF16 after every step",
+    "native": "FP32 activations, BF16 dense weights, affine-Q8/group-64 selected tail matrices, identical per-step BF16 latent rounding",
+    "cache": "Step 1 extracts post-RoPE prefix K and raw V; steps 2-40 execute target rows only from the same 32-layer cache",
+    "checkpoint_steps": [1, 2, 40]
+  },
+  "reference": {
+    "fixture": "tests/fixtures/trajectory_256_fp32",
+    "summed_wall_seconds": 34.95011991611682,
+    "step_1_wall_seconds": 2.857713834149763,
+    "typical_cached_step_wall_seconds": 0.82
+  },
+  "native": {
+    "prefix_cache_bytes": 23068672,
+    "q8_dispatch_matrices": 1600,
+    "summed_gpu_kernel_ms": 147234.0,
+    "step_1_gpu_ms": 4032.02,
+    "step_2_gpu_ms": 3640.01,
+    "step_40_gpu_ms": 3718.55,
+    "checkpoint_latent_nrmse": {
+      "1": 0.000895723,
+      "2": 0.00129116,
+      "40": 0.0100476
+    },
+    "finite_at_every_checked_boundary": true
+  },
+  "acceptance": {
+    "per_checkpoint_limits": {
+      "1": 0.001,
+      "2": 0.0015,
+      "40": 0.011
+    },
+    "schedule_vectors_match_fixture": true,
+    "passed": true
+  },
+  "interpretation": "The final 1.00476% latent nRMSE is accumulated complete-runtime divergence from official BF16 execution, not a quantization-only number. The native path retains FP32 transformer activations but deliberately reproduces the scheduler's BF16 cast-back after each Euler update. The checkpoint-specific gates preserve the observed growth instead of masking early regressions behind one loose final tolerance. A preceding corrected-oracle run produced identical errors and 145779 ms summed GPU time; the recorded timing is the final rebuilt run against the tightened limits.",
+  "limitations": [
+    "The 1-step and 2-step commands validate prefixes of the official 40-step schedule; they are not separate one-step or two-step schedules.",
+    "The trajectory is 256px so a 40-step regression remains practical. The earlier independent scale gate covers 512px and 1024px single-step execution.",
+    "Summed GPU time excludes packed-file validation, pipeline compilation, CPU scheduler work, and process startup; every kernel still uses a separate command buffer and synchronous wait.",
+    "Prompt embeddings and initial noise are precomputed fixtures. Native prompt encoding and RNG remain later boundaries.",
+    "No VAE decode is included; this gate ends at the latent after scheduler step 40."
+  ]
+}

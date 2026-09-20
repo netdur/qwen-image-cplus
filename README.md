@@ -46,6 +46,9 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 256
 ./target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 512
 ./target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 1024
+./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 1
+./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 2
+./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -206,6 +209,33 @@ Inspect a shard, optionally filtering tensor names:
   on the 32 GB M1 Max without a quadratic attention allocation. Full results
   and limitations are recorded in
   `benchmarks/m1-max-transformer-scale-native.json`.
+- The pinned FlowMatch Euler integration is now exercised as a complete
+  40-step 256px latent trajectory. The native scheduler reproduces dynamic
+  exponential shifting, terminal stretching to sigma 0.02, the 1000x model
+  timestep convention, and Diffusers' FP32 Euler update followed by a cast
+  back to the BF16 model dtype after every step. Unit tests cover 2-, 10-, and
+  40-step schedules at several token lengths, while the model-scale command
+  checks the complete official 40-step sigma and timestep fixtures before any
+  transformer work begins.
+- Step 1 runs the complete 278-row joint sequence and extracts every layer's
+  post-RoPE text K and raw V. Steps 2-40 reuse the same 23,068,672-byte cache
+  and recompute only 256 target rows. This is valid specifically because the
+  pinned model has `causal_condition=true`: prefix tokens use the t=0
+  modulation row and are independent of the sampled denoising timestep.
+- The `1` and `2` trajectory commands are prefixes of the canonical 40-step
+  schedule, not independently constructed short schedules. That makes each
+  checkpoint comparable to one reference run and catches the cache transition
+  at step 2. Against the official BF16 trajectory, latent nRMSE is 0.0896% at
+  step 1, 0.1291% at step 2, and 1.0048% at step 40. Separate measured gates
+  of 0.10%, 0.15%, and 1.10% preserve the observed accumulation curve rather
+  than hiding early regressions behind one loose final limit.
+- The full native run dispatches 1,600 selected Q8 matrices, stays finite, and
+  totals 147,234 ms of summed GPU kernel time (145,779 ms on the preceding
+  corrected-oracle run). It is intentionally 256px so a
+  40-step regression remains practical; the independent scale gate already
+  covers one complete noise prediction at 512px and 1024px. Fixture provenance,
+  timings, acceptance limits, and limitations are recorded in
+  `benchmarks/m1-max-transformer-trajectory-native.json`.
 
 ## Quantization decision log
 
@@ -258,9 +288,8 @@ claim. The packed mapping is exposed to Metal without copying 12.42 GiB of
 weights; only activations, cache arenas, and 128-element Q/K norm vectors are
 copied.
 
-Image generation is not implemented yet. The next phase is the exact latent-
-only denoising trajectory: integrate the already-tested FlowMatch Euler
-schedule with the production transformer, import deterministic initial-noise
-fixtures, and verify 1-, 2-, then 40-step latent evolution. The native prompt
-encoder and causal 3D VAE remain later independent boundaries tracked in
-`plan.md`.
+Image generation is not implemented yet. The latent-only denoising trajectory
+is now validated; the next phase is the real Qwen-Image-2.1 causal 3D VAE
+decoder, beginning with fixed reference latents and intermediate feature/pixel
+fixtures. Native prompt encoding remains a later independent boundary tracked
+in `plan.md`.

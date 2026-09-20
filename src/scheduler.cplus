@@ -1,3 +1,4 @@
+import "./cpu_ops" as cpu;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/status" as status;
@@ -86,6 +87,59 @@ fn euler_step(sample: *f32, model_output: *f32, output: *f32, count: usize, sigm
     }
 }
 
+// Copy the exact model-evaluation timesteps and N+1 Euler endpoints into
+// caller-owned storage.  Runtime code uses this boundary so Schedule's Vec
+// allocation remains private to this module.
+fn fill_schedule(
+    step_count: usize,
+    image_sequence_length: usize,
+    sigmas: *f32,
+    timesteps: *f32,
+) -> bool {
+    match build_schedule(step_count, image_sequence_length) {
+        ScheduleResult::Ok(schedule) => {
+            var index: usize = 0 as usize;
+            while index < step_count {
+                guard let option::Option[f32]::Some(sigma) = schedule.sigmas.at(index) else {
+                    return false;
+                };
+                guard let option::Option[f32]::Some(timestep) = schedule.timesteps.at(index) else {
+                    return false;
+                };
+                sigmas[index] = sigma;
+                timesteps[index] = timestep;
+                index = index +% (1 as usize);
+            }
+            guard let option::Option[f32]::Some(endpoint) = schedule.sigmas.at(step_count) else {
+                return false;
+            };
+            sigmas[step_count] = endpoint;
+            return true;
+        }
+        ScheduleResult::Err(_error) => { return false; }
+    }
+}
+
+// Diffusers performs the Euler arithmetic in FP32, then casts the result back
+// to model_output.dtype. Qwen-Image-2.1 runs the transformer in BF16, so every
+// trajectory step must round here before the next model evaluation.
+fn euler_step_bf16(
+    sample: *f32,
+    model_output: *f32,
+    output: *f32,
+    count: usize,
+    sigma: f32,
+    next_sigma: f32,
+) {
+    let delta: f32 = next_sigma - sigma;
+    var index: usize = 0 as usize;
+    while index < count {
+        let updated: f32 = sample[index] + delta * model_output[index];
+        output[index] = cpu::bf16_to_f32(cpu::f32_to_bf16(updated));
+        index = index +% (1 as usize);
+    }
+}
+
 fn close(left: f32, right: f32, tolerance: f32) -> bool {
     return (left - right).abs() <= tolerance;
 }
@@ -138,4 +192,46 @@ fn euler_step_uses_next_sigma_delta() {
     assert close(output[0], 0.4f32, 0.000001f32);
     assert close(output[1], 2.3f32, 0.000001f32);
     assert close(output[2], 2.85f32, 0.000001f32);
+}
+
+#[test]
+fn schedules_cover_multiple_step_counts_and_token_lengths() {
+    let counts: [usize; 3] = [2 as usize, 10 as usize, 40 as usize];
+    let lengths: [usize; 3] = [256 as usize, 1024 as usize, 4096 as usize];
+    var case: usize = 0 as usize;
+    while case < (3 as usize) {
+        var sigmas: [f32; 41] = [0.0f32; 41];
+        var timesteps: [f32; 40] = [0.0f32; 40];
+        let count: usize = counts[case];
+        assert fill_schedule(count, lengths[case], #addr_of(sigmas[0]), #addr_of(timesteps[0]));
+        assert close(sigmas[0], 1.0f32, 0.000001f32);
+        assert close(sigmas[count -% (1 as usize)], TERMINAL_SHIFT, 0.000001f32);
+        assert sigmas[count] == 0.0f32;
+        var index: usize = 0 as usize;
+        while index < count {
+            assert close(timesteps[index], sigmas[index] * TRAIN_TIMESTEPS, 0.0001f32);
+            assert sigmas[index] > sigmas[index +% (1 as usize)];
+            index = index +% (1 as usize);
+        }
+        case = case +% (1 as usize);
+    }
+}
+
+#[test]
+fn bf16_euler_step_matches_scheduler_cast_back() {
+    let sample: [f32; 2] = [1.001f32, 0.0f32 - 2.003f32];
+    let prediction: [f32; 2] = [0.333f32, 1.777f32];
+    var output: [f32; 2] = [0.0f32, 0.0f32];
+    euler_step_bf16(
+        #addr_of(sample[0]),
+        #addr_of(prediction[0]),
+        #addr_of(output[0]),
+        2 as usize,
+        0.9f32,
+        0.7f32,
+    );
+    let first: f32 = sample[0] + (0.7f32 - 0.9f32) * prediction[0];
+    let second: f32 = sample[1] + (0.7f32 - 0.9f32) * prediction[1];
+    assert output[0] == cpu::bf16_to_f32(cpu::f32_to_bf16(first));
+    assert output[1] == cpu::bf16_to_f32(cpu::f32_to_bf16(second));
 }
