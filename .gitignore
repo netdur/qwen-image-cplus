@@ -1,0 +1,4 @@
+.DS_Store
+target/
+tests/fixtures/small/
+vendor

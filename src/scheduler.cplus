@@ -1,0 +1,141 @@
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/vec" as vec;
+
+const TRAIN_TIMESTEPS: f32 = 1000.0f32;
+const BASE_SEQUENCE_LENGTH: f32 = 256.0f32;
+const MAX_SEQUENCE_LENGTH: f32 = 8192.0f32;
+const BASE_SHIFT: f32 = 0.5f32;
+const MAX_SHIFT: f32 = 0.9f32;
+const TERMINAL_SHIFT: f32 = 0.02f32;
+
+enum ScheduleError {
+    InvalidStepCount,
+    AllocationFailed,
+}
+
+struct Schedule {
+    // One sigma per model evaluation plus a final zero endpoint.
+    sigmas: vec::Vec[f32],
+    timesteps: vec::Vec[f32],
+}
+
+enum ScheduleResult {
+    Ok(Schedule),
+    Err(ScheduleError),
+}
+
+fn calculate_shift(image_sequence_length: usize) -> f32 {
+    let slope: f32 = (MAX_SHIFT - BASE_SHIFT) / (MAX_SEQUENCE_LENGTH - BASE_SEQUENCE_LENGTH);
+    let intercept: f32 = BASE_SHIFT - slope * BASE_SEQUENCE_LENGTH;
+    return image_sequence_length as f32 * slope + intercept;
+}
+
+fn exponential_time_shift(mu: f32, timestep: f32) -> f32 {
+    let scale: f32 = mu.exp();
+    return scale / (scale + (1.0f32 / timestep - 1.0f32));
+}
+
+fn build_schedule(step_count: usize, image_sequence_length: usize) -> ScheduleResult {
+    if step_count < (2 as usize) {
+        return ScheduleResult::Err(ScheduleError::InvalidStepCount);
+    }
+    var shifted: vec::Vec[f32] = vec::Vec[f32]::with_capacity(step_count);
+    let mu: f32 = calculate_shift(image_sequence_length);
+    var index: usize = 0 as usize;
+    while index < step_count {
+        // np.linspace(1, 1 / N, N) is exactly (N-i)/N before FP rounding.
+        let sigma: f32 = (step_count -% index) as f32 / step_count as f32;
+        if shifted.append(exponential_time_shift(mu, sigma)) != status::Status::Ok {
+            return ScheduleResult::Err(ScheduleError::AllocationFailed);
+        }
+        index = index +% (1 as usize);
+    }
+
+    guard let option::Option[f32]::Some(last_shifted) = shifted.last() else {
+        return ScheduleResult::Err(ScheduleError::InvalidStepCount);
+    };
+    let terminal_scale: f32 = (1.0f32 - last_shifted) / (1.0f32 - TERMINAL_SHIFT);
+    var sigmas: vec::Vec[f32] = vec::Vec[f32]::with_capacity(step_count +% (1 as usize));
+    var timesteps: vec::Vec[f32] = vec::Vec[f32]::with_capacity(step_count);
+    index = 0 as usize;
+    while index < step_count {
+        guard let option::Option[f32]::Some(value) = shifted.at(index) else {
+            return ScheduleResult::Err(ScheduleError::AllocationFailed);
+        };
+        let stretched: f32 = 1.0f32 - (1.0f32 - value) / terminal_scale;
+        if sigmas.append(stretched) != status::Status::Ok
+            || timesteps.append(stretched * TRAIN_TIMESTEPS) != status::Status::Ok {
+            return ScheduleResult::Err(ScheduleError::AllocationFailed);
+        }
+        index = index +% (1 as usize);
+    }
+    if sigmas.append(0.0f32) != status::Status::Ok {
+        return ScheduleResult::Err(ScheduleError::AllocationFailed);
+    }
+    return ScheduleResult::Ok(Schedule { sigmas: sigmas, timesteps: timesteps });
+}
+
+fn euler_step(sample: *f32, model_output: *f32, output: *f32, count: usize, sigma: f32, next_sigma: f32) {
+    let delta: f32 = next_sigma - sigma;
+    var index: usize = 0 as usize;
+    while index < count {
+        output[index] = sample[index] + delta * model_output[index];
+        index = index +% (1 as usize);
+    }
+}
+
+fn close(left: f32, right: f32, tolerance: f32) -> bool {
+    return (left - right).abs() <= tolerance;
+}
+
+#[test]
+fn qwen_1024_schedule_matches_pinned_reference_points() {
+    assert close(calculate_shift(4096 as usize), 0.6935484f32, 0.0000001f32);
+    match build_schedule(40 as usize, 4096 as usize) {
+        ScheduleResult::Ok(schedule) => {
+            assert schedule.sigmas.count() == (41 as usize);
+            assert schedule.timesteps.count() == (40 as usize);
+            guard let option::Option[f32]::Some(first) = schedule.sigmas.at(0 as usize) else {
+                assert false;
+                return;
+            };
+            guard let option::Option[f32]::Some(second) = schedule.sigmas.at(1 as usize) else {
+                assert false;
+                return;
+            };
+            guard let option::Option[f32]::Some(last_model_sigma) = schedule.sigmas.at(39 as usize) else {
+                assert false;
+                return;
+            };
+            guard let option::Option[f32]::Some(endpoint) = schedule.sigmas.at(40 as usize) else {
+                assert false;
+                return;
+            };
+            assert close(first, 1.0f32, 0.000001f32);
+            assert close(second, 0.9869637f32, 0.000001f32);
+            assert close(last_model_sigma, 0.02f32, 0.000001f32);
+            assert endpoint == 0.0f32;
+        }
+        ScheduleResult::Err(_error) => { assert false; }
+    }
+}
+
+#[test]
+fn euler_step_uses_next_sigma_delta() {
+    let sample: [f32; 3] = [1.0f32, 2.0f32, 3.0f32];
+    let prediction: [f32; 3] = [2.0f32, 0.0f32 - 1.0f32, 0.5f32];
+    var output: [f32; 3] = [0.0f32, 0.0f32, 0.0f32];
+    euler_step(
+        #addr_of(sample[0]),
+        #addr_of(prediction[0]),
+        #addr_of(output[0]),
+        3 as usize,
+        0.8f32,
+        0.5f32,
+    );
+    assert close(output[0], 0.4f32, 0.000001f32);
+    assert close(output[1], 2.3f32, 0.000001f32);
+    assert close(output[2], 2.85f32, 0.000001f32);
+}

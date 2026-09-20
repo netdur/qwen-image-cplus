@@ -1,0 +1,143 @@
+import "./safetensors" as safetensors;
+import "stdlib/io" as io;
+import "stdlib/text" as text;
+
+const TRANSFORMER_TENSORS: usize = 297;
+const TRANSFORMER_PARAMETERS: u64 = 7115124736;
+const TRANSFORMER_FILE_BYTES: u64 = 14230284408;
+const TRANSFORMER_WEIGHT_BYTES: u64 = 14230249472;
+
+const TEXT_ENCODER_TENSORS: usize = 750;
+const TEXT_ENCODER_PARAMETERS: u64 = 8767123696;
+const TEXT_ENCODER_FILE_BYTES: u64 = 17534339488;
+const TEXT_ENCODER_WEIGHT_BYTES: u64 = 17534247392;
+
+const VAE_TENSORS: usize = 238;
+const VAE_PARAMETERS: u64 = 337740404;
+const VAE_FILE_BYTES: u64 = 1350989512;
+const VAE_WEIGHT_BYTES: u64 = 1350961616;
+
+fn summary_matches(
+    label: str,
+    summary: safetensors::ComponentSummary,
+    shards: usize,
+    tensors: usize,
+    parameters: u64,
+    file_bytes: u64,
+    weight_bytes: u64,
+    bf16_tensors: usize,
+    f32_tensors: usize,
+) -> bool {
+    let matches: bool = summary.shards == shards && summary.tensors == tensors
+        && summary.parameters == parameters && summary.file_bytes == file_bytes
+        && summary.weight_bytes == weight_bytes && summary.bf16_tensors == bf16_tensors
+        && summary.f16_tensors == (0 as usize) && summary.f32_tensors == f32_tensors;
+    io::println(
+        "${label}: shards=${summary.shards} tensors=${summary.tensors} parameters=${summary.parameters} file_bytes=${summary.file_bytes} weight_bytes=${summary.weight_bytes}",
+    );
+    if !matches {
+        io::eprintln("${label}: inventory does not match the pinned manifest");
+    }
+    return matches;
+}
+
+fn verify_model(root: str) -> i32 {
+    let transformer_directory: text::Text = "${root}/transformer";
+    let text_encoder_directory: text::Text = "${root}/text_encoder";
+    let vae_path: text::Text = "${root}/vae/diffusion_pytorch_model.safetensors";
+
+    let transformer_ok: bool = match safetensors::verify_index(
+        transformer_directory.view(),
+        "diffusion_pytorch_model.safetensors.index.json",
+    ) {
+        safetensors::ComponentResult::Ok(summary) => summary_matches(
+            "transformer",
+            summary,
+            2 as usize,
+            TRANSFORMER_TENSORS,
+            TRANSFORMER_PARAMETERS,
+            TRANSFORMER_FILE_BYTES,
+            TRANSFORMER_WEIGHT_BYTES,
+            TRANSFORMER_TENSORS,
+            0 as usize,
+        ),
+        safetensors::ComponentResult::Err => false,
+    };
+
+    let text_encoder_ok: bool = match safetensors::verify_index(
+        text_encoder_directory.view(),
+        "model.safetensors.index.json",
+    ) {
+        safetensors::ComponentResult::Ok(summary) => summary_matches(
+            "text_encoder",
+            summary,
+            4 as usize,
+            TEXT_ENCODER_TENSORS,
+            TEXT_ENCODER_PARAMETERS,
+            TEXT_ENCODER_FILE_BYTES,
+            TEXT_ENCODER_WEIGHT_BYTES,
+            TEXT_ENCODER_TENSORS,
+            0 as usize,
+        ),
+        safetensors::ComponentResult::Err => false,
+    };
+
+    let vae_ok: bool = match safetensors::summarize_file(vae_path.view()) {
+        safetensors::ComponentResult::Ok(summary) => summary_matches(
+            "vae",
+            summary,
+            1 as usize,
+            VAE_TENSORS,
+            VAE_PARAMETERS,
+            VAE_FILE_BYTES,
+            VAE_WEIGHT_BYTES,
+            0 as usize,
+            VAE_TENSORS,
+        ),
+        safetensors::ComponentResult::Err => false,
+    };
+
+    let transformer_shape_path: text::Text =
+        "${transformer_directory}/diffusion_pytorch_model-00002-of-00002.safetensors";
+    let text_shape_path: text::Text = "${text_encoder_directory}/model-00001-of-00004.safetensors";
+    let representative_shapes_ok: bool = safetensors::tensor_matches(
+        transformer_shape_path.view(),
+        "proj_out.weight",
+        "BF16",
+        2 as usize,
+        64 as u64,
+        4096 as u64,
+    ) && safetensors::tensor_matches(
+        transformer_shape_path.view(),
+        "transformer_blocks.31.attn.to_q.weight",
+        "BF16",
+        2 as usize,
+        4096 as u64,
+        4096 as u64,
+    ) && safetensors::tensor_matches(
+        text_shape_path.view(),
+        "model.language_model.embed_tokens.weight",
+        "BF16",
+        2 as usize,
+        151936 as u64,
+        4096 as u64,
+    ) && safetensors::tensor_matches(
+        vae_path.view(),
+        "decoder.conv_in.weight",
+        "F32",
+        4 as usize,
+        1152 as u64,
+        64 as u64,
+        3 as u64,
+        3 as u64,
+    );
+    if !representative_shapes_ok {
+        io::eprintln("model: a representative tensor shape does not match the pinned manifest");
+    }
+
+    if transformer_ok && text_encoder_ok && vae_ok && representative_shapes_ok {
+        io::println("model inventory: verified");
+        return 0;
+    }
+    return 1;
+}

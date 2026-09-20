@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "model": {
+    "repository": "Qwen/Qwen-Image-2.1",
+    "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+    "declared_diffusers_version": "0.37.0.dev0"
+  },
+  "reference": {
+    "repository": "https://github.com/huggingface/diffusers",
+    "commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69"
+  },
+  "transformer_config": {
+    "class": "QwenImage21Transformer2DModel",
+    "attention_head_dim": 128,
+    "axes_dims_rope": [16, 56, 56],
+    "causal_condition": true,
+    "context_in_dim": 4096,
+    "eps": 0.000001,
+    "in_channels": 64,
+    "mlp_ratio": 3,
+    "num_attention_heads": 32,
+    "num_layers": 32,
+    "out_channels": 64,
+    "patch_size": 1
+  },
+  "scheduler_config": {
+    "class": "FlowMatchEulerDiscreteScheduler",
+    "base_image_seq_len": 256,
+    "base_shift": 0.5,
+    "max_image_seq_len": 8192,
+    "max_shift": 0.9,
+    "num_train_timesteps": 1000,
+    "shift_terminal": 0.02,
+    "stochastic_sampling": false,
+    "time_shift_type": "exponential",
+    "use_dynamic_shifting": true
+  },
+  "vae_config": {
+    "class": "AutoencoderKLQwenImage21",
+    "base_dim": 96,
+    "decoder_base_dim": 144,
+    "dim_mult": [1, 2, 4, 8, 8],
+    "in_channels": 4,
+    "out_channels": 4,
+    "scale_factor_spatial": 16,
+    "scale_factor_temporal": 8,
+    "temperal_downsample": [false, true, true, true],
+    "z_dim": 64,
+    "latent_statistics": {
+      "channels": 64,
+      "source": "vae/config.json"
+    }
+  },
+  "components": {
+    "transformer": {
+      "dtype": "BF16",
+      "tensor_count": 297,
+      "parameter_count": 7115124736,
+      "weight_bytes": 14230249472,
+      "file_bytes": 14230284408,
+      "index": "transformer/diffusion_pytorch_model.safetensors.index.json",
+      "shards": [
+        {
+          "path": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+          "tensor_count": 211,
+          "parameter_count": 4984153856,
+          "file_bytes": 9968332504
+        },
+        {
+          "path": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+          "tensor_count": 86,
+          "parameter_count": 2130970880,
+          "file_bytes": 4261951904
+        }
+      ]
+    },
+    "text_encoder": {
+      "dtype": "BF16",
+      "tensor_count": 750,
+      "parameter_count": 8767123696,
+      "weight_bytes": 17534247392,
+      "file_bytes": 17534339488,
+      "index": "text_encoder/model.safetensors.index.json",
+      "shards": [
+        {
+          "path": "text_encoder/model-00001-of-00004.safetensors",
+          "tensor_count": 426,
+          "parameter_count": 2499003376,
+          "file_bytes": 4998056552
+        },
+        {
+          "path": "text_encoder/model-00002-of-00004.safetensors",
+          "tensor_count": 142,
+          "parameter_count": 2457971968,
+          "file_bytes": 4915962464
+        },
+        {
+          "path": "text_encoder/model-00003-of-00004.safetensors",
+          "tensor_count": 142,
+          "parameter_count": 2457971968,
+          "file_bytes": 4915962496
+        },
+        {
+          "path": "text_encoder/model-00004-of-00004.safetensors",
+          "tensor_count": 40,
+          "parameter_count": 1352176384,
+          "file_bytes": 2704357976
+        }
+      ]
+    },
+    "vae": {
+      "dtype": "F32",
+      "tensor_count": 238,
+      "parameter_count": 337740404,
+      "weight_bytes": 1350961616,
+      "file_bytes": 1350989512,
+      "shards": [
+        {
+          "path": "vae/diffusion_pytorch_model.safetensors",
+          "tensor_count": 238,
+          "parameter_count": 337740404,
+          "file_bytes": 1350989512
+        }
+      ]
+    }
+  },
+  "representative_shapes": {
+    "proj_out.weight": {"dtype": "BF16", "shape": [64, 4096]},
+    "transformer_blocks.31.attn.to_q.weight": {"dtype": "BF16", "shape": [4096, 4096]},
+    "model.language_model.embed_tokens.weight": {"dtype": "BF16", "shape": [151936, 4096]},
+    "decoder.conv_in.weight": {"dtype": "F32", "shape": [1152, 64, 3, 3]}
+  }
+}

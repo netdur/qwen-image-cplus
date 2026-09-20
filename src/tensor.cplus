@@ -1,0 +1,294 @@
+import "stdlib/option" as option;
+
+const MAX_RANK: usize = 5;
+
+enum DType {
+    BF16,
+    F16,
+    F32,
+}
+
+impl DType {
+    fn byte_width(this) -> u64 {
+        return match this {
+            DType::BF16 => 2 as u64,
+            DType::F16 => 2 as u64,
+            DType::F32 => 4 as u64,
+        };
+    }
+
+    fn name(this) -> str {
+        return match this {
+            DType::BF16 => "BF16",
+            DType::F16 => "F16",
+            DType::F32 => "F32",
+        };
+    }
+}
+
+enum StorageKind {
+    MappedFile,
+    SharedMetalBuffer,
+    PrivateMetalBuffer,
+    ActivationArena,
+}
+
+enum ShapeError {
+    RankTooLarge,
+    DimensionOverflow,
+    ByteLengthOverflow,
+}
+
+struct Shape {
+    rank: usize,
+    dimensions: [u64; 5],
+    strides: [u64; 5],
+    elements: u64,
+}
+
+enum ShapeResult {
+    Ok(Shape),
+    Err(ShapeError),
+}
+
+fn checked_multiply(left: u64, right: u64) -> option::Option[u64] {
+    if right != (0 as u64) && left > (((0 as u64) -% (1 as u64)) / right) {
+        return option::Option[u64]::None;
+    }
+    return option::Option[u64]::Some(left *% right);
+}
+
+fn make_shape(rank: usize, dimensions: [u64; 5]) -> ShapeResult {
+    if rank > MAX_RANK {
+        return ShapeResult::Err(ShapeError::RankTooLarge);
+    }
+    var strides: [u64; 5] = [0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64];
+    var elements: u64 = 1 as u64;
+    var cursor: usize = rank;
+    while cursor > (0 as usize) {
+        cursor = cursor -% (1 as usize);
+        strides[cursor] = elements;
+        guard let option::Option[u64]::Some(next) = checked_multiply(elements, dimensions[cursor]) else {
+            return ShapeResult::Err(ShapeError::DimensionOverflow);
+        };
+        elements = next;
+    }
+    return ShapeResult::Ok(Shape {
+        rank: rank,
+        dimensions: dimensions,
+        strides: strides,
+        elements: elements,
+    });
+}
+
+fn shape_2(dimension_0: u64, dimension_1: u64) -> ShapeResult {
+    return make_shape(
+        2 as usize,
+        [dimension_0, dimension_1, 0 as u64, 0 as u64, 0 as u64],
+    );
+}
+
+fn shape_3(dimension_0: u64, dimension_1: u64, dimension_2: u64) -> ShapeResult {
+    return make_shape(
+        3 as usize,
+        [dimension_0, dimension_1, dimension_2, 0 as u64, 0 as u64],
+    );
+}
+
+fn shape_4(dimension_0: u64, dimension_1: u64, dimension_2: u64, dimension_3: u64) -> ShapeResult {
+    return make_shape(4 as usize, [dimension_0, dimension_1, dimension_2, dimension_3, 0 as u64]);
+}
+
+fn shape_5(
+    dimension_0: u64,
+    dimension_1: u64,
+    dimension_2: u64,
+    dimension_3: u64,
+    dimension_4: u64,
+) -> ShapeResult {
+    return make_shape(5 as usize, [dimension_0, dimension_1, dimension_2, dimension_3, dimension_4]);
+}
+
+struct TensorView {
+    // Non-owning. The mapped file or Metal buffer must outlive this view.
+    opaque base: *u8,
+    byte_offset: u64,
+    byte_length: u64,
+    dtype: DType,
+    shape: Shape,
+    storage: StorageKind,
+}
+
+enum ViewResult {
+    Ok(TensorView),
+    Err(ShapeError),
+}
+
+fn make_view(
+    base: *u8,
+    byte_offset: u64,
+    dtype: DType,
+    shape: Shape,
+    storage: StorageKind,
+) -> ViewResult {
+    guard let option::Option[u64]::Some(byte_length) = checked_multiply(shape.elements, dtype.byte_width()) else {
+        return ViewResult::Err(ShapeError::ByteLengthOverflow);
+    };
+    return ViewResult::Ok(TensorView {
+        base: base,
+        byte_offset: byte_offset,
+        byte_length: byte_length,
+        dtype: dtype,
+        shape: shape,
+        storage: storage,
+    });
+}
+
+enum ArenaError {
+    InvalidAlignment,
+    OffsetOverflow,
+    OutOfMemory,
+}
+
+struct Allocation {
+    offset: u64,
+    length: u64,
+}
+
+enum AllocationResult {
+    Ok(Allocation),
+    Err(ArenaError),
+}
+
+struct ActivationArena {
+    capacity: u64,
+    cursor: u64,
+    high_water: u64,
+}
+
+impl ActivationArena {
+    fn new(capacity: u64) -> ActivationArena {
+        return ActivationArena { capacity: capacity, cursor: 0 as u64, high_water: 0 as u64 };
+    }
+
+    fn reset(ref this) {
+        this.cursor = 0 as u64;
+    }
+
+    fn allocate(ref this, length: u64, alignment: u64) -> AllocationResult {
+        if alignment == (0 as u64) || (alignment & (alignment -% (1 as u64))) != (0 as u64) {
+            return AllocationResult::Err(ArenaError::InvalidAlignment);
+        }
+        let mask: u64 = alignment -% (1 as u64);
+        if this.cursor > (((0 as u64) -% (1 as u64)) -% mask) {
+            return AllocationResult::Err(ArenaError::OffsetOverflow);
+        }
+        let aligned: u64 = ((this.cursor +% mask) / alignment) *% alignment;
+        if length > this.capacity || aligned > this.capacity -% length {
+            return AllocationResult::Err(ArenaError::OutOfMemory);
+        }
+        let end: u64 = aligned +% length;
+        this.cursor = end;
+        if end > this.high_water {
+            this.high_water = end;
+        }
+        return AllocationResult::Ok(Allocation { offset: aligned, length: length });
+    }
+}
+
+#[test]
+fn row_major_transformer_shape_has_expected_strides() {
+    match shape_4(1 as u64, 4096 as u64, 32 as u64, 128 as u64) {
+        ShapeResult::Ok(shape) => {
+            assert shape.elements == (16777216 as u64);
+            assert shape.strides[0] == (16777216 as u64);
+            assert shape.strides[1] == (4096 as u64);
+            assert shape.strides[2] == (128 as u64);
+            assert shape.strides[3] == (1 as u64);
+        }
+        ShapeResult::Err(_error) => { assert false; }
+    }
+}
+
+#[test]
+fn five_dimensional_vae_shape_is_checked() {
+    match shape_5(1 as u64, 64 as u64, 1 as u64, 64 as u64, 64 as u64) {
+        ShapeResult::Ok(shape) => { assert shape.elements == (262144 as u64); }
+        ShapeResult::Err(_error) => { assert false; }
+    }
+}
+
+#[test]
+fn shape_overflow_is_typed() {
+    match shape_2((0 as u64) -% (1 as u64), 2 as u64) {
+        ShapeResult::Err(ShapeError::DimensionOverflow) => {}
+        _ => { assert false; }
+    }
+}
+
+#[test]
+fn tensor_byte_length_is_checked() {
+    guard let ShapeResult::Ok(shape) = shape_3(1 as u64, 4 as u64, 4096 as u64) else {
+        assert false;
+        return;
+    };
+    match make_view(0 as *u8, 128 as u64, DType::BF16, shape, StorageKind::MappedFile) {
+        ViewResult::Ok(view) => { assert view.byte_length == (32768 as u64); }
+        ViewResult::Err(_error) => { assert false; }
+    }
+}
+
+#[test]
+fn arena_aligns_reuses_and_tracks_high_water() {
+    var arena: ActivationArena = ActivationArena::new(1024 as u64);
+    match arena.allocate(13 as u64, 16 as u64) {
+        AllocationResult::Ok(allocation) => { assert allocation.offset == (0 as u64); }
+        AllocationResult::Err(_error) => { assert false; }
+    }
+    match arena.allocate(1 as u64, 256 as u64) {
+        AllocationResult::Ok(allocation) => { assert allocation.offset == (256 as u64); }
+        AllocationResult::Err(_error) => { assert false; }
+    }
+    assert arena.high_water == (257 as u64);
+    arena.reset();
+    match arena.allocate(32 as u64, 16 as u64) {
+        AllocationResult::Ok(allocation) => { assert allocation.offset == (0 as u64); }
+        AllocationResult::Err(_error) => { assert false; }
+    }
+    assert arena.high_water == (257 as u64);
+}
+
+#[test]
+fn arena_rejects_bad_alignment_and_capacity_overrun() {
+    var arena: ActivationArena = ActivationArena::new(64 as u64);
+    match arena.allocate(1 as u64, 3 as u64) {
+        AllocationResult::Err(ArenaError::InvalidAlignment) => {}
+        _ => { assert false; }
+    }
+    match arena.allocate(65 as u64, 1 as u64) {
+        AllocationResult::Err(ArenaError::OutOfMemory) => {}
+        _ => { assert false; }
+    }
+}
+
+#[test]
+fn synthetic_transformer_loop_reuses_arena_without_growth() {
+    var arena: ActivationArena = ActivationArena::new(4096 as u64);
+    var block: usize = 0 as usize;
+    while block < (32 as usize) {
+        arena.reset();
+        match arena.allocate(1024 as u64, 256 as u64) {
+            AllocationResult::Ok(allocation) => {
+                assert allocation.offset == (0 as u64);
+                assert allocation.length == (1024 as u64);
+            }
+            AllocationResult::Err(_error) => { assert false; }
+        }
+        match arena.allocate(512 as u64, 256 as u64) {
+            AllocationResult::Ok(allocation) => { assert allocation.offset == (1024 as u64); }
+            AllocationResult::Err(_error) => { assert false; }
+        }
+        assert arena.high_water == (1536 as u64);
+        block = block +% (1 as usize);
+    }
+}

@@ -1,0 +1,87 @@
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+
+#[link_name = "open"]
+extern fn qi_open(path: *u8, flags: i32, ...) -> i32;
+
+#[link_name = "close"]
+extern fn qi_close(fd: i32) -> i32;
+
+#[link_name = "mmap"]
+extern fn qi_mmap(address: *u8, length: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> *u8;
+
+#[link_name = "munmap"]
+extern fn qi_munmap(address: *u8, length: usize) -> i32;
+
+const PROT_READ: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+
+enum MapError {
+    NotFound,
+    Empty,
+    TooLarge,
+    InvalidPath,
+    MapFailed,
+}
+
+struct MappedFile {
+    opaque _ptr: *u8,
+    _length: usize,
+}
+
+impl MappedFile {
+    fn pointer(this) -> *u8 {
+        return this._ptr;
+    }
+
+    fn length(this) -> usize {
+        return this._length;
+    }
+
+    fn drop(ref this) {
+        if !this._ptr.is_null() && this._length > (0 as usize) {
+            let _status: i32 = qi_munmap(this._ptr, this._length);
+            this._ptr = 0 as *u8;
+            this._length = 0 as usize;
+        }
+    }
+}
+
+enum MapResult {
+    Ok(MappedFile),
+    Err(MapError),
+}
+
+fn map_readonly(path: str) -> MapResult {
+    let metadata = fs::metadata(path);
+    guard let result::Result[fs::Metadata, result::IoError]::Ok(info) = metadata else {
+        return MapResult::Err(MapError::NotFound);
+    };
+    if info.size <= (0 as i64) {
+        return MapResult::Err(MapError::Empty);
+    }
+    let max_size: u64 = ((0 as usize) -% (1 as usize)) as u64;
+    if info.size as u64 > max_size {
+        return MapResult::Err(MapError::TooLarge);
+    }
+
+    let path_owner: text::Text = text::from_str(path);
+    guard let option::Option[text::CString]::Some(c_path) = path_owner.c_str() else {
+        return MapResult::Err(MapError::InvalidPath);
+    };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) {
+        return MapResult::Err(MapError::NotFound);
+    }
+
+    let length: usize = info.size as usize;
+    let pointer: *u8 = qi_mmap(0 as *u8, length, PROT_READ, MAP_PRIVATE, fd, 0 as i64);
+    let _closed: i32 = qi_close(fd);
+    let map_failed: usize = (0 as usize) -% (1 as usize);
+    if #addr(pointer) == map_failed {
+        return MapResult::Err(MapError::MapFailed);
+    }
+    return MapResult::Ok(MappedFile { _ptr: pointer, _length: length });
+}

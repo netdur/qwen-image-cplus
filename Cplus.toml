@@ -1,0 +1,15 @@
+[package]
+name    = "qwen-image-cplus"
+version = "0.0.1"
+edition = "2026"
+
+[macos]
+entry = "src/main.cplus"
+
+[dependencies]
+json        = "*"
+stdlib      = "*"
+
+[macos.dependencies]
+objc          = "*"
+metal         = "*"

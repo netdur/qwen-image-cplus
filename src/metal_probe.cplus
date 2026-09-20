@@ -1,0 +1,297 @@
+import "metal/metal" as metal;
+import "objc/runtime" as rt;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+
+extern fn MTLCreateSystemDefaultDevice() -> *u8;
+extern fn mmap(address: *u8, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> *u8;
+extern fn mprotect(address: *u8, length: usize, protection: i32) -> i32;
+extern fn munmap(address: *u8, length: usize) -> i32;
+
+const ELEMENT_COUNT: usize = 64;
+const STRESS_DISPATCH_COUNT: usize = 1000;
+const PAGE_BYTES: usize = 4096;
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const MAP_PRIVATE: i32 = 2;
+const MAP_ANONYMOUS: i32 = 4096;
+
+struct OwnedObjc {
+    opaque _ptr: *u8,
+}
+
+impl OwnedObjc {
+    fn new(ptr: *u8) -> OwnedObjc {
+        return OwnedObjc { _ptr: ptr };
+    }
+
+    fn raw(this) -> *u8 {
+        return this._ptr;
+    }
+
+    fn drop(ref this) {
+        if !this._ptr.is_null() {
+            rt::release(this._ptr);
+            this._ptr = 0 as *u8;
+        }
+    }
+}
+
+fn dispatch_once(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    lhs: metal::Buffer,
+    rhs: metal::Buffer,
+    output: metal::Buffer,
+) -> option::Option[f64] {
+    let pool_ptr: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_ptr.is_null() {
+        return option::Option[f64]::None;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_ptr);
+
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else {
+        return option::Option[f64]::None;
+    };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(lhs, 0 as u64, 0 as u64);
+    encoder.set_buffer(rhs, 0 as u64, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    let grid: metal::Size = metal::Size { width: ELEMENT_COUNT as u64, height: 1 as u64, depth: 1 as u64 };
+    let group: metal::Size = metal::Size {
+        width: pipeline.thread_execution_width(),
+        height: 1 as u64,
+        depth: 1 as u64,
+    };
+    encoder.dispatch_threads(grid, group);
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let gpu_ms: f64 = (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64;
+    return option::Option[f64]::Some(gpu_ms);
+}
+
+fn highest_apple_family(device: metal::Device) -> u64 {
+    if device.supports_family(metal::GPUFamily::Apple10) { return 10 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple9) { return 9 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple8) { return 8 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple7) { return 7 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple6) { return 6 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple5) { return 5 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple4) { return 4 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple3) { return 3 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple2) { return 2 as u64; }
+    if device.supports_family(metal::GPUFamily::Apple1) { return 1 as u64; }
+    return 0 as u64;
+}
+
+fn release_mapping(_context: *u8, pointer: *u8, length: u64) {
+    let _result: i32 = munmap(pointer, length as usize);
+}
+
+fn probe_readonly_no_copy(
+    device: metal::Device,
+    pipeline: metal::ComputePipelineState,
+    queue: metal::CommandQueue,
+    rhs: metal::Buffer,
+    output: metal::Buffer,
+) -> bool {
+    let mapped: *u8 = mmap(
+        0 as *u8,
+        PAGE_BYTES,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        0 -% (1 as i32),
+        0 as i64,
+    );
+    if mapped as usize == ((0 as usize) -% (1 as usize)) {
+        return false;
+    }
+    if mapped as usize % PAGE_BYTES != (0 as usize) {
+        let _unmapped: i32 = munmap(mapped, PAGE_BYTES);
+        return false;
+    }
+    let values: *f32 = mapped as *f32;
+    var index: usize = 0 as usize;
+    while index < ELEMENT_COUNT {
+        values[index] = index as f32;
+        index = index +% (1 as usize);
+    }
+    if mprotect(mapped, PAGE_BYTES, PROT_READ) != (0 as i32) {
+        let _unmapped: i32 = munmap(mapped, PAGE_BYTES);
+        return false;
+    }
+
+    let storage: u64 = metal::resource_options_m_t_l_resource_storage_mode_shared;
+    guard let option::Option[metal::Buffer]::Some(buffer) = device.new_buffer_with_bytes_no_copy(
+        mapped,
+        PAGE_BYTES as u64,
+        storage,
+        release_mapping,
+        0 as *u8,
+    ) else {
+        let _unmapped: i32 = munmap(mapped, PAGE_BYTES);
+        return false;
+    };
+    let buffer_owner: OwnedObjc = OwnedObjc::new(buffer.raw());
+    guard let option::Option[f64]::Some(_gpu_ms) = dispatch_once(queue, pipeline, buffer, rhs, output) else {
+        return false;
+    };
+    let output_values: *f32 = output.contents() as *f32;
+    index = 0 as usize;
+    while index < ELEMENT_COUNT {
+        if output_values[index] != ELEMENT_COUNT as f32 {
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn run_count(dispatch_count: usize) -> i32 {
+    let pool_ptr: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_ptr.is_null() {
+        io::eprintln("metal probe: could not create autorelease pool");
+        return 1;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_ptr);
+
+    let device_ptr: *u8 = MTLCreateSystemDefaultDevice();
+    if device_ptr.is_null() {
+        io::eprintln("metal probe: no Metal device");
+        return 1;
+    }
+    // MTLCreateSystemDefaultDevice does not follow the Objective-C `new` rule.
+    // Retain it so this wrapper owns exactly one reference.
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_ptr));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+
+    guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else {
+        io::eprintln("metal probe: could not create command queue");
+        return 1;
+    };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+
+    let options_ptr: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_ptr.is_null() {
+        io::eprintln("metal probe: could not create compile options");
+        return 1;
+    }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_ptr);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+
+    let source: str = #include_str("../kernels/smoke.metal");
+    guard let option::Option[metal::Library]::Some(library) =
+        device.new_library_with_source(source, options, 0 as *u8) else {
+        io::eprintln("metal probe: Metal source compilation failed");
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+
+    guard let option::Option[metal::Function]::Some(function) =
+        library.new_function_with_name("qi_vector_add") else {
+        io::eprintln("metal probe: qi_vector_add was not found");
+        return 1;
+    };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+
+    guard let option::Option[metal::ComputePipelineState]::Some(pipeline) =
+        device.new_compute_pipeline_state_with_function(function, 0 as *u8) else {
+        io::eprintln("metal probe: could not create compute pipeline");
+        return 1;
+    };
+    let pipeline_owner: OwnedObjc = OwnedObjc::new(pipeline.raw());
+
+    let byte_count: u64 = (ELEMENT_COUNT * #size_of::[f32]()) as u64;
+    let storage: u64 = metal::resource_options_m_t_l_resource_storage_mode_shared;
+    guard let option::Option[metal::Buffer]::Some(lhs) = device.new_buffer_with_length(byte_count, storage) else {
+        io::eprintln("metal probe: could not allocate lhs buffer");
+        return 1;
+    };
+    let lhs_owner: OwnedObjc = OwnedObjc::new(lhs.raw());
+    guard let option::Option[metal::Buffer]::Some(rhs) = device.new_buffer_with_length(byte_count, storage) else {
+        io::eprintln("metal probe: could not allocate rhs buffer");
+        return 1;
+    };
+    let rhs_owner: OwnedObjc = OwnedObjc::new(rhs.raw());
+    guard let option::Option[metal::Buffer]::Some(output) = device.new_buffer_with_length(byte_count, storage) else {
+        io::eprintln("metal probe: could not allocate output buffer");
+        return 1;
+    };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+
+    let lhs_values: *f32 = lhs.contents() as *f32;
+    let rhs_values: *f32 = rhs.contents() as *f32;
+    let output_values: *f32 = output.contents() as *f32;
+    var i: usize = 0 as usize;
+    while i < ELEMENT_COUNT {
+        lhs_values[i] = i as f32;
+        rhs_values[i] = (ELEMENT_COUNT -% i) as f32;
+        output_values[i] = 0.0f32;
+        i = i +% (1 as usize);
+    }
+
+    let readonly_no_copy: bool = probe_readonly_no_copy(device, pipeline, queue, rhs, output);
+
+    let allocated_before: u64 = device.current_allocated_size();
+    var total_gpu_ms: f64 = 0.0f64;
+    var dispatch_index: usize = 0 as usize;
+    while dispatch_index < dispatch_count {
+        guard let option::Option[f64]::Some(gpu_ms) = dispatch_once(queue, pipeline, lhs, rhs, output) else {
+            io::eprintln("metal probe: dispatch ${dispatch_index} failed");
+            return 1;
+        };
+        total_gpu_ms = total_gpu_ms + gpu_ms;
+        dispatch_index = dispatch_index +% (1 as usize);
+    }
+    let allocated_after: u64 = device.current_allocated_size();
+
+    i = 0 as usize;
+    while i < ELEMENT_COUNT {
+        let expected: f32 = ELEMENT_COUNT as f32;
+        if output_values[i] != expected {
+            io::eprintln("metal probe: incorrect output at ${i}: ${output_values[i]}, expected ${expected}");
+            return 1;
+        }
+        i = i +% (1 as usize);
+    }
+
+    let name = device.name();
+    let working_set_mib: u64 = device.recommended_max_working_set_size() / (1024 as u64 * 1024 as u64);
+    let max_buffer_mib: u64 = device.max_buffer_length() / (1024 as u64 * 1024 as u64);
+    io::println("device: ${name}");
+    io::println("highest Apple GPU family: ${highest_apple_family(device)}");
+    io::println("Metal 3 family: ${device.supports_family(metal::GPUFamily::Metal3)}");
+    io::println("unified memory: ${device.has_unified_memory()}");
+    io::println("recommended working set: ${working_set_mib} MiB");
+    io::println("maximum buffer: ${max_buffer_mib} MiB");
+    io::println("thread execution width: ${pipeline.thread_execution_width()}");
+    io::println("page-aligned read-only no-copy buffer: ${readonly_no_copy}");
+    io::println("dispatches: ${dispatch_count}");
+    io::println("total GPU time: ${total_gpu_ms} ms");
+    io::println("Metal allocated before/after: ${allocated_before}/${allocated_after} bytes");
+    if allocated_after != allocated_before {
+        io::eprintln("metal probe: Metal allocation changed during steady-state dispatch");
+        return 1;
+    }
+    io::println("metal vector add: ok");
+
+    return 0;
+}
+
+fn run() -> i32 {
+    return run_count(1 as usize);
+}
+
+fn stress() -> i32 {
+    return run_count(STRESS_DISPATCH_COUNT);
+}

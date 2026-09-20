@@ -1,0 +1,808 @@
+import "./mmap_macos" as mapped;
+import "json/json" as json;
+import "stdlib/fs" as fs;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+const MAX_HEADER_BYTES: u64 = 100u64 * 1024u64 * 1024u64;
+const MAX_RANK: usize = 8;
+
+enum DType {
+    BF16,
+    F16,
+    F32,
+}
+
+impl DType {
+    fn byte_width(this) -> u64 {
+        return match this {
+            DType::BF16 => 2 as u64,
+            DType::F16 => 2 as u64,
+            DType::F32 => 4 as u64,
+        };
+    }
+
+    fn name(this) -> str {
+        return match this {
+            DType::BF16 => "BF16",
+            DType::F16 => "F16",
+            DType::F32 => "F32",
+        };
+    }
+}
+
+enum LoadError {
+    Map,
+    TooSmall,
+    HeaderTooLarge,
+    HeaderOutOfBounds,
+    InvalidJson,
+    RootNotObject,
+    DuplicateName,
+    InvalidTensor,
+    UnsupportedDType,
+    RankTooLarge,
+    InvalidNumber,
+    ShapeOverflow,
+    ByteLengthMismatch,
+    OffsetOutOfBounds,
+    NonContiguousData,
+}
+
+impl LoadError {
+    fn name(this) -> str {
+        return match this {
+            LoadError::Map => "could not map file",
+            LoadError::TooSmall => "file is too small",
+            LoadError::HeaderTooLarge => "header exceeds the Safetensors limit",
+            LoadError::HeaderOutOfBounds => "header extends past the file",
+            LoadError::InvalidJson => "header is not valid JSON",
+            LoadError::RootNotObject => "header root is not an object",
+            LoadError::DuplicateName => "header contains a duplicate tensor name",
+            LoadError::InvalidTensor => "tensor metadata has an invalid shape",
+            LoadError::UnsupportedDType => "tensor dtype is not supported",
+            LoadError::RankTooLarge => "tensor rank exceeds the runtime limit",
+            LoadError::InvalidNumber => "metadata contains an invalid integer",
+            LoadError::ShapeOverflow => "tensor shape overflows 64-bit size",
+            LoadError::ByteLengthMismatch => "tensor byte length does not match its shape and dtype",
+            LoadError::OffsetOutOfBounds => "tensor data offset is outside the file",
+            LoadError::NonContiguousData => "tensor data does not cover the data region contiguously",
+        };
+    }
+}
+
+struct TensorInfo {
+    name: text::Text,
+    dtype: DType,
+    shape: vec::Vec[u64],
+    begin: u64,
+    end: u64,
+    elements: u64,
+}
+
+struct File {
+    _mapping: mapped::MappedFile,
+    _tensors: vec::Vec[TensorInfo],
+    _data_start: u64,
+}
+
+impl File {
+    fn tensor_count(this) -> usize {
+        return this._tensors.count();
+    }
+
+    fn parameter_count(this) -> u64 {
+        var total: u64 = 0 as u64;
+        var index: usize = 0 as usize;
+        while index < this._tensors.count() {
+            match this._tensors.at_ptr(index) {
+                option::Option[*TensorInfo]::Some(info) => {
+                    total = total +% { (*info).elements };
+                }
+                option::Option[*TensorInfo]::None => {}
+            }
+            index = index +% (1 as usize);
+        }
+        return total;
+    }
+
+    fn byte_count(this) -> u64 {
+        return this._mapping.length() as u64;
+    }
+
+    fn data_byte_count(this) -> u64 {
+        return this._mapping.length() as u64 -% this._data_start;
+    }
+
+    fn dtype_count(this, dtype: DType) -> usize {
+        var total: usize = 0 as usize;
+        var index: usize = 0 as usize;
+        while index < this._tensors.count() {
+            match this._tensors.at_ptr(index) {
+                option::Option[*TensorInfo]::Some(info) => {
+                    if { (*info).dtype.name() } == dtype.name() {
+                        total = total +% (1 as usize);
+                    }
+                }
+                option::Option[*TensorInfo]::None => {}
+            }
+            index = index +% (1 as usize);
+        }
+        return total;
+    }
+
+    fn has_tensor(this, name: str) -> bool {
+        return has_name(this._tensors, name);
+    }
+}
+
+enum LoadResult {
+    Ok(File),
+    Err(LoadError),
+}
+
+enum TensorResult {
+    Ok(TensorInfo),
+    Err(LoadError),
+}
+
+struct ComponentSummary {
+    shards: usize,
+    tensors: usize,
+    parameters: u64,
+    file_bytes: u64,
+    weight_bytes: u64,
+    bf16_tensors: usize,
+    f16_tensors: usize,
+    f32_tensors: usize,
+}
+
+enum ComponentResult {
+    Ok(ComponentSummary),
+    Err,
+}
+
+fn read_u64_le(pointer: *u8) -> u64 {
+    return (pointer[0] as u64) | ((pointer[1] as u64) << (8 as u64))
+        | ((pointer[2] as u64) << (16 as u64)) | ((pointer[3] as u64) << (24 as u64))
+        | ((pointer[4] as u64) << (32 as u64)) | ((pointer[5] as u64) << (40 as u64))
+        | ((pointer[6] as u64) << (48 as u64)) | ((pointer[7] as u64) << (56 as u64));
+}
+
+fn json_u64(value: json::Value) -> option::Option[u64] {
+    guard let option::Option[f64]::Some(number) = value.as_number() else {
+        return option::Option[u64]::None;
+    };
+    // JSON numbers are parsed as f64. Integers through 2^53 - 1 are exact.
+    if number < 0.0f64 || number > 9007199254740991.0f64 {
+        return option::Option[u64]::None;
+    }
+    let integer: u64 = number as u64;
+    if integer as f64 != number {
+        return option::Option[u64]::None;
+    }
+    return option::Option[u64]::Some(integer);
+}
+
+fn parse_dtype(value: json::Value) -> option::Option[DType] {
+    guard let option::Option[text::Text]::Some(name) = value.as_text() else {
+        return option::Option[DType]::None;
+    };
+    if name == "BF16" {
+        return option::Option[DType]::Some(DType::BF16);
+    }
+    if name == "F16" {
+        return option::Option[DType]::Some(DType::F16);
+    }
+    if name == "F32" {
+        return option::Option[DType]::Some(DType::F32);
+    }
+    return option::Option[DType]::None;
+}
+
+fn parse_tensor(take name: text::Text, value: json::Value) -> TensorResult {
+    if !value.is_object() {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    }
+
+    guard let option::Option[json::Value]::Some(dtype_value) = value.value(for_key: "dtype") else {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    };
+    guard let option::Option[DType]::Some(dtype) = parse_dtype(dtype_value) else {
+        return TensorResult::Err(LoadError::UnsupportedDType);
+    };
+
+    guard let option::Option[json::Value]::Some(shape_value) = value.value(for_key: "shape") else {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    };
+    if !shape_value.is_array() {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    }
+    let rank: usize = shape_value.item_count();
+    if rank > MAX_RANK {
+        return TensorResult::Err(LoadError::RankTooLarge);
+    }
+    var shape: vec::Vec[u64] = vec::Vec[u64]::with_capacity(rank);
+    var elements: u64 = 1 as u64;
+    var index: usize = 0 as usize;
+    while index < rank {
+        guard let option::Option[json::Value]::Some(dimension_value) = shape_value.item(at: index) else {
+            return TensorResult::Err(LoadError::InvalidTensor);
+        };
+        guard let option::Option[u64]::Some(dimension) = json_u64(dimension_value) else {
+            return TensorResult::Err(LoadError::InvalidNumber);
+        };
+        if dimension != (0 as u64) && elements > (((0 as u64) -% (1 as u64)) / dimension) {
+            return TensorResult::Err(LoadError::ShapeOverflow);
+        }
+        elements = elements *% dimension;
+        if shape.append(dimension) != status::Status::Ok {
+            return TensorResult::Err(LoadError::InvalidTensor);
+        }
+        index = index +% (1 as usize);
+    }
+
+    guard let option::Option[json::Value]::Some(offsets_value) = value.value(for_key: "data_offsets") else {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    };
+    if !offsets_value.is_array() || offsets_value.item_count() != (2 as usize) {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    }
+    guard let option::Option[json::Value]::Some(begin_value) = offsets_value.item(at: 0 as usize) else {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    };
+    guard let option::Option[json::Value]::Some(end_value) = offsets_value.item(at: 1 as usize) else {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    };
+    guard let option::Option[u64]::Some(begin) = json_u64(begin_value) else {
+        return TensorResult::Err(LoadError::InvalidNumber);
+    };
+    guard let option::Option[u64]::Some(end) = json_u64(end_value) else {
+        return TensorResult::Err(LoadError::InvalidNumber);
+    };
+    if end < begin {
+        return TensorResult::Err(LoadError::InvalidTensor);
+    }
+    let width: u64 = dtype.byte_width();
+    if elements != (0 as u64) && width > (((0 as u64) -% (1 as u64)) / elements) {
+        return TensorResult::Err(LoadError::ShapeOverflow);
+    }
+    if end -% begin != elements *% width {
+        return TensorResult::Err(LoadError::ByteLengthMismatch);
+    }
+
+    return TensorResult::Ok(TensorInfo {
+        name: name,
+        dtype: dtype,
+        shape: shape,
+        begin: begin,
+        end: end,
+        elements: elements,
+    });
+}
+
+fn has_name(tensors: vec::Vec[TensorInfo], name: str) -> bool {
+    var index: usize = 0 as usize;
+    while index < tensors.count() {
+        match tensors.at_ptr(index) {
+            option::Option[*TensorInfo]::Some(info) => {
+                if { (*info).name.equals(name) } {
+                    return true;
+                }
+            }
+            option::Option[*TensorInfo]::None => {}
+        }
+        index = index +% (1 as usize);
+    }
+    return false;
+}
+
+fn has_text(values: vec::Vec[text::Text], wanted: str) -> bool {
+    var index: usize = 0 as usize;
+    while index < values.count() {
+        match values.at_ptr(index) {
+            option::Option[*text::Text]::Some(value) => {
+                if { (*value).equals(wanted) } {
+                    return true;
+                }
+            }
+            option::Option[*text::Text]::None => {}
+        }
+        index = index +% (1 as usize);
+    }
+    return false;
+}
+
+fn is_plain_filename(value: text::Text) -> bool {
+    if value.count() == (0 as usize) || value == "." || value == ".." {
+        return false;
+    }
+    var index: usize = 0 as usize;
+    while index < value.count() {
+        match value.byte_at(index) {
+            option::Option[u8]::Some(byte) => {
+                if byte == (47 as u8) || byte == (92 as u8) || byte == (0 as u8) {
+                    return false;
+                }
+            }
+            option::Option[u8]::None => { return false; }
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn validate_data_region(tensors: vec::Vec[TensorInfo], data_bytes: u64) -> option::Option[LoadError] {
+    var covered: u64 = 0 as u64;
+    var left_index: usize = 0 as usize;
+    while left_index < tensors.count() {
+        guard let option::Option[*TensorInfo]::Some(left) = tensors.at_ptr(left_index) else {
+            return option::Option[LoadError]::Some(LoadError::InvalidTensor);
+        };
+        if { (*left).end } > data_bytes {
+            return option::Option[LoadError]::Some(LoadError::OffsetOutOfBounds);
+        }
+        let length: u64 = { (*left).end -% (*left).begin };
+        if covered > (((0 as u64) -% (1 as u64)) -% length) {
+            return option::Option[LoadError]::Some(LoadError::ShapeOverflow);
+        }
+        covered = covered +% length;
+
+        var right_index: usize = left_index +% (1 as usize);
+        while right_index < tensors.count() {
+            guard let option::Option[*TensorInfo]::Some(right) = tensors.at_ptr(right_index) else {
+                return option::Option[LoadError]::Some(LoadError::InvalidTensor);
+            };
+            // Empty tensors occupy no bytes and may legally share an offset.
+            if { (*left).begin < (*right).end && (*right).begin < (*left).end } {
+                return option::Option[LoadError]::Some(LoadError::NonContiguousData);
+            }
+            right_index = right_index +% (1 as usize);
+        }
+        left_index = left_index +% (1 as usize);
+    }
+    if covered != data_bytes {
+        return option::Option[LoadError]::Some(LoadError::NonContiguousData);
+    }
+    return option::Option[LoadError]::None;
+}
+
+fn valid_metadata(value: json::Value) -> bool {
+    if !value.is_object() {
+        return false;
+    }
+    var index: usize = 0 as usize;
+    while index < value.item_count() {
+        guard let option::Option[json::Value]::Some(item) = value.object_value(at: index) else {
+            return false;
+        };
+        guard let option::Option[text::Text]::Some(_text) = item.as_text() else {
+            return false;
+        };
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn load(path: str) -> LoadResult {
+    guard let mapped::MapResult::Ok(mapping) = mapped::map_readonly(path) else {
+        return LoadResult::Err(LoadError::Map);
+    };
+    if mapping.length() < (8 as usize) {
+        return LoadResult::Err(LoadError::TooSmall);
+    }
+    let header_length: u64 = read_u64_le(mapping.pointer());
+    if header_length > MAX_HEADER_BYTES {
+        return LoadResult::Err(LoadError::HeaderTooLarge);
+    }
+    if header_length > (mapping.length() as u64 -% (8 as u64)) {
+        return LoadResult::Err(LoadError::HeaderOutOfBounds);
+    }
+    let header_source: str = #str_from_raw_parts(mapping.pointer() + (8 as usize), header_length as usize);
+    guard let result::Result[json::Value, json::ParseError]::Ok(root) = json::Value::parse(source: header_source) else {
+        return LoadResult::Err(LoadError::InvalidJson);
+    };
+    if !root.is_object() {
+        return LoadResult::Err(LoadError::RootNotObject);
+    }
+
+    var tensors: vec::Vec[TensorInfo] = vec::Vec[TensorInfo]::with_capacity(root.item_count());
+    var root_names: vec::Vec[text::Text] = vec::Vec[text::Text]::with_capacity(root.item_count());
+    var index: usize = 0 as usize;
+    while index < root.item_count() {
+        guard let option::Option[text::Text]::Some(name) = root.key(at: index) else {
+            return LoadResult::Err(LoadError::InvalidTensor);
+        };
+        guard let option::Option[json::Value]::Some(value) = root.object_value(at: index) else {
+            return LoadResult::Err(LoadError::InvalidTensor);
+        };
+        if has_text(root_names, name) {
+            return LoadResult::Err(LoadError::DuplicateName);
+        }
+        if root_names.append(name.clone()) != status::Status::Ok {
+            return LoadResult::Err(LoadError::InvalidTensor);
+        }
+        if name == "__metadata__" {
+            if !valid_metadata(value) {
+                return LoadResult::Err(LoadError::InvalidTensor);
+            }
+        } else {
+            guard let TensorResult::Ok(tensor) = parse_tensor(name, value) else TensorResult::Err(error) {
+                return LoadResult::Err(error);
+            };
+            if tensors.append(tensor) != status::Status::Ok {
+                return LoadResult::Err(LoadError::InvalidTensor);
+            }
+        }
+        index = index +% (1 as usize);
+    }
+
+    let data_start: u64 = 8 as u64 +% header_length;
+    if data_start > mapping.length() as u64 {
+        return LoadResult::Err(LoadError::OffsetOutOfBounds);
+    }
+    let data_bytes: u64 = mapping.length() as u64 -% data_start;
+    match validate_data_region(tensors, data_bytes) {
+        option::Option[LoadError]::Some(error) => { return LoadResult::Err(error); }
+        option::Option[LoadError]::None => {}
+    }
+    return LoadResult::Ok(File { _mapping: mapping, _tensors: tensors, _data_start: data_start });
+}
+
+fn print_shape(shape: vec::Vec[u64]) {
+    io::print("[");
+    var index: usize = 0 as usize;
+    while index < shape.count() {
+        if index > (0 as usize) {
+            io::print(", ");
+        }
+        match shape.at(index) {
+            option::Option[u64]::Some(dimension) => { io::print("${dimension}"); }
+            option::Option[u64]::None => {}
+        }
+        index = index +% (1 as usize);
+    }
+    io::print("]");
+}
+
+fn inspect(path: str, filter: str = "") -> i32 {
+    match load(path) {
+        LoadResult::Ok(file) => {
+            var index: usize = 0 as usize;
+            while index < file._tensors.count() {
+                match file._tensors.at_ptr(index) {
+                    option::Option[*TensorInfo]::Some(info) => {
+                        if filter == "" || { (*info).name.contains(filter) } {
+                            let absolute: u64 = file._data_start +% { (*info).begin };
+                            io::print("${(*info).name} ${(*info).dtype.name()} ");
+                            print_shape({ (*info).shape });
+                            io::println(
+                                " offset=${absolute} bytes=${(*info).end -% (*info).begin} shard=${path}",
+                            );
+                        }
+                    }
+                    option::Option[*TensorInfo]::None => {}
+                }
+                index = index +% (1 as usize);
+            }
+            let tensor_count: usize = file.tensor_count();
+            let parameter_count: u64 = file.parameter_count();
+            io::println("tensors=${tensor_count} parameters=${parameter_count}");
+            return 0;
+        }
+        LoadResult::Err(error) => {
+            io::eprintln("safetensors: ${error.name()}: ${path}");
+            return 1;
+        }
+    }
+}
+
+fn shard_matches_index(file: File, weight_map: json::Value, shard_name: str) -> bool {
+    var index: usize = 0 as usize;
+    while index < file._tensors.count() {
+        guard let option::Option[*TensorInfo]::Some(info) = file._tensors.at_ptr(index) else {
+            return false;
+        };
+        guard let option::Option[json::Value]::Some(mapped_value) = weight_map.value(for_key: { (*info).name }) else {
+            return false;
+        };
+        guard let option::Option[text::Text]::Some(mapped_shard) = mapped_value.as_text() else {
+            return false;
+        };
+        if mapped_shard != shard_name {
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn verify_index(directory: str, index_filename: str) -> ComponentResult {
+    let index_path: text::Text = "${directory}/${index_filename}";
+    guard let result::Result[text::Text, result::IoError]::Ok(source) = fs::read_to_string(index_path.view()) else {
+        io::eprintln("index: could not read ${index_path}");
+        return ComponentResult::Err;
+    };
+    guard let result::Result[json::Value, json::ParseError]::Ok(root) = json::Value::parse(source: source.view()) else {
+        io::eprintln("index: invalid JSON in ${index_path}");
+        return ComponentResult::Err;
+    };
+    guard let option::Option[json::Value]::Some(weight_map) = root.value(for_key: "weight_map") else {
+        io::eprintln("index: missing weight_map in ${index_path}");
+        return ComponentResult::Err;
+    };
+    if !weight_map.is_object() {
+        io::eprintln("index: weight_map is not an object in ${index_path}");
+        return ComponentResult::Err;
+    }
+
+    var shard_names: vec::Vec[text::Text] = vec::Vec[text::Text]::new();
+    var tensor_names: vec::Vec[text::Text] = vec::Vec[text::Text]::new();
+    var map_index: usize = 0 as usize;
+    while map_index < weight_map.item_count() {
+        guard let option::Option[text::Text]::Some(tensor_name) = weight_map.key(at: map_index) else {
+            io::eprintln("index: invalid tensor name in ${index_path}");
+            return ComponentResult::Err;
+        };
+        if has_text(tensor_names, tensor_name) {
+            io::eprintln("index: duplicate tensor name ${tensor_name}");
+            return ComponentResult::Err;
+        }
+        if tensor_names.append(tensor_name) != status::Status::Ok {
+            io::eprintln("index: could not store tensor name");
+            return ComponentResult::Err;
+        }
+        guard let option::Option[json::Value]::Some(mapped_value) = weight_map.object_value(at: map_index) else {
+            io::eprintln("index: invalid weight_map entry in ${index_path}");
+            return ComponentResult::Err;
+        };
+        guard let option::Option[text::Text]::Some(shard_name) = mapped_value.as_text() else {
+            io::eprintln("index: shard name is not text in ${index_path}");
+            return ComponentResult::Err;
+        };
+        if !is_plain_filename(shard_name) {
+            io::eprintln("index: unsafe shard name ${shard_name}");
+            return ComponentResult::Err;
+        }
+        if !has_text(shard_names, shard_name) {
+            if shard_names.append(shard_name) != status::Status::Ok {
+                io::eprintln("index: could not store shard name");
+                return ComponentResult::Err;
+            }
+        }
+        map_index = map_index +% (1 as usize);
+    }
+
+    var summary: ComponentSummary = ComponentSummary {
+        shards: shard_names.count(),
+        tensors: 0 as usize,
+        parameters: 0 as u64,
+        file_bytes: 0 as u64,
+        weight_bytes: 0 as u64,
+        bf16_tensors: 0 as usize,
+        f16_tensors: 0 as usize,
+        f32_tensors: 0 as usize,
+    };
+    var shard_index: usize = 0 as usize;
+    while shard_index < shard_names.count() {
+        guard let option::Option[*text::Text]::Some(shard_name) = shard_names.at_ptr(shard_index) else {
+            return ComponentResult::Err;
+        };
+        let shard_path: text::Text = "${directory}/${(*shard_name)}";
+        match load(shard_path.view()) {
+            LoadResult::Ok(file) => {
+                if !shard_matches_index(file, weight_map, { (*shard_name).view() }) {
+                    io::eprintln("index: tensor mapping mismatch in ${shard_path}");
+                    return ComponentResult::Err;
+                }
+                summary.tensors = summary.tensors +% file.tensor_count();
+                summary.parameters = summary.parameters +% file.parameter_count();
+                summary.file_bytes = summary.file_bytes +% file.byte_count();
+                summary.weight_bytes = summary.weight_bytes +% file.data_byte_count();
+                summary.bf16_tensors = summary.bf16_tensors +% file.dtype_count(DType::BF16);
+                summary.f16_tensors = summary.f16_tensors +% file.dtype_count(DType::F16);
+                summary.f32_tensors = summary.f32_tensors +% file.dtype_count(DType::F32);
+            }
+            LoadResult::Err(error) => {
+                io::eprintln("safetensors: ${error.name()}: ${shard_path}");
+                return ComponentResult::Err;
+            }
+        }
+        shard_index = shard_index +% (1 as usize);
+    }
+    if summary.tensors != weight_map.item_count() {
+        io::eprintln("index: weight_map has ${weight_map.item_count()} entries but shards contain ${summary.tensors} tensors");
+        return ComponentResult::Err;
+    }
+
+    guard let option::Option[json::Value]::Some(metadata) = root.value(for_key: "metadata") else {
+        io::eprintln("index: missing metadata in ${index_path}");
+        return ComponentResult::Err;
+    };
+    guard let option::Option[json::Value]::Some(total_size_value) = metadata.value(for_key: "total_size") else {
+        io::eprintln("index: missing metadata.total_size in ${index_path}");
+        return ComponentResult::Err;
+    };
+    guard let option::Option[u64]::Some(weight_bytes) = json_u64(total_size_value) else {
+        io::eprintln("index: invalid metadata.total_size in ${index_path}");
+        return ComponentResult::Err;
+    };
+    if summary.weight_bytes != weight_bytes {
+        io::eprintln("index: declared weight bytes ${weight_bytes}, computed ${summary.weight_bytes}");
+        return ComponentResult::Err;
+    }
+    match metadata.value(for_key: "total_parameters") {
+        option::Option[json::Value]::Some(total_parameters_value) => {
+            guard let option::Option[u64]::Some(total_parameters) = json_u64(total_parameters_value) else {
+                io::eprintln("index: invalid metadata.total_parameters in ${index_path}");
+                return ComponentResult::Err;
+            };
+            if total_parameters != summary.parameters {
+                io::eprintln(
+                    "index: declared parameters ${total_parameters}, computed ${summary.parameters}",
+                );
+                return ComponentResult::Err;
+            }
+        }
+        option::Option[json::Value]::None => {}
+    }
+    return ComponentResult::Ok(summary);
+}
+
+fn summarize_file(path: str) -> ComponentResult {
+    match load(path) {
+        LoadResult::Ok(file) => {
+            return ComponentResult::Ok(ComponentSummary {
+                shards: 1 as usize,
+                tensors: file.tensor_count(),
+                parameters: file.parameter_count(),
+                file_bytes: file.byte_count(),
+                weight_bytes: file.data_byte_count(),
+                bf16_tensors: file.dtype_count(DType::BF16),
+                f16_tensors: file.dtype_count(DType::F16),
+                f32_tensors: file.dtype_count(DType::F32),
+            });
+        }
+        LoadResult::Err(error) => {
+            io::eprintln("safetensors: ${error.name()}: ${path}");
+            return ComponentResult::Err;
+        }
+    }
+}
+
+fn tensor_matches(
+    path: str,
+    tensor_name: str,
+    dtype_name: str,
+    rank: usize,
+    dimension_0: u64,
+    dimension_1: u64,
+    dimension_2: u64 = 0 as u64,
+    dimension_3: u64 = 0 as u64,
+) -> bool {
+    guard let LoadResult::Ok(file) = load(path) else {
+        return false;
+    };
+    var index: usize = 0 as usize;
+    while index < file._tensors.count() {
+        guard let option::Option[*TensorInfo]::Some(info) = file._tensors.at_ptr(index) else {
+            return false;
+        };
+        if { (*info).name.equals(tensor_name) } {
+            if { (*info).dtype.name() } != dtype_name || { (*info).shape.count() } != rank {
+                return false;
+            }
+            let expected: [u64; 4] = [dimension_0, dimension_1, dimension_2, dimension_3];
+            var dimension_index: usize = 0 as usize;
+            while dimension_index < rank {
+                guard let option::Option[u64]::Some(actual) = { (*info).shape.at(dimension_index) } else {
+                    return false;
+                };
+                if actual != expected[dimension_index] {
+                    return false;
+                }
+                dimension_index = dimension_index +% (1 as usize);
+            }
+            return true;
+        }
+        index = index +% (1 as usize);
+    }
+    return false;
+}
+
+#[test]
+fn little_endian_header_length() {
+    let bytes: [u8; 8] = [8 as u8, 7 as u8, 6 as u8, 5 as u8, 4 as u8, 3 as u8, 2 as u8, 1 as u8];
+    assert read_u64_le(#addr_of(bytes[0])) == 0x0102030405060708 as u64;
+}
+
+#[test]
+fn supported_dtype_widths() {
+    assert DType::BF16.byte_width() == (2 as u64);
+    assert DType::F16.byte_width() == (2 as u64);
+    assert DType::F32.byte_width() == (4 as u64);
+}
+
+fn synthetic_tensor(name: str, begin: u64, end: u64) -> TensorInfo {
+    var shape: vec::Vec[u64] = vec::Vec[u64]::new();
+    let _status: status::Status = shape.append(end -% begin);
+    return TensorInfo {
+        name: name.to_text(),
+        dtype: DType::BF16,
+        shape: shape,
+        begin: begin,
+        end: end,
+        elements: (end -% begin) / (2 as u64),
+    };
+}
+
+#[test]
+fn data_region_accepts_unordered_contiguous_tensors() {
+    var tensors: vec::Vec[TensorInfo] = vec::Vec[TensorInfo]::new();
+    let _a: status::Status = tensors.append(synthetic_tensor("second", 4 as u64, 8 as u64));
+    let _b: status::Status = tensors.append(synthetic_tensor("first", 0 as u64, 4 as u64));
+    match validate_data_region(tensors, 8 as u64) {
+        option::Option[LoadError]::Some(_error) => { assert false; }
+        option::Option[LoadError]::None => {}
+    }
+}
+
+#[test]
+fn data_region_rejects_holes() {
+    var tensors: vec::Vec[TensorInfo] = vec::Vec[TensorInfo]::new();
+    let _a: status::Status = tensors.append(synthetic_tensor("first", 0 as u64, 2 as u64));
+    let _b: status::Status = tensors.append(synthetic_tensor("second", 4 as u64, 6 as u64));
+    match validate_data_region(tensors, 6 as u64) {
+        option::Option[LoadError]::Some(LoadError::NonContiguousData) => {}
+        _ => { assert false; }
+    }
+}
+
+#[test]
+fn data_region_rejects_overlaps() {
+    var tensors: vec::Vec[TensorInfo] = vec::Vec[TensorInfo]::new();
+    let _a: status::Status = tensors.append(synthetic_tensor("first", 0 as u64, 4 as u64));
+    let _b: status::Status = tensors.append(synthetic_tensor("second", 2 as u64, 6 as u64));
+    match validate_data_region(tensors, 6 as u64) {
+        option::Option[LoadError]::Some(LoadError::NonContiguousData) => {}
+        _ => { assert false; }
+    }
+}
+
+#[test]
+fn data_region_rejects_out_of_bounds_offsets() {
+    var tensors: vec::Vec[TensorInfo] = vec::Vec[TensorInfo]::new();
+    let _a: status::Status = tensors.append(synthetic_tensor("outside", 0 as u64, 8 as u64));
+    match validate_data_region(tensors, 4 as u64) {
+        option::Option[LoadError]::Some(LoadError::OffsetOutOfBounds) => {}
+        _ => { assert false; }
+    }
+}
+
+#[test]
+fn malformed_file_reports_too_small() {
+    let path: str = "/tmp/qwen_image_cplus_safetensors_too_small.bin";
+    let _write = fs::write_string(path, "tiny");
+    match load(path) {
+        LoadResult::Err(LoadError::TooSmall) => {}
+        _ => { assert false; }
+    }
+    let _remove = fs::remove_file(path);
+}
+
+#[test]
+fn malformed_file_reports_absurd_header_length() {
+    let path: str = "/tmp/qwen_image_cplus_safetensors_header_too_large.bin";
+    // The first eight ASCII bytes are interpreted as a little-endian integer,
+    // deliberately producing a length far above the 100 MiB format limit.
+    let _write = fs::write_string(path, "12345678");
+    match load(path) {
+        LoadResult::Err(LoadError::HeaderTooLarge) => {}
+        _ => { assert false; }
+    }
+    let _remove = fs::remove_file(path);
+}

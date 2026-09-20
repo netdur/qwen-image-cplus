@@ -1,0 +1,289 @@
+import "stdlib/math" as _;
+
+extern fn tanhf(value: f32) -> f32;
+
+fn f32_from_bits(bits: u32) -> f32 {
+    var storage: u32 = bits;
+    return { *({ #addr_of(storage) } as *f32) };
+}
+
+fn f32_bits(value: f32) -> u32 {
+    var storage: f32 = value;
+    return { *({ #addr_of(storage) } as *u32) };
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    return f32_from_bits((bits as u32) << (16 as u32));
+}
+
+fn fp16_to_f32(bits: u16) -> f32 {
+    let sign: u32 = ((bits as u32) & (0x8000 as u32)) << (16 as u32);
+    let exponent: u32 = ((bits as u32) >> (10 as u32)) & (0x1F as u32);
+    var mantissa: u32 = (bits as u32) & (0x03FF as u32);
+    if exponent == (0 as u32) {
+        if mantissa == (0 as u32) {
+            return f32_from_bits(sign);
+        }
+        var unbiased: i32 = 0 -% (14 as i32);
+        while (mantissa & (0x0400 as u32)) == (0 as u32) {
+            mantissa = mantissa << (1 as u32);
+            unbiased = unbiased -% (1 as i32);
+        }
+        mantissa = mantissa & (0x03FF as u32);
+        let normal_exponent: u32 = (unbiased +% (127 as i32)) as u32;
+        return f32_from_bits(sign | (normal_exponent << (23 as u32)) | (mantissa << (13 as u32)));
+    }
+    if exponent == (31 as u32) {
+        return f32_from_bits(sign | (0x7F800000 as u32) | (mantissa << (13 as u32)));
+    }
+    let normal_exponent: u32 = exponent +% (127 as u32) -% (15 as u32);
+    return f32_from_bits(sign | (normal_exponent << (23 as u32)) | (mantissa << (13 as u32)));
+}
+
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits: u32 = f32_bits(value);
+    // Round to nearest, ties to even. NaN payloads remain NaNs.
+    let rounding_bias: u32 = 0x7FFF as u32 +% ((bits >> (16 as u32)) & (1 as u32));
+    return ((bits +% rounding_bias) >> (16 as u32)) as u16;
+}
+
+fn silu(value: f32) -> f32 {
+    return value / (1.0f32 + (0.0f32 - value).exp());
+}
+
+fn tanh_gelu(value: f32) -> f32 {
+    let inner: f32 = 0.7978845608028654f32 * (value + 0.044715f32 * value * value * value);
+    return 0.5f32 * value * (1.0f32 + tanhf(inner));
+}
+
+fn swiglu(gate: f32, projected: f32) -> f32 {
+    return silu(gate) * projected;
+}
+
+fn layer_norm(input: *f32, output: *f32, count: usize, epsilon: f32) -> bool {
+    if count == (0 as usize) {
+        return false;
+    }
+    var mean: f32 = 0.0f32;
+    var index: usize = 0 as usize;
+    while index < count {
+        mean = mean + input[index];
+        index = index +% (1 as usize);
+    }
+    mean = mean / count as f32;
+
+    var variance: f32 = 0.0f32;
+    index = 0 as usize;
+    while index < count {
+        let centered: f32 = input[index] - mean;
+        variance = variance + centered * centered;
+        index = index +% (1 as usize);
+    }
+    variance = variance / count as f32;
+    let inverse_standard_deviation: f32 = 1.0f32 / (variance + epsilon).sqrt();
+    index = 0 as usize;
+    while index < count {
+        output[index] = (input[index] - mean) * inverse_standard_deviation;
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn zero_centered_rms_norm(
+    input: *f32,
+    weight: *f32,
+    output: *f32,
+    count: usize,
+    epsilon: f32,
+) -> bool {
+    if count == (0 as usize) {
+        return false;
+    }
+    var mean_square: f32 = 0.0f32;
+    var index: usize = 0 as usize;
+    while index < count {
+        mean_square = mean_square + input[index] * input[index];
+        index = index +% (1 as usize);
+    }
+    mean_square = mean_square / count as f32;
+    let inverse_rms: f32 = 1.0f32 / (mean_square + epsilon).sqrt();
+    index = 0 as usize;
+    while index < count {
+        output[index] = input[index] * inverse_rms * (weight[index] + 1.0f32);
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn rms_norm(input: *f32, output: *f32, count: usize, epsilon: f32) -> bool {
+    if count == (0 as usize) {
+        return false;
+    }
+    var mean_square: f32 = 0.0f32;
+    var index: usize = 0 as usize;
+    while index < count {
+        mean_square = mean_square + input[index] * input[index];
+        index = index +% (1 as usize);
+    }
+    mean_square = mean_square / count as f32;
+    let inverse_rms: f32 = 1.0f32 / (mean_square + epsilon).sqrt();
+    index = 0 as usize;
+    while index < count {
+        output[index] = input[index] * inverse_rms;
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn timestep_embedding(
+    timestep: f32,
+    dimension: usize,
+    max_period: f32,
+    output: *f32,
+) -> bool {
+    if dimension < (2 as usize) || dimension % (2 as usize) != (0 as usize) || max_period <= 0.0f32 {
+        return false;
+    }
+    let half: usize = dimension / (2 as usize);
+    var index: usize = 0 as usize;
+    while index < half {
+        let exponent: f32 = (0.0f32 - max_period.ln()) * index as f32 / half as f32;
+        // QwenImage21TemporalTimesteps fixes time_factor to 1000.
+        let phase: f32 = (1000.0f32 * timestep) * exponent.exp();
+        output[index] = phase.cos();
+        output[index +% half] = phase.sin();
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn apply_complex_rope(input: *f32, cosine: *f32, sine: *f32, output: *f32, complex_count: usize) {
+    var index: usize = 0 as usize;
+    while index < complex_count {
+        let real: f32 = input[index *% (2 as usize)];
+        let imaginary: f32 = input[index *% (2 as usize) +% (1 as usize)];
+        output[index *% (2 as usize)] = real * cosine[index] - imaginary * sine[index];
+        output[index *% (2 as usize) +% (1 as usize)] = real * sine[index] + imaginary * cosine[index];
+        index = index +% (1 as usize);
+    }
+}
+
+fn block_causal_allowed(
+    query_index: usize,
+    key_index: usize,
+    query_image_id: i32,
+    key_image_id: i32,
+    key_valid: bool,
+) -> bool {
+    let same_image_block: bool = query_image_id >= (0 as i32) && query_image_id == key_image_id;
+    return key_valid && (query_index >= key_index || same_image_block);
+}
+
+fn close(left: f32, right: f32, tolerance: f32) -> bool {
+    return (left - right).abs() <= tolerance;
+}
+
+#[test]
+fn bf16_round_trip_known_values() {
+    assert bf16_to_f32(0x3F80 as u16) == 1.0f32;
+    assert bf16_to_f32(0xC020 as u16) == (0.0f32 - 2.5f32);
+    assert f32_to_bf16(1.0f32) == (0x3F80 as u16);
+    assert f32_to_bf16(0.0f32 - 2.5f32) == (0xC020 as u16);
+}
+
+#[test]
+fn fp16_decodes_normal_and_subnormal_values() {
+    assert fp16_to_f32(0x3C00 as u16) == 1.0f32;
+    assert fp16_to_f32(0xC100 as u16) == (0.0f32 - 2.5f32);
+    assert close(fp16_to_f32(0x0001 as u16), 0.000000059604645f32, 0.00000000000001f32);
+}
+
+#[test]
+fn scalar_activations_match_known_points() {
+    assert silu(0.0f32) == 0.0f32;
+    assert tanh_gelu(0.0f32) == 0.0f32;
+    assert close(silu(1.0f32), 0.7310586f32, 0.000001f32);
+    assert close(tanh_gelu(1.0f32), 0.841192f32, 0.000001f32);
+    assert close(swiglu(1.0f32, 2.0f32), 1.4621172f32, 0.000001f32);
+}
+
+#[test]
+fn affine_free_layer_norm_matches_hand_computation() {
+    let input: [f32; 3] = [1.0f32, 2.0f32, 3.0f32];
+    var output: [f32; 3] = [0.0f32, 0.0f32, 0.0f32];
+    assert layer_norm(#addr_of(input[0]), #addr_of(output[0]), 3 as usize, 0.000001f32);
+    assert close(output[0], 0.0f32 - 1.224744f32, 0.00001f32);
+    assert close(output[1], 0.0f32, 0.00001f32);
+    assert close(output[2], 1.224744f32, 0.00001f32);
+}
+
+#[test]
+fn zero_centered_rms_norm_adds_one_to_weight() {
+    let input: [f32; 2] = [3.0f32, 4.0f32];
+    let weight: [f32; 2] = [0.0f32, 0.0f32];
+    var output: [f32; 2] = [0.0f32, 0.0f32];
+    assert zero_centered_rms_norm(
+        #addr_of(input[0]),
+        #addr_of(weight[0]),
+        #addr_of(output[0]),
+        2 as usize,
+        0.0f32,
+    );
+    assert close(output[0], 0.8485281f32, 0.000001f32);
+    assert close(output[1], 1.1313709f32, 0.000001f32);
+}
+
+#[test]
+fn non_affine_rms_norm_matches_qk_normalization() {
+    let input: [f32; 2] = [3.0f32, 4.0f32];
+    var output: [f32; 2] = [0.0f32, 0.0f32];
+    assert rms_norm(#addr_of(input[0]), #addr_of(output[0]), 2 as usize, 0.0f32);
+    assert close(output[0], 0.8485281f32, 0.000001f32);
+    assert close(output[1], 1.1313709f32, 0.000001f32);
+}
+
+#[test]
+fn zero_timestep_embedding_is_cosine_then_sine() {
+    var output: [f32; 4] = [0.0f32, 0.0f32, 0.0f32, 0.0f32];
+    assert timestep_embedding(0.0f32, 4 as usize, 10000.0f32, #addr_of(output[0]));
+    assert output[0] == 1.0f32;
+    assert output[1] == 1.0f32;
+    assert output[2] == 0.0f32;
+    assert output[3] == 0.0f32;
+}
+
+#[test]
+fn timestep_embedding_applies_qwen_time_factor() {
+    var output: [f32; 2] = [0.0f32, 0.0f32];
+    assert timestep_embedding(0.001f32, 2 as usize, 10000.0f32, #addr_of(output[0]));
+    assert close(output[0], 0.5403023f32, 0.000001f32);
+    assert close(output[1], 0.8414710f32, 0.000001f32);
+}
+
+#[test]
+fn complex_rope_rotates_adjacent_pairs() {
+    let input: [f32; 4] = [1.0f32, 2.0f32, 3.0f32, 4.0f32];
+    let cosine: [f32; 2] = [0.0f32, 1.0f32];
+    let sine: [f32; 2] = [1.0f32, 0.0f32];
+    var output: [f32; 4] = [0.0f32, 0.0f32, 0.0f32, 0.0f32];
+    apply_complex_rope(
+        #addr_of(input[0]),
+        #addr_of(cosine[0]),
+        #addr_of(sine[0]),
+        #addr_of(output[0]),
+        2 as usize,
+    );
+    assert output[0] == (0.0f32 - 2.0f32);
+    assert output[1] == 1.0f32;
+    assert output[2] == 3.0f32;
+    assert output[3] == 4.0f32;
+}
+
+#[test]
+fn block_causal_mask_distinguishes_text_and_image_blocks() {
+    assert block_causal_allowed(2 as usize, 1 as usize, 0 -% (1 as i32), 0 -% (1 as i32), true);
+    assert !block_causal_allowed(1 as usize, 2 as usize, 0 -% (1 as i32), 0 -% (1 as i32), true);
+    assert block_causal_allowed(3 as usize, 5 as usize, 7 as i32, 7 as i32, true);
+    assert !block_causal_allowed(3 as usize, 5 as usize, 7 as i32, 8 as i32, true);
+    assert !block_causal_allowed(5 as usize, 1 as usize, 7 as i32, 7 as i32, false);
+}
