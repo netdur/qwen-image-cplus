@@ -1,0 +1,144 @@
+{
+  "case": "trajectory_256",
+  "decoded_output_shape_ncthw": [
+    1,
+    4,
+    1,
+    256,
+    256
+  ],
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "environment": {
+    "accelerate": "1.10.1",
+    "device": "mps",
+    "diffusers": "0.41.0.dev0",
+    "torch": "2.9.0",
+    "transformers": "5.17.0"
+  },
+  "fixture_layout": "HWC contiguous",
+  "latent_handoff": "BF16-rounded scheduler latent converted to FP32, then latent * per-channel std + mean",
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "normalized_latent_shape_ncthw": [
+    1,
+    64,
+    1,
+    16,
+    16
+  ],
+  "operation": "Qwen-Image-2.1 still-image causal-3D VAE decode",
+  "output_summary": {
+    "maximum": 1.0,
+    "mean": 0.004483088850975037,
+    "minimum": -0.9968407154083252,
+    "rms": 0.6625633835792542
+  },
+  "reference_seconds": 0.36439975001849234,
+  "schema_version": 1,
+  "still_image_specialization": {
+    "causal_conv": "squeeze time and execute checkpoint Conv2d",
+    "first_chunk": true,
+    "frames": 1,
+    "upsample3d_main_path": "first cache visit records Rep and skips time_conv",
+    "upsample_shortcut": "DupUp3D followed by first_chunk temporal crop"
+  },
+  "summaries": {
+    "conv_in": {
+      "maximum": 8.282870292663574,
+      "mean": -0.17548207938671112,
+      "minimum": -22.246295928955078,
+      "rms": 1.1428754329681396
+    },
+    "conv_out": {
+      "maximum": 1.0157595872879028,
+      "mean": 0.0048099905252456665,
+      "minimum": -0.9968407154083252,
+      "rms": 0.6630580425262451
+    },
+    "mid": {
+      "maximum": 13.061565399169922,
+      "mean": -0.1403517723083496,
+      "minimum": -24.85894012451172,
+      "rms": 0.9571825861930847
+    },
+    "norm_out": {
+      "maximum": 1.3462400436401367,
+      "mean": -0.10516972094774246,
+      "minimum": -2.009528398513794,
+      "rms": 0.3180534839630127
+    },
+    "post_quant": {
+      "maximum": 6.7566609382629395,
+      "mean": 0.04650573059916496,
+      "minimum": -5.9918904304504395,
+      "rms": 1.6105732917785645
+    },
+    "up_block_00": {
+      "maximum": 34.852962493896484,
+      "mean": -0.6546459794044495,
+      "minimum": -63.66575622558594,
+      "rms": 3.9821202754974365
+    },
+    "up_block_01": {
+      "maximum": 109.41874694824219,
+      "mean": -1.551081895828247,
+      "minimum": -208.71072387695312,
+      "rms": 10.153240203857422
+    },
+    "up_block_02": {
+      "maximum": 107.9271011352539,
+      "mean": -1.6783779859542847,
+      "minimum": -212.4317626953125,
+      "rms": 13.80787181854248
+    },
+    "up_block_03": {
+      "maximum": 109.1251220703125,
+      "mean": -1.4048296213150024,
+      "minimum": -219.74134826660156,
+      "rms": 15.523026466369629
+    },
+    "up_block_04": {
+      "maximum": 75.04509735107422,
+      "mean": -5.759710311889648,
+      "minimum": -123.54749298095703,
+      "rms": 20.82497787475586
+    }
+  },
+  "tensors": {
+    "denormalized_latent": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "denormalized_latent.f32",
+      "layout": "HWC",
+      "sha256": "a56b8f145a05e241ed201d6102491ee9a2c134c32b055faae7b402dba6f811ed",
+      "shape": [
+        16,
+        16,
+        64
+      ]
+    },
+    "normalized_latent": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "normalized_latent.f32",
+      "layout": "HWC",
+      "sha256": "1b3a2d2e923353b3600b57e30305cf34e4130f31c7bed3363e6efeb3f3f9d022",
+      "shape": [
+        16,
+        16,
+        64
+      ]
+    },
+    "output": {
+      "bytes": 1048576,
+      "dtype": "F32",
+      "file": "output.f32",
+      "layout": "HWC",
+      "sha256": "1d31813d5ea531ac790fd85380d17448a1bc856c708391397f72094c8711d01e",
+      "shape": [
+        256,
+        256,
+        4
+      ]
+    }
+  }
+}

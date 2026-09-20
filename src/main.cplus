@@ -7,6 +7,7 @@ import "./packed_model" as packed_model;
 import "./model_inventory" as model_inventory;
 import "./safetensors" as safetensors;
 import "./scheduler" as scheduler;
+import "./vae" as vae;
 import "./tensor" as tensor;
 import "./cpu_ops" as cpu_ops;
 import "stdlib/env" as env;
@@ -17,7 +18,7 @@ import "stdlib/text" as text;
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256 [FIXTURE_ROOT] | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -150,6 +151,24 @@ fn main() -> i32 {
             }
             option::Option[text::Text]::None => {
                 return transformer_block::run_trajectory_packed(path.view(), steps.view());
+            }
+        }
+    }
+    if command == "test-vae-decoder" {
+        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256 [FIXTURE_ROOT]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(test_case) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256 [FIXTURE_ROOT]");
+            return 2;
+        };
+        match env::arg(4 as usize) {
+            option::Option[text::Text]::Some(fixtures) => {
+                return vae::run(path.view(), test_case.view(), fixtures.view());
+            }
+            option::Option[text::Text]::None => {
+                return vae::run(path.view(), test_case.view());
             }
         }
     }

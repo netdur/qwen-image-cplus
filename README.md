@@ -15,7 +15,8 @@ Diffusers source; those fixtures are plain binary files consumed by C+ tests.
 - Snapshot: `b3179ad355be050328e483a9dfdd9e60cd62adfa`
 - Diffusers commit: `80c7ed262aeffbeb43ef13ae04baeb9b84515a69`
 - Machine-readable inventory: `manifests/qwen-image-2.1.json`
-- Pinned official [transformer source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/transformers/transformer_qwenimage21.py)
+- Pinned official [transformer source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/transformers/transformer_qwenimage21.py),
+  [VAE source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py),
   and [pipeline source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py)
 
 ## Build and verify
@@ -49,6 +50,8 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 1
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 2
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
+./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
+./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -236,6 +239,34 @@ Inspect a shard, optionally filtering tensor names:
   covers one complete noise prediction at 512px and 1024px. Fixture provenance,
   timings, acceptance limits, and limitations are recorded in
   `benchmarks/m1-max-transformer-trajectory-native.json`.
+- The real Qwen-Image-2.1 VAE still-image decoder now runs natively from its
+  1.258 GiB FP32 Safetensors file through one read-only no-copy Metal mapping.
+  It applies the exact 64-channel latent mean/std handoff, post-quant and input
+  convolutions, the 1,152-channel residual/one-head-attention middle block,
+  five residual up blocks, final RMSNorm/SiLU, output convolution, and clamp.
+  Activations use HWC order so the shared 16x16 tiled OIHW convolution can read
+  checkpoint weights without transposing or repacking them.
+- The official class is named a causal 3D VAE, but its image specialization is
+  materially different from a generic Conv3D decoder. Its checkpoint
+  convolution weights are four-dimensional Conv2d tensors. On the first
+  one-frame cached chunk, each nominal temporal-upsample main path records the
+  `Rep` sentinel and skips `time_conv`; the `DupUp3D` residual shortcut still
+  performs temporal/channel/spatial reshaping and then crops to the first
+  frame. The native shortcut reconstructs that exact channel mapping directly,
+  without materializing discarded temporal frames.
+- Each residual up block must preserve its original input for that shortcut.
+  Reusing it during the three residual layers initially caused the first
+  observable divergence at up block 0 despite every preceding boundary being
+  correct. A dedicated preserved-shortcut arena fixes the ownership hazard;
+  the committed small oracle now checks all three residuals, the main
+  upsample, shortcut, and combined result for every block. All 35 comparisons
+  stay below 2.51e-6 nRMSE and the final output is 5.51e-7.
+- The complete step-40 trajectory latent decodes from `[16,16,64]` to
+  `[256,256,4]` at 8.09e-7 nRMSE against the pinned official FP32 MPS decoder,
+  under a 3e-6 gate. The measured M1 Max run used 456,523,776 bytes of explicit
+  scratch storage plus the no-copy weights and took 2,297.53 ms of summed GPU
+  kernel time. Results, scope, and limitations are recorded in
+  `benchmarks/m1-max-vae-decoder-native.json`.
 
 ## Quantization decision log
 
@@ -288,8 +319,10 @@ claim. The packed mapping is exposed to Metal without copying 12.42 GiB of
 weights; only activations, cache arenas, and 128-element Q/K norm vectors are
 copied.
 
-Image generation is not implemented yet. The latent-only denoising trajectory
-is now validated; the next phase is the real Qwen-Image-2.1 causal 3D VAE
-decoder, beginning with fixed reference latents and intermediate feature/pixel
-fixtures. Native prompt encoding remains a later independent boundary tracked
-in `plan.md`.
+The denoising trajectory and still-image VAE decode are now separately
+validated through the final four-channel image tensor. They are not yet one
+user-facing generation command: native prompt encoding, pipeline orchestration,
+and exact image postprocessing/file output remain independent boundaries. The
+current VAE path intentionally implements the pinned one-frame first-chunk
+semantics; temporal continuation and tiled decode are outside its verified
+scope.

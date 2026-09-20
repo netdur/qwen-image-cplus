@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "artifact": {
+    "source": "vae/diffusion_pytorch_model.safetensors",
+    "source_bytes": 1350989512,
+    "mapped_bytes": 1350991872,
+    "dtype": "FP32",
+    "mapping": "One read-only page-aligned no-copy Metal buffer"
+  },
+  "method": {
+    "reference": "Pinned official AutoencoderKLQwenImage21 FP32 execution on MPS",
+    "native": "FP32 HWC activations, OIHW checkpoint weights, FP32 Metal accumulation with fast math disabled",
+    "small_case": "Deterministic BF16-rounded [1,64,1,1,1] latent with 35 internal/output comparisons",
+    "production_case": "Committed scheduler step-40 [1,64,1,16,16] latent decoded to [1,4,1,256,256]",
+    "still_image_semantics": "One cached first chunk: causal convolution folds away time, upsample3d skips time_conv, DupUp3D shortcut retains its exact first-frame mapping"
+  },
+  "native": {
+    "small": {
+      "summed_gpu_kernel_ms": 36.4999,
+      "preceding_run_gpu_kernel_ms": 31.681,
+      "maximum_reported_boundary_nrmse": 0.00000250341,
+      "output_nrmse": 0.000000551354,
+      "output_limit": 0.000002
+    },
+    "trajectory_256": {
+      "summed_gpu_kernel_ms": 2297.53,
+      "preceding_run_gpu_kernel_ms": 2276.55,
+      "scratch_bytes": 456523776,
+      "output_nrmse": 0.000000809444,
+      "output_limit": 0.000003,
+      "finite_output": true
+    }
+  },
+  "acceptance": {
+    "small_internal_boundaries_passed": true,
+    "trajectory_256_output_passed": true,
+    "passed": true
+  },
+  "interpretation": "The model-scale output agrees closely enough to use arithmetic-error gates far tighter than the mixed-transformer runtime. The independently captured small boundaries make the unusual first-chunk shortcut semantics observable instead of relying only on final pixels.",
+  "limitations": [
+    "This validates the pinned still-image first-chunk path only; temporal continuation and tiled decode are not implemented.",
+    "The command is a decoder validation boundary, not yet a user-facing generation pipeline or image writer.",
+    "Summed GPU time excludes Safetensors parsing, Metal source compilation, fixture I/O, and process startup; each kernel currently uses a separate command buffer and synchronous wait.",
+    "The 1.258 GiB FP32 VAE checkpoint is mapped without copying, but is not quantized.",
+    "Native prompt encoding remains a separate later boundary."
+  ]
+}
