@@ -2,7 +2,7 @@
   "schema_version": 1,
   "machine": "Apple M1 Max",
   "fast_math": false,
-  "reference": "C+ FP32 scalar implementation",
+  "reference": "C+ FP32 scalar implementation; block0 uses the pinned Diffusers equations transcribed independently to NumPy with decoded BF16 checkpoint weights",
   "operations": {
     "bf16_decode": {"absolute_tolerance": 0.0, "relative_tolerance": 0.0},
     "fp16_decode": {"absolute_tolerance": 0.0, "relative_tolerance": 0.0},
@@ -16,6 +16,14 @@
     "complex_rope": {"absolute_tolerance": 0.000002, "relative_tolerance": 0.000002},
     "bf16_linear": {"absolute_tolerance": 0.00002, "relative_tolerance": 0.00002},
     "fp16_linear": {"absolute_tolerance": 0.00002, "relative_tolerance": 0.00002},
-    "block_causal_mask": {"exact": true}
+    "block_causal_mask": {"exact": true},
+    "block0_norm_modulation": {"absolute_tolerance": 0.0005, "relative_tolerance": 0.0005},
+    "block0_qkv_projection": {"absolute_tolerance": 0.0002, "relative_tolerance": 0.0002},
+    "block0_qk_norm_rope": {"absolute_tolerance": 0.0003, "relative_tolerance": 0.0003},
+    "block0_attention": {"absolute_tolerance": 0.0005, "relative_tolerance": 0.0005},
+    "block0_mlp_input_projection": {"absolute_tolerance": 0.0008, "relative_tolerance": 0.0008},
+    "block0_swiglu": {"absolute_tolerance": 0.001, "relative_tolerance": 0.001},
+    "block0_mlp_output_projection": {"absolute_tolerance": 0.002, "relative_tolerance": 0.002},
+    "block0_output": {"absolute_tolerance": 0.002, "relative_tolerance": 0.002}
   }
 }

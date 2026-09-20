@@ -27,6 +27,7 @@ cpc test
 ./target/debug/qwen-image-cplus test-metal-primitives
 ./target/debug/qwen-image-cplus test-metal-linear
 ./target/debug/qwen-image-cplus benchmark-linear
+./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -56,7 +57,13 @@ Inspect a shard, optionally filtering tensor names:
   weights with FP32 accumulation. It is exact on partial-tile validation cases
   and has recorded full-4096-token timings for all three transformer matrix
   shapes in `benchmarks/m1-max-linear.json`.
+- An exact model-width block-0 correctness path using the checkpoint's nine
+  block tensors: affine-free LayerNorm and shared modulation, Q/K/V, learned
+  per-head Q/K RMSNorm, three-axis complex RoPE, block-causal attention,
+  attention output projection, tanh-gated residuals, and SwiGLU MLP. Fifteen
+  named boundaries are checked against the committed FP32 oracle, and the M1
+  Max result is recorded in `benchmarks/m1-max-block0.json`.
 
-Image generation is not implemented yet. The remaining model kernels,
-quantized packed format, transformer, native prompt encoder, and causal 3D VAE
-are tracked in `plan.md`.
+Image generation is not implemented yet. The full 32-block streaming runtime,
+quantized packed format, native prompt encoder, and causal 3D VAE are tracked
+in `plan.md`.

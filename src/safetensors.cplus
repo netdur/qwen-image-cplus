@@ -90,6 +90,18 @@ struct File {
     _data_start: u64,
 }
 
+// A borrowed view into a mapped Safetensors payload. The owning `File` must
+// outlive this value. Dimensions are copied so callers never retain pointers
+// into the parser's metadata vectors.
+struct TensorData {
+    opaque pointer: *u8,
+    byte_length: u64,
+    elements: u64,
+    dtype: DType,
+    rank: usize,
+    dimensions: [u64; 8],
+}
+
 impl File {
     fn tensor_count(this) -> usize {
         return this._tensors.count();
@@ -137,6 +149,39 @@ impl File {
 
     fn has_tensor(this, name: str) -> bool {
         return has_name(this._tensors, name);
+    }
+
+    fn tensor(this, name: str) -> option::Option[TensorData] {
+        var index: usize = 0 as usize;
+        while index < this._tensors.count() {
+            guard let option::Option[*TensorInfo]::Some(info) = this._tensors.at_ptr(index) else {
+                return option::Option[TensorData]::None;
+            };
+            if { (*info).name.equals(name) } {
+                var dimensions: [u64; 8] = [0 as u64; 8];
+                var dimension_index: usize = 0 as usize;
+                while dimension_index < { (*info).shape.count() } {
+                    guard let option::Option[u64]::Some(dimension) = {
+                        (*info).shape.at(dimension_index)
+                    } else {
+                        return option::Option[TensorData]::None;
+                    };
+                    dimensions[dimension_index] = dimension;
+                    dimension_index = dimension_index +% (1 as usize);
+                }
+                return option::Option[TensorData]::Some(TensorData {
+                    pointer: this._mapping.pointer()
+                        + (this._data_start +% { (*info).begin }) as usize,
+                    byte_length: { (*info).end -% (*info).begin },
+                    elements: { (*info).elements },
+                    dtype: { (*info).dtype },
+                    rank: { (*info).shape.count() },
+                    dimensions: dimensions,
+                });
+            }
+            index = index +% (1 as usize);
+        }
+        return option::Option[TensorData]::None;
     }
 }
 

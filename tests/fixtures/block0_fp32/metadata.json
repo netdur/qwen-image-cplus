@@ -1,0 +1,222 @@
+{
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "operation": "QwenImage21TransformerBlock block 0, FP32 reference",
+  "reference": "Pinned Diffusers equations transcribed to NumPy; BF16 checkpoint weights decoded to FP32",
+  "schema_version": 1,
+  "shape": {
+    "head_dim": 128,
+    "heads": 32,
+    "mlp": 12288,
+    "rows": 4,
+    "width": 4096
+  },
+  "tensors": {
+    "attention": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "attention.f32",
+      "sha256": "5f817682fbe91c089fbd5dc024e624c394e5f118bcef2a7bd665bb438075fee9",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "attention_projected": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "attention_projected.f32",
+      "sha256": "a811a93715c453e1fe0a54c5e0c2142d444b4d115b688f6e17f290176e6b2014",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "gate": {
+      "bytes": 196608,
+      "dtype": "F32",
+      "file": "gate.f32",
+      "sha256": "3b92e5e1bf5e55a91a8d217fed33b6d3c625048a8acf57126f6bedb52b782319",
+      "shape": [
+        4,
+        12288
+      ]
+    },
+    "hidden": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "hidden.f32",
+      "sha256": "69fd9b980d640155171e66409f39a691c378938f1d8dc626cf9d6b68ac6d564a",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "key": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "key.f32",
+      "sha256": "b20a90346a2a1742ba8bbf0f5f37078cb52fa49cd48b570543a3dde58a6225fc",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "key_rope": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "key_rope.f32",
+      "sha256": "78a45261dc4bc512c796126674ca6453bcb8a94258c3325a9d22d5f3691723e0",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "mlp_projected": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "mlp_projected.f32",
+      "sha256": "099271e50536bd89a59980b45d8a092a5876a4e29e22d82c2fea16f15e639a9d",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "modulation": {
+      "bytes": 131072,
+      "dtype": "F32",
+      "file": "modulation.f32",
+      "sha256": "ac43682d42b3e0ba5dd2ca8ad0481a3fb052f44db681aa88a553ad881f4c558b",
+      "shape": [
+        2,
+        4,
+        4096
+      ]
+    },
+    "norm1": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "norm1.f32",
+      "sha256": "ec6cdee6e303a2d6d442535bea7da6d50eff8c442a19c0d22b0d052cde03bca5",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "norm2": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "norm2.f32",
+      "sha256": "ebe8d3f30fe26a972feca2d0cc4b859d30abd72c886f25ac1dabf19d7dc7c7b8",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "output.f32",
+      "sha256": "0f52ce56365129f38b1045e32641331bdf9526001f010ef336d72a6114278c30",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "projected": {
+      "bytes": 196608,
+      "dtype": "F32",
+      "file": "projected.f32",
+      "sha256": "79cdccb3344966843d872c04ec4649672a76ff0a1f40cc4ae793b376227bcc0f",
+      "shape": [
+        4,
+        12288
+      ]
+    },
+    "query": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "query.f32",
+      "sha256": "0cdda37d023e7df0569ad70567697fe9404447b96e2b8fa9fbb90278f923f237",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "query_rope": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "query_rope.f32",
+      "sha256": "ea1858eb2a56f44d6698b8f415068d0f2e38ea7aaea22d942fd01b7cf819f55a",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "residual1": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "residual1.f32",
+      "sha256": "c1e20d2e31a77a7388e4e11ebae0235f96c426735b1ef91c79f3c9e16c5176cf",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "rope": {
+      "bytes": 2048,
+      "dtype": "F32",
+      "file": "rope.f32",
+      "sha256": "336e6b281688d0f923b3f8e8c73fc7e1505796054b2fe9d124c15326ac801274",
+      "shape": [
+        4,
+        128
+      ]
+    },
+    "swiglu": {
+      "bytes": 196608,
+      "dtype": "F32",
+      "file": "swiglu.f32",
+      "sha256": "6ffff46324b463efad79e5e4a492b99f882935845d1f12973e03a0882532786b",
+      "shape": [
+        4,
+        12288
+      ]
+    },
+    "value": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "value.f32",
+      "sha256": "67727ed3181a1773883f579fa537e7f966729573982ee25aba2ac38afc7fccd0",
+      "shape": [
+        4,
+        4096
+      ]
+    }
+  },
+  "tokens": {
+    "image_ids": [
+      -1,
+      -1,
+      0,
+      0
+    ],
+    "target_mask": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "tolerance": {
+    "max_abs": 0.003,
+    "max_rel": 0.003
+  },
+  "wrong_equation_max_abs_separation": {
+    "q_weight_transposed_wrong_way": 33.39300537109375,
+    "qk_rmsnorm_omitted": 10.608197212219238,
+    "residual_gate_without_tanh": 0.15972900390625,
+    "rope_omitted": 6.499690055847168,
+    "strict_causal_instead_of_block_causal": 8.806381225585938
+  }
+}

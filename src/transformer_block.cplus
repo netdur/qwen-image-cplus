@@ -1,0 +1,489 @@
+import "./metal_primitives" as metrics;
+import "./mmap_macos" as mapped;
+import "./safetensors" as safetensors;
+import "metal/metal" as metal;
+import "objc/bridge" as bridge;
+import "objc/runtime" as rt;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+extern fn MTLCreateSystemDefaultDevice() -> *u8;
+
+const ROWS: usize = 4;
+const WIDTH: usize = 4096;
+const HEADS: usize = 32;
+const HEAD_DIMENSION: usize = 128;
+const MLP_WIDTH: usize = 12288;
+const TILE: usize = 16;
+
+struct OwnedObjc {
+    opaque pointer: *u8,
+}
+
+impl OwnedObjc {
+    fn new(pointer: *u8) -> OwnedObjc {
+        return OwnedObjc { pointer: pointer };
+    }
+
+    fn raw(this) -> *u8 {
+        return this.pointer;
+    }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            rt::release(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+#[repr(C)]
+struct LinearParams {
+    rows: u32,
+    output_columns: u32,
+    input_columns: u32,
+    weight_mode: u32,
+}
+
+#[repr(C)]
+struct BlockParams {
+    rows: u32,
+    width: u32,
+    heads: u32,
+    head_dimension: u32,
+    epsilon: f32,
+    slot: u32,
+}
+
+fn round_up(value: usize, multiple: usize) -> usize {
+    return ((value +% multiple -% (1 as usize)) / multiple) *% multiple;
+}
+
+fn pipeline(
+    device: metal::Device,
+    library: metal::Library,
+    name: str,
+) -> option::Option[OwnedObjc] {
+    guard let option::Option[metal::Function]::Some(function) = library.new_function_with_name(name) else {
+        io::eprintln("transformer block: missing Metal function ${name}");
+        return option::Option[OwnedObjc]::None;
+    };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+    guard let option::Option[metal::ComputePipelineState]::Some(value) =
+        device.new_compute_pipeline_state_with_function(function, 0 as *u8) else {
+        io::eprintln("transformer block: could not create ${name} pipeline");
+        return option::Option[OwnedObjc]::None;
+    };
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(value.raw()));
+}
+
+fn dispatch_linear(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    output: metal::Buffer,
+    output_columns: usize,
+    input_columns: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() {
+        return option::Option[f64]::None;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else {
+        return option::Option[f64]::None;
+    };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: LinearParams = LinearParams {
+        rows: ROWS as u32,
+        output_columns: output_columns as u32,
+        input_columns: input_columns as u32,
+        weight_mode: 0 as u32,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weights, 0 as u64, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 3 as u64);
+    encoder.dispatch_threads(
+        metal::Size {
+            width: round_up(output_columns, TILE) as u64,
+            height: round_up(ROWS, TILE) as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: TILE as u64, height: TILE as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn dispatch_1d(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    buffer_0: metal::Buffer,
+    buffer_1: metal::Buffer,
+    buffer_2: metal::Buffer,
+    buffer_3: metal::Buffer,
+    buffer_5: metal::Buffer,
+    buffer_6: metal::Buffer,
+    parameters: *BlockParams,
+    thread_count: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() {
+        return option::Option[f64]::None;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else {
+        return option::Option[f64]::None;
+    };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(buffer_0, 0 as u64, 0 as u64);
+    encoder.set_buffer(buffer_1, 0 as u64, 1 as u64);
+    encoder.set_buffer(buffer_2, 0 as u64, 2 as u64);
+    encoder.set_buffer(buffer_3, 0 as u64, 3 as u64);
+    encoder.set_bytes(parameters as *u8, #size_of::[BlockParams]() as u64, 4 as u64);
+    encoder.set_buffer(buffer_5, 0 as u64, 5 as u64);
+    encoder.set_buffer(buffer_6, 0 as u64, 6 as u64);
+    let width: u64 = pipeline.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: thread_count as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: width, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn new_buffer(device: metal::Device, bytes: u64) -> option::Option[metal::Buffer] {
+    return device.new_buffer_with_length(
+        bytes,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    );
+}
+
+fn fixture_buffer(
+    device: metal::Device,
+    fixture_directory: str,
+    name: str,
+    expected_bytes: u64,
+) -> option::Option[metal::Buffer] {
+    let path: text::Text = "${fixture_directory}/${name}.f32";
+    guard let mapped::MapResult::Ok(file) = mapped::map_readonly(path.view()) else {
+        io::eprintln("transformer block: missing fixture ${path}");
+        return option::Option[metal::Buffer]::None;
+    };
+    if file.length() as u64 != expected_bytes {
+        io::eprintln("transformer block: fixture ${name} has ${file.length()} bytes, expected ${expected_bytes}");
+        return option::Option[metal::Buffer]::None;
+    }
+    return device.new_buffer_with_bytes(
+        file.pointer(),
+        expected_bytes,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    );
+}
+
+fn weight_buffer(
+    device: metal::Device,
+    file: safetensors::File,
+    name: str,
+    dimension_0: u64,
+    dimension_1: u64 = 0 as u64,
+) -> option::Option[metal::Buffer] {
+    guard let option::Option[safetensors::TensorData]::Some(tensor) = file.tensor(name) else {
+        io::eprintln("transformer block: missing weight ${name}");
+        return option::Option[metal::Buffer]::None;
+    };
+    let expected_rank: usize = if dimension_1 == (0 as u64) { 1 as usize } else { 2 as usize };
+    let valid_shape: bool = tensor.rank == expected_rank && tensor.dimensions[0] == dimension_0
+        && (expected_rank == (1 as usize) || tensor.dimensions[1] == dimension_1);
+    if tensor.dtype.name() != "BF16" || !valid_shape {
+        io::eprintln("transformer block: unexpected metadata for ${name}");
+        return option::Option[metal::Buffer]::None;
+    }
+    return device.new_buffer_with_bytes(
+        tensor.pointer,
+        tensor.byte_length,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    );
+}
+
+fn compare_fixture(
+    label: str,
+    actual: metal::Buffer,
+    fixture_directory: str,
+    fixture_name: str,
+    count: usize,
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+) -> bool {
+    let path: text::Text = "${fixture_directory}/${fixture_name}.f32";
+    guard let mapped::MapResult::Ok(expected) = mapped::map_readonly(path.view()) else {
+        io::eprintln("transformer block: missing expected tensor ${path}");
+        return false;
+    };
+    if expected.length() != count *% #size_of::[f32]() {
+        io::eprintln("transformer block: wrong byte count for ${fixture_name}");
+        return false;
+    }
+    return metrics::report(
+        label,
+        metrics::compare_f32(
+            actual.contents() as *f32,
+            expected.pointer() as *f32,
+            count,
+            absolute_tolerance,
+            relative_tolerance,
+        ),
+        count,
+    );
+}
+
+fn finite(label: str, buffer: metal::Buffer, count: usize) -> bool {
+    let values: *f32 = buffer.contents() as *f32;
+    var index: usize = 0 as usize;
+    while index < count {
+        var value: f32 = values[index];
+        let bits: u32 = { *({ #addr_of(value) } as *u32) };
+        if (bits & (0x7F800000 as u32)) == (0x7F800000 as u32) {
+            io::eprintln("${label}: non-finite value at ${index}");
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn run(model_directory: str, fixture_directory: str = "tests/fixtures/block0_fp32") -> i32 {
+    let shard_path: text::Text =
+        "${model_directory}/transformer/diffusion_pytorch_model-00001-of-00002.safetensors";
+    guard let safetensors::LoadResult::Ok(weight_file) = safetensors::load(shard_path.view()) else {
+        io::eprintln("transformer block: could not load ${shard_path}");
+        return 1;
+    };
+
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() {
+        return 1;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() {
+        io::eprintln("transformer block: no Metal device");
+        return 1;
+    }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else {
+        return 1;
+    };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() {
+        return 1;
+    }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        #include_str("../kernels/transformer_block.metal"),
+        options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 = rt::msg_id(compile_error, rt::sel(#str_ptr("localizedDescription\0")));
+            io::eprintln("transformer block Metal compile: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[OwnedObjc]::Some(linear_owner) = pipeline(device, library, "qi_block_linear_16x16") else {
+        return 1;
+    };
+    guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else {
+        return 1;
+    };
+    guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else {
+        return 1;
+    };
+    guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qi_block_attention") else {
+        return 1;
+    };
+    guard let option::Option[OwnedObjc]::Some(residual_owner) = pipeline(device, library, "qi_block_residual") else {
+        return 1;
+    };
+    guard let option::Option[OwnedObjc]::Some(swiglu_owner) = pipeline(device, library, "qi_block_swiglu") else {
+        return 1;
+    };
+    let linear_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(linear_owner.raw());
+    let norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(norm_owner.raw());
+    let qk_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(qk_owner.raw());
+    let attention_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(attention_owner.raw());
+    let residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(residual_owner.raw());
+    let swiglu_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(swiglu_owner.raw());
+
+    let activation_bytes: u64 = (ROWS *% WIDTH *% #size_of::[f32]()) as u64;
+    let mlp_bytes: u64 = (ROWS *% MLP_WIDTH *% #size_of::[f32]()) as u64;
+    guard let option::Option[metal::Buffer]::Some(hidden) = fixture_buffer(device, fixture_directory, "hidden", activation_bytes) else { return 1; };
+    let hidden_owner: OwnedObjc = OwnedObjc::new(hidden.raw());
+    guard let option::Option[metal::Buffer]::Some(modulation) = fixture_buffer(device, fixture_directory, "modulation", ((2 as usize) *% (4 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; };
+    let modulation_owner: OwnedObjc = OwnedObjc::new(modulation.raw());
+    guard let option::Option[metal::Buffer]::Some(rope) = fixture_buffer(device, fixture_directory, "rope", (ROWS *% HEAD_DIMENSION *% #size_of::[f32]()) as u64) else { return 1; };
+    let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
+
+    guard let option::Option[metal::Buffer]::Some(target_mask) = new_buffer(device, ROWS as u64) else { return 1; };
+    let target_mask_owner: OwnedObjc = OwnedObjc::new(target_mask.raw());
+    let target_values: *u8 = target_mask.contents();
+    target_values[0] = 0 as u8; target_values[1] = 0 as u8;
+    target_values[2] = 1 as u8; target_values[3] = 1 as u8;
+    guard let option::Option[metal::Buffer]::Some(image_ids) = new_buffer(device, (ROWS *% #size_of::[i32]()) as u64) else { return 1; };
+    let image_ids_owner: OwnedObjc = OwnedObjc::new(image_ids.raw());
+    let image_values: *i32 = image_ids.contents() as *i32;
+    image_values[0] = 0 -% (1 as i32); image_values[1] = 0 -% (1 as i32);
+    image_values[2] = 0 as i32; image_values[3] = 0 as i32;
+    guard let option::Option[metal::Buffer]::Some(key_valid) = new_buffer(device, ROWS as u64) else { return 1; };
+    let key_valid_owner: OwnedObjc = OwnedObjc::new(key_valid.raw());
+    var index: usize = 0 as usize;
+    while index < ROWS { (key_valid.contents())[index] = 1 as u8; index = index +% (1 as usize); }
+
+    guard let option::Option[metal::Buffer]::Some(dummy) = new_buffer(device, 4 as u64) else { return 1; };
+    let dummy_owner: OwnedObjc = OwnedObjc::new(dummy.raw());
+
+    guard let option::Option[metal::Buffer]::Some(norm_q_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.attn.norm_q.weight", HEAD_DIMENSION as u64) else { return 1; };
+    let norm_q_weight_owner: OwnedObjc = OwnedObjc::new(norm_q_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(norm_k_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.attn.norm_k.weight", HEAD_DIMENSION as u64) else { return 1; };
+    let norm_k_weight_owner: OwnedObjc = OwnedObjc::new(norm_k_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(q_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.attn.to_q.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
+    let q_weight_owner: OwnedObjc = OwnedObjc::new(q_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(k_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.attn.to_k.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
+    let k_weight_owner: OwnedObjc = OwnedObjc::new(k_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(v_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.attn.to_v.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
+    let v_weight_owner: OwnedObjc = OwnedObjc::new(v_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(attention_output_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.attn.to_out.0.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
+    let attention_output_weight_owner: OwnedObjc = OwnedObjc::new(attention_output_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(gate_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.img_mlp.gate_layer.weight", MLP_WIDTH as u64, WIDTH as u64) else { return 1; };
+    let gate_weight_owner: OwnedObjc = OwnedObjc::new(gate_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(projected_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.img_mlp.proj.weight", MLP_WIDTH as u64, WIDTH as u64) else { return 1; };
+    let projected_weight_owner: OwnedObjc = OwnedObjc::new(projected_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(mlp_output_weight) = weight_buffer(device, weight_file, "transformer_blocks.0.img_mlp.out.weight", WIDTH as u64, MLP_WIDTH as u64) else { return 1; };
+    let mlp_output_weight_owner: OwnedObjc = OwnedObjc::new(mlp_output_weight.raw());
+
+    guard let option::Option[metal::Buffer]::Some(norm1) = new_buffer(device, activation_bytes) else { return 1; }; let norm1_owner: OwnedObjc = OwnedObjc::new(norm1.raw());
+    guard let option::Option[metal::Buffer]::Some(query) = new_buffer(device, activation_bytes) else { return 1; }; let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
+    guard let option::Option[metal::Buffer]::Some(key) = new_buffer(device, activation_bytes) else { return 1; }; let key_owner: OwnedObjc = OwnedObjc::new(key.raw());
+    guard let option::Option[metal::Buffer]::Some(value) = new_buffer(device, activation_bytes) else { return 1; }; let value_owner: OwnedObjc = OwnedObjc::new(value.raw());
+    guard let option::Option[metal::Buffer]::Some(query_rope) = new_buffer(device, activation_bytes) else { return 1; }; let query_rope_owner: OwnedObjc = OwnedObjc::new(query_rope.raw());
+    guard let option::Option[metal::Buffer]::Some(key_rope) = new_buffer(device, activation_bytes) else { return 1; }; let key_rope_owner: OwnedObjc = OwnedObjc::new(key_rope.raw());
+    guard let option::Option[metal::Buffer]::Some(attended) = new_buffer(device, activation_bytes) else { return 1; }; let attended_owner: OwnedObjc = OwnedObjc::new(attended.raw());
+    guard let option::Option[metal::Buffer]::Some(attention_projected) = new_buffer(device, activation_bytes) else { return 1; }; let attention_projected_owner: OwnedObjc = OwnedObjc::new(attention_projected.raw());
+    guard let option::Option[metal::Buffer]::Some(residual1) = new_buffer(device, activation_bytes) else { return 1; }; let residual1_owner: OwnedObjc = OwnedObjc::new(residual1.raw());
+    guard let option::Option[metal::Buffer]::Some(norm2) = new_buffer(device, activation_bytes) else { return 1; }; let norm2_owner: OwnedObjc = OwnedObjc::new(norm2.raw());
+    guard let option::Option[metal::Buffer]::Some(gate) = new_buffer(device, mlp_bytes) else { return 1; }; let gate_owner: OwnedObjc = OwnedObjc::new(gate.raw());
+    guard let option::Option[metal::Buffer]::Some(projected) = new_buffer(device, mlp_bytes) else { return 1; }; let projected_owner: OwnedObjc = OwnedObjc::new(projected.raw());
+    guard let option::Option[metal::Buffer]::Some(swiglu) = new_buffer(device, mlp_bytes) else { return 1; }; let swiglu_buffer_owner: OwnedObjc = OwnedObjc::new(swiglu.raw());
+    guard let option::Option[metal::Buffer]::Some(mlp_projected) = new_buffer(device, activation_bytes) else { return 1; }; let mlp_projected_owner: OwnedObjc = OwnedObjc::new(mlp_projected.raw());
+    guard let option::Option[metal::Buffer]::Some(output) = new_buffer(device, activation_bytes) else { return 1; }; let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+
+    var params: BlockParams = BlockParams {
+        rows: ROWS as u32,
+        width: WIDTH as u32,
+        heads: HEADS as u32,
+        head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32,
+        slot: 0 as u32,
+    };
+    var all_ok: bool = true;
+    var total_ms: f64 = 0.0f64;
+
+    guard let option::Option[f64]::Some(elapsed) = dispatch_1d(queue, norm_pipeline, hidden, modulation, norm1, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; };
+    total_ms = total_ms + elapsed;
+    all_ok = compare_fixture("block0 norm1 + scale1", norm1, fixture_directory, "norm1", ROWS *% WIDTH, 0.00005f64, 0.00005f64) && all_ok;
+
+    guard let option::Option[f64]::Some(q_ms) = dispatch_linear(queue, linear_pipeline, norm1, q_weight, query, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + q_ms;
+    guard let option::Option[f64]::Some(k_ms) = dispatch_linear(queue, linear_pipeline, norm1, k_weight, key, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + k_ms;
+    guard let option::Option[f64]::Some(v_ms) = dispatch_linear(queue, linear_pipeline, norm1, v_weight, value, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + v_ms;
+    all_ok = compare_fixture("block0 Q projection", query, fixture_directory, "query", ROWS *% WIDTH, 0.0002f64, 0.0002f64) && all_ok;
+    all_ok = compare_fixture("block0 K projection", key, fixture_directory, "key", ROWS *% WIDTH, 0.0002f64, 0.0002f64) && all_ok;
+    all_ok = compare_fixture("block0 V projection", value, fixture_directory, "value", ROWS *% WIDTH, 0.0002f64, 0.0002f64) && all_ok;
+
+    guard let option::Option[f64]::Some(qk_q_ms) = dispatch_1d(queue, qk_pipeline, query, norm_q_weight, query_rope, rope, dummy, dummy, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + qk_q_ms;
+    guard let option::Option[f64]::Some(qk_k_ms) = dispatch_1d(queue, qk_pipeline, key, norm_k_weight, key_rope, rope, dummy, dummy, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + qk_k_ms;
+    all_ok = compare_fixture("block0 Q RMSNorm + RoPE", query_rope, fixture_directory, "query_rope", ROWS *% WIDTH, 0.0003f64, 0.0003f64) && all_ok;
+    all_ok = compare_fixture("block0 K RMSNorm + RoPE", key_rope, fixture_directory, "key_rope", ROWS *% WIDTH, 0.0003f64, 0.0003f64) && all_ok;
+
+    guard let option::Option[f64]::Some(attention_ms) = dispatch_1d(queue, attention_pipeline, query_rope, key_rope, attended, value, image_ids, key_valid, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + attention_ms;
+    all_ok = compare_fixture("block0 block-causal attention", attended, fixture_directory, "attention", ROWS *% WIDTH, 0.0005f64, 0.0005f64) && all_ok;
+
+    guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_linear(queue, linear_pipeline, attended, attention_output_weight, attention_projected, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + attention_projection_ms;
+    all_ok = compare_fixture("block0 attention output projection", attention_projected, fixture_directory, "attention_projected", ROWS *% WIDTH, 0.0005f64, 0.0005f64) && all_ok;
+
+    params.slot = 1 as u32;
+    guard let option::Option[f64]::Some(residual1_ms) = dispatch_1d(queue, residual_pipeline, hidden, modulation, residual1, attention_projected, target_mask, dummy, #addr_of(params), ROWS *% WIDTH) else { return 1; }; total_ms = total_ms + residual1_ms;
+    all_ok = compare_fixture("block0 attention gated residual", residual1, fixture_directory, "residual1", ROWS *% WIDTH, 0.0005f64, 0.0005f64) && all_ok;
+
+    params.slot = 2 as u32;
+    guard let option::Option[f64]::Some(norm2_ms) = dispatch_1d(queue, norm_pipeline, residual1, modulation, norm2, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; }; total_ms = total_ms + norm2_ms;
+    all_ok = compare_fixture("block0 norm2 + scale2", norm2, fixture_directory, "norm2", ROWS *% WIDTH, 0.0005f64, 0.0005f64) && all_ok;
+
+    guard let option::Option[f64]::Some(gate_ms) = dispatch_linear(queue, linear_pipeline, norm2, gate_weight, gate, MLP_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + gate_ms;
+    guard let option::Option[f64]::Some(projected_ms) = dispatch_linear(queue, linear_pipeline, norm2, projected_weight, projected, MLP_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + projected_ms;
+    all_ok = compare_fixture("block0 MLP gate projection", gate, fixture_directory, "gate", ROWS *% MLP_WIDTH, 0.0008f64, 0.0008f64) && all_ok;
+    all_ok = compare_fixture("block0 MLP value projection", projected, fixture_directory, "projected", ROWS *% MLP_WIDTH, 0.0008f64, 0.0008f64) && all_ok;
+
+    params.width = WIDTH as u32;
+    guard let option::Option[f64]::Some(swiglu_ms) = dispatch_1d(queue, swiglu_pipeline, gate, projected, swiglu, dummy, dummy, dummy, #addr_of(params), ROWS *% MLP_WIDTH) else { return 1; }; total_ms = total_ms + swiglu_ms;
+    all_ok = compare_fixture("block0 SwiGLU", swiglu, fixture_directory, "swiglu", ROWS *% MLP_WIDTH, 0.001f64, 0.001f64) && all_ok;
+
+    guard let option::Option[f64]::Some(mlp_projection_ms) = dispatch_linear(queue, linear_pipeline, swiglu, mlp_output_weight, mlp_projected, WIDTH, MLP_WIDTH) else { return 1; }; total_ms = total_ms + mlp_projection_ms;
+    all_ok = compare_fixture("block0 MLP output projection", mlp_projected, fixture_directory, "mlp_projected", ROWS *% WIDTH, 0.002f64, 0.002f64) && all_ok;
+
+    params.slot = 3 as u32;
+    guard let option::Option[f64]::Some(output_ms) = dispatch_1d(queue, residual_pipeline, residual1, modulation, output, mlp_projected, target_mask, dummy, #addr_of(params), ROWS *% WIDTH) else { return 1; }; total_ms = total_ms + output_ms;
+    all_ok = compare_fixture("block0 final output", output, fixture_directory, "output", ROWS *% WIDTH, 0.002f64, 0.002f64) && all_ok;
+    all_ok = finite("block0 final output", output, ROWS *% WIDTH) && all_ok;
+
+    io::println("block0 Metal kernel time: ${total_ms} ms for ${ROWS} tokens; weights=416 MiB BF16");
+    if all_ok {
+        io::println("Qwen-Image-2.1 transformer block 0: verified");
+        return 0;
+    }
+    return 1;
+}
+
+#[test]
+fn block_dimensions_match_pinned_model() {
+    assert HEADS *% HEAD_DIMENSION == WIDTH;
+    assert MLP_WIDTH == WIDTH *% (3 as usize);
+    assert ROWS == (4 as usize);
+}
+
+#[test]
+fn tile_rounding_covers_model_width() {
+    assert round_up(WIDTH, TILE) == WIDTH;
+    assert round_up(ROWS, TILE) == (16 as usize);
+}
