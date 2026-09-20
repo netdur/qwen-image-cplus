@@ -1,0 +1,212 @@
+{
+  "acceptance": {
+    "final_limit": 0.015,
+    "metric": "target-output normalized RMS versus pinned BF16 Diffusers"
+  },
+  "capture_blocks": [
+    0,
+    1,
+    7,
+    15,
+    31
+  ],
+  "case": "short-256-early",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "environment": {
+    "accelerate": "1.10.1",
+    "device": "mps",
+    "diffusers": "0.41.0.dev0",
+    "torch": "2.9.0",
+    "transformers": "5.17.0"
+  },
+  "latent_seed": 1101,
+  "layout": {
+    "image_ids": "-1 for the text prefix, 0 for every target row",
+    "image_shapes": [
+      [
+        1,
+        16,
+        16
+      ]
+    ],
+    "key_valid": "all rows",
+    "target_rows": [
+      22,
+      278
+    ]
+  },
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "normalized_timestep": 1.0,
+  "operation": "Production-scale QwenImage21Transformer2DModel BF16 reference",
+  "pixels": [
+    256,
+    256
+  ],
+  "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+  "reference_dtype": "BF16 model and inputs; fixture tensors exported as F32",
+  "reference_seconds": 7.206025167135522,
+  "sampled_rows": [
+    0,
+    9,
+    18,
+    27,
+    36,
+    45,
+    54,
+    63,
+    71,
+    80,
+    89,
+    98,
+    107,
+    116,
+    125,
+    134,
+    143,
+    152,
+    161,
+    170,
+    179,
+    188,
+    197,
+    206,
+    214,
+    223,
+    232,
+    241,
+    250,
+    259,
+    268,
+    277
+  ],
+  "scheduler_timestep": 1000.0,
+  "schema_version": 1,
+  "shape": {
+    "channels": 64,
+    "head_dimension": 128,
+    "heads": 32,
+    "joint_rows": 278,
+    "target_rows": 256,
+    "text_rows": 22,
+    "width": 4096
+  },
+  "tensors": {
+    "block_00_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_00_sample.f32",
+      "sha256": "531cc3c38b96258295cfe094bfae038a07ddfde0c2f72c812df7f3ac0c6bedce",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_01_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_01_sample.f32",
+      "sha256": "5d663ec38de9afd27f173ec4ca2d0ad90d3d0aef944b2dff1294b6ac4dd151d6",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_07_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_07_sample.f32",
+      "sha256": "ed07afa19cdd7d9fd28cc05a6dbfebde3dd015b978b3082c9e4cb4bf66bd9bf9",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_15_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_15_sample.f32",
+      "sha256": "6b857254099bff46f5e7a8dba83d3f5cf2f5ebfbe70d382fb112768d53c90fd0",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_31_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_31_sample.f32",
+      "sha256": "67a93ee1dd955126a7b3632c49edcfa5100832fe6447925e30ed222dfd1d9636",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "image_input": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "image_input.f32",
+      "sha256": "57dc9e9202ee4fc766ef105027356071a5559bb623211cb4ca538d7b06657351",
+      "shape": [
+        1,
+        256,
+        64
+      ]
+    },
+    "output": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "output.f32",
+      "sha256": "87630901715095e4bb44e8dd7bfb18e624f867d10d38887f019bf5c34558db8e",
+      "shape": [
+        1,
+        256,
+        64
+      ]
+    },
+    "rope": {
+      "bytes": 142336,
+      "dtype": "F32",
+      "file": "rope.f32",
+      "sha256": "ba7f42bb24de6b5a1fae4abb8e99f40994bd762a3ba10784aa6a2bcb85a869c3",
+      "shape": [
+        278,
+        128
+      ]
+    },
+    "sample_rows": {
+      "bytes": 128,
+      "dtype": "I32",
+      "file": "sample_rows.i32",
+      "sha256": "3737f25f444dea642be090b372b8cdeaa70454fcf702aa2ad3f90364e2ab6f1f",
+      "shape": [
+        32
+      ]
+    },
+    "text_input": {
+      "bytes": 360448,
+      "dtype": "F32",
+      "file": "text_input.f32",
+      "sha256": "b0526e69a0f3b8c7d1d97d8f37ca17c4df10e7ae39fff9ef09b20ae2588b5c34",
+      "shape": [
+        1,
+        22,
+        4096
+      ]
+    },
+    "timestep": {
+      "bytes": 8,
+      "dtype": "F32",
+      "file": "timestep.f32",
+      "sha256": "434b26042aff3fb844a4c4c6be0d81a079b0ce84cfb8190679024404e5dc4822",
+      "shape": [
+        2
+      ]
+    }
+  },
+  "timestep_index": 0
+}

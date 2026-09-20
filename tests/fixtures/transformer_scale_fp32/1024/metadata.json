@@ -1,0 +1,212 @@
+{
+  "acceptance": {
+    "final_limit": 0.015,
+    "metric": "target-output normalized RMS versus pinned BF16 Diffusers"
+  },
+  "capture_blocks": [
+    0,
+    1,
+    7,
+    15,
+    31
+  ],
+  "case": "text-1024-middle",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "environment": {
+    "accelerate": "1.10.1",
+    "device": "mps",
+    "diffusers": "0.41.0.dev0",
+    "torch": "2.9.0",
+    "transformers": "5.17.0"
+  },
+  "latent_seed": 1301,
+  "layout": {
+    "image_ids": "-1 for the text prefix, 0 for every target row",
+    "image_shapes": [
+      [
+        1,
+        64,
+        64
+      ]
+    ],
+    "key_valid": "all rows",
+    "target_rows": [
+      31,
+      4127
+    ]
+  },
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "normalized_timestep": 0.65625,
+  "operation": "Production-scale QwenImage21Transformer2DModel BF16 reference",
+  "pixels": [
+    1024,
+    1024
+  ],
+  "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+  "reference_dtype": "BF16 model and inputs; fixture tensors exported as F32",
+  "reference_seconds": 16.82294583390467,
+  "sampled_rows": [
+    0,
+    133,
+    266,
+    399,
+    532,
+    665,
+    799,
+    932,
+    1065,
+    1198,
+    1331,
+    1464,
+    1597,
+    1730,
+    1863,
+    1996,
+    2130,
+    2263,
+    2396,
+    2529,
+    2662,
+    2795,
+    2928,
+    3061,
+    3194,
+    3327,
+    3461,
+    3594,
+    3727,
+    3860,
+    3993,
+    4126
+  ],
+  "scheduler_timestep": 656.666259765625,
+  "schema_version": 1,
+  "shape": {
+    "channels": 64,
+    "head_dimension": 128,
+    "heads": 32,
+    "joint_rows": 4127,
+    "target_rows": 4096,
+    "text_rows": 31,
+    "width": 4096
+  },
+  "tensors": {
+    "block_00_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_00_sample.f32",
+      "sha256": "c7aaeabbef9d3c205ec7d5b9d9494e8ddf70cd50759ff7198cf87ec48a2a10d1",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_01_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_01_sample.f32",
+      "sha256": "1d39cc1d031246402949f3f955f453f2d783085a80ecebfc8e57d734dcda989b",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_07_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_07_sample.f32",
+      "sha256": "742f5b460d019273b1d9720d9cee244a55418a5d9d9cd6db28140c7e046aa740",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_15_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_15_sample.f32",
+      "sha256": "cdf26d32b37d81784fd4f8a65cba273e66ccb3f4be5925287b89956a13a037c3",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_31_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_31_sample.f32",
+      "sha256": "fc26274766ff759f0025225aefb3c5f1ccf179798c3322c41ec118c39777fc68",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "image_input": {
+      "bytes": 1048576,
+      "dtype": "F32",
+      "file": "image_input.f32",
+      "sha256": "cf11c9da2554931b7b4a0b57313dff808f9be29c06613e0eb94b4dccc3c3c21b",
+      "shape": [
+        1,
+        4096,
+        64
+      ]
+    },
+    "output": {
+      "bytes": 1048576,
+      "dtype": "F32",
+      "file": "output.f32",
+      "sha256": "c578c4e9da1a38768fb5c267cb4061b99e4550d6c09a18d9aa73217504e89db0",
+      "shape": [
+        1,
+        4096,
+        64
+      ]
+    },
+    "rope": {
+      "bytes": 2113024,
+      "dtype": "F32",
+      "file": "rope.f32",
+      "sha256": "a09b809e7a6aaf7faad55d9a549ea99b08963ad184863233ce8c252161db6bcf",
+      "shape": [
+        4127,
+        128
+      ]
+    },
+    "sample_rows": {
+      "bytes": 128,
+      "dtype": "I32",
+      "file": "sample_rows.i32",
+      "sha256": "45fa82b50c3cc50377e4954ae6df22173ab7a8fe6c5d30d145517b029a9bf71e",
+      "shape": [
+        32
+      ]
+    },
+    "text_input": {
+      "bytes": 507904,
+      "dtype": "F32",
+      "file": "text_input.f32",
+      "sha256": "cc8d3d32ea33935b8d153f5f5c2e408bcb79d1f5d1c4faad66a0a1a055e4dbcd",
+      "shape": [
+        1,
+        31,
+        4096
+      ]
+    },
+    "timestep": {
+      "bytes": 8,
+      "dtype": "F32",
+      "file": "timestep.f32",
+      "sha256": "a264626e55cb393f100e40a58965a1bc7d49e76f5764b4cdf4a098f442d5583d",
+      "shape": [
+        2
+      ]
+    }
+  },
+  "timestep_index": 20
+}

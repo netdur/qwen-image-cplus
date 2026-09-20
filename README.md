@@ -43,6 +43,9 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-block-int8 block0.qipack
 ./target/debug/qwen-image-cplus test-transformer-mixed transformer.qipack
 ./target/debug/qwen-image-cplus test-transformer-complete transformer.qipack
+./target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 256
+./target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 512
+./target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 1024
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -181,6 +184,28 @@ Inspect a shard, optionally filtering tensor names:
   the 2 GiB FP32 score tensor that `[32,4096,4096]` would require. This is an
   attention memory/feasibility gate, not a production throughput claim; each
   dispatch still uses its own command buffer and CPU wait.
+- Production-size full noise-prediction gates now run the image/text/timestep
+  projections, all 32 mixed-precision blocks, final adaptive norm, and output
+  projection at 256, 512, and 1024 pixels. Their pinned fixtures use real
+  prompt-encoder embeddings, exact 40-step scheduler timesteps, and seeded
+  latent noise from the earlier calibration cases. They store all inputs and
+  final target noise but only 32 rows at blocks 0, 1, 7, 15, and 31, keeping
+  three model-scale oracles to 15 MiB rather than committing full block states.
+- All three scales complete with finite output. Target-output nRMSE versus the
+  pinned official BF16 execution is 0.9114% at 256, 1.2452% at 512, and 0.8794%
+  at 1024, under the declared 1.5% production-runtime gate. This gate is kept
+  distinct from the 1% quantization-search gate: the native runtime retains
+  FP32 activations while the official oracle rounds model activations to BF16,
+  and sampled divergence is already 2.2933% at unquantized block 15 in the
+  512-pixel case. The tolerance therefore covers the complete arithmetic path,
+  not only the 40 Q8 matrices.
+- The 1024-pixel case executes 4,096 target tokens plus a 31-token prefix in
+  144,597 ms of summed GPU kernel time. Explicit non-weight buffers total
+  1,665,752,320 bytes (1.551 GiB), including the extracted 32-layer prefix
+  cache; the read-only 12.42 GiB QIPACK1 mapping remains separate. It completes
+  on the 32 GB M1 Max without a quadratic attention allocation. Full results
+  and limitations are recorded in
+  `benchmarks/m1-max-transformer-scale-native.json`.
 
 ## Quantization decision log
 
@@ -233,10 +258,9 @@ claim. The packed mapping is exposed to Metal without copying 12.42 GiB of
 weights; only activations, cache arenas, and 128-element Q/K norm vectors are
 copied.
 
-Image generation is not implemented yet. The next phase is a scalable
-production-size transformer/noise-prediction gate at 256, 512, and then 1024
-pixels, using the now-validated attention and cache path. That separates model-
-scale memory/runtime failures from scheduler-state failures before the runtime
-adds a replayed 40-step denoising trajectory and Euler updates. The native
-prompt encoder and causal 3D VAE remain later independent boundaries tracked
-in `plan.md`.
+Image generation is not implemented yet. The next phase is the exact latent-
+only denoising trajectory: integrate the already-tested FlowMatch Euler
+schedule with the production transformer, import deterministic initial-noise
+fixtures, and verify 1-, 2-, then 40-step latent evolution. The native prompt
+encoder and causal 3D VAE remain later independent boundaries tracked in
+`plan.md`.

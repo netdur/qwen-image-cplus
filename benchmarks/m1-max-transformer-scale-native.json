@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "artifact": {
+    "path_used_for_measurement": "/private/tmp/qwen-image-2.1-mixed.qipack",
+    "logical_bytes": 13334843392,
+    "mapped_bytes": 13334855680,
+    "q8_matrices": 40
+  },
+  "method": {
+    "reference": "Pinned official Diffusers transformer with BF16 weights and activations on MPS",
+    "native": "FP32 activations, BF16 dense weights, affine-Q8/group-64 selected tail matrices",
+    "prompts": "real prompt-encoder outputs from the established quantization calibration cases",
+    "latents": "deterministic seeded Gaussian inputs rounded to BF16 before fixture export",
+    "block_checkpoints": [0, 1, 7, 15, 31],
+    "sampled_rows_per_checkpoint": 32,
+    "final_nrmse_limit": 0.015,
+    "declared_non_weight_buffer_limit_bytes": 2415919104
+  },
+  "cases": [
+    {
+      "name": "short-256-early",
+      "pixels": 256,
+      "text_rows": 22,
+      "target_rows": 256,
+      "joint_rows": 278,
+      "scheduler_timestep": 1000.0,
+      "normalized_timestep_after_bf16_rounding": 1.0,
+      "latent_seed": 1101,
+      "reference_seconds": 7.206025167135522,
+      "declared_non_weight_working_bytes": 138297856,
+      "prefix_cache_bytes": 23068672,
+      "summed_gpu_kernel_ms": 4049.76,
+      "sampled_block_nrmse": {
+        "0": 0.00377934,
+        "1": 0.00495511,
+        "7": 0.0102689,
+        "15": 0.0170077,
+        "31": 0.0186131
+      },
+      "target_output_nrmse": 0.0091138,
+      "finite": true,
+      "passed": true
+    },
+    {
+      "name": "spatial-512-early",
+      "pixels": 512,
+      "text_rows": 58,
+      "target_rows": 1024,
+      "joint_rows": 1082,
+      "scheduler_timestep": 1000.0,
+      "normalized_timestep_after_bf16_rounding": 1.0,
+      "latent_seed": 1201,
+      "reference_seconds": 5.671213374938816,
+      "declared_non_weight_working_bytes": 495365632,
+      "prefix_cache_bytes": 60817408,
+      "summed_gpu_kernel_ms": 19610.0,
+      "sampled_block_nrmse": {
+        "0": 0.00431522,
+        "1": 0.00419141,
+        "7": 0.00915744,
+        "15": 0.0229327,
+        "31": 0.0153938
+      },
+      "target_output_nrmse": 0.0124516,
+      "finite": true,
+      "passed": true
+    },
+    {
+      "name": "text-1024-middle",
+      "pixels": 1024,
+      "text_rows": 31,
+      "target_rows": 4096,
+      "joint_rows": 4127,
+      "scheduler_timestep": 656.666259765625,
+      "normalized_timestep_after_bf16_rounding": 0.65625,
+      "latent_seed": 1301,
+      "reference_seconds": 16.82294583390467,
+      "declared_non_weight_working_bytes": 1665752320,
+      "prefix_cache_bytes": 32505856,
+      "summed_gpu_kernel_ms": 144597.0,
+      "sampled_block_nrmse": {
+        "0": 0.00284552,
+        "1": 0.00349886,
+        "7": 0.00962306,
+        "15": 0.0200289,
+        "31": 0.0102145
+      },
+      "target_output_nrmse": 0.00879384,
+      "finite": true,
+      "passed": true
+    }
+  ],
+  "acceptance": {
+    "metric": "worst production-scale target-output normalized RMS versus pinned BF16 Diffusers",
+    "limit": 0.015,
+    "measured": 0.0124516,
+    "passed": true,
+    "all_scales_finite": true,
+    "1024_completed_within_declared_buffer_ceiling": true
+  },
+  "interpretation": "The production gate deliberately measures the complete native arithmetic path, not quantization in isolation. Native FP32 activations diverge from the official BF16 execution before the mixed-Q8 tail: the largest sampled pre-tail value is 2.29327% at block 15 in the 512-pixel case. The separate policy search retains its 1% quantization-only gate.",
+  "limitations": [
+    "Summed GPU time is not wall time; every kernel uses a separate command buffer and synchronous wait.",
+    "Declared working bytes cover explicit Metal buffers and exclude the mapped packed weights, Metal driver bookkeeping, and pipeline objects.",
+    "These are independent single-step noise predictions, not a scheduler-integrated denoising trajectory.",
+    "Prompt embeddings are precomputed; the native prompt encoder is a later boundary."
+  ]
+}

@@ -1,0 +1,212 @@
+{
+  "acceptance": {
+    "final_limit": 0.015,
+    "metric": "target-output normalized RMS versus pinned BF16 Diffusers"
+  },
+  "capture_blocks": [
+    0,
+    1,
+    7,
+    15,
+    31
+  ],
+  "case": "spatial-512-early",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "environment": {
+    "accelerate": "1.10.1",
+    "device": "mps",
+    "diffusers": "0.41.0.dev0",
+    "torch": "2.9.0",
+    "transformers": "5.17.0"
+  },
+  "latent_seed": 1201,
+  "layout": {
+    "image_ids": "-1 for the text prefix, 0 for every target row",
+    "image_shapes": [
+      [
+        1,
+        32,
+        32
+      ]
+    ],
+    "key_valid": "all rows",
+    "target_rows": [
+      58,
+      1082
+    ]
+  },
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "normalized_timestep": 1.0,
+  "operation": "Production-scale QwenImage21Transformer2DModel BF16 reference",
+  "pixels": [
+    512,
+    512
+  ],
+  "prompt": "An isometric cutaway of a crowded orbital greenhouse: citrus trees on the upper deck, a blue maintenance robot beside the central stairs, three gardeners at the lower-left workbench, warm sunlight entering from windows on the right, precise architectural detail.",
+  "reference_dtype": "BF16 model and inputs; fixture tensors exported as F32",
+  "reference_seconds": 5.671213374938816,
+  "sampled_rows": [
+    0,
+    35,
+    70,
+    105,
+    139,
+    174,
+    209,
+    244,
+    279,
+    314,
+    349,
+    384,
+    418,
+    453,
+    488,
+    523,
+    558,
+    593,
+    628,
+    663,
+    697,
+    732,
+    767,
+    802,
+    837,
+    872,
+    907,
+    942,
+    976,
+    1011,
+    1046,
+    1081
+  ],
+  "scheduler_timestep": 1000.0,
+  "schema_version": 1,
+  "shape": {
+    "channels": 64,
+    "head_dimension": 128,
+    "heads": 32,
+    "joint_rows": 1082,
+    "target_rows": 1024,
+    "text_rows": 58,
+    "width": 4096
+  },
+  "tensors": {
+    "block_00_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_00_sample.f32",
+      "sha256": "44ce40e344001ae0ed6280dba67d8254ff01ba0be402c811ba3f5cd1c8e6f81e",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_01_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_01_sample.f32",
+      "sha256": "34a43bb552534cf6d9956180d9812ea536a7acb8ef880ef9f02a5fa08c0cdb96",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_07_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_07_sample.f32",
+      "sha256": "b052fa67ac5fec8b92d3613f0c77c53429677c567f03447ac9264f3a6e8f748f",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_15_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_15_sample.f32",
+      "sha256": "3556358b0761e8443a30318e25e7f21ce99668d774c30296417930a6097539ed",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "block_31_sample": {
+      "bytes": 524288,
+      "dtype": "F32",
+      "file": "block_31_sample.f32",
+      "sha256": "e7a380a69d931d44f56d6de616fe377002ad07a8fa28a95069ae689bf3021eec",
+      "shape": [
+        1,
+        32,
+        4096
+      ]
+    },
+    "image_input": {
+      "bytes": 262144,
+      "dtype": "F32",
+      "file": "image_input.f32",
+      "sha256": "c53bc815fbf9fc9c6e04a9a95f87cd55439c69e5bb07b4c69ba99444e00fec2e",
+      "shape": [
+        1,
+        1024,
+        64
+      ]
+    },
+    "output": {
+      "bytes": 262144,
+      "dtype": "F32",
+      "file": "output.f32",
+      "sha256": "8beab8e2eaf090f98cf11aadca36cb0aeb006c5bdfed9eb35ad9f69d517db175",
+      "shape": [
+        1,
+        1024,
+        64
+      ]
+    },
+    "rope": {
+      "bytes": 553984,
+      "dtype": "F32",
+      "file": "rope.f32",
+      "sha256": "de39d5f2281943d99f9a8dd1dd8c8814db325adc4ff8d43a4ae3825aa161223d",
+      "shape": [
+        1082,
+        128
+      ]
+    },
+    "sample_rows": {
+      "bytes": 128,
+      "dtype": "I32",
+      "file": "sample_rows.i32",
+      "sha256": "0f51e471d31e6a99836c9ddadcea7d97d8e7ef84a28d1a81f1e12dbaa46ee4ef",
+      "shape": [
+        32
+      ]
+    },
+    "text_input": {
+      "bytes": 950272,
+      "dtype": "F32",
+      "file": "text_input.f32",
+      "sha256": "f1356f86b58851a5089641fc9081b24d66b66390fb28d744f018718b600e2827",
+      "shape": [
+        1,
+        58,
+        4096
+      ]
+    },
+    "timestep": {
+      "bytes": 8,
+      "dtype": "F32",
+      "file": "timestep.f32",
+      "sha256": "434b26042aff3fb844a4c4c6be0d81a079b0ce84cfb8190679024404e5dc4822",
+      "shape": [
+        2
+      ]
+    }
+  },
+  "timestep_index": 0
+}
