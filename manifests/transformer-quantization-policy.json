@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "status": "uniform_policy_rejected",
+  "scope": "seven matrix roles in all 32 transformer blocks",
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "candidate": {
+    "scheme": "affine_int8",
+    "group_axis": 1,
+    "group_size": 64,
+    "scale_dtype": "F16",
+    "zero_point_dtype": "U8"
+  },
+  "calibration": {
+    "report": "benchmarks/m1-max-transformer-quantization.json",
+    "prompts": 3,
+    "cases": 6,
+    "resolutions": [256, 512, 1024],
+    "timestep_indices": [0, 20, 39],
+    "representative_blocks": [0, 7, 15, 23, 31],
+    "matrix_count": 224
+  },
+  "selection_criterion": "worst per-case final-noise normalized RMS <= 0.01",
+  "measured": {
+    "best_final_normalized_rms_error": 0.007990671748383716,
+    "worst_final_normalized_rms_error": 0.019210390249306708,
+    "passing_cases": 2,
+    "total_cases": 6,
+    "packed_block_matrix_bytes": 7306477568,
+    "compression_vs_bf16": 1.9104477611940298
+  },
+  "limitations": [
+    "Latent inputs are deterministic Gaussian samples, not states replayed from a complete denoising trajectory.",
+    "The packed values and FP16 linear inputs match the native path, but PyTorch MPS matmul is not a bit-exact emulation of the Metal kernel's product rounding."
+  ],
+  "decision": "Do not quantize all 32 blocks uniformly with affine INT8/group-64.",
+  "next": "Measure mixed precision by block range and matrix role, concentrating on the middle blocks where sampled activation error peaks."
+}

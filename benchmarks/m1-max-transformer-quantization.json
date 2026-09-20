@@ -1,0 +1,411 @@
+{
+  "schema_version": 1,
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "environment": {
+    "torch": "2.9.0",
+    "diffusers": "0.41.0.dev0",
+    "transformers": "5.17.0",
+    "device": "mps"
+  },
+  "method": {
+    "prompt_encoding": "official raw T2I template; last decoder layer before final RMSNorm",
+    "latents": "deterministic Gaussian BF16 inputs",
+    "scheduler_steps": 40,
+    "sampled_blocks": [
+      0,
+      7,
+      15,
+      23,
+      31
+    ],
+    "sampled_rows_per_block": 32,
+    "quantization": {
+      "scheme": "affine_int8",
+      "group_axis": 1,
+      "group_size": 64,
+      "scale_dtype": "F16",
+      "zero_point_dtype": "U8",
+      "linear_input_dtype": "F16",
+      "linear_weight_dtype": "F16 dequantized from packed representation",
+      "linear_arithmetic": "PyTorch MPS FP16 matmul; not bit-exact Metal product rounding",
+      "scope": "seven matrix roles in all 32 transformer blocks"
+    }
+  },
+  "prompts": [
+    "A red fox asleep beside a mossy stone in soft morning light.",
+    "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+    "An isometric cutaway of a crowded orbital greenhouse: citrus trees on the upper deck, a blue maintenance robot beside the central stairs, three gardeners at the lower-left workbench, warm sunlight entering from windows on the right, precise architectural detail."
+  ],
+  "quantization_storage": {
+    "matrix_count": 224,
+    "source_bf16_bytes": 13958643712,
+    "packed_bytes": 7306477568,
+    "compression_vs_bf16": 1.9104477611940298,
+    "elapsed_seconds": 5.951413040980697
+  },
+  "cases": [
+    {
+      "name": "short-256-early",
+      "prompt_index": 0,
+      "pixels": [
+        256,
+        256
+      ],
+      "image_tokens": 256,
+      "timestep_index": 0,
+      "scheduler_timestep": 1000.0,
+      "latent_seed": 1101,
+      "prompt_tokens": 22,
+      "reference_seconds": 4.10844016703777,
+      "quantized_seconds": 0.6954639169853181,
+      "sampled_blocks": {
+        "0": {
+          "max_abs": 2.0,
+          "mean_abs": 0.0021533112740144134,
+          "rms": 0.014494626365793122,
+          "reference_rms": 14.312804315140623,
+          "normalized_rms": 0.0010127034539597639
+        },
+        "7": {
+          "max_abs": 6.0,
+          "mean_abs": 0.0320138473471161,
+          "rms": 0.07921071151817276,
+          "reference_rms": 19.784460421055535,
+          "normalized_rms": 0.0040036831853080546
+        },
+        "15": {
+          "max_abs": 8.0,
+          "mean_abs": 0.07078943372471258,
+          "rms": 0.13927412337562686,
+          "reference_rms": 20.979428460806233,
+          "normalized_rms": 0.006638604270646303
+        },
+        "23": {
+          "max_abs": 7.5,
+          "mean_abs": 0.06378960818983614,
+          "rms": 0.13390139129860645,
+          "reference_rms": 21.587681067676176,
+          "normalized_rms": 0.006202676002060298
+        },
+        "31": {
+          "max_abs": 9.5,
+          "mean_abs": 0.16560371377272531,
+          "rms": 0.2672915695777535,
+          "reference_rms": 29.698854983537295,
+          "normalized_rms": 0.0090000631245184
+        }
+      },
+      "final_noise_prediction": {
+        "max_abs": 0.16015625,
+        "mean_abs": 0.0094621142197866,
+        "rms": 0.013154467043769942,
+        "reference_rms": 1.3782629068023213,
+        "normalized_rms": 0.009544236428947611
+      }
+    },
+    {
+      "name": "text-256-late",
+      "prompt_index": 1,
+      "pixels": [
+        256,
+        256
+      ],
+      "image_tokens": 256,
+      "timestep_index": 39,
+      "scheduler_timestep": 19.999980926513672,
+      "latent_seed": 1102,
+      "prompt_tokens": 31,
+      "reference_seconds": 1.0237162499688566,
+      "quantized_seconds": 0.5921580831054598,
+      "sampled_blocks": {
+        "0": {
+          "max_abs": 2.0,
+          "mean_abs": 0.002762851057923399,
+          "rms": 0.01609910345895631,
+          "reference_rms": 8.614944195037564,
+          "normalized_rms": 0.0018687414676730953
+        },
+        "7": {
+          "max_abs": 8.0,
+          "mean_abs": 0.05157565150875598,
+          "rms": 0.10892103737693784,
+          "reference_rms": 10.411985510203232,
+          "normalized_rms": 0.010461120721902714
+        },
+        "15": {
+          "max_abs": 8.5,
+          "mean_abs": 0.06654033751692623,
+          "rms": 0.13417826578631525,
+          "reference_rms": 7.939554927693828,
+          "normalized_rms": 0.016899973236319622
+        },
+        "23": {
+          "max_abs": 11.0,
+          "mean_abs": 0.11156041163485497,
+          "rms": 0.19959574229385596,
+          "reference_rms": 10.168546570076844,
+          "normalized_rms": 0.01962873857324013
+        },
+        "31": {
+          "max_abs": 14.25,
+          "mean_abs": 0.3087988818951999,
+          "rms": 0.45086677495149463,
+          "reference_rms": 28.471763770436866,
+          "normalized_rms": 0.01583557585637332
+        }
+      },
+      "final_noise_prediction": {
+        "max_abs": 0.1875,
+        "mean_abs": 0.022755481477361172,
+        "rms": 0.029329640529564313,
+        "reference_rms": 1.8872573691314065,
+        "normalized_rms": 0.015540880120162423
+      }
+    },
+    {
+      "name": "spatial-512-early",
+      "prompt_index": 2,
+      "pixels": [
+        512,
+        512
+      ],
+      "image_tokens": 1024,
+      "timestep_index": 0,
+      "scheduler_timestep": 1000.0,
+      "latent_seed": 1201,
+      "prompt_tokens": 58,
+      "reference_seconds": 4.059729999862611,
+      "quantized_seconds": 2.2964965410064906,
+      "sampled_blocks": {
+        "0": {
+          "max_abs": 2.0,
+          "mean_abs": 0.001931726437760517,
+          "rms": 0.014242552957212036,
+          "reference_rms": 6.896288148629215,
+          "normalized_rms": 0.002065249109413018
+        },
+        "7": {
+          "max_abs": 4.0,
+          "mean_abs": 0.02430385885236319,
+          "rms": 0.056973829599860124,
+          "reference_rms": 6.920350425456353,
+          "normalized_rms": 0.0082327954651376
+        },
+        "15": {
+          "max_abs": 10.0,
+          "mean_abs": 0.08195115240232553,
+          "rms": 0.14449301763860017,
+          "reference_rms": 5.537933740775156,
+          "normalized_rms": 0.026091503510544928
+        },
+        "23": {
+          "max_abs": 8.0,
+          "mean_abs": 0.07773807179182768,
+          "rms": 0.15011358463802726,
+          "reference_rms": 5.917687007494304,
+          "normalized_rms": 0.025366935501644435
+        },
+        "31": {
+          "max_abs": 9.75,
+          "mean_abs": 0.29555322852684185,
+          "rms": 0.4283539414554493,
+          "reference_rms": 22.090867958683003,
+          "normalized_rms": 0.019390543742174745
+        }
+      },
+      "final_noise_prediction": {
+        "max_abs": 0.390625,
+        "mean_abs": 0.029889603407355025,
+        "rms": 0.03944396321293718,
+        "reference_rms": 2.0532619432007992,
+        "normalized_rms": 0.019210390249306708
+      }
+    },
+    {
+      "name": "short-512-middle",
+      "prompt_index": 0,
+      "pixels": [
+        512,
+        512
+      ],
+      "image_tokens": 1024,
+      "timestep_index": 20,
+      "scheduler_timestep": 623.0131225585938,
+      "latent_seed": 1202,
+      "prompt_tokens": 22,
+      "reference_seconds": 3.5896024161484092,
+      "quantized_seconds": 2.1958824591711164,
+      "sampled_blocks": {
+        "0": {
+          "max_abs": 1.0,
+          "mean_abs": 0.0014344727387651801,
+          "rms": 0.010702529897730472,
+          "reference_rms": 7.260833516409894,
+          "normalized_rms": 0.001474008441805221
+        },
+        "7": {
+          "max_abs": 3.0,
+          "mean_abs": 0.02463899452413898,
+          "rms": 0.055561873785455546,
+          "reference_rms": 5.923007176781624,
+          "normalized_rms": 0.009380686554502221
+        },
+        "15": {
+          "max_abs": 9.0,
+          "mean_abs": 0.09221812772739213,
+          "rms": 0.1862308544222854,
+          "reference_rms": 4.655715727081577,
+          "normalized_rms": 0.0400004779800041
+        },
+        "23": {
+          "max_abs": 7.0,
+          "mean_abs": 0.08150661934632808,
+          "rms": 0.17746907374743182,
+          "reference_rms": 6.502759831639543,
+          "normalized_rms": 0.027291346803851816
+        },
+        "31": {
+          "max_abs": 8.0,
+          "mean_abs": 0.28188265347853303,
+          "rms": 0.4086908646246963,
+          "reference_rms": 21.000522216111303,
+          "normalized_rms": 0.019460985799255717
+        }
+      },
+      "final_noise_prediction": {
+        "max_abs": 0.203125,
+        "mean_abs": 0.012837665715778712,
+        "rms": 0.017088905414931133,
+        "reference_rms": 1.4035666120249986,
+        "normalized_rms": 0.01217534334923804
+      }
+    },
+    {
+      "name": "text-1024-middle",
+      "prompt_index": 1,
+      "pixels": [
+        1024,
+        1024
+      ],
+      "image_tokens": 4096,
+      "timestep_index": 20,
+      "scheduler_timestep": 656.666259765625,
+      "latent_seed": 1301,
+      "prompt_tokens": 31,
+      "reference_seconds": 15.897090290905908,
+      "quantized_seconds": 10.648368958150968,
+      "sampled_blocks": {
+        "0": {
+          "max_abs": 1.0,
+          "mean_abs": 0.0015690865111537278,
+          "rms": 0.012363761736692907,
+          "reference_rms": 7.027307932316725,
+          "normalized_rms": 0.0017593880694818063
+        },
+        "7": {
+          "max_abs": 3.0,
+          "mean_abs": 0.01921154987940099,
+          "rms": 0.044755554752090226,
+          "reference_rms": 5.731659916537663,
+          "normalized_rms": 0.007808480510673043
+        },
+        "15": {
+          "max_abs": 8.0,
+          "mean_abs": 0.05640298282378353,
+          "rms": 0.10412665633340422,
+          "reference_rms": 4.5618312462427335,
+          "normalized_rms": 0.0228256265330214
+        },
+        "23": {
+          "max_abs": 6.0,
+          "mean_abs": 0.053041339095216244,
+          "rms": 0.10494304472582348,
+          "reference_rms": 6.454481565358111,
+          "normalized_rms": 0.016258942513534158
+        },
+        "31": {
+          "max_abs": 8.0,
+          "mean_abs": 0.1463244166225195,
+          "rms": 0.21790062179223701,
+          "reference_rms": 20.940867446477753,
+          "normalized_rms": 0.010405520322840678
+        }
+      },
+      "final_noise_prediction": {
+        "max_abs": 0.2421875,
+        "mean_abs": 0.007977466307828252,
+        "rms": 0.010884632764599306,
+        "reference_rms": 1.3621674256361433,
+        "normalized_rms": 0.007990671748383716
+      }
+    },
+    {
+      "name": "spatial-1024-late",
+      "prompt_index": 2,
+      "pixels": [
+        1024,
+        1024
+      ],
+      "image_tokens": 4096,
+      "timestep_index": 39,
+      "scheduler_timestep": 19.999980926513672,
+      "latent_seed": 1302,
+      "prompt_tokens": 58,
+      "reference_seconds": 17.37633104203269,
+      "quantized_seconds": 19.406658084131777,
+      "sampled_blocks": {
+        "0": {
+          "max_abs": 2.0,
+          "mean_abs": 0.0023475526031688787,
+          "rms": 0.019221571427732582,
+          "reference_rms": 8.395246847197422,
+          "normalized_rms": 0.002289577873954868
+        },
+        "7": {
+          "max_abs": 8.0,
+          "mean_abs": 0.04849180649034679,
+          "rms": 0.11054784996716856,
+          "reference_rms": 9.986428119243872,
+          "normalized_rms": 0.011069808809232059
+        },
+        "15": {
+          "max_abs": 9.0,
+          "mean_abs": 0.060194574762135744,
+          "rms": 0.13549288081284114,
+          "reference_rms": 7.66679530897142,
+          "normalized_rms": 0.017672687916200403
+        },
+        "23": {
+          "max_abs": 10.0,
+          "mean_abs": 0.11497153522213921,
+          "rms": 0.20283494066860278,
+          "reference_rms": 10.278119392857771,
+          "normalized_rms": 0.01973463558027474
+        },
+        "31": {
+          "max_abs": 11.25,
+          "mean_abs": 0.3019485453842208,
+          "rms": 0.43671336875377426,
+          "reference_rms": 31.206039900944,
+          "normalized_rms": 0.01399451420750646
+        }
+      },
+      "final_noise_prediction": {
+        "max_abs": 0.1875,
+        "mean_abs": 0.022146741387018665,
+        "rms": 0.028529523894424282,
+        "reference_rms": 1.8486534902495033,
+        "normalized_rms": 0.015432596776464472
+      }
+    }
+  ],
+  "acceptance": {
+    "metric": "worst per-case final-noise normalized RMS",
+    "limit": 0.01,
+    "measured": 0.019210390249306708,
+    "passed": false
+  },
+  "elapsed_seconds": 97.41022370895371
+}

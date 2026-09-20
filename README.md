@@ -88,8 +88,15 @@ Inspect a shard, optionally filtering tensor names:
   through the INT8 kernel and finish at 0.837% normalized RMS error. Repeated
   M1 Max measurements and every intermediate error boundary are recorded in
   `benchmarks/m1-max-block0-int8.json`.
+- Full-transformer calibration of the same Q8 policy on three real prompts,
+  exact early/middle/late 40-step scheduler timesteps, 256/512/1024-pixel
+  token layouts, all 224 block matrices, and sampled outputs from blocks 0,
+  7, 15, 23, and 31. Uniform Q8 is rejected: four of six final-noise cases
+  exceed the 1% gate and the worst reaches 1.921%. Results are recorded in
+  `benchmarks/m1-max-transformer-quantization.json`; the decision is in
+  `manifests/transformer-quantization-policy.json`.
 
-Image generation is not implemented yet. The block-0 quantization policy must
-still be calibrated across real prompts/timesteps before it is generalized to
-the full 32-block runtime. The native prompt encoder and causal 3D VAE are also
-tracked in `plan.md`.
+Image generation is not implemented yet. The next quantization step is a
+mixed-precision search by block range and matrix role, with special attention
+to the middle blocks where error peaks. The native prompt encoder and causal
+3D VAE are also tracked in `plan.md`.
