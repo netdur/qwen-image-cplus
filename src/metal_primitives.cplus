@@ -1,0 +1,718 @@
+import "./cpu_ops" as cpu;
+import "metal/metal" as metal;
+import "objc/bridge" as bridge;
+import "objc/runtime" as rt;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+
+extern fn MTLCreateSystemDefaultDevice() -> *u8;
+
+const BUFFER_BYTES: u64 = 4096;
+
+struct OwnedObjc {
+    opaque pointer: *u8,
+}
+
+impl OwnedObjc {
+    fn new(pointer: *u8) -> OwnedObjc {
+        return OwnedObjc { pointer: pointer };
+    }
+
+    fn raw(this) -> *u8 {
+        return this.pointer;
+    }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            rt::release(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+#[repr(C)]
+struct DecodeParams {
+    count: u32,
+    mode: u32,
+}
+
+#[repr(C)]
+struct ElementwiseParams {
+    count: u32,
+    mode: u32,
+}
+
+#[repr(C)]
+struct NormParams {
+    rows: u32,
+    width: u32,
+    epsilon: f32,
+    mode: u32,
+}
+
+#[repr(C)]
+struct TimestepParams {
+    batch: u32,
+    dimension: u32,
+    max_period: f32,
+    time_factor: f32,
+}
+
+#[repr(C)]
+struct RopeParams {
+    complex_count: u32,
+}
+
+#[repr(C)]
+struct MaskParams {
+    sequence_length: u32,
+}
+
+struct Metrics {
+    max_absolute: f64,
+    mean_absolute: f64,
+    rms: f64,
+    max_relative: f64,
+    non_finite: usize,
+    first_failure: usize,
+    passed: bool,
+}
+
+fn compare_f32(
+    actual: *f32,
+    expected: *f32,
+    count: usize,
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+) -> Metrics {
+    var maximum_absolute: f64 = 0.0f64;
+    var maximum_relative: f64 = 0.0f64;
+    var absolute_sum: f64 = 0.0f64;
+    var squared_sum: f64 = 0.0f64;
+    var first_failure: usize = count;
+    var non_finite: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < count {
+        let actual_value: f64 = actual[index] as f64;
+        let expected_value: f64 = expected[index] as f64;
+        let actual_bits: u32 = cpu::f32_bits(actual[index]);
+        let expected_bits: u32 = cpu::f32_bits(expected[index]);
+        let finite: bool = (actual_bits & (0x7F800000 as u32)) != (0x7F800000 as u32)
+            && (expected_bits & (0x7F800000 as u32)) != (0x7F800000 as u32);
+        if !finite {
+            non_finite = non_finite +% (1 as usize);
+            if first_failure == count {
+                first_failure = index;
+            }
+            index = index +% (1 as usize);
+            continue;
+        }
+        let difference: f64 = (actual_value - expected_value).abs();
+        let denominator: f64 = expected_value.abs().max(0.000001f64);
+        let relative: f64 = difference / denominator;
+        maximum_absolute = maximum_absolute.max(difference);
+        maximum_relative = maximum_relative.max(relative);
+        absolute_sum = absolute_sum + difference;
+        squared_sum = squared_sum + difference * difference;
+        let allowed: f64 = absolute_tolerance + relative_tolerance * expected_value.abs();
+        if first_failure == count && difference > allowed {
+            first_failure = index;
+        }
+        index = index +% (1 as usize);
+    }
+    return Metrics {
+        max_absolute: maximum_absolute,
+        mean_absolute: absolute_sum / count as f64,
+        rms: (squared_sum / count as f64).sqrt(),
+        max_relative: maximum_relative,
+        non_finite: non_finite,
+        first_failure: first_failure,
+        passed: first_failure == count,
+    };
+}
+
+fn report(label: str, metrics: Metrics, count: usize) -> bool {
+    io::println(
+        "${label}: max_abs=${metrics.max_absolute} mean_abs=${metrics.mean_absolute} rms=${metrics.rms} max_rel=${metrics.max_relative} non_finite=${metrics.non_finite}",
+    );
+    if !metrics.passed {
+        io::eprintln("${label}: first failure at ${metrics.first_failure} of ${count}");
+    }
+    return metrics.passed;
+}
+
+fn dispatch(
+    device: metal::Device,
+    library: metal::Library,
+    queue: metal::CommandQueue,
+    function_name: str,
+    buffer_0: metal::Buffer,
+    buffer_1: metal::Buffer,
+    buffer_2: metal::Buffer,
+    buffer_3: metal::Buffer,
+    parameters: *u8,
+    parameter_bytes: u64,
+    thread_count: usize,
+) -> option::Option[f64] {
+    guard let option::Option[metal::Function]::Some(function) = library.new_function_with_name(function_name) else {
+        return option::Option[f64]::None;
+    };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+    guard let option::Option[metal::ComputePipelineState]::Some(pipeline) =
+        device.new_compute_pipeline_state_with_function(function, 0 as *u8) else {
+        return option::Option[f64]::None;
+    };
+    let pipeline_owner: OwnedObjc = OwnedObjc::new(pipeline.raw());
+
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() {
+        return option::Option[f64]::None;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else {
+        return option::Option[f64]::None;
+    };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(buffer_0, 0 as u64, 0 as u64);
+    encoder.set_buffer(buffer_1, 0 as u64, 1 as u64);
+    encoder.set_buffer(buffer_2, 0 as u64, 2 as u64);
+    encoder.set_buffer(buffer_3, 0 as u64, 3 as u64);
+    encoder.set_bytes(parameters, parameter_bytes, 4 as u64);
+    let grid: metal::Size = metal::Size { width: thread_count as u64, height: 1 as u64, depth: 1 as u64 };
+    let group: metal::Size = metal::Size {
+        width: pipeline.thread_execution_width(),
+        height: 1 as u64,
+        depth: 1 as u64,
+    };
+    encoder.dispatch_threads(grid, group);
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn test_decode(
+    device: metal::Device,
+    library: metal::Library,
+    queue: metal::CommandQueue,
+    input: metal::Buffer,
+    scratch: metal::Buffer,
+    output: metal::Buffer,
+    extra: metal::Buffer,
+) -> bool {
+    let count: usize = 64;
+    let input_values: *u16 = input.contents() as *u16;
+    var expected: [f32; 64] = [0.0f32; 64];
+    var index: usize = 0 as usize;
+    while index < count {
+        let value: f32 = ((index as i32 -% (32 as i32)) as f32) / 8.0f32;
+        input_values[index] = cpu::f32_to_bf16(value);
+        expected[index] = cpu::bf16_to_f32(input_values[index]);
+        index = index +% (1 as usize);
+    }
+    var params: DecodeParams = DecodeParams { count: count as u32, mode: 0 as u32 };
+    guard let option::Option[f64]::Some(_bf16_time) = dispatch(
+        device,
+        library,
+        queue,
+        "qi_decode_16",
+        input,
+        scratch,
+        output,
+        extra,
+        #addr_of(params) as *u8,
+        #size_of::[DecodeParams]() as u64,
+        count,
+    ) else {
+        return false;
+    };
+    let bf16_ok: bool = report(
+        "BF16 decode",
+        compare_f32(output.contents() as *f32, #addr_of(expected[0]), count, 0.0f64, 0.0f64),
+        count,
+    );
+
+    let patterns: [u16; 8] = [
+        0x0000 as u16,
+        0x3C00 as u16,
+        0xC100 as u16,
+        0x3555 as u16,
+        0x0400 as u16,
+        0x0001 as u16,
+        0x7BFF as u16,
+        0xBBFF as u16,
+    ];
+    index = 0 as usize;
+    while index < count {
+        let bits: u16 = patterns[index % (8 as usize)];
+        input_values[index] = bits;
+        expected[index] = cpu::fp16_to_f32(bits);
+        index = index +% (1 as usize);
+    }
+    params.mode = 1 as u32;
+    guard let option::Option[f64]::Some(_fp16_time) = dispatch(
+        device,
+        library,
+        queue,
+        "qi_decode_16",
+        input,
+        scratch,
+        output,
+        extra,
+        #addr_of(params) as *u8,
+        #size_of::[DecodeParams]() as u64,
+        count,
+    ) else {
+        return false;
+    };
+    let fp16_ok: bool = report(
+        "FP16 decode",
+        compare_f32(output.contents() as *f32, #addr_of(expected[0]), count, 0.0f64, 0.0f64),
+        count,
+    );
+    return bf16_ok && fp16_ok;
+}
+
+fn test_elementwise(
+    device: metal::Device,
+    library: metal::Library,
+    queue: metal::CommandQueue,
+    input: metal::Buffer,
+    projected: metal::Buffer,
+    output: metal::Buffer,
+    extra: metal::Buffer,
+) -> bool {
+    let count: usize = 64;
+    let input_values: *f32 = input.contents() as *f32;
+    let projected_values: *f32 = projected.contents() as *f32;
+    var expected: [f32; 64] = [0.0f32; 64];
+    var index: usize = 0 as usize;
+    while index < count {
+        input_values[index] = ((index as i32 -% (32 as i32)) as f32) * 3.125f32;
+        projected_values[index] = ((17 as i32 -% index as i32) as f32) / 9.0f32;
+        index = index +% (1 as usize);
+    }
+
+    var all_ok: bool = true;
+    var mode: u32 = 0 as u32;
+    while mode < (3 as u32) {
+        index = 0 as usize;
+        while index < count {
+            expected[index] = if mode == (0 as u32) {
+                cpu::silu(input_values[index])
+            } else if mode == (1 as u32) {
+                cpu::tanh_gelu(input_values[index])
+            } else {
+                cpu::swiglu(input_values[index], projected_values[index])
+            };
+            index = index +% (1 as usize);
+        }
+        var params: ElementwiseParams = ElementwiseParams { count: count as u32, mode: mode };
+        guard let option::Option[f64]::Some(_time) = dispatch(
+            device,
+            library,
+            queue,
+            "qi_elementwise",
+            input,
+            projected,
+            output,
+            extra,
+            #addr_of(params) as *u8,
+            #size_of::[ElementwiseParams]() as u64,
+            count,
+        ) else {
+            return false;
+        };
+        let label: str = if mode == (0 as u32) { "SiLU" } else if mode == (1 as u32) {
+            "tanh GELU"
+        } else {
+            "SwiGLU"
+        };
+        all_ok = report(
+            label,
+            compare_f32(output.contents() as *f32, #addr_of(expected[0]), count, 0.000002f64, 0.000002f64),
+            count,
+        ) && all_ok;
+        mode = mode +% (1 as u32);
+    }
+    return all_ok;
+}
+
+fn test_norms(
+    device: metal::Device,
+    library: metal::Library,
+    queue: metal::CommandQueue,
+    input: metal::Buffer,
+    weight: metal::Buffer,
+    output: metal::Buffer,
+    extra: metal::Buffer,
+) -> bool {
+    let rows: usize = 4;
+    let width: usize = 16;
+    let count: usize = rows *% width;
+    let input_values: *f32 = input.contents() as *f32;
+    let weight_values: *f32 = weight.contents() as *f32;
+    var expected: [f32; 64] = [0.0f32; 64];
+    var index: usize = 0 as usize;
+    while index < count {
+        input_values[index] = ((index as i32 -% (23 as i32)) as f32) / 11.0f32;
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < width {
+        weight_values[index] = ((index as i32 -% (8 as i32)) as f32) / 32.0f32;
+        index = index +% (1 as usize);
+    }
+
+    var all_ok: bool = true;
+    var mode: u32 = 0 as u32;
+    while mode < (3 as u32) {
+        var row: usize = 0 as usize;
+        while row < rows {
+            let start: usize = row *% width;
+            if mode == (0 as u32) {
+                let _ok: bool = cpu::layer_norm(
+                    input_values + start,
+                    #addr_of(expected[0]) + start,
+                    width,
+                    0.000001f32,
+                );
+            } else if mode == (1 as u32) {
+                let _ok: bool = cpu::rms_norm(
+                    input_values + start,
+                    #addr_of(expected[0]) + start,
+                    width,
+                    0.000001f32,
+                );
+            } else {
+                let _ok: bool = cpu::zero_centered_rms_norm(
+                    input_values + start,
+                    weight_values,
+                    #addr_of(expected[0]) + start,
+                    width,
+                    0.000001f32,
+                );
+            }
+            row = row +% (1 as usize);
+        }
+        var params: NormParams = NormParams {
+            rows: rows as u32,
+            width: width as u32,
+            epsilon: 0.000001f32,
+            mode: mode,
+        };
+        guard let option::Option[f64]::Some(_time) = dispatch(
+            device,
+            library,
+            queue,
+            "qi_norm_rows",
+            input,
+            weight,
+            output,
+            extra,
+            #addr_of(params) as *u8,
+            #size_of::[NormParams]() as u64,
+            rows,
+        ) else {
+            return false;
+        };
+        let label: str = if mode == (0 as u32) { "LayerNorm" } else if mode == (1 as u32) {
+            "RMSNorm"
+        } else {
+            "zero-centered RMSNorm"
+        };
+        all_ok = report(
+            label,
+            compare_f32(output.contents() as *f32, #addr_of(expected[0]), count, 0.00001f64, 0.00001f64),
+            count,
+        ) && all_ok;
+        mode = mode +% (1 as u32);
+    }
+    return all_ok;
+}
+
+fn test_timestep(
+    device: metal::Device,
+    library: metal::Library,
+    queue: metal::CommandQueue,
+    input: metal::Buffer,
+    scratch: metal::Buffer,
+    output: metal::Buffer,
+    extra: metal::Buffer,
+) -> bool {
+    let batch: usize = 2;
+    let dimension: usize = 256;
+    let count: usize = batch *% dimension;
+    let timesteps: *f32 = input.contents() as *f32;
+    timesteps[0] = 0.001f32;
+    timesteps[1] = 0.5f32;
+    var expected: [f32; 512] = [0.0f32; 512];
+    let _first: bool = cpu::timestep_embedding(timesteps[0], dimension, 10000.0f32, #addr_of(expected[0]));
+    let _second: bool = cpu::timestep_embedding(
+        timesteps[1],
+        dimension,
+        10000.0f32,
+        #addr_of(expected[0]) + dimension,
+    );
+    var params: TimestepParams = TimestepParams {
+        batch: batch as u32,
+        dimension: dimension as u32,
+        max_period: 10000.0f32,
+        time_factor: 1000.0f32,
+    };
+    guard let option::Option[f64]::Some(_time) = dispatch(
+        device,
+        library,
+        queue,
+        "qi_timestep_embedding",
+        input,
+        scratch,
+        output,
+        extra,
+        #addr_of(params) as *u8,
+        #size_of::[TimestepParams]() as u64,
+        batch *% (dimension / (2 as usize)),
+    ) else {
+        return false;
+    };
+    return report(
+        "timestep embedding",
+        compare_f32(output.contents() as *f32, #addr_of(expected[0]), count, 0.00004f64, 0.00002f64),
+        count,
+    );
+}
+
+fn test_rope(
+    device: metal::Device,
+    library: metal::Library,
+    queue: metal::CommandQueue,
+    input: metal::Buffer,
+    cosine: metal::Buffer,
+    output: metal::Buffer,
+    sine: metal::Buffer,
+) -> bool {
+    let complex_count: usize = 32;
+    let input_values: *f32 = input.contents() as *f32;
+    let cosine_values: *f32 = cosine.contents() as *f32;
+    let sine_values: *f32 = sine.contents() as *f32;
+    var expected: [f32; 64] = [0.0f32; 64];
+    var index: usize = 0 as usize;
+    while index < complex_count {
+        input_values[index *% (2 as usize)] = ((index as i32 -% (16 as i32)) as f32) / 9.0f32;
+        input_values[index *% (2 as usize) +% (1 as usize)] = ((11 as i32 -% index as i32) as f32) / 7.0f32;
+        let angle: f32 = index as f32 / 13.0f32;
+        cosine_values[index] = angle.cos();
+        sine_values[index] = angle.sin();
+        index = index +% (1 as usize);
+    }
+    cpu::apply_complex_rope(
+        input_values,
+        cosine_values,
+        sine_values,
+        #addr_of(expected[0]),
+        complex_count,
+    );
+    var params: RopeParams = RopeParams { complex_count: complex_count as u32 };
+    guard let option::Option[f64]::Some(_time) = dispatch(
+        device,
+        library,
+        queue,
+        "qi_complex_rope",
+        input,
+        cosine,
+        output,
+        sine,
+        #addr_of(params) as *u8,
+        #size_of::[RopeParams]() as u64,
+        complex_count,
+    ) else {
+        return false;
+    };
+    return report(
+        "complex RoPE",
+        compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            complex_count *% (2 as usize),
+            0.000002f64,
+            0.000002f64,
+        ),
+        complex_count *% (2 as usize),
+    );
+}
+
+fn test_mask(
+    device: metal::Device,
+    library: metal::Library,
+    queue: metal::CommandQueue,
+    ids: metal::Buffer,
+    valid: metal::Buffer,
+    output: metal::Buffer,
+    extra: metal::Buffer,
+) -> bool {
+    let sequence_length: usize = 7;
+    let image_ids: *i32 = ids.contents() as *i32;
+    image_ids[0] = 0 -% (1 as i32);
+    image_ids[1] = 0 -% (1 as i32);
+    image_ids[2] = 0 as i32;
+    image_ids[3] = 0 as i32;
+    image_ids[4] = 0 as i32;
+    image_ids[5] = 1 as i32;
+    image_ids[6] = 1 as i32;
+    let key_valid: *u8 = valid.contents();
+    var index: usize = 0 as usize;
+    while index < sequence_length {
+        key_valid[index] = if index == (1 as usize) { 0 as u8 } else { 1 as u8 };
+        index = index +% (1 as usize);
+    }
+    var params: MaskParams = MaskParams { sequence_length: sequence_length as u32 };
+    let count: usize = sequence_length *% sequence_length;
+    guard let option::Option[f64]::Some(_time) = dispatch(
+        device,
+        library,
+        queue,
+        "qi_block_causal_mask",
+        ids,
+        valid,
+        output,
+        extra,
+        #addr_of(params) as *u8,
+        #size_of::[MaskParams]() as u64,
+        count,
+    ) else {
+        return false;
+    };
+    let actual: *u8 = output.contents();
+    index = 0 as usize;
+    while index < count {
+        let query: usize = index / sequence_length;
+        let key: usize = index % sequence_length;
+        let expected: bool = cpu::block_causal_allowed(
+            query,
+            key,
+            image_ids[query],
+            image_ids[key],
+            key_valid[key] != (0 as u8),
+        );
+        if (actual[index] != (0 as u8)) != expected {
+            io::eprintln("block-causal mask: first failure at query=${query} key=${key}");
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    io::println("block-causal mask: exact");
+    return true;
+}
+
+fn run() -> i32 {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() {
+        io::eprintln("metal primitives: could not create autorelease pool");
+        return 1;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() {
+        io::eprintln("metal primitives: no Metal device");
+        return 1;
+    }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else {
+        io::eprintln("metal primitives: could not create command queue");
+        return 1;
+    };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() {
+        return 1;
+    }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    let source: str = #include_str("../kernels/primitives.metal");
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) =
+        device.new_library_with_source(source, options, #addr_of(compile_error) as *u8) else {
+        if compile_error.is_null() {
+            io::eprintln("metal primitives: source compilation failed");
+        } else {
+            let description: *u8 = rt::msg_id(
+                compile_error,
+                rt::sel(#str_ptr("localizedDescription\0")),
+            );
+            io::eprintln("metal primitives: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    let storage: u64 = metal::resource_options_m_t_l_resource_storage_mode_shared;
+    guard let option::Option[metal::Buffer]::Some(buffer_0) = device.new_buffer_with_length(BUFFER_BYTES, storage) else {
+        return 1;
+    };
+    let buffer_0_owner: OwnedObjc = OwnedObjc::new(buffer_0.raw());
+    guard let option::Option[metal::Buffer]::Some(buffer_1) = device.new_buffer_with_length(BUFFER_BYTES, storage) else {
+        return 1;
+    };
+    let buffer_1_owner: OwnedObjc = OwnedObjc::new(buffer_1.raw());
+    guard let option::Option[metal::Buffer]::Some(buffer_2) = device.new_buffer_with_length(BUFFER_BYTES, storage) else {
+        return 1;
+    };
+    let buffer_2_owner: OwnedObjc = OwnedObjc::new(buffer_2.raw());
+    guard let option::Option[metal::Buffer]::Some(buffer_3) = device.new_buffer_with_length(BUFFER_BYTES, storage) else {
+        return 1;
+    };
+    let buffer_3_owner: OwnedObjc = OwnedObjc::new(buffer_3.raw());
+
+    let passed: bool = test_decode(device, library, queue, buffer_0, buffer_1, buffer_2, buffer_3)
+        && test_elementwise(device, library, queue, buffer_0, buffer_1, buffer_2, buffer_3)
+        && test_norms(device, library, queue, buffer_0, buffer_1, buffer_2, buffer_3)
+        && test_timestep(device, library, queue, buffer_0, buffer_1, buffer_2, buffer_3)
+        && test_rope(device, library, queue, buffer_0, buffer_1, buffer_2, buffer_3)
+        && test_mask(device, library, queue, buffer_0, buffer_1, buffer_2, buffer_3);
+    if !passed {
+        return 1;
+    }
+    io::println("Metal primitive validation: ok");
+    return 0;
+}
+
+#[test]
+fn metric_comparison_reports_first_failure() {
+    let actual: [f32; 3] = [1.0f32, 2.25f32, 3.0f32];
+    let expected: [f32; 3] = [1.0f32, 2.0f32, 3.0f32];
+    let metrics: Metrics = compare_f32(
+        #addr_of(actual[0]),
+        #addr_of(expected[0]),
+        3 as usize,
+        0.01f64,
+        0.0f64,
+    );
+    assert !metrics.passed;
+    assert metrics.first_failure == (1 as usize);
+}
+
+#[test]
+fn metric_comparison_rejects_non_finite_output() {
+    let actual: [f32; 1] = [cpu::f32_from_bits(0x7F800000 as u32)];
+    let expected: [f32; 1] = [1.0f32];
+    let metrics: Metrics = compare_f32(
+        #addr_of(actual[0]),
+        #addr_of(expected[0]),
+        1 as usize,
+        1000.0f64,
+        1000.0f64,
+    );
+    assert !metrics.passed;
+    assert metrics.non_finite == (1 as usize);
+}

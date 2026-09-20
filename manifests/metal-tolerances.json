@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "machine": "Apple M1 Max",
+  "fast_math": false,
+  "reference": "C+ FP32 scalar implementation",
+  "operations": {
+    "bf16_decode": {"absolute_tolerance": 0.0, "relative_tolerance": 0.0},
+    "fp16_decode": {"absolute_tolerance": 0.0, "relative_tolerance": 0.0},
+    "silu": {"absolute_tolerance": 0.000002, "relative_tolerance": 0.000002},
+    "tanh_gelu": {"absolute_tolerance": 0.000002, "relative_tolerance": 0.000002},
+    "swiglu": {"absolute_tolerance": 0.000002, "relative_tolerance": 0.000002},
+    "layer_norm": {"absolute_tolerance": 0.00001, "relative_tolerance": 0.00001},
+    "rms_norm": {"absolute_tolerance": 0.00001, "relative_tolerance": 0.00001},
+    "zero_centered_rms_norm": {"absolute_tolerance": 0.00001, "relative_tolerance": 0.00001},
+    "qwen_timestep_embedding": {"absolute_tolerance": 0.00004, "relative_tolerance": 0.00002},
+    "complex_rope": {"absolute_tolerance": 0.000002, "relative_tolerance": 0.000002},
+    "block_causal_mask": {"exact": true}
+  }
+}

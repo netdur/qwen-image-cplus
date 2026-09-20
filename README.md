@@ -24,6 +24,7 @@ cpc check
 cpc build
 cpc test
 ./target/debug/qwen-image-cplus probe-stress
+./target/debug/qwen-image-cplus test-metal-primitives
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -44,6 +45,11 @@ Inspect a shard, optionally filtering tensor names:
 - CPU truth functions for checkpoint float formats, activations, norms,
   Qwen timestep embeddings, complex RoPE, block-causal masking, and the exact
   FlowMatch Euler schedule.
+- Metal correctness kernels for BF16/FP16 decode, SiLU, tanh GELU, SwiGLU,
+  LayerNorm, RMSNorm, zero-centered RMSNorm, timestep embedding, complex RoPE,
+  and block-causal masks. The validation command reports error metrics and
+  rejects non-finite output; measured tolerances are recorded in
+  `manifests/metal-tolerances.json`.
 
 Image generation is not implemented yet. The remaining model kernels,
 quantized packed format, transformer, native prompt encoder, and causal 3D VAE
