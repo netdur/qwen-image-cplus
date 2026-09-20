@@ -15,6 +15,8 @@ Diffusers source; those fixtures are plain binary files consumed by C+ tests.
 - Snapshot: `b3179ad355be050328e483a9dfdd9e60cd62adfa`
 - Diffusers commit: `80c7ed262aeffbeb43ef13ae04baeb9b84515a69`
 - Machine-readable inventory: `manifests/qwen-image-2.1.json`
+- Pinned official [transformer source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/transformers/transformer_qwenimage21.py)
+  and [pipeline source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py)
 
 ## Build and verify
 
@@ -38,6 +40,7 @@ cpc test
 ./target/debug/qwen-image-cplus verify-packed-source transformer.qipack /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-transformer-block-int8 block0.qipack
 ./target/debug/qwen-image-cplus test-transformer-mixed transformer.qipack
+./target/debug/qwen-image-cplus test-transformer-complete transformer.qipack
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -121,6 +124,34 @@ Inspect a shard, optionally filtering tensor names:
   precision transitions. The final native mixed output measured 0.1300%
   nRMSE, with 581.5 ms summed GPU kernel time on the M1 Max; repeated results
   are recorded in `benchmarks/m1-max-transformer-mixed-native.json`.
+- Native execution of the complete transformer boundary around those blocks:
+  64-to-4096 image projection; zero-centered RMSNorm and two-layer tanh-GELU
+  text projection; exact 256-channel sinusoidal timestep projection and
+  two-layer timestep embedding; shared SiLU modulation; four-fold VLM image-
+  slot expansion and condition/target latent substitution; final adaptive
+  LayerNorm; and 4096-to-64 output projection. Linear dispatch is now row-
+  variable for both BF16 and packed Q8 weights rather than fixed to the old
+  four-token fixture.
+- The complete fixture is deliberately small but structurally realistic: four
+  VLM rows contain one condition-image slot, the target contributes two slots,
+  expansion produces 15 joint rows (three text, four condition-image, eight
+  target-image), and one interleaved text key is invalid. This catches treating
+  padding as a prefix, confusing condition and target modulation, or omitting
+  image-slot expansion. It checks the global boundaries and six block-depth
+  checkpoints against a committed independent NumPy/FP32 oracle.
+- On the M1 Max, the 15-row complete path passed at 0.3347% target-output
+  nRMSE (1.2% gate), with 0.1300% at block 31 and 1,245.9 ms summed GPU kernel
+  time on the first recorded run (1,242.1 ms on repeat). Results are in
+  `benchmarks/m1-max-transformer-complete-native.json`.
+  The full joint output is retained because the transformer API returns it;
+  the target-only metric is decisive because the pinned pipeline slices the
+  trailing target rows before its scheduler step.
+- The packed Metal mapping uses a process-lifetime Objective-C block
+  descriptor for its no-copy deallocator. This is required because Metal
+  retains that callback until the buffer is released; a descriptor allocated
+  on the helper's stack survives execution but crashes during buffer teardown.
+  The dedicated mapping path now releases cleanly, including the short-lived
+  block-0 validation command.
 
 ## Quantization decision log
 
@@ -166,14 +197,18 @@ role search showed that exchanging projection/output for the gate crossed the
 1% error threshold. QIPACK1 still accepts the original block-0 scope so the
 existing isolated Metal fixture remains reproducible.
 
-The native validation fixture is intentionally four tokens, not a speed claim
-for production image-token counts. Its purpose is high-coverage correctness:
-it runs every real block weight, crosses both mixed-policy boundaries, and
-checks accumulated error without requiring the not-yet-native prompt encoder.
-The packed mapping is exposed to Metal without copying 12.42 GiB of weights;
-only small activation workspaces and 128-element Q/K norm vectors are copied.
+The original four-token fixture remains useful as a cheap block-chain
+regression. The newer 15-token fixture proves the whole transformer boundary
+and the real interleaved token semantics, but it is still not a throughput
+claim: the correctness attention kernel is scalar over query/head and repeats
+dot products while streaming keys. The packed mapping is exposed to Metal
+without copying 12.42 GiB of weights; only activations and 128-element Q/K norm
+vectors are copied.
 
-Image generation is not implemented yet. The next transformer step is native
-execution of the global input/modulation/output layers and realistic variable
-token layouts, followed by denoising-state replay. The native prompt encoder
-and causal 3D VAE are also tracked in `plan.md`.
+Image generation is not implemented yet. The next phase is a scalable
+block-causal attention path plus prefix KV-cache extract/decode, because the
+current O(S^2) correctness kernel makes 256/512/1024-pixel token layouts
+impractical. Once that path matches the complete oracle, the transformer can
+run a replayed 40-step denoising trajectory with scheduler updates. The native
+prompt encoder and causal 3D VAE remain later independent boundaries tracked
+in `plan.md`.

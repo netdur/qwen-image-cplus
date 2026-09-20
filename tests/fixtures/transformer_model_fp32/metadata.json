@@ -1,0 +1,302 @@
+{
+  "acceptance": {
+    "final_limit": 0.012,
+    "metric": "target-output normalized RMS versus dense FP32 oracle",
+    "target_rows": [
+      7,
+      15
+    ]
+  },
+  "capture_blocks": [
+    0,
+    23,
+    24,
+    27,
+    28,
+    31
+  ],
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "layout": {
+    "image_ids": [
+      -1,
+      -1,
+      0,
+      0,
+      0,
+      0,
+      -1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "image_pad_mask": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "image_shapes": [
+      [
+        1,
+        2,
+        2
+      ],
+      [
+        1,
+        2,
+        4
+      ]
+    ],
+    "img_mask_before_expansion": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ],
+    "key_valid": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "target_mask": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "operation": "Complete QwenImage21Transformer2DModel FP32 reference",
+  "reference": "Pinned Diffusers equations transcribed to NumPy; BF16 checkpoint weights decoded to FP32",
+  "schema_version": 1,
+  "shape": {
+    "image_rows": 12,
+    "joint_rows": 15,
+    "text_rows": 4,
+    "width": 4096
+  },
+  "tensors": {
+    "block_00_output": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "block_00_output.f32",
+      "sha256": "890a38b42028ea4d60bf4aedd9893148cda99465c72a82c9019acb5706284478",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "block_23_output": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "block_23_output.f32",
+      "sha256": "b82a2bf5d4f03cd73aa3c60c7da3b3dbce518f03ee327259a991a3c5bc13582f",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "block_24_output": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "block_24_output.f32",
+      "sha256": "74feca0fc9adb68788238b440d2c31ddf4c1fad032977689d7365fe1c67f43c1",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "block_27_output": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "block_27_output.f32",
+      "sha256": "32e8ff5f6fc8e420d5e63c9d9c167e8c7524e2e7b9d60b3ab42c006d32572503",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "block_28_output": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "block_28_output.f32",
+      "sha256": "0d94af3e2f685c2b1625335f5a97a6ca5b94060a573504eee61f1b95be76206c",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "block_31_output": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "block_31_output.f32",
+      "sha256": "cb343ef4350fced320ee56bceee7e76e25802b9f7e291a315280deeff51bfae0",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "final_normalized": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "final_normalized.f32",
+      "sha256": "749ac8585919eb016d7c4f5aefd7c66e3cd341caba5060a62ae3ed58d0dedc5f",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "image_input": {
+      "bytes": 3072,
+      "dtype": "F32",
+      "file": "image_input.f32",
+      "sha256": "09cf775df61485870499f31e51e4473e5878179e34daba41a13582e8d81778e5",
+      "shape": [
+        12,
+        64
+      ]
+    },
+    "image_projected": {
+      "bytes": 196608,
+      "dtype": "F32",
+      "file": "image_projected.f32",
+      "sha256": "69799b3960098b2e87bba33df707faf0f9428d95490e6d6fd7c1f2b40c37a14e",
+      "shape": [
+        12,
+        4096
+      ]
+    },
+    "joint_input": {
+      "bytes": 245760,
+      "dtype": "F32",
+      "file": "joint_input.f32",
+      "sha256": "d9806a46774dbac0328cc3c8b9e15d312c094a7219bd8b27dad3e1861d269cd8",
+      "shape": [
+        15,
+        4096
+      ]
+    },
+    "modulation": {
+      "bytes": 131072,
+      "dtype": "F32",
+      "file": "modulation.f32",
+      "sha256": "c074059792711daba08c77310f12b54ad48c54b4b6035368b7b31fe8453c602d",
+      "shape": [
+        2,
+        4,
+        4096
+      ]
+    },
+    "output": {
+      "bytes": 3840,
+      "dtype": "F32",
+      "file": "output.f32",
+      "sha256": "8c610390be6ce1dcf7ad6624c10ac8763a1482fcff61087ab98c173c83caafae",
+      "shape": [
+        15,
+        64
+      ]
+    },
+    "rope": {
+      "bytes": 7680,
+      "dtype": "F32",
+      "file": "rope.f32",
+      "sha256": "a20948de1124bad0e5d506ab826d77ffafbe435d4735f3fb69992d7eaa1995d5",
+      "shape": [
+        15,
+        128
+      ]
+    },
+    "text_input": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "text_input.f32",
+      "sha256": "b0532f1b1a34b4f497bea44a26310bdca6425c8a644ecd212c7fc7d15dd6b835",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "text_projected": {
+      "bytes": 65536,
+      "dtype": "F32",
+      "file": "text_projected.f32",
+      "sha256": "dd7b5df1605751d1dee8de685fbd251ef74130930e0e2942fd656ff23f252a2e",
+      "shape": [
+        4,
+        4096
+      ]
+    },
+    "time_embedding": {
+      "bytes": 32768,
+      "dtype": "F32",
+      "file": "time_embedding.f32",
+      "sha256": "0d9ebff45438d3a65869f643b3bb02cfbb2592e4226e02fefcf395dcd0427979",
+      "shape": [
+        2,
+        4096
+      ]
+    },
+    "time_projection": {
+      "bytes": 2048,
+      "dtype": "F32",
+      "file": "time_projection.f32",
+      "sha256": "4d94df47d8e6995a3030d41c614b4fc72fbbe8f70c5ef78c16cb71869512d6c5",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    "timestep": {
+      "bytes": 8,
+      "dtype": "F32",
+      "file": "timestep.f32",
+      "sha256": "426d6f10eb188c66b3ec2b835885459fe330f3b86931f985abb24b071a2be2a2",
+      "shape": [
+        2
+      ]
+    }
+  },
+  "timestep": 0.6230130195617676
+}

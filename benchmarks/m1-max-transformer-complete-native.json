@@ -1,0 +1,47 @@
+{
+  "date": "2026-09-20",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "hardware": "Apple M1 Max, 32 GB unified memory",
+  "artifact": {
+    "path_used_for_measurement": "/private/tmp/qwen-image-2.1-mixed.qipack",
+    "logical_bytes": 13334843392,
+    "metal_mapping_bytes": 13334855680,
+    "q8_matrices": 40
+  },
+  "fixture": {
+    "directory": "tests/fixtures/transformer_model_fp32",
+    "text_rows": 4,
+    "condition_image_tokens": 4,
+    "target_image_tokens": 8,
+    "joint_rows": 15,
+    "image_shapes": [[1, 2, 2], [1, 2, 4]],
+    "invalid_interleaved_text_keys": 1,
+    "timestep": 0.623013
+  },
+  "native_run": {
+    "summed_gpu_kernel_ms_runs": [1245.86, 1242.08],
+    "global_boundaries": {
+      "img_in_max_abs": 0.0,
+      "text_projection_rms": 0.0000084333,
+      "timestep_embedding_rms": 0.0000000845577,
+      "shared_modulation_rms": 0.0000014537,
+      "joint_assembly_rms": 0.00000412756
+    },
+    "block_nrmse": {
+      "0": 0.00000283986,
+      "23": 0.0000061395,
+      "24": 0.000175243,
+      "27": 0.000439587,
+      "28": 0.000587933,
+      "31": 0.00129899
+    },
+    "final_norm_nrmse": 0.00280857,
+    "all_output_nrmse": 0.00446802,
+    "target_output_nrmse": 0.00334726,
+    "target_output_limit": 0.012,
+    "passed": true
+  },
+  "interpretation": "This is an end-to-end transformer-boundary correctness measurement, not a production-token throughput claim. The official pipeline consumes only the trailing target-image rows, so target_output_nrmse is the acceptance metric. The current attention kernel remains a scalar correctness path and must be replaced or cached before realistic resolutions are practical."
+}

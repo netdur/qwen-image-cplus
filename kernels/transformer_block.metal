@@ -30,6 +30,119 @@ inline float qi_bf16(ushort bits) {
     return as_type<float>(uint(bits) << 16);
 }
 
+kernel void qi_time_projection(
+    device const float *timestep [[buffer(0)]],
+    device float *output [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index >= count) {
+        return;
+    }
+    const uint row = index / params.width;
+    const uint column = index % params.width;
+    const uint half_width = params.width / 2;
+    const uint frequency_column = column % half_width;
+    const float frequency = exp(-log(10000.0f) * float(frequency_column) / float(half_width));
+    const float argument = timestep[row] * 1000.0f * frequency;
+    output[index] = column < half_width ? cos(argument) : sin(argument);
+}
+
+kernel void qi_silu(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        const float value = input[index];
+        output[index] = value / (1.0f + exp(-value));
+    }
+}
+
+kernel void qi_gelu_tanh(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        const float value = input[index];
+        output[index] = 0.5f * value *
+            (1.0f + tanh(0.7978845608028654f * (value + 0.044715f * value * value * value)));
+    }
+}
+
+kernel void qi_zero_center_rms_norm(
+    device const float *input [[buffer(0)]],
+    device const ushort *weight [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= params.rows) {
+        return;
+    }
+    const uint start = row * params.width;
+    float mean_square = 0.0f;
+    for (uint column = 0; column < params.width; ++column) {
+        mean_square = fma(input[start + column], input[start + column], mean_square);
+    }
+    const float inverse_rms = rsqrt(mean_square / float(params.width) + params.epsilon);
+    for (uint column = 0; column < params.width; ++column) {
+        output[start + column] =
+            input[start + column] * inverse_rms * (1.0f + qi_bf16(weight[column]));
+    }
+}
+
+// source_index >= 0 selects an image row. Negative values encode text row as -1-row.
+kernel void qi_joint_assemble(
+    device const float *text [[buffer(0)]],
+    device const float *image [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const int *source_index [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index >= count) {
+        return;
+    }
+    const uint row = index / params.width;
+    const uint column = index % params.width;
+    const int source = source_index[row];
+    output[index] = source >= 0
+        ? image[uint(source) * params.width + column]
+        : text[uint(-source - 1) * params.width + column];
+}
+
+kernel void qi_final_layernorm_modulate(
+    device const float *input [[buffer(0)]],
+    device const float *scale [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const uchar *target_mask [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= params.rows) {
+        return;
+    }
+    const uint start = row * params.width;
+    float mean = 0.0f;
+    for (uint column = 0; column < params.width; ++column) {
+        mean += input[start + column];
+    }
+    mean /= float(params.width);
+    float variance = 0.0f;
+    for (uint column = 0; column < params.width; ++column) {
+        const float centered = input[start + column] - mean;
+        variance = fma(centered, centered, variance);
+    }
+    const float inverse_std = rsqrt(variance / float(params.width) + params.epsilon);
+    const uint scale_start = (target_mask[row] != 0 ? 0 : 1) * params.width;
+    for (uint column = 0; column < params.width; ++column) {
+        output[start + column] =
+            (input[start + column] - mean) * inverse_std * (1.0f + scale[scale_start + column]);
+    }
+}
+
 kernel void qi_block_linear_16x16(
     device const float *input [[buffer(0)]],
     device const ushort *weights [[buffer(1)]],
