@@ -1,5 +1,6 @@
 import "./metal_probe" as metal_probe;
 import "./metal_primitives" as metal_primitives;
+import "./metal_linear" as metal_linear;
 import "./model_inventory" as model_inventory;
 import "./safetensors" as safetensors;
 import "./scheduler" as scheduler;
@@ -13,7 +14,7 @@ import "stdlib/text" as text;
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -31,6 +32,12 @@ fn main() -> i32 {
     }
     if command == "test-metal-primitives" {
         return metal_primitives::run();
+    }
+    if command == "test-metal-linear" {
+        return metal_linear::run_validation();
+    }
+    if command == "benchmark-linear" {
+        return metal_linear::run_benchmark();
     }
     if command == "inspect" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {

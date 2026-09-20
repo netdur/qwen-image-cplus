@@ -14,6 +14,8 @@
     "zero_centered_rms_norm": {"absolute_tolerance": 0.00001, "relative_tolerance": 0.00001},
     "qwen_timestep_embedding": {"absolute_tolerance": 0.00004, "relative_tolerance": 0.00002},
     "complex_rope": {"absolute_tolerance": 0.000002, "relative_tolerance": 0.000002},
+    "bf16_linear": {"absolute_tolerance": 0.00002, "relative_tolerance": 0.00002},
+    "fp16_linear": {"absolute_tolerance": 0.00002, "relative_tolerance": 0.00002},
     "block_causal_mask": {"exact": true}
   }
 }

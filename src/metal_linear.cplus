@@ -1,0 +1,459 @@
+import "./cpu_ops" as cpu;
+import "./metal_primitives" as metrics;
+import "metal/metal" as metal;
+import "objc/bridge" as bridge;
+import "objc/runtime" as rt;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+
+extern fn MTLCreateSystemDefaultDevice() -> *u8;
+
+const TILE: usize = 16;
+
+struct OwnedObjc {
+    opaque pointer: *u8,
+}
+
+impl OwnedObjc {
+    fn new(pointer: *u8) -> OwnedObjc {
+        return OwnedObjc { pointer: pointer };
+    }
+
+    fn raw(this) -> *u8 {
+        return this.pointer;
+    }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            rt::release(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+#[repr(C)]
+struct LinearParams {
+    rows: u32,
+    output_columns: u32,
+    input_columns: u32,
+    weight_mode: u32,
+}
+
+fn round_up(value: usize, multiple: usize) -> usize {
+    return ((value +% multiple -% (1 as usize)) / multiple) *% multiple;
+}
+
+fn dispatch_linear(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    output: metal::Buffer,
+    params: *LinearParams,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() {
+        return option::Option[f64]::None;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else {
+        return option::Option[f64]::None;
+    };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weights, 0 as u64, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_bytes(params as *u8, #size_of::[LinearParams]() as u64, 3 as u64);
+    let grid: metal::Size = metal::Size {
+        width: round_up((*params).output_columns as usize, TILE) as u64,
+        height: round_up((*params).rows as usize, TILE) as u64,
+        depth: 1 as u64,
+    };
+    let group: metal::Size = metal::Size { width: TILE as u64, height: TILE as u64, depth: 1 as u64 };
+    encoder.dispatch_threads(grid, group);
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn cpu_linear(
+    input: *f32,
+    weights: *u16,
+    output: *f32,
+    rows: usize,
+    output_columns: usize,
+    input_columns: usize,
+    weight_mode: u32,
+) {
+    var row: usize = 0 as usize;
+    while row < rows {
+        var output_column: usize = 0 as usize;
+        while output_column < output_columns {
+            var sum: f32 = 0.0f32;
+            var input_column: usize = 0 as usize;
+            while input_column < input_columns {
+                let bits: u16 = weights[output_column *% input_columns +% input_column];
+                let weight: f32 = if weight_mode == (0 as u32) {
+                    cpu::bf16_to_f32(bits)
+                } else {
+                    cpu::fp16_to_f32(bits)
+                };
+                sum = sum + input[row *% input_columns +% input_column] * weight;
+                input_column = input_column +% (1 as usize);
+            }
+            output[row *% output_columns +% output_column] = sum;
+            output_column = output_column +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+}
+
+fn validate(
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+) -> bool {
+    let rows: usize = 5;
+    let output_columns: usize = 17;
+    let input_columns: usize = 33;
+    let input_bytes: u64 = (rows *% input_columns *% #size_of::[f32]()) as u64;
+    let weight_bytes: u64 = (output_columns *% input_columns *% #size_of::[u16]()) as u64;
+    let output_bytes: u64 = (rows *% output_columns *% #size_of::[f32]()) as u64;
+    let storage: u64 = metal::resource_options_m_t_l_resource_storage_mode_shared;
+    guard let option::Option[metal::Buffer]::Some(input) = device.new_buffer_with_length(input_bytes, storage) else {
+        return false;
+    };
+    let input_owner: OwnedObjc = OwnedObjc::new(input.raw());
+    guard let option::Option[metal::Buffer]::Some(weights) = device.new_buffer_with_length(weight_bytes, storage) else {
+        return false;
+    };
+    let weights_owner: OwnedObjc = OwnedObjc::new(weights.raw());
+    guard let option::Option[metal::Buffer]::Some(output) = device.new_buffer_with_length(output_bytes, storage) else {
+        return false;
+    };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+    let input_values: *f32 = input.contents() as *f32;
+    let weight_values: *u16 = weights.contents() as *u16;
+    var expected: [f32; 85] = [0.0f32; 85];
+
+    var index: usize = 0 as usize;
+    while index < rows *% input_columns {
+        input_values[index] = ((index as i32 % (19 as i32) -% (9 as i32)) as f32) / 8.0f32;
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < output_columns *% input_columns {
+        let value: f32 = ((index as i32 % (23 as i32) -% (11 as i32)) as f32) / 16.0f32;
+        weight_values[index] = cpu::f32_to_bf16(value);
+        index = index +% (1 as usize);
+    }
+    cpu_linear(
+        input_values,
+        weight_values,
+        #addr_of(expected[0]),
+        rows,
+        output_columns,
+        input_columns,
+        0 as u32,
+    );
+    var params: LinearParams = LinearParams {
+        rows: rows as u32,
+        output_columns: output_columns as u32,
+        input_columns: input_columns as u32,
+        weight_mode: 0 as u32,
+    };
+    guard let option::Option[f64]::Some(bf16_time) = dispatch_linear(
+        queue,
+        pipeline,
+        input,
+        weights,
+        output,
+        #addr_of(params),
+    ) else {
+        return false;
+    };
+    io::println("BF16 linear GPU time: ${bf16_time} ms");
+    let bf16_ok: bool = metrics::report(
+        "BF16 linear [5,33] x [17,33]^T",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00002f64,
+            0.00002f64,
+        ),
+        rows *% output_columns,
+    );
+
+    let patterns: [u16; 8] = [
+        0x0000 as u16,
+        0x3C00 as u16,
+        0xC100 as u16,
+        0x3555 as u16,
+        0xB800 as u16,
+        0x4000 as u16,
+        0x2E66 as u16,
+        0xBA00 as u16,
+    ];
+    index = 0 as usize;
+    while index < output_columns *% input_columns {
+        weight_values[index] = patterns[index % (8 as usize)];
+        index = index +% (1 as usize);
+    }
+    cpu_linear(
+        input_values,
+        weight_values,
+        #addr_of(expected[0]),
+        rows,
+        output_columns,
+        input_columns,
+        1 as u32,
+    );
+    params.weight_mode = 1 as u32;
+    guard let option::Option[f64]::Some(fp16_time) = dispatch_linear(
+        queue,
+        pipeline,
+        input,
+        weights,
+        output,
+        #addr_of(params),
+    ) else {
+        return false;
+    };
+    io::println("FP16 linear GPU time: ${fp16_time} ms");
+    let fp16_ok: bool = metrics::report(
+        "FP16 linear [5,33] x [17,33]^T",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00002f64,
+            0.00002f64,
+        ),
+        rows *% output_columns,
+    );
+    return bf16_ok && fp16_ok;
+}
+
+fn benchmark_shape(
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    label: str,
+    rows: usize,
+    output_columns: usize,
+    input_columns: usize,
+) -> bool {
+    let input_bytes: u64 = (rows *% input_columns *% #size_of::[f32]()) as u64;
+    let weight_bytes: u64 = (output_columns *% input_columns *% #size_of::[u16]()) as u64;
+    let output_bytes: u64 = (rows *% output_columns *% #size_of::[f32]()) as u64;
+    let storage: u64 = metal::resource_options_m_t_l_resource_storage_mode_shared;
+    guard let option::Option[metal::Buffer]::Some(input) = device.new_buffer_with_length(input_bytes, storage) else {
+        return false;
+    };
+    let input_owner: OwnedObjc = OwnedObjc::new(input.raw());
+    guard let option::Option[metal::Buffer]::Some(weights) = device.new_buffer_with_length(weight_bytes, storage) else {
+        return false;
+    };
+    let weights_owner: OwnedObjc = OwnedObjc::new(weights.raw());
+    guard let option::Option[metal::Buffer]::Some(output) = device.new_buffer_with_length(output_bytes, storage) else {
+        return false;
+    };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+
+    let input_values: *f32 = input.contents() as *f32;
+    let input_count: usize = rows *% input_columns;
+    var index: usize = 0 as usize;
+    while index < input_count {
+        input_values[index] = 0.01f32;
+        index = index +% (1 as usize);
+    }
+    let encoded_weight: u16 = cpu::f32_to_bf16(0.001f32);
+    let weight_values: *u16 = weights.contents() as *u16;
+    let weight_count: usize = output_columns *% input_columns;
+    index = 0 as usize;
+    while index < weight_count {
+        weight_values[index] = encoded_weight;
+        index = index +% (1 as usize);
+    }
+
+    var params: LinearParams = LinearParams {
+        rows: rows as u32,
+        output_columns: output_columns as u32,
+        input_columns: input_columns as u32,
+        weight_mode: 0 as u32,
+    };
+    guard let option::Option[f64]::Some(_warmup) = dispatch_linear(
+        queue,
+        pipeline,
+        input,
+        weights,
+        output,
+        #addr_of(params),
+    ) else {
+        return false;
+    };
+    var total_ms: f64 = 0.0f64;
+    var repetition: usize = 0 as usize;
+    while repetition < (3 as usize) {
+        guard let option::Option[f64]::Some(elapsed) = dispatch_linear(
+            queue,
+            pipeline,
+            input,
+            weights,
+            output,
+            #addr_of(params),
+        ) else {
+            return false;
+        };
+        total_ms = total_ms + elapsed;
+        repetition = repetition +% (1 as usize);
+    }
+    let average_ms: f64 = total_ms / 3.0f64;
+    let operations: f64 = 2.0f64 * rows as f64 * output_columns as f64 * input_columns as f64;
+    let gigaflops: f64 = operations / (average_ms * 1000000.0f64);
+    let allocated_mib: u64 = (input_bytes +% weight_bytes +% output_bytes) / (1024 as u64 * 1024 as u64);
+    io::println(
+        "${label}: M=${rows} N=${output_columns} K=${input_columns} time=${average_ms} ms GFLOP/s=${gigaflops} buffers=${allocated_mib} MiB",
+    );
+
+    let expected: f32 = input_columns as f32 * 0.01f32 * cpu::bf16_to_f32(encoded_weight);
+    let output_values: *f32 = output.contents() as *f32;
+    let output_count: usize = rows *% output_columns;
+    index = 0 as usize;
+    while index < output_count {
+        let bits: u32 = cpu::f32_bits(output_values[index]);
+        if (bits & (0x7F800000 as u32)) == (0x7F800000 as u32)
+            || (output_values[index] - expected).abs() > 0.01f32 {
+            io::eprintln("${label}: invalid benchmark output at ${index}: ${output_values[index]}");
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn run_mode(benchmark: bool) -> i32 {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() {
+        return 1;
+    }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() {
+        io::eprintln("metal linear: no Metal device");
+        return 1;
+    }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else {
+        return 1;
+    };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() {
+        return 1;
+    }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    let source: str = #include_str("../kernels/linear.metal");
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        source,
+        options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 = rt::msg_id(
+                compile_error,
+                rt::sel(#str_ptr("localizedDescription\0")),
+            );
+            io::eprintln("metal linear: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[metal::Function]::Some(function) = library.new_function_with_name("qi_linear_16x16") else {
+        return 1;
+    };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+    guard let option::Option[metal::ComputePipelineState]::Some(pipeline) =
+        device.new_compute_pipeline_state_with_function(function, 0 as *u8) else {
+        return 1;
+    };
+    let pipeline_owner: OwnedObjc = OwnedObjc::new(pipeline.raw());
+    if pipeline.max_total_threads_per_threadgroup() < (TILE *% TILE) as u64 {
+        io::eprintln("metal linear: device cannot run a 16x16 threadgroup");
+        return 1;
+    }
+
+    if !benchmark {
+        if validate(device, queue, pipeline) {
+            io::println("Metal linear validation: ok");
+            return 0;
+        }
+        return 1;
+    }
+
+    // 1024x1024 text-to-image has 64x64 = 4096 target tokens.
+    let rows: usize = 4096;
+    let first: bool = benchmark_shape(
+        device,
+        queue,
+        pipeline,
+        "attention projection",
+        rows,
+        4096 as usize,
+        4096 as usize,
+    );
+    let second: bool = benchmark_shape(
+        device,
+        queue,
+        pipeline,
+        "MLP gate/proj",
+        rows,
+        12288 as usize,
+        4096 as usize,
+    );
+    let third: bool = benchmark_shape(
+        device,
+        queue,
+        pipeline,
+        "MLP output",
+        rows,
+        4096 as usize,
+        12288 as usize,
+    );
+    if first && second && third {
+        io::println("Metal linear benchmark: ok");
+        return 0;
+    }
+    return 1;
+}
+
+fn run_validation() -> i32 {
+    return run_mode(false);
+}
+
+fn run_benchmark() -> i32 {
+    return run_mode(true);
+}
+
+#[test]
+fn tile_rounding_covers_partial_shapes() {
+    assert round_up(1 as usize, TILE) == (16 as usize);
+    assert round_up(16 as usize, TILE) == (16 as usize);
+    assert round_up(17 as usize, TILE) == (32 as usize);
+}

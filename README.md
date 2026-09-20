@@ -25,6 +25,8 @@ cpc build
 cpc test
 ./target/debug/qwen-image-cplus probe-stress
 ./target/debug/qwen-image-cplus test-metal-primitives
+./target/debug/qwen-image-cplus test-metal-linear
+./target/debug/qwen-image-cplus benchmark-linear
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -50,6 +52,10 @@ Inspect a shard, optionally filtering tensor names:
   and block-causal masks. The validation command reports error metrics and
   rejects non-finite output; measured tolerances are recorded in
   `manifests/metal-tolerances.json`.
+- A correctness-first 16x16 tiled linear kernel for BF16 and FP16 `[out,in]`
+  weights with FP32 accumulation. It is exact on partial-tile validation cases
+  and has recorded full-4096-token timings for all three transformer matrix
+  shapes in `benchmarks/m1-max-linear.json`.
 
 Image generation is not implemented yet. The remaining model kernels,
 quantized packed format, transformer, native prompt encoder, and causal 3D VAE

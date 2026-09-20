@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "device": "Apple M1 Max",
+  "cpc_version": "0.0.28",
+  "kernel": "qi_linear_16x16",
+  "weight_dtype": "BF16",
+  "accumulation_dtype": "F32",
+  "fast_math": false,
+  "storage_mode": "shared",
+  "warmup_dispatches": 1,
+  "measured_dispatches": 3,
+  "measurements": [
+    {
+      "name": "attention_projection",
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "average_gpu_ms": 121.729,
+      "gflops": 1129.05,
+      "buffer_mib": 160
+    },
+    {
+      "name": "mlp_gate_or_projection",
+      "m": 4096,
+      "n": 12288,
+      "k": 4096,
+      "average_gpu_ms": 365.387,
+      "gflops": 1128.44,
+      "buffer_mib": 352
+    },
+    {
+      "name": "mlp_output",
+      "m": 4096,
+      "n": 4096,
+      "k": 12288,
+      "average_gpu_ms": 370.633,
+      "gflops": 1112.47,
+      "buffer_mib": 352
+    }
+  ]
+}
