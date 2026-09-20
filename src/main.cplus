@@ -17,7 +17,7 @@ import "stdlib/text" as text;
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | quantize-block0 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -86,6 +86,17 @@ fn main() -> i32 {
             return 2;
         };
         return packed_model::quantize_block0(model_path.view(), output_path.view());
+    }
+    if command == "quantize-transformer" {
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus quantize-transformer MODEL_DIR OUTPUT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(output_path) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus quantize-transformer MODEL_DIR OUTPUT");
+            return 2;
+        };
+        return packed_model::quantize_transformer(model_path.view(), output_path.view());
     }
     if command == "verify-packed" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {

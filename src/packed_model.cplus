@@ -32,7 +32,13 @@ const HEADER_BYTES: u64 = 256;
 const RECORD_BYTES: u64 = 256;
 const DATA_ALIGNMENT: u64 = 4096;
 const TENSOR_ALIGNMENT: u64 = 256;
-const TENSOR_COUNT: usize = 9;
+const BLOCK0_TENSOR_COUNT: usize = 9;
+const FULL_TENSOR_COUNT: usize = 297;
+const GLOBAL_TENSOR_COUNT: usize = 9;
+const BLOCK_TENSOR_COUNT: usize = 9;
+const TRANSFORMER_BLOCK_COUNT: usize = 32;
+const SCOPE_BLOCK0: u32 = 1;
+const SCOPE_TRANSFORMER: u32 = 2;
 const O_WRONLY: i32 = 1;
 const O_CREAT: i32 = 0x0200;
 const O_TRUNC: i32 = 0x0400;
@@ -46,6 +52,9 @@ const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
 const SNAPSHOT: str = "b3179ad355be050328e483a9dfdd9e60cd62adfa";
 const DIFFUSERS_COMMIT: str = "80c7ed262aeffbeb43ef13ae04baeb9b84515a69";
+const FULL_POLICY: str = "transformer:mixed-q8-g64-v1";
+const FULL_PARAMETER_COUNT: u64 = 7115124736;
+const FULL_FILE_BYTES: u64 = 13334843392;
 
 #[repr(C)]
 struct PackedHeader {
@@ -87,6 +96,12 @@ struct PackedRecord {
 
 struct TensorSpec {
     name: str,
+    output: u64,
+    input: u64,
+    quantized: bool,
+}
+
+struct FullTensorSpec {
     output: u64,
     input: u64,
     quantized: bool,
@@ -302,6 +317,139 @@ fn make_specs() -> [TensorSpec; 9] {
     ];
 }
 
+fn full_tensor_name(index: usize) -> text::Text {
+    if index == (0 as usize) { return text::from_str("img_in.weight"); }
+    if index == (1 as usize) { return text::from_str("modulation.1.weight"); }
+    if index == (2 as usize) { return text::from_str("norm_out.linear.weight"); }
+    if index == (3 as usize) { return text::from_str("proj_out.weight"); }
+    if index == (4 as usize) {
+        return text::from_str("time_text_embed.timestep_embedder.linear_1.weight");
+    }
+    if index == (5 as usize) {
+        return text::from_str("time_text_embed.timestep_embedder.linear_2.weight");
+    }
+    if index == (6 as usize) { return text::from_str("txt_in.in_layer.weight"); }
+    if index == (7 as usize) { return text::from_str("txt_in.out_layer.weight"); }
+    if index == (8 as usize) { return text::from_str("txt_in.text_norm.weight"); }
+
+    let block_index: usize = (index -% GLOBAL_TENSOR_COUNT) / BLOCK_TENSOR_COUNT;
+    let role_index: usize = (index -% GLOBAL_TENSOR_COUNT) % BLOCK_TENSOR_COUNT;
+    if role_index == (0 as usize) {
+        return "transformer_blocks.${block_index}.attn.norm_k.weight";
+    }
+    if role_index == (1 as usize) {
+        return "transformer_blocks.${block_index}.attn.norm_q.weight";
+    }
+    if role_index == (2 as usize) {
+        return "transformer_blocks.${block_index}.attn.to_k.weight";
+    }
+    if role_index == (3 as usize) {
+        return "transformer_blocks.${block_index}.attn.to_out.0.weight";
+    }
+    if role_index == (4 as usize) {
+        return "transformer_blocks.${block_index}.attn.to_q.weight";
+    }
+    if role_index == (5 as usize) {
+        return "transformer_blocks.${block_index}.attn.to_v.weight";
+    }
+    if role_index == (6 as usize) {
+        return "transformer_blocks.${block_index}.img_mlp.gate_layer.weight";
+    }
+    if role_index == (7 as usize) {
+        return "transformer_blocks.${block_index}.img_mlp.out.weight";
+    }
+    return "transformer_blocks.${block_index}.img_mlp.proj.weight";
+}
+
+fn full_tensor_spec(index: usize) -> FullTensorSpec {
+    if index == (0 as usize) {
+        return FullTensorSpec { output: 4096 as u64, input: 64 as u64, quantized: false };
+    }
+    if index == (1 as usize) {
+        return FullTensorSpec { output: 16384 as u64, input: 4096 as u64, quantized: false };
+    }
+    if index == (2 as usize) {
+        return FullTensorSpec { output: 4096 as u64, input: 4096 as u64, quantized: false };
+    }
+    if index == (3 as usize) {
+        return FullTensorSpec { output: 64 as u64, input: 4096 as u64, quantized: false };
+    }
+    if index == (4 as usize) {
+        return FullTensorSpec { output: 4096 as u64, input: 256 as u64, quantized: false };
+    }
+    if index == (5 as usize) || index == (6 as usize) || index == (7 as usize) {
+        return FullTensorSpec { output: 4096 as u64, input: 4096 as u64, quantized: false };
+    }
+    if index == (8 as usize) {
+        return FullTensorSpec { output: 4096 as u64, input: 0 as u64, quantized: false };
+    }
+
+    let block_index: usize = (index -% GLOBAL_TENSOR_COUNT) / BLOCK_TENSOR_COUNT;
+    let role_index: usize = (index -% GLOBAL_TENSOR_COUNT) % BLOCK_TENSOR_COUNT;
+    if role_index == (0 as usize) || role_index == (1 as usize) {
+        return FullTensorSpec { output: 128 as u64, input: 0 as u64, quantized: false };
+    }
+    if role_index >= (2 as usize) && role_index <= (5 as usize) {
+        return FullTensorSpec {
+            output: 4096 as u64,
+            input: 4096 as u64,
+            quantized: block_index >= (24 as usize),
+        };
+    }
+    if role_index == (6 as usize) {
+        return FullTensorSpec { output: 12288 as u64, input: 4096 as u64, quantized: false };
+    }
+    if role_index == (7 as usize) {
+        return FullTensorSpec {
+            output: 4096 as u64,
+            input: 12288 as u64,
+            quantized: block_index >= (28 as usize),
+        };
+    }
+    return FullTensorSpec {
+        output: 12288 as u64,
+        input: 4096 as u64,
+        quantized: block_index >= (28 as usize),
+    };
+}
+
+fn make_full_record(name: str, spec: FullTensorSpec, ref cursor: u64) -> PackedRecord {
+    let elements: u64 = if spec.input == (0 as u64) { spec.output } else { spec.output *% spec.input };
+    let groups: u64 = if spec.quantized { spec.output *% (spec.input / (64 as u64)) } else { 0 as u64 };
+    var record: PackedRecord = PackedRecord {
+        name: [0 as u8; 128],
+        scheme: if spec.quantized { SCHEME_INT8_AFFINE } else { SCHEME_BF16 },
+        rank: if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 },
+        dimensions: [spec.output, spec.input, 0 as u64, 0 as u64],
+        group_axis: if spec.quantized { 1 as u32 } else { (0xFFFFFFFF as u32) },
+        group_size: if spec.quantized { 64 as u32 } else { 0 as u32 },
+        scale_type: if spec.quantized { TYPE_F16 } else { TYPE_NONE },
+        zero_type: if spec.quantized { TYPE_U8 } else { TYPE_NONE },
+        weights_offset: 0 as u64,
+        weights_length: if spec.quantized { elements } else { elements *% (2 as u64) },
+        scales_offset: 0 as u64,
+        scales_length: groups *% (2 as u64),
+        zeros_offset: 0 as u64,
+        zeros_length: groups,
+        elements: elements,
+        tensor_checksum: 0 as u64,
+        reserved: [0 as u8; 8],
+    };
+    let _name_ok: bool = fixed_text(#addr_of(record.name[0]), 128 as usize, name);
+    cursor = align_up(cursor, TENSOR_ALIGNMENT);
+    record.weights_offset = cursor;
+    cursor = cursor +% record.weights_length;
+    if spec.quantized {
+        cursor = align_up(cursor, TENSOR_ALIGNMENT);
+        record.scales_offset = cursor;
+        cursor = cursor +% record.scales_length;
+        cursor = align_up(cursor, TENSOR_ALIGNMENT);
+        record.zeros_offset = cursor;
+        cursor = cursor +% record.zeros_length;
+    }
+    return record;
+}
+
 fn make_record(spec: TensorSpec, ref cursor: u64) -> PackedRecord {
     let elements: u64 = if spec.input == (0 as u64) { spec.output } else { spec.output *% spec.input };
     let groups: u64 = if spec.quantized { spec.output *% (spec.input / (64 as u64)) } else { 0 as u64 };
@@ -396,6 +544,136 @@ fn quantize_tensor(tensor: safetensors::TensorData, record: PackedRecord) -> opt
     return option::Option[[OwnedBytes; 3]]::Some([weights, scales, zeros]);
 }
 
+fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
+    let header: *PackedHeader = file.pointer() as *PackedHeader;
+    let expected_data_offset: u64 = align_up(
+        HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64,
+        DATA_ALIGNMENT,
+    );
+    if !magic_matches(header) || (*header).version != VERSION
+        || (*header).header_bytes != HEADER_BYTES as u32
+        || (*header).tensor_count != FULL_TENSOR_COUNT as u32
+        || (*header).scope != SCOPE_TRANSFORMER
+        || (*header).directory_offset != HEADER_BYTES
+        || (*header).data_offset != expected_data_offset
+        || (*header).file_bytes != FULL_FILE_BYTES
+        || (*header).file_bytes != file.length() as u64
+        || !fixed_matches(#addr_of((*header).model_snapshot[0]), 40 as usize, SNAPSHOT)
+        || !fixed_matches(#addr_of((*header).diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT)
+        || !fixed_matches(#addr_of((*header).policy[0]), 32 as usize, FULL_POLICY) {
+        if !quiet { io::eprintln("packed transformer: invalid header or model identity"); }
+        return 1;
+    }
+    let payload_hash: u64 = hash_update(
+        FNV_OFFSET,
+        file.pointer() + (*header).data_offset as usize,
+        file.length() -% (*header).data_offset as usize,
+    );
+    if payload_hash != (*header).payload_checksum {
+        if !quiet { io::eprintln("packed transformer: payload checksum mismatch"); }
+        return 1;
+    }
+
+    let records: *PackedRecord =
+        (file.pointer() + (*header).directory_offset as usize) as *PackedRecord;
+    var cursor: u64 = (*header).data_offset;
+    var parameter_count: u64 = 0 as u64;
+    var quantized_count: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < FULL_TENSOR_COUNT {
+        let record: *PackedRecord = records + index;
+        let name: text::Text = full_tensor_name(index);
+        let spec: FullTensorSpec = full_tensor_spec(index);
+        let expected_rank: u32 = if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 };
+        let expected_elements: u64 = if spec.input == (0 as u64) {
+            spec.output
+        } else {
+            spec.output *% spec.input
+        };
+        parameter_count = parameter_count +% expected_elements;
+        if spec.quantized { quantized_count = quantized_count +% (1 as usize); }
+        if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, name.view())
+            || (*record).rank != expected_rank
+            || (*record).dimensions[0] != spec.output
+            || (expected_rank == (2 as u32) && (*record).dimensions[1] != spec.input)
+            || (*record).elements != expected_elements
+            || (spec.quantized && (*record).scheme != SCHEME_INT8_AFFINE)
+            || (!spec.quantized && (*record).scheme != SCHEME_BF16)
+            || (spec.quantized && (*record).weights_length != expected_elements)
+            || (*record).weights_offset % TENSOR_ALIGNMENT != (0 as u64)
+            || (*record).weights_offset < cursor
+            || (*record).weights_offset > (*header).file_bytes
+            || (*record).weights_length > (*header).file_bytes -% (*record).weights_offset {
+            if !quiet { io::eprintln("packed transformer: invalid tensor record ${index} (${name})"); }
+            return 1;
+        }
+        var tensor_hash: u64 = hash_update(
+            FNV_OFFSET,
+            file.pointer() + (*record).weights_offset as usize,
+            (*record).weights_length as usize,
+        );
+        cursor = (*record).weights_offset +% (*record).weights_length;
+        if (*record).scheme == SCHEME_INT8_AFFINE {
+            let groups: u64 = spec.output *% (spec.input / (64 as u64));
+            if (*record).group_axis != (1 as u32) || (*record).group_size != (64 as u32)
+                || (*record).scale_type != TYPE_F16 || (*record).zero_type != TYPE_U8
+                || (*record).scales_length != groups *% (2 as u64)
+                || (*record).zeros_length != groups
+                || (*record).scales_offset % TENSOR_ALIGNMENT != (0 as u64)
+                || (*record).zeros_offset % TENSOR_ALIGNMENT != (0 as u64)
+                || (*record).scales_offset < cursor
+                || (*record).scales_offset > (*header).file_bytes
+                || (*record).scales_length > (*header).file_bytes -% (*record).scales_offset {
+                if !quiet { io::eprintln("packed transformer: invalid quantization metadata ${index}"); }
+                return 1;
+            }
+            tensor_hash = hash_update(
+                tensor_hash,
+                file.pointer() + (*record).scales_offset as usize,
+                (*record).scales_length as usize,
+            );
+            cursor = (*record).scales_offset +% (*record).scales_length;
+            if (*record).zeros_offset < cursor
+                || (*record).zeros_offset > (*header).file_bytes
+                || (*record).zeros_length > (*header).file_bytes -% (*record).zeros_offset {
+                if !quiet { io::eprintln("packed transformer: invalid zero-point range ${index}"); }
+                return 1;
+            }
+            tensor_hash = hash_update(
+                tensor_hash,
+                file.pointer() + (*record).zeros_offset as usize,
+                (*record).zeros_length as usize,
+            );
+            cursor = (*record).zeros_offset +% (*record).zeros_length;
+        } else if (*record).scheme != SCHEME_BF16
+            || (*record).weights_length != expected_elements *% (2 as u64)
+            || (*record).scales_offset != (0 as u64)
+            || (*record).scales_length != (0 as u64)
+            || (*record).zeros_offset != (0 as u64)
+            || (*record).zeros_length != (0 as u64) {
+            if !quiet { io::eprintln("packed transformer: unsupported scheme ${(*record).scheme}"); }
+            return 1;
+        }
+        if tensor_hash != (*record).tensor_checksum {
+            if !quiet { io::eprintln("packed transformer: tensor checksum mismatch ${index}"); }
+            return 1;
+        }
+        index = index +% (1 as usize);
+    }
+    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != (40 as usize)
+        || align_up(cursor, TENSOR_ALIGNMENT) != (*header).file_bytes {
+        if !quiet { io::eprintln("packed transformer: inventory or trailing data mismatch"); }
+        return 1;
+    }
+    if !quiet {
+        io::println(
+            "packed transformer: tensors=${FULL_TENSOR_COUNT} parameters=${parameter_count} q8=${quantized_count} bytes=${(*header).file_bytes}",
+        );
+        io::println("packed transformer: verified");
+    }
+    return 0;
+}
+
 fn verify_packed(path: str, quiet: bool = false) -> i32 {
     guard let mapped::MapResult::Ok(file) = mapped::map_readonly(path) else {
         if !quiet { io::eprintln("packed model: could not map ${path}"); }
@@ -406,9 +684,13 @@ fn verify_packed(path: str, quiet: bool = false) -> i32 {
         return 1;
     }
     let header: *PackedHeader = file.pointer() as *PackedHeader;
+    if magic_matches(header) && (*header).scope == SCOPE_TRANSFORMER {
+        return verify_full_packed(file, quiet);
+    }
     if !magic_matches(header) || (*header).version != VERSION
         || (*header).header_bytes != HEADER_BYTES as u32
-        || (*header).tensor_count != TENSOR_COUNT as u32
+        || (*header).tensor_count != BLOCK0_TENSOR_COUNT as u32
+        || (*header).scope != SCOPE_BLOCK0
         || (*header).directory_offset != HEADER_BYTES
         || (*header).data_offset != DATA_ALIGNMENT
         || (*header).file_bytes != file.length() as u64
@@ -434,7 +716,7 @@ fn verify_packed(path: str, quiet: bool = false) -> i32 {
     let specs: [TensorSpec; 9] = make_specs();
     var cursor: u64 = (*header).data_offset;
     var index: usize = 0 as usize;
-    while index < TENSOR_COUNT {
+    while index < BLOCK0_TENSOR_COUNT {
         let record: *PackedRecord = records + index;
         let spec: TensorSpec = specs[index];
         let expected_rank: u32 = if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 };
@@ -517,7 +799,7 @@ fn verify_packed(path: str, quiet: bool = false) -> i32 {
     }
     if !quiet {
         let bytes: u64 = (*header).file_bytes;
-        io::println("packed block0: tensors=${TENSOR_COUNT} bytes=${bytes} checksum=${(*header).payload_checksum}");
+        io::println("packed block0: tensors=${BLOCK0_TENSOR_COUNT} bytes=${bytes} checksum=${(*header).payload_checksum}");
         io::println("packed block0: verified");
     }
     return 0;
@@ -546,14 +828,14 @@ fn verify_against_source(
         return 1;
     }
     let header: *PackedHeader = packed.pointer() as *PackedHeader;
-    if !magic_matches(header) || (*header).tensor_count != TENSOR_COUNT as u32 {
+    if !magic_matches(header) || (*header).tensor_count != BLOCK0_TENSOR_COUNT as u32 {
         return 1;
     }
     let records: *PackedRecord =
         (packed.pointer() + (*header).directory_offset as usize) as *PackedRecord;
     let specs: [TensorSpec; 9] = make_specs();
     var index: usize = 0 as usize;
-    while index < TENSOR_COUNT {
+    while index < BLOCK0_TENSOR_COUNT {
         let record: *PackedRecord = records + index;
         let spec: TensorSpec = specs[index];
         if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, spec.name) {
@@ -631,16 +913,157 @@ fn verify_against_source(
     return 0;
 }
 
+fn tensor_from_sources(
+    first: safetensors::File,
+    second: safetensors::File,
+    name: str,
+) -> option::Option[safetensors::TensorData] {
+    return match first.tensor(name) {
+        option::Option[safetensors::TensorData]::Some(tensor) => {
+            option::Option[safetensors::TensorData]::Some(tensor)
+        }
+        option::Option[safetensors::TensorData]::None => second.tensor(name),
+    };
+}
+
+fn verify_full_against_source(
+    packed_path: str,
+    first: safetensors::File,
+    second: safetensors::File,
+    quiet: bool = false,
+) -> i32 {
+    if first.tensor_count() +% second.tensor_count() != FULL_TENSOR_COUNT
+        || first.parameter_count() +% second.parameter_count() != FULL_PARAMETER_COUNT {
+        if !quiet { io::eprintln("packed transformer: source inventory mismatch"); }
+        return 1;
+    }
+    guard let mapped::MapResult::Ok(packed) = mapped::map_readonly(packed_path) else {
+        if !quiet { io::eprintln("packed transformer: could not map ${packed_path}"); }
+        return 1;
+    };
+    let header: *PackedHeader = packed.pointer() as *PackedHeader;
+    if !magic_matches(header) || (*header).scope != SCOPE_TRANSFORMER
+        || (*header).tensor_count != FULL_TENSOR_COUNT as u32 {
+        return 1;
+    }
+    let records: *PackedRecord =
+        (packed.pointer() + (*header).directory_offset as usize) as *PackedRecord;
+    var index: usize = 0 as usize;
+    while index < FULL_TENSOR_COUNT {
+        let record: *PackedRecord = records + index;
+        let name: text::Text = full_tensor_name(index);
+        let spec: FullTensorSpec = full_tensor_spec(index);
+        if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, name.view()) {
+            if !quiet { io::eprintln("packed transformer: tensor order/name mismatch ${index}"); }
+            return 1;
+        }
+        guard let option::Option[safetensors::TensorData]::Some(tensor) = tensor_from_sources(
+            first,
+            second,
+            name.view(),
+        ) else {
+            if !quiet { io::eprintln("packed transformer: source is missing ${name}"); }
+            return 1;
+        };
+        let expected_rank: usize = if spec.input == (0 as u64) { 1 as usize } else { 2 as usize };
+        if tensor.dtype.name() != "BF16" || tensor.rank != expected_rank
+            || tensor.dimensions[0] != spec.output
+            || (expected_rank == (2 as usize) && tensor.dimensions[1] != spec.input) {
+            if !quiet { io::eprintln("packed transformer: wrong source metadata for ${name}"); }
+            return 1;
+        }
+        if !spec.quantized {
+            var byte_index: usize = 0 as usize;
+            let packed_weights: *u8 = packed.pointer() + (*record).weights_offset as usize;
+            while byte_index < tensor.byte_length as usize {
+                if tensor.pointer[byte_index] != packed_weights[byte_index] {
+                    if !quiet { io::eprintln("packed transformer: raw round-trip mismatch ${name}"); }
+                    return 1;
+                }
+                byte_index = byte_index +% (1 as usize);
+            }
+        } else {
+            let source_values: *u16 = tensor.pointer as *u16;
+            let packed_weights: *u8 = packed.pointer() + (*record).weights_offset as usize;
+            let packed_scales: *u16 =
+                (packed.pointer() + (*record).scales_offset as usize) as *u16;
+            let packed_zeros: *u8 = packed.pointer() + (*record).zeros_offset as usize;
+            let output_count: usize = spec.output as usize;
+            let input_count: usize = spec.input as usize;
+            let group_size: usize = 64 as usize;
+            let groups_per_row: usize = input_count / group_size;
+            var row: usize = 0 as usize;
+            while row < output_count {
+                var group: usize = 0 as usize;
+                while group < groups_per_row {
+                    let start: usize = row *% input_count +% group *% group_size;
+                    var minimum: f32 = cpu::bf16_to_f32(source_values[start]);
+                    var maximum: f32 = minimum;
+                    var inner: usize = 1 as usize;
+                    while inner < group_size {
+                        let value: f32 = cpu::bf16_to_f32(source_values[start +% inner]);
+                        minimum = minimum.min(value);
+                        maximum = maximum.max(value);
+                        inner = inner +% (1 as usize);
+                    }
+                    var scale: f32 = (maximum - minimum) / 255.0f32;
+                    if scale == 0.0f32 { scale = 1.0f32; }
+                    let scale_bits: u16 = cpu::f32_to_fp16(scale);
+                    let stored_scale: f32 = cpu::fp16_to_f32(scale_bits);
+                    var zero_value: f32 = (0.0f32 - minimum) / stored_scale;
+                    zero_value = zero_value.round().max(0.0f32).min(255.0f32);
+                    let zero: u8 = zero_value as u8;
+                    let group_index: usize = row *% groups_per_row +% group;
+                    if packed_scales[group_index] != scale_bits || packed_zeros[group_index] != zero {
+                        if !quiet {
+                            io::eprintln("packed transformer: group metadata round-trip mismatch ${name}");
+                        }
+                        return 1;
+                    }
+                    inner = 0 as usize;
+                    while inner < group_size {
+                        let value: f32 = cpu::bf16_to_f32(source_values[start +% inner]);
+                        var expected: f32 = (value / stored_scale).round() + zero as f32;
+                        expected = expected.max(0.0f32).min(255.0f32);
+                        if packed_weights[start +% inner] != expected as u8 {
+                            if !quiet {
+                                io::eprintln("packed transformer: quantized round-trip mismatch ${name}");
+                            }
+                            return 1;
+                        }
+                        inner = inner +% (1 as usize);
+                    }
+                    group = group +% (1 as usize);
+                }
+                row = row +% (1 as usize);
+            }
+        }
+        index = index +% (1 as usize);
+    }
+    if !quiet { io::println("packed transformer: source round-trip verified"); }
+    return 0;
+}
+
 fn verify_packed_source(path: str, model_directory: str) -> i32 {
     if verify_packed(path) != (0 as i32) {
         return 1;
     }
-    let shard_path: text::Text =
+    guard let mapped::MapResult::Ok(packed) = mapped::map_readonly(path) else { return 1; };
+    let header: *PackedHeader = packed.pointer() as *PackedHeader;
+    let first_path: text::Text =
         "${model_directory}/transformer/diffusion_pytorch_model-00001-of-00002.safetensors";
-    guard let safetensors::LoadResult::Ok(source) = safetensors::load(shard_path.view()) else {
+    guard let safetensors::LoadResult::Ok(first) = safetensors::load(first_path.view()) else {
         return 1;
     };
-    return verify_against_source(path, source);
+    if (*header).scope == SCOPE_BLOCK0 {
+        return verify_against_source(path, first);
+    }
+    let second_path: text::Text =
+        "${model_directory}/transformer/diffusion_pytorch_model-00002-of-00002.safetensors";
+    guard let safetensors::LoadResult::Ok(second) = safetensors::load(second_path.view()) else {
+        return 1;
+    };
+    return verify_full_against_source(path, first, second);
 }
 
 fn quantize_block0(model_directory: str, output_path: str) -> i32 {
@@ -656,10 +1079,10 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
         return 1;
     };
     let specs: [TensorSpec; 9] = make_specs();
-    var records: vec::Vec[PackedRecord] = vec::Vec[PackedRecord]::with_capacity(TENSOR_COUNT);
+    var records: vec::Vec[PackedRecord] = vec::Vec[PackedRecord]::with_capacity(BLOCK0_TENSOR_COUNT);
     var cursor: u64 = DATA_ALIGNMENT;
     var index: usize = 0 as usize;
-    while index < TENSOR_COUNT {
+    while index < BLOCK0_TENSOR_COUNT {
         let record: PackedRecord = make_record(specs[index], cursor);
         if records.append(record) != status::Status::Ok {
             return 1;
@@ -671,8 +1094,8 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
         magic: [81 as u8, 73 as u8, 80 as u8, 65 as u8, 67 as u8, 75 as u8, 49 as u8, 0 as u8],
         version: VERSION,
         header_bytes: HEADER_BYTES as u32,
-        tensor_count: TENSOR_COUNT as u32,
-        scope: 1 as u32,
+        tensor_count: BLOCK0_TENSOR_COUNT as u32,
+        scope: SCOPE_BLOCK0,
         directory_offset: HEADER_BYTES,
         data_offset: DATA_ALIGNMENT,
         file_bytes: file_bytes,
@@ -703,7 +1126,7 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
     }
     var ok: bool = write_all(fd, #addr_of(header) as *u8, HEADER_BYTES as usize);
     index = 0 as usize;
-    while ok && index < TENSOR_COUNT {
+    while ok && index < BLOCK0_TENSOR_COUNT {
         guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else {
             ok = false;
             break;
@@ -712,13 +1135,13 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
         index = index +% (1 as usize);
     }
     var payload_checksum: u64 = FNV_OFFSET;
-    let directory_end: u64 = HEADER_BYTES +% RECORD_BYTES *% TENSOR_COUNT as u64;
+    let directory_end: u64 = HEADER_BYTES +% RECORD_BYTES *% BLOCK0_TENSOR_COUNT as u64;
     if ok {
         ok = write_zeroes(fd, DATA_ALIGNMENT -% directory_end, payload_checksum, false);
     }
     var position: u64 = DATA_ALIGNMENT;
     index = 0 as usize;
-    while ok && index < TENSOR_COUNT {
+    while ok && index < BLOCK0_TENSOR_COUNT {
         guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else {
             ok = false;
             break;
@@ -780,7 +1203,7 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
     if ok && qi_pack_lseek(fd, 0 as i64, SEEK_SET) != (0 as i64) { ok = false; }
     if ok { ok = write_all(fd, #addr_of(header) as *u8, HEADER_BYTES as usize); }
     index = 0 as usize;
-    while ok && index < TENSOR_COUNT {
+    while ok && index < BLOCK0_TENSOR_COUNT {
         guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else { ok = false; break; };
         ok = write_all(fd, record as *u8, RECORD_BYTES as usize);
         index = index +% (1 as usize);
@@ -811,11 +1234,259 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
     return 0;
 }
 
+fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
+    if #size_of::[PackedHeader]() != HEADER_BYTES as usize
+        || #size_of::[PackedRecord]() != RECORD_BYTES as usize {
+        io::eprintln("packed transformer: ABI layout does not match the format");
+        return 1;
+    }
+    let first_path: text::Text =
+        "${model_directory}/transformer/diffusion_pytorch_model-00001-of-00002.safetensors";
+    let second_path: text::Text =
+        "${model_directory}/transformer/diffusion_pytorch_model-00002-of-00002.safetensors";
+    guard let safetensors::LoadResult::Ok(first) = safetensors::load(first_path.view()) else {
+        io::eprintln("packed transformer: could not load ${first_path}");
+        return 1;
+    };
+    guard let safetensors::LoadResult::Ok(second) = safetensors::load(second_path.view()) else {
+        io::eprintln("packed transformer: could not load ${second_path}");
+        return 1;
+    };
+    if first.tensor_count() +% second.tensor_count() != FULL_TENSOR_COUNT
+        || first.parameter_count() +% second.parameter_count() != FULL_PARAMETER_COUNT {
+        io::eprintln("packed transformer: source inventory does not match the pinned model");
+        return 1;
+    }
+
+    let data_offset: u64 = align_up(
+        HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64,
+        DATA_ALIGNMENT,
+    );
+    var records: vec::Vec[PackedRecord] =
+        vec::Vec[PackedRecord]::with_capacity(FULL_TENSOR_COUNT);
+    var cursor: u64 = data_offset;
+    var index: usize = 0 as usize;
+    while index < FULL_TENSOR_COUNT {
+        let name: text::Text = full_tensor_name(index);
+        let record: PackedRecord = make_full_record(name.view(), full_tensor_spec(index), cursor);
+        if records.append(record) != status::Status::Ok {
+            return 1;
+        }
+        index = index +% (1 as usize);
+    }
+    let file_bytes: u64 = align_up(cursor, TENSOR_ALIGNMENT);
+    if file_bytes != FULL_FILE_BYTES {
+        io::eprintln("packed transformer: generated layout does not match the pinned size");
+        return 1;
+    }
+    var header: PackedHeader = PackedHeader {
+        magic: [81 as u8, 73 as u8, 80 as u8, 65 as u8, 67 as u8, 75 as u8, 49 as u8, 0 as u8],
+        version: VERSION,
+        header_bytes: HEADER_BYTES as u32,
+        tensor_count: FULL_TENSOR_COUNT as u32,
+        scope: SCOPE_TRANSFORMER,
+        directory_offset: HEADER_BYTES,
+        data_offset: data_offset,
+        file_bytes: file_bytes,
+        payload_checksum: 0 as u64,
+        model_snapshot: [0 as u8; 40],
+        diffusers_commit: [0 as u8; 40],
+        policy: [0 as u8; 32],
+        reserved: [0 as u8; 88],
+    };
+    let _snapshot_ok: bool = fixed_text(#addr_of(header.model_snapshot[0]), 40 as usize, SNAPSHOT);
+    let _commit_ok: bool = fixed_text(#addr_of(header.diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT);
+    let _policy_ok: bool = fixed_text(#addr_of(header.policy[0]), 32 as usize, FULL_POLICY);
+
+    let temporary_path: text::Text = "${output_path}.tmp";
+    guard let option::Option[text::CString]::Some(c_temporary) = temporary_path.c_str() else {
+        return 1;
+    };
+    let fd: i32 = qi_pack_open(c_temporary.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 420 as i32);
+    if fd < (0 as i32) {
+        io::eprintln("packed transformer: could not create ${temporary_path}");
+        return 1;
+    }
+    if qi_pack_fchmod(fd, 420 as u16) != (0 as i32) {
+        let _closed: i32 = qi_pack_close(fd);
+        let _removed: i32 = qi_pack_unlink(c_temporary.as_ptr());
+        io::eprintln("packed transformer: could not set safe output permissions");
+        return 1;
+    }
+    var ok: bool = write_all(fd, #addr_of(header) as *u8, HEADER_BYTES as usize);
+    index = 0 as usize;
+    while ok && index < FULL_TENSOR_COUNT {
+        guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else {
+            ok = false;
+            break;
+        };
+        ok = write_all(fd, record as *u8, RECORD_BYTES as usize);
+        index = index +% (1 as usize);
+    }
+    var payload_checksum: u64 = FNV_OFFSET;
+    let directory_end: u64 = HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64;
+    if ok {
+        ok = write_zeroes(fd, data_offset -% directory_end, payload_checksum, false);
+    }
+    var position: u64 = data_offset;
+    index = 0 as usize;
+    while ok && index < FULL_TENSOR_COUNT {
+        guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else {
+            ok = false;
+            break;
+        };
+        let name: text::Text = full_tensor_name(index);
+        let spec: FullTensorSpec = full_tensor_spec(index);
+        if index >= GLOBAL_TENSOR_COUNT
+            && (index -% GLOBAL_TENSOR_COUNT) % BLOCK_TENSOR_COUNT == (0 as usize) {
+            let block_index: usize = (index -% GLOBAL_TENSOR_COUNT) / BLOCK_TENSOR_COUNT;
+            io::println("packing transformer block ${block_index}/${TRANSFORMER_BLOCK_COUNT}");
+        }
+        guard let option::Option[safetensors::TensorData]::Some(tensor) = tensor_from_sources(
+            first,
+            second,
+            name.view(),
+        ) else {
+            io::eprintln("packed transformer: missing ${name}");
+            ok = false;
+            break;
+        };
+        let expected_rank: usize = if spec.input == (0 as u64) { 1 as usize } else { 2 as usize };
+        if tensor.dtype.name() != "BF16" || tensor.rank != expected_rank
+            || tensor.dimensions[0] != spec.output
+            || (expected_rank == (2 as usize) && tensor.dimensions[1] != spec.input) {
+            io::eprintln("packed transformer: wrong metadata for ${name}");
+            ok = false;
+            break;
+        }
+        if position < { (*record).weights_offset } {
+            ok = write_zeroes(fd, { (*record).weights_offset } -% position, payload_checksum, true);
+            position = { (*record).weights_offset };
+        }
+        var tensor_hash: u64 = FNV_OFFSET;
+        if !spec.quantized {
+            ok = write_payload(fd, tensor.pointer, tensor.byte_length as usize, payload_checksum);
+            tensor_hash = hash_update(tensor_hash, tensor.pointer, tensor.byte_length as usize);
+            position = position +% tensor.byte_length;
+        } else {
+            guard let option::Option[[OwnedBytes; 3]]::Some(buffers) = quantize_tensor(
+                tensor,
+                { *record },
+            ) else {
+                ok = false;
+                break;
+            };
+            ok = write_payload(fd, buffers[0].pointer, buffers[0].length, payload_checksum);
+            tensor_hash = hash_update(tensor_hash, buffers[0].pointer, buffers[0].length);
+            position = position +% buffers[0].length as u64;
+            if ok && position < { (*record).scales_offset } {
+                ok = write_zeroes(fd, { (*record).scales_offset } -% position, payload_checksum, true);
+                position = { (*record).scales_offset };
+            }
+            if ok {
+                ok = write_payload(fd, buffers[1].pointer, buffers[1].length, payload_checksum);
+            }
+            tensor_hash = hash_update(tensor_hash, buffers[1].pointer, buffers[1].length);
+            position = position +% buffers[1].length as u64;
+            if ok && position < { (*record).zeros_offset } {
+                ok = write_zeroes(fd, { (*record).zeros_offset } -% position, payload_checksum, true);
+                position = { (*record).zeros_offset };
+            }
+            if ok {
+                ok = write_payload(fd, buffers[2].pointer, buffers[2].length, payload_checksum);
+            }
+            tensor_hash = hash_update(tensor_hash, buffers[2].pointer, buffers[2].length);
+            position = position +% buffers[2].length as u64;
+        }
+        (*record).tensor_checksum = tensor_hash;
+        index = index +% (1 as usize);
+    }
+    if ok && position < file_bytes {
+        ok = write_zeroes(fd, file_bytes -% position, payload_checksum, true);
+    }
+    header.payload_checksum = payload_checksum;
+    if ok && qi_pack_lseek(fd, 0 as i64, SEEK_SET) != (0 as i64) { ok = false; }
+    if ok { ok = write_all(fd, #addr_of(header) as *u8, HEADER_BYTES as usize); }
+    index = 0 as usize;
+    while ok && index < FULL_TENSOR_COUNT {
+        guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else {
+            ok = false;
+            break;
+        };
+        ok = write_all(fd, record as *u8, RECORD_BYTES as usize);
+        index = index +% (1 as usize);
+    }
+    if ok && qi_pack_fsync(fd) != (0 as i32) { ok = false; }
+    let _closed: i32 = qi_pack_close(fd);
+    if !ok || verify_packed(temporary_path.view(), true) != (0 as i32)
+        || verify_full_against_source(temporary_path.view(), first, second, true) != (0 as i32) {
+        let _removed: i32 = qi_pack_unlink(c_temporary.as_ptr());
+        io::eprintln("packed transformer: temporary output failed validation");
+        return 1;
+    }
+    let output_owner: text::Text = text::from_str(output_path);
+    guard let option::Option[text::CString]::Some(c_output) = output_owner.c_str() else {
+        let _removed: i32 = qi_pack_unlink(c_temporary.as_ptr());
+        return 1;
+    };
+    if qi_pack_rename(c_temporary.as_ptr(), c_output.as_ptr()) != (0 as i32) {
+        let _removed: i32 = qi_pack_unlink(c_temporary.as_ptr());
+        io::eprintln("packed transformer: could not install ${output_path}");
+        return 1;
+    }
+    io::println("packed transformer written atomically: ${output_path}");
+    if verify_packed(output_path) != (0 as i32) { return 1; }
+    io::println("packed transformer: source round-trip verified");
+    return 0;
+}
+
 #[test]
 fn packed_layout_is_fixed_and_aligned() {
     assert #size_of::[PackedHeader]() == (256 as usize);
     assert #size_of::[PackedRecord]() == (256 as usize);
     assert align_up(257 as u64, 256 as u64) == (512 as u64);
+}
+
+#[test]
+fn full_transformer_layout_matches_inventory_and_policy() {
+    let data_offset: u64 = align_up(
+        HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64,
+        DATA_ALIGNMENT,
+    );
+    var cursor: u64 = data_offset;
+    var parameters: u64 = 0 as u64;
+    var quantized: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < FULL_TENSOR_COUNT {
+        let name: text::Text = full_tensor_name(index);
+        let spec: FullTensorSpec = full_tensor_spec(index);
+        let record: PackedRecord = make_full_record(name.view(), spec, cursor);
+        parameters = parameters +% record.elements;
+        if spec.quantized { quantized = quantized +% (1 as usize); }
+        index = index +% (1 as usize);
+    }
+    assert data_offset == (77824 as u64);
+    assert parameters == FULL_PARAMETER_COUNT;
+    assert quantized == (40 as usize);
+    assert align_up(cursor, TENSOR_ALIGNMENT) == FULL_FILE_BYTES;
+}
+
+#[test]
+fn full_transformer_policy_boundaries_match_calibration() {
+    let block23: usize = GLOBAL_TENSOR_COUNT +% (23 as usize) *% BLOCK_TENSOR_COUNT;
+    let block24: usize = GLOBAL_TENSOR_COUNT +% (24 as usize) *% BLOCK_TENSOR_COUNT;
+    let block28: usize = GLOBAL_TENSOR_COUNT +% (28 as usize) *% BLOCK_TENSOR_COUNT;
+    assert !full_tensor_spec(block23 +% (2 as usize)).quantized;
+    assert full_tensor_spec(block24 +% (2 as usize)).quantized;
+    assert full_tensor_spec(block24 +% (5 as usize)).quantized;
+    assert !full_tensor_spec(block24 +% (6 as usize)).quantized;
+    assert !full_tensor_spec(block24 +% (7 as usize)).quantized;
+    assert !full_tensor_spec(block24 +% (8 as usize)).quantized;
+    assert !full_tensor_spec(block28 +% (6 as usize)).quantized;
+    assert full_tensor_spec(block28 +% (7 as usize)).quantized;
+    assert full_tensor_spec(block28 +% (8 as usize)).quantized;
+    assert full_tensor_name(block28 +% (8 as usize))
+        == "transformer_blocks.28.img_mlp.proj.weight";
 }
 
 #[test]

@@ -31,8 +31,11 @@ cpc test
 ./target/debug/qwen-image-cplus benchmark-int8-linear
 ./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
+./target/debug/qwen-image-cplus quantize-transformer /path/to/model/snapshot transformer.qipack
 ./target/debug/qwen-image-cplus verify-packed block0.qipack
+./target/debug/qwen-image-cplus verify-packed transformer.qipack
 ./target/debug/qwen-image-cplus verify-packed-source block0.qipack /path/to/model/snapshot
+./target/debug/qwen-image-cplus verify-packed-source transformer.qipack /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-transformer-block-int8 block0.qipack
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
@@ -101,6 +104,14 @@ Inspect a shard, optionally filtering tensor names:
   and output in blocks 28-31. Its repeated worst-case error is 0.985%, and its
   block-matrix storage is 12.166 GiB instead of 13 GiB. The repeat is recorded
   in `benchmarks/m1-max-mixed-quantization.json`.
+- A full-transformer QIPACK1 writer/reader for that mixed policy. It generates
+  the complete 297-tensor inventory from nine global tensor definitions and a
+  nine-role block schema, preserving BF16 everywhere except the measured 40
+  Q8 matrices. The writer refuses a source other than the exact 7,115,124,736-
+  parameter, two-shard inventory; installs atomically only after structure,
+  payload, per-tensor, and exact source round-trip checks; and produced a
+  verified 13,334,843,392-byte artifact from the pinned snapshot. The layout
+  and scope compatibility rules are documented in `docs/packed-format-v1.md`.
 
 ## Quantization decision log
 
@@ -139,8 +150,14 @@ native Metal comparisons and replayed-trajectory calibration. The simpler
 blocks-28-31-only policy remains the fallback; it measured 0.906% at the cost
 of about 61 MiB more block-matrix storage.
 
-Image generation is not implemented yet. The next transformer step is to
-generalize the packed writer/reader and native execution path to the measured
-mixed BF16/Q8 policy, then validate it with native Metal and denoising-state
-replay. The native prompt encoder and causal 3D VAE are also tracked in
-`plan.md`.
+The full writer intentionally keeps the nine non-block tensors in BF16: they
+were not part of the 224-matrix calibration, so quantizing them would extend
+the policy beyond its evidence. Likewise, MLP gates remain BF16 because the
+role search showed that exchanging projection/output for the gate crossed the
+1% error threshold. QIPACK1 still accepts the original block-0 scope so the
+existing isolated Metal fixture remains reproducible.
+
+Image generation is not implemented yet. The next transformer step is native
+execution directly from the full mixed artifact, followed by native Metal
+boundary comparisons and denoising-state replay. The native prompt encoder and
+causal 3D VAE are also tracked in `plan.md`.
