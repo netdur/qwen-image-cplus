@@ -95,8 +95,52 @@ Inspect a shard, optionally filtering tensor names:
   exceed the 1% gate and the worst reaches 1.921%. Results are recorded in
   `benchmarks/m1-max-transformer-quantization.json`; the decision is in
   `manifests/transformer-quantization-policy.json`.
+- A mixed-precision search by block range and matrix role. The smallest tested
+  policy under the 1% gate keeps blocks 0-23 fully BF16, quantizes Q/K/V and
+  attention output in blocks 24-31, and additionally quantizes MLP projection
+  and output in blocks 28-31. Its repeated worst-case error is 0.985%, and its
+  block-matrix storage is 12.166 GiB instead of 13 GiB. The repeat is recorded
+  in `benchmarks/m1-max-mixed-quantization.json`.
 
-Image generation is not implemented yet. The next quantization step is a
-mixed-precision search by block range and matrix role, with special attention
-to the middle blocks where error peaks. The native prompt encoder and causal
-3D VAE are also tracked in `plan.md`.
+## Quantization decision log
+
+The quantization policy is measurement-driven and deliberately conservative:
+
+1. Uniform Q4 was rejected at block 0. Its best complete-block candidate was
+   already 13.68% nRMSE, so propagating it through 32 blocks had no plausible
+   path to the 1% full-transformer budget.
+2. Affine Q8/group-64 passed the original isolated block-0 fixture at 0.837%.
+   That justified implementing the packed format and Metal kernel, but not
+   generalizing the policy: one four-token block does not expose accumulated
+   error or prompt/timestep/resolution sensitivity.
+3. Uniform Q8 across all 32 blocks was then tested on six full-transformer
+   cases. It failed four, reaching 1.921% final-noise nRMSE. Error at sampled
+   internal outputs reached 4.000% around block 15, showing that local block
+   success does not compose uniformly.
+4. Coarse mixed policies did not solve this. Quantizing either 16-block half,
+   all attention matrices, all MLP matrices, or any single matrix role across
+   every block exceeded the gate. Even every contiguous eight-block group
+   failed; blocks 24-31 were best at 1.130% while blocks 0-7 reached 1.986%.
+   The strong depth dependence is why the policy is expressed per block rather
+   than only per tensor role.
+5. Four-block scans found only blocks 28-31 safe when all seven roles were Q8
+   (0.906%). A role refinement then found that attention can extend through
+   blocks 24-31. Adding both MLP projection and MLP output in blocks 28-31
+   produced the smallest tested passing layout at 0.985%; substituting the MLP
+   gate crossed the threshold. This is the current measured frontier, not a
+   final release claim.
+
+The calibration uses real prompt embeddings and exact scheduler timesteps,
+but deterministic Gaussian latent states rather than a replayed denoising
+trajectory. It also emulates packed FP16 values with PyTorch MPS matmul, which
+is not bit-exact Metal product rounding. Because the selected frontier has only
+a narrow margin, it remains provisional until the mixed packed runtime passes
+native Metal comparisons and replayed-trajectory calibration. The simpler
+blocks-28-31-only policy remains the fallback; it measured 0.906% at the cost
+of about 61 MiB more block-matrix storage.
+
+Image generation is not implemented yet. The next transformer step is to
+generalize the packed writer/reader and native execution path to the measured
+mixed BF16/Q8 policy, then validate it with native Metal and denoising-state
+replay. The native prompt encoder and causal 3D VAE are also tracked in
+`plan.md`.

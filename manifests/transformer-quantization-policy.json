@@ -1,10 +1,10 @@
 {
-  "schema_version": 1,
-  "status": "uniform_policy_rejected",
-  "scope": "seven matrix roles in all 32 transformer blocks",
+  "schema_version": 2,
+  "status": "mixed_policy_provisional",
+  "scope": "seven matrix roles in 32 transformer blocks",
   "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
   "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
-  "candidate": {
+  "quantization": {
     "scheme": "affine_int8",
     "group_axis": 1,
     "group_size": 64,
@@ -12,27 +12,64 @@
     "zero_point_dtype": "U8"
   },
   "calibration": {
-    "report": "benchmarks/m1-max-transformer-quantization.json",
+    "uniform_report": "benchmarks/m1-max-transformer-quantization.json",
+    "selected_policy_report": "benchmarks/m1-max-mixed-quantization.json",
     "prompts": 3,
     "cases": 6,
     "resolutions": [256, 512, 1024],
     "timestep_indices": [0, 20, 39],
-    "representative_blocks": [0, 7, 15, 23, 31],
-    "matrix_count": 224
+    "representative_blocks": [0, 7, 15, 23, 31]
   },
-  "selection_criterion": "worst per-case final-noise normalized RMS <= 0.01",
-  "measured": {
-    "best_final_normalized_rms_error": 0.007990671748383716,
+  "selection_criterion": "smallest tested block-matrix storage with every final-noise normalized RMS <= 0.01",
+  "uniform_policy": {
+    "decision": "rejected",
+    "quantized_matrix_count": 224,
     "worst_final_normalized_rms_error": 0.019210390249306708,
     "passing_cases": 2,
-    "total_cases": 6,
-    "packed_block_matrix_bytes": 7306477568,
-    "compression_vs_bf16": 1.9104477611940298
+    "total_cases": 6
+  },
+  "selected_policy": {
+    "dense_bf16": [
+      {"blocks": [0, 23], "roles": "all"},
+      {"blocks": [24, 27], "roles": ["mlp_gate", "mlp_projection", "mlp_output"]},
+      {"blocks": [28, 31], "roles": ["mlp_gate"]}
+    ],
+    "affine_int8_group64": [
+      {"blocks": [24, 31], "roles": ["q", "k", "v", "attention_output"]},
+      {"blocks": [28, 31], "roles": ["mlp_projection", "mlp_output"]}
+    ],
+    "quantized_matrix_count": 40,
+    "block_matrix_bf16_bytes": 13958643712,
+    "block_matrix_mixed_bytes": 13063159808,
+    "bytes_saved": 895483904,
+    "compression_vs_bf16": 1.0685503291057954,
+    "worst_final_normalized_rms_error": 0.009849076395253302,
+    "gate_passed": true
+  },
+  "search_evidence": {
+    "first_16_blocks_all_roles_nrmse": 0.018855168238296895,
+    "last_16_blocks_all_roles_nrmse": 0.013823835950402045,
+    "all_blocks_attention_roles_nrmse": 0.01959802976228821,
+    "all_blocks_mlp_roles_nrmse": 0.015394255037133134,
+    "blocks_0_7_all_roles_nrmse": 0.019859436471590344,
+    "blocks_24_31_all_roles_nrmse": 0.011300003721852187,
+    "blocks_24_27_all_roles_nrmse": 0.01059214337561774,
+    "blocks_28_31_all_roles_nrmse": 0.00905720935461897,
+    "tail_attention_plus_all_tail_mlp_nrmse": 0.010323101009057492,
+    "tail_attention_plus_gate_projection_nrmse": 0.010060675124280953,
+    "tail_attention_plus_gate_output_nrmse": 0.010241537546308285,
+    "tail_attention_plus_projection_output_nrmse": 0.009849076395253302
+  },
+  "fallback_policy": {
+    "description": "quantize all seven roles only in blocks 28-31",
+    "block_matrix_mixed_bytes": 13127122944,
+    "worst_final_normalized_rms_error": 0.00905720935461897
   },
   "limitations": [
+    "The search is broad but not an exhaustive enumeration of every per-matrix assignment.",
     "Latent inputs are deterministic Gaussian samples, not states replayed from a complete denoising trajectory.",
-    "The packed values and FP16 linear inputs match the native path, but PyTorch MPS matmul is not a bit-exact emulation of the Metal kernel's product rounding."
+    "The packed values and FP16 linear inputs match the native path, but PyTorch MPS matmul is not a bit-exact emulation of the Metal kernel's product rounding.",
+    "The selected policy has a narrow 0.000150923604746698 margin below the acceptance limit and must remain provisional until native validation."
   ],
-  "decision": "Do not quantize all 32 blocks uniformly with affine INT8/group-64.",
-  "next": "Measure mixed precision by block range and matrix role, concentrating on the middle blocks where sampled activation error peaks."
+  "next": "Implement mixed BF16/Q8 full-transformer packing and execution, validate native Metal outputs, then repeat calibration on replayed denoising states."
 }

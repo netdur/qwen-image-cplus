@@ -1,0 +1,367 @@
+{
+  "schema_version": 1,
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "environment": {
+    "torch": "2.9.0",
+    "diffusers": "0.41.0.dev0",
+    "transformers": "5.17.0",
+    "device": "mps"
+  },
+  "method": {
+    "screen_cases": [
+      "spatial-512-early",
+      "text-256-late",
+      "spatial-1024-late"
+    ],
+    "screen_limit": 0.01,
+    "passing_candidates_run_all_cases": true,
+    "case_source": "tools/calibrate_transformer_quantization.py",
+    "selection": "smallest mixed block-matrix storage with every final-noise nRMSE <= 0.01",
+    "requested_policies": [
+      "blocks_24_31_attention_28_31_projection_output"
+    ]
+  },
+  "policies": [
+    {
+      "name": "blocks_24_31_attention_28_31_projection_output",
+      "quantized_blocks": [
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "quantized_roles": [
+        "q",
+        "k",
+        "v",
+        "attention_output"
+      ],
+      "extra_segments": [
+        {
+          "blocks": [
+            28,
+            29,
+            30,
+            31
+          ],
+          "roles": [
+            "mlp_projection",
+            "mlp_output"
+          ]
+        }
+      ],
+      "storage": {
+        "matrix_count": 40,
+        "quantized_block_count": 8,
+        "quantized_roles": [
+          "attention_output",
+          "k",
+          "mlp_output",
+          "mlp_projection",
+          "q",
+          "v"
+        ],
+        "source_bf16_bytes": 13958643712,
+        "packed_bytes": 13063159808,
+        "compression_vs_bf16": 1.0685503291057954,
+        "elapsed_seconds": 0.9676952918525785
+      },
+      "screened_in": true,
+      "complete_suite": true,
+      "passed": true,
+      "worst_final_normalized_rms": 0.009849076395253302,
+      "cases": {
+        "spatial-512-early": {
+          "seconds": 4.638397749979049,
+          "final_noise_prediction": {
+            "max_abs": 0.0625,
+            "mean_abs": 0.006222056501428597,
+            "rms": 0.009300148962297226,
+            "reference_rms": 2.0532619432007992,
+            "normalized_rms": 0.004529450805384997
+          },
+          "sampled_blocks": {
+            "0": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 6.896288148629215,
+              "normalized_rms": 0.0
+            },
+            "7": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 6.920350425456353,
+              "normalized_rms": 0.0
+            },
+            "15": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 5.537933740775156,
+              "normalized_rms": 0.0
+            },
+            "23": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 5.917687007494304,
+              "normalized_rms": 0.0
+            },
+            "31": {
+              "max_abs": 6.0,
+              "mean_abs": 0.09188718759105541,
+              "rms": 0.15133417557636478,
+              "reference_rms": 22.090867958683003,
+              "normalized_rms": 0.006850530991331267
+            }
+          }
+        },
+        "text-256-late": {
+          "seconds": 0.9455472498666495,
+          "final_noise_prediction": {
+            "max_abs": 0.125,
+            "mean_abs": 0.014176852302625775,
+            "rms": 0.018587742006079985,
+            "reference_rms": 1.8872573691314065,
+            "normalized_rms": 0.009849076395253302
+          },
+          "sampled_blocks": {
+            "0": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 8.614944195037564,
+              "normalized_rms": 0.0
+            },
+            "7": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 10.411985510203232,
+              "normalized_rms": 0.0
+            },
+            "15": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 7.939554927693828,
+              "normalized_rms": 0.0
+            },
+            "23": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 10.168546570076844,
+              "normalized_rms": 0.0
+            },
+            "31": {
+              "max_abs": 10.0,
+              "mean_abs": 0.19739515741821378,
+              "rms": 0.3021491768383462,
+              "reference_rms": 28.471763770436866,
+              "normalized_rms": 0.010612239525254745
+            }
+          }
+        },
+        "spatial-1024-late": {
+          "seconds": 14.43347108294256,
+          "final_noise_prediction": {
+            "max_abs": 0.125,
+            "mean_abs": 0.013530872757485213,
+            "rms": 0.017709222878625197,
+            "reference_rms": 1.8486534902495033,
+            "normalized_rms": 0.009579525298835248
+          },
+          "sampled_blocks": {
+            "0": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 8.395246847197422,
+              "normalized_rms": 0.0
+            },
+            "7": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 9.986428119243872,
+              "normalized_rms": 0.0
+            },
+            "15": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 7.66679530897142,
+              "normalized_rms": 0.0
+            },
+            "23": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 10.278119392857771,
+              "normalized_rms": 0.0
+            },
+            "31": {
+              "max_abs": 7.0,
+              "mean_abs": 0.19410885497927666,
+              "rms": 0.2881975484115356,
+              "reference_rms": 31.206039900944,
+              "normalized_rms": 0.009235313078056325
+            }
+          }
+        },
+        "short-256-early": {
+          "seconds": 1.0066961660049856,
+          "final_noise_prediction": {
+            "max_abs": 0.03125,
+            "mean_abs": 0.003964921255828813,
+            "rms": 0.005934007520888576,
+            "reference_rms": 1.3782629068023213,
+            "normalized_rms": 0.004305424960362563
+          },
+          "sampled_blocks": {
+            "0": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 14.312804315140623,
+              "normalized_rms": 0.0
+            },
+            "7": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 19.784460421055535,
+              "normalized_rms": 0.0
+            },
+            "15": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 20.979428460806233,
+              "normalized_rms": 0.0
+            },
+            "23": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 21.587681067676176,
+              "normalized_rms": 0.0
+            },
+            "31": {
+              "max_abs": 8.0,
+              "mean_abs": 0.0716717941686511,
+              "rms": 0.1294646139361755,
+              "reference_rms": 29.698854983537295,
+              "normalized_rms": 0.004359245971197896
+            }
+          }
+        },
+        "short-512-middle": {
+          "seconds": 3.2924582499545068,
+          "final_noise_prediction": {
+            "max_abs": 0.0390625,
+            "mean_abs": 0.005098815137898782,
+            "rms": 0.007225321069364817,
+            "reference_rms": 1.4035666120249986,
+            "normalized_rms": 0.005147829114387717
+          },
+          "sampled_blocks": {
+            "0": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 7.260833516409894,
+              "normalized_rms": 0.0
+            },
+            "7": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 5.923007176781624,
+              "normalized_rms": 0.0
+            },
+            "15": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 4.655715727081577,
+              "normalized_rms": 0.0
+            },
+            "23": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 6.502759831639543,
+              "normalized_rms": 0.0
+            },
+            "31": {
+              "max_abs": 4.0,
+              "mean_abs": 0.08972110832110047,
+              "rms": 0.14552061849782658,
+              "reference_rms": 21.000522216111303,
+              "normalized_rms": 0.006929380945878823
+            }
+          }
+        },
+        "text-1024-middle": {
+          "seconds": 14.795069333165884,
+          "final_noise_prediction": {
+            "max_abs": 0.046875,
+            "mean_abs": 0.0047381821541634395,
+            "rms": 0.006757357878113809,
+            "reference_rms": 1.3621674256361433,
+            "normalized_rms": 0.004960739591139516
+          },
+          "sampled_blocks": {
+            "0": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 7.027307932316725,
+              "normalized_rms": 0.0
+            },
+            "7": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 5.731659916537663,
+              "normalized_rms": 0.0
+            },
+            "15": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 4.5618312462427335,
+              "normalized_rms": 0.0
+            },
+            "23": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "rms": 0.0,
+              "reference_rms": 6.454481565358111,
+              "normalized_rms": 0.0
+            },
+            "31": {
+              "max_abs": 4.0,
+              "mean_abs": 0.08596768486313522,
+              "rms": 0.14030778258001655,
+              "reference_rms": 20.940867446477753,
+              "normalized_rms": 0.00670018961433311
+            }
+          }
+        }
+      }
+    }
+  ],
+  "selected_policy": "blocks_24_31_attention_28_31_projection_output",
+  "elapsed_seconds": 121.06293633300811
+}

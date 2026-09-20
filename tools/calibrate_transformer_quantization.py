@@ -285,7 +285,22 @@ def run_case(model: nn.Module, inputs: dict) -> tuple[torch.Tensor, dict[int, to
     return output[:, -image_tokens:].detach().cpu(), captures, elapsed
 
 
-def quantize_transformer_blocks(model: nn.Module) -> dict[str, int | float]:
+def quantize_transformer_blocks(
+    model: nn.Module,
+    block_indices: tuple[int, ...] = tuple(range(32)),
+    roles: tuple[str, ...] = tuple(LINEAR_ROLES),
+    matrix_selection: frozenset[tuple[int, str]] | None = None,
+) -> dict[str, object]:
+    if matrix_selection is None:
+        matrix_selection = frozenset((block, role) for block in block_indices for role in roles)
+    selected_blocks = {block for block, _role in matrix_selection}
+    selected_roles = {role for _block, role in matrix_selection}
+    unknown_roles = selected_roles - set(LINEAR_ROLES)
+    if unknown_roles:
+        raise ValueError(f"unknown quantized roles: {sorted(unknown_roles)}")
+    unknown_blocks = selected_blocks - set(range(len(model.transformer_blocks)))
+    if unknown_blocks:
+        raise ValueError(f"unknown quantized blocks: {sorted(unknown_blocks)}")
     source_bytes = 0
     packed_bytes = 0
     matrix_count = 0
@@ -297,17 +312,26 @@ def quantize_transformer_blocks(model: nn.Module) -> dict[str, int | float]:
                 raise TypeError(f"unexpected {block_index}:{role} module {dense!r}")
             elements = dense.weight.numel()
             groups = dense.weight.shape[0] * (dense.weight.shape[1] // GROUP_SIZE)
-            replacement = AffineInt8LinearEmulation(dense.weight)
-            set_child(block, path, replacement)
             source_bytes += elements * 2
-            packed_bytes += elements + groups * 3
-            matrix_count += 1
-        print(f"quantized block {block_index + 1}/32", flush=True)
+            if (block_index, role) in matrix_selection:
+                replacement = AffineInt8LinearEmulation(dense.weight)
+                set_child(block, path, replacement)
+                packed_bytes += elements + groups * 3
+                matrix_count += 1
+            else:
+                packed_bytes += elements * 2
+        if block_index in selected_blocks:
+            print(
+                f"quantized block {block_index + 1}/{len(model.transformer_blocks)}",
+                flush=True,
+            )
     gc.collect()
     if next(model.parameters()).device.type == "mps":
         torch.mps.empty_cache()
     return {
         "matrix_count": matrix_count,
+        "quantized_block_count": len(selected_blocks),
+        "quantized_roles": sorted(selected_roles),
         "source_bf16_bytes": source_bytes,
         "packed_bytes": packed_bytes,
         "compression_vs_bf16": source_bytes / packed_bytes,
