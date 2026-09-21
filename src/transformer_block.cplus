@@ -1,6 +1,7 @@
 import "./cpu_ops" as cpu;
 import "./metal_primitives" as metrics;
 import "./mmap_macos" as mapped;
+import "./mps_matrix" as mps;
 import "./packed_model" as packed;
 import "./random" as random;
 import "./scheduler" as flow;
@@ -153,6 +154,15 @@ struct BlockWorkspace {
     projected: metal::Buffer,
     swiglu: metal::Buffer,
     mlp_projected: metal::Buffer,
+}
+
+struct MpsWorkspace {
+    device: metal::Device,
+    input_pipeline: metal::ComputePipelineState,
+    bf16_pipeline: metal::ComputePipelineState,
+    q8_pipeline: metal::ComputePipelineState,
+    half_input: metal::Buffer,
+    half_weight: metal::Buffer,
 }
 
 #[repr(C)]
@@ -390,6 +400,186 @@ fn dispatch_simdgroup_int8_linear(
     );
     let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
     command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn convert_mps_weight(
+    queue: metal::CommandQueue,
+    bf16_pipeline: metal::ComputePipelineState,
+    q8_pipeline: metal::ComputePipelineState,
+    weight: LinearWeight,
+    output: metal::Buffer,
+    output_columns: usize,
+    input_columns: usize,
+) -> option::Option[f64] {
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    let count: usize = output_columns *% input_columns;
+    if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
+        var params: Int8LinearParams = Int8LinearParams {
+            rows: 0 as u32,
+            output_columns: output_columns as u32,
+            input_columns: input_columns as u32,
+            group_size: 64 as u32,
+        };
+        encoder.set_compute_pipeline_state(q8_pipeline);
+        encoder.set_buffer(weight.storage, weight.weights_offset, 0 as u64);
+        encoder.set_buffer(weight.storage, weight.scales_offset, 1 as u64);
+        encoder.set_buffer(weight.storage, weight.zeros_offset, 2 as u64);
+        encoder.set_buffer(output, 0 as u64, 3 as u64);
+        encoder.set_bytes(
+            #addr_of(params) as *u8, #size_of::[Int8LinearParams]() as u64, 4 as u64,
+        );
+        encoder.dispatch_threads(
+            metal::Size { width: count as u64, height: 1 as u64, depth: 1 as u64 },
+            metal::Size { width: q8_pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+        );
+    } else {
+        var params: LinearParams = LinearParams {
+            rows: 0 as u32,
+            output_columns: output_columns as u32,
+            input_columns: input_columns as u32,
+            weight_mode: 0 as u32,
+        };
+        encoder.set_compute_pipeline_state(bf16_pipeline);
+        encoder.set_buffer(weight.storage, weight.weights_offset, 0 as u64);
+        encoder.set_buffer(output, 0 as u64, 1 as u64);
+        encoder.set_bytes(
+            #addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 2 as u64,
+        );
+        encoder.dispatch_threads(
+            metal::Size { width: count as u64, height: 1 as u64, depth: 1 as u64 },
+            metal::Size { width: bf16_pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+        );
+    }
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn encode_mps_input_conversion(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+    input_columns: usize,
+) {
+    var params: LinearParams = LinearParams {
+        rows: rows as u32,
+        output_columns: 0 as u32,
+        input_columns: input_columns as u32,
+        weight_mode: 0 as u32,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(output, 0 as u64, 1 as u64);
+    encoder.set_bytes(
+        #addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 2 as u64,
+    );
+    encoder.dispatch_threads(
+        metal::Size {
+            width: (rows *% input_columns) as u64,
+            height: 1 as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_mps_weight_conversion(
+    encoder: metal::ComputeCommandEncoder,
+    workspace: MpsWorkspace,
+    weight: LinearWeight,
+    output_columns: usize,
+    input_columns: usize,
+) {
+    let count: usize = output_columns *% input_columns;
+    if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
+        var params: Int8LinearParams = Int8LinearParams {
+            rows: 0 as u32,
+            output_columns: output_columns as u32,
+            input_columns: input_columns as u32,
+            group_size: 64 as u32,
+        };
+        encoder.set_compute_pipeline_state(workspace.q8_pipeline);
+        encoder.set_buffer(weight.storage, weight.weights_offset, 0 as u64);
+        encoder.set_buffer(weight.storage, weight.scales_offset, 1 as u64);
+        encoder.set_buffer(weight.storage, weight.zeros_offset, 2 as u64);
+        encoder.set_buffer(workspace.half_weight, 0 as u64, 3 as u64);
+        encoder.set_bytes(
+            #addr_of(params) as *u8, #size_of::[Int8LinearParams]() as u64, 4 as u64,
+        );
+        encoder.dispatch_threads(
+            metal::Size { width: count as u64, height: 1 as u64, depth: 1 as u64 },
+            metal::Size { width: workspace.q8_pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+        );
+    } else {
+        var params: LinearParams = LinearParams {
+            rows: 0 as u32,
+            output_columns: output_columns as u32,
+            input_columns: input_columns as u32,
+            weight_mode: 0 as u32,
+        };
+        encoder.set_compute_pipeline_state(workspace.bf16_pipeline);
+        encoder.set_buffer(weight.storage, weight.weights_offset, 0 as u64);
+        encoder.set_buffer(workspace.half_weight, 0 as u64, 1 as u64);
+        encoder.set_bytes(
+            #addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 2 as u64,
+        );
+        encoder.dispatch_threads(
+            metal::Size { width: count as u64, height: 1 as u64, depth: 1 as u64 },
+            metal::Size { width: workspace.bf16_pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+        );
+    }
+}
+
+fn dispatch_mps_preconverted_linear(
+    queue: metal::CommandQueue,
+    input_pipeline: metal::ComputePipelineState,
+    ref operation: mps::Multiplication,
+    input: metal::Buffer,
+    half_input: metal::Buffer,
+    rows: usize,
+    input_columns: usize,
+) -> option::Option[f64] {
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: LinearParams = LinearParams {
+        rows: rows as u32,
+        output_columns: 0 as u32,
+        input_columns: input_columns as u32,
+        weight_mode: 0 as u32,
+    };
+    encoder.set_compute_pipeline_state(input_pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(half_input, 0 as u64, 1 as u64);
+    encoder.set_bytes(
+        #addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 2 as u64,
+    );
+    encoder.dispatch_threads(
+        metal::Size { width: (rows *% input_columns) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: input_pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    operation.encode(command_buffer);
     command_buffer.commit();
     command_buffer.wait_until_completed();
     return option::Option[f64]::Some(
@@ -1714,6 +1904,176 @@ fn execute_batched_runtime_block(
 
     let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
     command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn execute_mps_mlp_runtime_block(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    mps_workspace: MpsWorkspace,
+    weights: BlockWeights,
+    workspace: BlockWorkspace,
+    hidden: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+    cache_key: metal::Buffer,
+    cache_value: metal::Buffer,
+    cache_offset: u64,
+    prefix_rows: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[mps::Multiplication]::Some(gate_operation) = mps::create(
+        mps_workspace.device, mps_workspace.half_input, 0 as u64,
+        mps_workspace.half_weight, 0 as u64, workspace.gate, 0 as u64,
+        rows, MLP_WIDTH, WIDTH,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[mps::Multiplication]::Some(projected_operation) = mps::create(
+        mps_workspace.device, mps_workspace.half_input, 0 as u64,
+        mps_workspace.half_weight, 0 as u64, workspace.projected, 0 as u64,
+        rows, MLP_WIDTH, WIDTH,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[mps::Multiplication]::Some(output_operation) = mps::create(
+        mps_workspace.device, mps_workspace.half_input, 0 as u64,
+        mps_workspace.half_weight, 0 as u64, workspace.mlp_projected, 0 as u64,
+        rows, WIDTH, MLP_WIDTH,
+    ) else { return option::Option[f64]::None; };
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(attention_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let attention_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(attention_encoder.raw()));
+    var params: BlockParams = BlockParams {
+        rows: rows as u32,
+        width: WIDTH as u32,
+        heads: HEADS as u32,
+        head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32,
+        slot: 0 as u32,
+    };
+    encode_1d(
+        attention_encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
+        workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
+    );
+    encode_buffer_barrier(attention_encoder);
+    encode_weighted_linear(
+        attention_encoder, pipelines, workspace.norm1, weights.q, workspace.query,
+        WIDTH, WIDTH, rows,
+    );
+    encode_weighted_linear(
+        attention_encoder, pipelines, workspace.norm1, weights.k, workspace.key,
+        WIDTH, WIDTH, rows,
+    );
+    encode_weighted_linear(
+        attention_encoder, pipelines, workspace.norm1, weights.v, workspace.value,
+        WIDTH, WIDTH, rows,
+    );
+    encode_buffer_barrier(attention_encoder);
+    encode_1d(
+        attention_encoder, pipelines.qk, workspace.query, weights.norm_q, workspace.query_rope,
+        workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
+    );
+    encode_1d(
+        attention_encoder, pipelines.qk, workspace.key, weights.norm_k, workspace.key_rope,
+        workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
+    );
+    encode_buffer_barrier(attention_encoder);
+    encode_attention(
+        attention_encoder, pipelines.attention, workspace.query_rope, workspace.key_rope,
+        workspace.attended, workspace.value, workspace.image_ids, workspace.key_valid,
+        rows, prefix_rows +% rows, cache_key, cache_value, cache_offset, prefix_rows,
+        true, prefix_rows, pipelines.attention_threads,
+    );
+    encode_buffer_barrier(attention_encoder);
+    encode_weighted_linear(
+        attention_encoder, pipelines, workspace.attended, weights.attention_output,
+        workspace.attention_projected, WIDTH, WIDTH, rows,
+    );
+    encode_buffer_barrier(attention_encoder);
+    params.slot = 1 as u32;
+    encode_1d(
+        attention_encoder, pipelines.residual, hidden, workspace.modulation, workspace.residual1,
+        workspace.attention_projected, workspace.target_mask, workspace.dummy,
+        #addr_of(params), rows *% WIDTH,
+    );
+    encode_buffer_barrier(attention_encoder);
+    params.slot = 2 as u32;
+    encode_1d(
+        attention_encoder, pipelines.norm, workspace.residual1, workspace.modulation,
+        workspace.norm2, workspace.target_mask, workspace.dummy, workspace.dummy,
+        #addr_of(params), rows,
+    );
+    let attention_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(attention_encoder.raw());
+    attention_command_encoder.end_encoding();
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(gate_conversion_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let gate_conversion_owner: OwnedObjc = OwnedObjc::new(rt::retain(gate_conversion_encoder.raw()));
+    encode_mps_input_conversion(
+        gate_conversion_encoder, mps_workspace.input_pipeline, workspace.norm2,
+        mps_workspace.half_input, rows, WIDTH,
+    );
+    encode_mps_weight_conversion(
+        gate_conversion_encoder, mps_workspace, weights.gate, MLP_WIDTH, WIDTH,
+    );
+    let gate_conversion_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(gate_conversion_encoder.raw());
+    gate_conversion_command_encoder.end_encoding();
+    gate_operation.encode(command_buffer);
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(projected_conversion_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let projected_conversion_owner: OwnedObjc = OwnedObjc::new(rt::retain(projected_conversion_encoder.raw()));
+    encode_mps_weight_conversion(
+        projected_conversion_encoder, mps_workspace, weights.projected, MLP_WIDTH, WIDTH,
+    );
+    let projected_conversion_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(projected_conversion_encoder.raw());
+    projected_conversion_command_encoder.end_encoding();
+    projected_operation.encode(command_buffer);
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(swiglu_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let swiglu_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(swiglu_encoder.raw()));
+    encode_1d(
+        swiglu_encoder, pipelines.swiglu, workspace.gate, workspace.projected,
+        workspace.swiglu, workspace.dummy, workspace.dummy, workspace.dummy,
+        #addr_of(params), rows *% MLP_WIDTH,
+    );
+    encode_buffer_barrier(swiglu_encoder);
+    encode_mps_input_conversion(
+        swiglu_encoder, mps_workspace.input_pipeline, workspace.swiglu,
+        mps_workspace.half_input, rows, MLP_WIDTH,
+    );
+    encode_mps_weight_conversion(
+        swiglu_encoder, mps_workspace, weights.mlp_output, WIDTH, MLP_WIDTH,
+    );
+    let swiglu_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(swiglu_encoder.raw());
+    swiglu_command_encoder.end_encoding();
+    output_operation.encode(command_buffer);
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(residual_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let residual_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(residual_encoder.raw()));
+    params.slot = 3 as u32;
+    encode_1d(
+        residual_encoder, pipelines.residual, workspace.residual1, workspace.modulation,
+        output, workspace.mlp_projected, workspace.target_mask, workspace.dummy,
+        #addr_of(params), rows *% WIDTH,
+    );
+    let residual_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(residual_encoder.raw());
+    residual_command_encoder.end_encoding();
+
     command_buffer.commit();
     command_buffer.wait_until_completed();
     return option::Option[f64]::Some(
@@ -3093,6 +3453,10 @@ fn run_trajectory_packed_impl(
     native_inputs: bool,
     validate_reference: bool,
 ) -> i32 {
+    if !mps::load_framework() {
+        io::eprintln("trajectory: could not load MetalPerformanceShaders");
+        return 1;
+    }
     var step_limit: usize = 0 as usize;
     if requested_steps == "1" {
         step_limit = 1 as usize;
@@ -3174,6 +3538,9 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(assemble_owner) = pipeline(device, library, "qi_joint_assemble") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(final_norm_owner) = pipeline(device, library, "qi_final_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_copy_owner) = pipeline(device, library, "qi_copy_prefix_kv") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(mps_input_owner) = pipeline(device, library, "qi_mps_input_to_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(mps_bf16_owner) = pipeline(device, library, "qi_mps_bf16_weight_to_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(mps_q8_owner) = pipeline(device, library, "qi_mps_q8_weight_to_half") else { return 1; };
     let pipelines: Pipelines = Pipelines {
         dense_linear: metal::ComputePipelineState::from_raw(dense_owner.raw()),
         dense_linear_fast: metal::ComputePipelineState::from_raw(dense_fast_owner.raw()),
@@ -3195,6 +3562,9 @@ fn run_trajectory_packed_impl(
     let assemble_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(assemble_owner.raw());
     let final_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(final_norm_owner.raw());
     let cache_copy_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_copy_owner.raw());
+    let mps_input_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_input_owner.raw());
+    let mps_bf16_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_bf16_owner.raw());
+    let mps_q8_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_q8_owner.raw());
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
 
     let storage_and_weights_start_ms: i64 = time::now_millis();
@@ -3353,6 +3723,9 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(cache_value_arena) = new_buffer(device, cache_arena_bytes) else { return 1; }; let cache_value_arena_owner: OwnedObjc = OwnedObjc::new(cache_value_arena.raw());
     let workspace: BlockWorkspace = BlockWorkspace { modulation: modulation, rope: rope, target_mask: target_mask, image_ids: image_ids, key_valid: key_valid, dummy: dummy, norm1: norm1, query: query, key: key, value: value, query_rope: query_rope, key_rope: key_rope, attended: attended, attention_projected: attention_projected, residual1: residual1, norm2: norm2, gate: gate, projected: projected, swiglu: swiglu, mlp_projected: mlp_projected };
     let cached_workspace: BlockWorkspace = BlockWorkspace { modulation: modulation, rope: cached_rope, target_mask: cached_target_mask, image_ids: image_ids, key_valid: key_valid, dummy: dummy, norm1: norm1, query: query, key: key, value: value, query_rope: query_rope, key_rope: key_rope, attended: attended, attention_projected: attention_projected, residual1: residual1, norm2: norm2, gate: gate, projected: projected, swiglu: swiglu, mlp_projected: mlp_projected };
+    guard let option::Option[metal::Buffer]::Some(mps_half_input) = new_buffer(device, (target_rows *% MLP_WIDTH *% (2 as usize)) as u64) else { return 1; }; let mps_half_input_owner: OwnedObjc = OwnedObjc::new(mps_half_input.raw());
+    guard let option::Option[metal::Buffer]::Some(mps_half_weight) = new_buffer(device, (MLP_WIDTH *% WIDTH *% (2 as usize)) as u64) else { return 1; }; let mps_half_weight_owner: OwnedObjc = OwnedObjc::new(mps_half_weight.raw());
+    let mps_workspace: MpsWorkspace = MpsWorkspace { device: device, input_pipeline: mps_input_pipeline, bf16_pipeline: mps_bf16_pipeline, q8_pipeline: mps_q8_pipeline, half_input: mps_half_input, half_weight: mps_half_weight };
     guard let option::Option[metal::Buffer]::Some(final_scale) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_owner: OwnedObjc = OwnedObjc::new(final_scale.raw());
     guard let option::Option[metal::Buffer]::Some(final_normalized) = new_buffer(device, activation_bytes) else { return 1; }; let final_normalized_owner: OwnedObjc = OwnedObjc::new(final_normalized.raw());
     guard let option::Option[metal::Buffer]::Some(noise_output) = new_buffer(device, (rows *% IMAGE_CHANNELS *% #size_of::[f32]()) as u64) else { return 1; }; let noise_output_owner: OwnedObjc = OwnedObjc::new(noise_output.raw());
@@ -3422,11 +3795,21 @@ fn run_trajectory_packed_impl(
                 (if projected_weight.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +%
                 (if mlp_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize });
             let cache_offset: u64 = block as u64 *% per_block_cache_bytes;
-            guard let option::Option[f64]::Some(block_ms) = execute_batched_runtime_block(
-                queue, pipelines, BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output }, active_workspace, current, next, active_rows,
-                cache_mode, cache_copy_pipeline, cache_key_arena, cache_value_arena,
-                cache_offset, text_rows,
-            ) else { return 1; };
+            let block_weights: BlockWeights = BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output };
+            let block_result: option::Option[f64] = if step == (0 as usize) {
+                execute_batched_runtime_block(
+                    queue, pipelines, block_weights, active_workspace, current, next, active_rows,
+                    cache_mode, cache_copy_pipeline, cache_key_arena, cache_value_arena,
+                    cache_offset, text_rows,
+                )
+            } else {
+                execute_mps_mlp_runtime_block(
+                    queue, pipelines, mps_workspace, block_weights, active_workspace,
+                    current, next, active_rows, cache_key_arena, cache_value_arena,
+                    cache_offset, text_rows,
+                )
+            };
+            guard let option::Option[f64]::Some(block_ms) = block_result else { return 1; };
             step_ms = step_ms + block_ms;
             let swap: metal::Buffer = current; current = next; next = swap;
             block = block +% (1 as usize);
@@ -4143,6 +4526,220 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
         row_case = row_case +% (1 as usize);
     }
     io::println("production GEMM benchmark: packed_load_wall_ms=${load_wall_ms} iterations=3");
+    return if all_ok { 0 } else { 1 };
+}
+
+fn benchmark_mps_gemm_case(
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    dense_pipeline: metal::ComputePipelineState,
+    int8_pipeline: metal::ComputePipelineState,
+    input_conversion_pipeline: metal::ComputePipelineState,
+    bf16_conversion_pipeline: metal::ComputePipelineState,
+    q8_conversion_pipeline: metal::ComputePipelineState,
+    file: packed::File,
+    storage: metal::Buffer,
+    input: metal::Buffer,
+    half_input: metal::Buffer,
+    half_weight: metal::Buffer,
+    output: metal::Buffer,
+    reference: metal::Buffer,
+    tensor_name: str,
+    output_columns: usize,
+    input_columns: usize,
+    expected_scheme: u32,
+) -> bool {
+    let rows: usize = 256 as usize;
+    guard let option::Option[LinearWeight]::Some(weight) = packed_linear_weight(
+        file, storage, tensor_name, output_columns as u64, input_columns as u64,
+    ) else { return false; };
+    if weight.scheme != expected_scheme { return false; }
+    let reference_result: option::Option[f64] =
+        if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
+        dispatch_int8_linear(
+                queue, int8_pipeline, input, weight, reference,
+            output_columns, input_columns, rows,
+        )
+    } else {
+        dispatch_linear(
+                queue, dense_pipeline, input, weight.storage, reference,
+            output_columns, input_columns, rows, weight.weights_offset,
+        )
+    };
+    guard let option::Option[f64]::Some(reference_ms) = reference_result else {
+        return false;
+    };
+    guard let option::Option[f64]::Some(weight_conversion_ms) = convert_mps_weight(
+        queue, bf16_conversion_pipeline, q8_conversion_pipeline, weight, half_weight,
+        output_columns, input_columns,
+    ) else { return false; };
+    guard let option::Option[mps::Multiplication]::Some(created_operation) = mps::create(
+        device, half_input, 0 as u64, half_weight, 0 as u64,
+        output, 0 as u64, rows, output_columns, input_columns,
+    ) else {
+        io::eprintln("MPS GEMM benchmark: could not create matrix multiplication");
+        return false;
+    };
+    var operation: mps::Multiplication = created_operation;
+    guard let option::Option[f64]::Some(_warmup_ms) = dispatch_mps_preconverted_linear(
+        queue, input_conversion_pipeline, operation, input, half_input, rows, input_columns,
+    ) else { return false; };
+    let iterations: usize = 3 as usize;
+    var total_ms: f64 = 0.0f64;
+    var iteration: usize = 0 as usize;
+    while iteration < iterations {
+        guard let option::Option[f64]::Some(elapsed_ms) = dispatch_mps_preconverted_linear(
+            queue, input_conversion_pipeline, operation,
+            input, half_input, rows, input_columns,
+        ) else { return false; };
+        total_ms = total_ms + elapsed_ms;
+        iteration = iteration +% (1 as usize);
+    }
+    let average_ms: f64 = total_ms / iterations as f64;
+    let error: f64 = normalized_rms_buffers(
+        output, 0 as usize, reference, 0 as usize, rows *% output_columns,
+    );
+    let operations: f64 = 2.0f64 * rows as f64
+        * output_columns as f64 * input_columns as f64;
+    let scheme_name: str =
+        if weight.scheme == PACKED_SCHEME_INT8_AFFINE { "q8" } else { "bf16" };
+    io::println(
+        "production MPS GEMM: scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} scalar_gpu_ms=${reference_ms} weight_conversion_gpu_ms=${weight_conversion_ms} preconverted_gpu_ms=${average_ms} dynamic_conversion_gpu_ms=${average_ms + weight_conversion_ms} preconverted_tflops=${operations / (average_ms * 1000000000.0f64)} nRMSE=${error} tensor=${tensor_name}",
+    );
+    return error <= (0.0003f64);
+}
+
+fn benchmark_mps_gemm(packed_path: str) -> i32 {
+    if !mps::load_framework() {
+        io::eprintln("MPS GEMM benchmark: could not load MetalPerformanceShaders");
+        return 1;
+    }
+    guard let packed::LoadResult::Ok(weight_file) = packed::load(packed_path) else {
+        io::eprintln("MPS GEMM benchmark: could not load ${packed_path}");
+        return 1;
+    };
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return 1; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() { return 1; }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) =
+        device.new_command_queue() else { return 1; };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() { return 1; }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        #include_str("../kernels/transformer_block.metal"), options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 =
+                rt::msg_id(compile_error, rt::sel(#str_ptr("localizedDescription\0")));
+            io::eprintln("MPS GEMM Metal compile: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[OwnedObjc]::Some(dense_owner) =
+        pipeline(device, library, "qi_block_linear_32x32") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(int8_owner) =
+        pipeline(device, library, "qi_block_int8_affine_linear_32x32") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(input_conversion_owner) =
+        pipeline(device, library, "qi_mps_input_to_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(bf16_conversion_owner) =
+        pipeline(device, library, "qi_mps_bf16_weight_to_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(q8_conversion_owner) =
+        pipeline(device, library, "qi_mps_q8_weight_to_half") else { return 1; };
+    let dense_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(dense_owner.raw());
+    let int8_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(int8_owner.raw());
+    let input_conversion_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(input_conversion_owner.raw());
+    let bf16_conversion_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(bf16_conversion_owner.raw());
+    let q8_conversion_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(q8_conversion_owner.raw());
+    guard let option::Option[metal::Buffer]::Some(storage) =
+        packed_storage_buffer(device, weight_file) else { return 1; };
+    let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
+    let maximum_input_elements: usize = (256 as usize) *% MLP_WIDTH;
+    let maximum_output_elements: usize = (256 as usize) *% MLP_WIDTH;
+    let maximum_weight_elements: usize = MLP_WIDTH *% WIDTH;
+    guard let option::Option[metal::Buffer]::Some(input) = new_buffer(
+        device, (maximum_input_elements *% #size_of::[f32]()) as u64,
+    ) else { return 1; };
+    let input_owner: OwnedObjc = OwnedObjc::new(input.raw());
+    guard let option::Option[metal::Buffer]::Some(half_input) = new_buffer(
+        device, (maximum_input_elements *% #size_of::[u16]()) as u64,
+    ) else { return 1; };
+    let half_input_owner: OwnedObjc = OwnedObjc::new(half_input.raw());
+    guard let option::Option[metal::Buffer]::Some(half_weight) = new_buffer(
+        device, (maximum_weight_elements *% #size_of::[u16]()) as u64,
+    ) else { return 1; };
+    let half_weight_owner: OwnedObjc = OwnedObjc::new(half_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(output) = new_buffer(
+        device, (maximum_output_elements *% #size_of::[f32]()) as u64,
+    ) else { return 1; };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+    guard let option::Option[metal::Buffer]::Some(reference) = new_buffer(
+        device, (maximum_output_elements *% #size_of::[f32]()) as u64,
+    ) else { return 1; };
+    let reference_owner: OwnedObjc = OwnedObjc::new(reference.raw());
+    let input_values: *f32 = input.contents() as *f32;
+    var index: usize = 0 as usize;
+    while index < maximum_input_elements {
+        input_values[index] = ((index % (251 as usize)) as f32 - 125.0f32) / 4096.0f32;
+        index = index +% (1 as usize);
+    }
+    var all_ok: bool = true;
+    all_ok = benchmark_mps_gemm_case(
+        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+        input, half_input, half_weight, output, reference,
+        "transformer_blocks.0.attn.to_q.weight", WIDTH, WIDTH, PACKED_SCHEME_BF16,
+    ) && all_ok;
+    all_ok = benchmark_mps_gemm_case(
+        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+        input, half_input, half_weight, output, reference,
+        "transformer_blocks.0.img_mlp.gate_layer.weight",
+        MLP_WIDTH, WIDTH, PACKED_SCHEME_BF16,
+    ) && all_ok;
+    all_ok = benchmark_mps_gemm_case(
+        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+        input, half_input, half_weight, output, reference,
+        "transformer_blocks.0.img_mlp.out.weight",
+        WIDTH, MLP_WIDTH, PACKED_SCHEME_BF16,
+    ) && all_ok;
+    all_ok = benchmark_mps_gemm_case(
+        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+        input, half_input, half_weight, output, reference,
+        "transformer_blocks.28.attn.to_q.weight",
+        WIDTH, WIDTH, PACKED_SCHEME_INT8_AFFINE,
+    ) && all_ok;
+    all_ok = benchmark_mps_gemm_case(
+        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+        input, half_input, half_weight, output, reference,
+        "transformer_blocks.28.img_mlp.proj.weight",
+        MLP_WIDTH, WIDTH, PACKED_SCHEME_INT8_AFFINE,
+    ) && all_ok;
+    all_ok = benchmark_mps_gemm_case(
+        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+        input, half_input, half_weight, output, reference,
+        "transformer_blocks.28.img_mlp.out.weight",
+        WIDTH, MLP_WIDTH, PACKED_SCHEME_INT8_AFFINE,
+    ) && all_ok;
     return if all_ok { 0 } else { 1 };
 }
 

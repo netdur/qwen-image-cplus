@@ -41,6 +41,48 @@ inline float qi_bf16(ushort bits) {
     return as_type<float>(uint(bits) << 16);
 }
 
+kernel void qi_mps_input_to_half(
+    device const float *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant LinearParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.input_columns;
+    if (index < count) {
+        output[index] = half(input[index]);
+    }
+}
+
+kernel void qi_mps_bf16_weight_to_half(
+    device const ushort *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant LinearParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.output_columns * params.input_columns;
+    if (index < count) {
+        output[index] = half(qi_bf16(input[index]));
+    }
+}
+
+kernel void qi_mps_q8_weight_to_half(
+    device const uchar *weights [[buffer(0)]],
+    device const half *scales [[buffer(1)]],
+    device const uchar *zeros [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    constant Int8LinearParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.output_columns * params.input_columns;
+    if (index >= count) {
+        return;
+    }
+    const uint output_column = index / params.input_columns;
+    const uint input_column = index % params.input_columns;
+    const uint groups_per_row = params.input_columns / params.group_size;
+    const uint group_index =
+        output_column * groups_per_row + input_column / params.group_size;
+    output[index] =
+        half(int(weights[index]) - int(zeros[group_index])) * scales[group_index];
+}
+
 kernel void qi_time_projection(
     device const float *timestep [[buffer(0)]],
     device float *output [[buffer(2)]],

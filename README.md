@@ -402,18 +402,31 @@ Inspect a shard, optionally filtering tensor names:
   The corrected 32-thread launch is material: launching the same kernel with
   the old 128-thread geometry duplicated the work across four SIMD groups and
   hid almost all of the gain.
-- Together these kernels reduce the fixture-fed 40-step transformer from
-  97,429 ms to 46,283 ms of summed GPU time and 47,989 ms loop wall time.
-  The exact checkpoint nRMSE values are 0.09039%, 0.13008%, and 1.00775% at
-  steps 1, 2, and 40, all within their unchanged gates. Packed validation and
-  prefix preparation still add about 10.6 seconds before the loop, so this is
-  a verified ~58.6-second transformer checkpoint, not the 25-30-second goal.
-  A follow-up Apple MPS probe established the next credible path: FP16 inputs
-  with FP32 outputs are supported and sustain 6.3-7.2 TFLOP/s on the two MLP
-  shapes. Using that path requires an FP16 packed-weight scheme plus encoder
-  interop; native MPS BF16 matmul was tested and rejected by the framework on
-  this M1 Max. Detailed measurements are in
-  `benchmarks/m1-max-production-kernel-profile.json`.
+- Exact production-shape MPS probes established a hybrid rather than a blanket
+  replacement. MPS on this M1 Max rejects BF16 matrix inputs, but accepts FP16
+  inputs with FP32 outputs. Including the required on-GPU conversion, MPS
+  completes the cached 4096->12288 and 12288->4096 MLP shapes in 4.24-4.56 ms,
+  versus 6.03-6.51 ms for the accepted custom kernels. The custom kernel stays
+  faster on BF16 4096x4096 attention projections (2.00 ms versus 2.83 ms), so
+  those remain custom Metal. Isolated MPS output nRMSE is at most 0.02095%.
+- Cached MLPs now convert their FP32 activations and BF16/Q8 packed weights to
+  FP16 scratch storage and invoke `MPSMatrixMultiplication` with FP32 output.
+  Conversion, MPS GEMM, SwiGLU, and residual work remain ordered in one command
+  buffer per transformer block; there is no CPU inference fallback or host
+  synchronization between operations. One reusable 96 MiB weight buffer and
+  6 MiB activation buffer avoid a roughly 9.7 GiB persistent copy of all MLP
+  weights. The 278-row first step deliberately retains the bounds-safe custom
+  path, while steps 2-40 use MPS for all three MLP matrices.
+- The verified fixture-fed 40-step loop now takes 37,778 ms of summed GPU time
+  and 39,437 ms wall time, down from 46,283 ms and 47,989 ms respectively
+  (18.4% GPU, 17.8% wall). Step 2 fell from 1,145.57 ms to 930.46 ms GPU and
+  step 40 to 927.60 ms. Exact latent nRMSE remains unchanged at 0.09039%,
+  0.13008%, and 1.00775% for steps 1, 2, and 40. This is substantial but still
+  above the 25-30-second target: eliminating dynamic conversion could approach
+  the low-30-second range only at a large memory cost, so further progress also
+  needs broader quantization or fusion. Detailed trajectory measurements are
+  in `benchmarks/m1-max-transformer-trajectory-native.json`; custom-kernel
+  baselines remain in `benchmarks/m1-max-production-kernel-profile.json`.
 
 ## Quantization decision log
 

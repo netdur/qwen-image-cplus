@@ -1,0 +1,199 @@
+import "metal/metal" as metal;
+import "objc/runtime" as rt;
+import "stdlib/option" as option;
+
+#[link_name = "dlopen"]
+extern fn qi_dlopen(path: *u8, mode: i32) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_u64_u64_u64_u32(
+    receiver: *u8,
+    selector: *u8,
+    first: u64,
+    second: u64,
+    third: u64,
+    fourth: u32,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_id_u64_id(
+    receiver: *u8,
+    selector: *u8,
+    first: *u8,
+    second: u64,
+    third: *u8,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_id_i8_i8_u64_u64_u64_f64_f64(
+    receiver: *u8,
+    selector: *u8,
+    device: *u8,
+    transpose_left: i8,
+    transpose_right: i8,
+    rows: u64,
+    columns: u64,
+    inner: u64,
+    alpha: f64,
+    beta: f64,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_void_id_id_id_id(
+    receiver: *u8,
+    selector: *u8,
+    command_buffer: *u8,
+    left: *u8,
+    right: *u8,
+    output: *u8,
+);
+
+const RTLD_LAZY: i32 = 1;
+const MPS_DATA_TYPE_FLOAT16: u32 = 0x10000010;
+const MPS_DATA_TYPE_FLOAT32: u32 = 0x10000020;
+
+struct OwnedObjc {
+    opaque pointer: *u8,
+}
+
+impl OwnedObjc {
+    fn new(pointer: *u8) -> OwnedObjc {
+        return OwnedObjc { pointer: pointer };
+    }
+
+    fn raw(this) -> *u8 {
+        return this.pointer;
+    }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            rt::release(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+struct Multiplication {
+    opaque left_descriptor: OwnedObjc,
+    opaque right_descriptor: OwnedObjc,
+    opaque output_descriptor: OwnedObjc,
+    opaque left_matrix: OwnedObjc,
+    opaque right_matrix: OwnedObjc,
+    opaque output_matrix: OwnedObjc,
+    opaque kernel: OwnedObjc,
+}
+
+impl Multiplication {
+    fn encode(this, command_buffer: metal::CommandBuffer) {
+        qi_msg_void_id_id_id_id(
+            this.kernel.raw(),
+            rt::sel(#str_ptr("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:\0")),
+            command_buffer.raw(),
+            this.left_matrix.raw(),
+            this.right_matrix.raw(),
+            this.output_matrix.raw(),
+        );
+    }
+}
+
+fn load_framework() -> bool {
+    let handle: *u8 = qi_dlopen(
+        #str_ptr("/System/Library/Frameworks/MetalPerformanceShaders.framework/MetalPerformanceShaders\0"),
+        RTLD_LAZY,
+    );
+    return !handle.is_null();
+}
+
+fn descriptor(rows: usize, columns: usize, element_bytes: usize, data_type: u32)
+    -> option::Option[OwnedObjc] {
+    let class: *u8 = rt::get_class(#str_ptr("MPSMatrixDescriptor\0"));
+    if class.is_null() { return option::Option[OwnedObjc]::None; }
+    let value: *u8 = qi_msg_id_u64_u64_u64_u32(
+        class,
+        rt::sel(#str_ptr("matrixDescriptorWithRows:columns:rowBytes:dataType:\0")),
+        rows as u64,
+        columns as u64,
+        (columns *% element_bytes) as u64,
+        data_type,
+    );
+    if value.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(value)));
+}
+
+fn matrix(
+    buffer: metal::Buffer,
+    offset: u64,
+    descriptor: *u8,
+) -> option::Option[OwnedObjc] {
+    let class: *u8 = rt::get_class(#str_ptr("MPSMatrix\0"));
+    if class.is_null() { return option::Option[OwnedObjc]::None; }
+    let allocated: *u8 = rt::msg_id(class, rt::sel(#str_ptr("alloc\0")));
+    if allocated.is_null() { return option::Option[OwnedObjc]::None; }
+    let value: *u8 = qi_msg_id_id_u64_id(
+        allocated,
+        rt::sel(#str_ptr("initWithBuffer:offset:descriptor:\0")),
+        buffer.raw(),
+        offset,
+        descriptor,
+    );
+    if value.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(value));
+}
+
+fn create(
+    device: metal::Device,
+    left_buffer: metal::Buffer,
+    left_offset: u64,
+    right_buffer: metal::Buffer,
+    right_offset: u64,
+    output_buffer: metal::Buffer,
+    output_offset: u64,
+    rows: usize,
+    columns: usize,
+    inner: usize,
+) -> option::Option[Multiplication] {
+    guard let option::Option[OwnedObjc]::Some(left_descriptor) = descriptor(
+        rows, inner, 2 as usize, MPS_DATA_TYPE_FLOAT16,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(right_descriptor) = descriptor(
+        columns, inner, 2 as usize, MPS_DATA_TYPE_FLOAT16,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(output_descriptor) = descriptor(
+        rows, columns, 4 as usize, MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(left_matrix) = matrix(
+        left_buffer, left_offset, left_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(right_matrix) = matrix(
+        right_buffer, right_offset, right_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(output_matrix) = matrix(
+        output_buffer, output_offset, output_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    let class: *u8 = rt::get_class(#str_ptr("MPSMatrixMultiplication\0"));
+    if class.is_null() { return option::Option[Multiplication]::None; }
+    let allocated: *u8 = rt::msg_id(class, rt::sel(#str_ptr("alloc\0")));
+    if allocated.is_null() { return option::Option[Multiplication]::None; }
+    let kernel_pointer: *u8 = qi_msg_id_id_i8_i8_u64_u64_u64_f64_f64(
+        allocated,
+        rt::sel(#str_ptr("initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:\0")),
+        device.raw(),
+        0 as i8,
+        1 as i8,
+        rows as u64,
+        columns as u64,
+        inner as u64,
+        1.0f64,
+        0.0f64,
+    );
+    if kernel_pointer.is_null() { return option::Option[Multiplication]::None; }
+    return option::Option[Multiplication]::Some(Multiplication {
+        left_descriptor: left_descriptor,
+        right_descriptor: right_descriptor,
+        output_descriptor: output_descriptor,
+        left_matrix: left_matrix,
+        right_matrix: right_matrix,
+        output_matrix: output_matrix,
+        kernel: OwnedObjc::new(kernel_pointer),
+    });
+}

@@ -20,7 +20,7 @@
     "steps": 40,
     "scheduler": "Pinned FlowMatchEulerDiscreteScheduler with dynamic exponential shift and terminal sigma 0.02",
     "reference": "Pinned official Diffusers BF16 transformer on MPS; FP32 Euler update cast back to BF16 after every step",
-    "native": "FP32 activations and accumulation, BF16 or affine-Q8/group-64 weights converted to FP16 SIMD-group operands, a bounds-safe 64x32 prefix kernel, a direct-store 64x64 cached kernel, 32-lane SIMD-group attention, and identical per-step BF16 latent rounding",
+    "native": "FP32 activations and outputs; custom FP16 SIMD-group GEMM for the 278-row prefix and cached attention projections; MPSMatrixMultiplication with dynamic BF16/Q8-to-FP16 weight conversion for cached MLPs; 32-lane SIMD-group attention; and identical per-step BF16 latent rounding",
     "cache": "Step 1 extracts post-RoPE prefix K and raw V; steps 2-40 execute target rows only from the same 32-layer cache",
     "checkpoint_steps": [1, 2, 40]
   },
@@ -32,18 +32,34 @@
   },
   "native": {
     "prefix_cache_bytes": 23068672,
+    "mps_scratch_bytes": 106954752,
     "q8_dispatch_matrices": 1600,
-    "summed_gpu_kernel_ms": 46282.6,
-    "summed_loop_wall_ms": 47989,
-    "step_1_gpu_ms": 1549.27,
-    "step_2_gpu_ms": 1145.57,
-    "step_40_gpu_ms": 1144.45,
+    "summed_gpu_kernel_ms": 37778.1,
+    "summed_loop_wall_ms": 39437,
+    "step_1_gpu_ms": 1578.76,
+    "step_2_gpu_ms": 930.462,
+    "step_40_gpu_ms": 927.6,
     "checkpoint_latent_nrmse": {
       "1": 0.000903863,
       "2": 0.00130082,
       "40": 0.0100775
     },
     "finite_at_every_checked_boundary": true
+  },
+  "comparison": {
+    "previous_custom_metal_gpu_ms": 46282.6,
+    "previous_custom_metal_wall_ms": 47989,
+    "gpu_reduction_percent": 18.4,
+    "wall_reduction_percent": 17.8,
+    "mps_exact_shape_probe": {
+      "bf16_256x4096x4096_dynamic_ms": 2.82792,
+      "bf16_256x12288x4096_dynamic_ms": 4.24375,
+      "bf16_256x4096x12288_dynamic_ms": 4.45408,
+      "q8_256x4096x4096_dynamic_ms": 1.49028,
+      "q8_256x12288x4096_dynamic_ms": 4.49475,
+      "q8_256x4096x12288_dynamic_ms": 4.56458,
+      "maximum_isolated_nrmse": 0.000209493
+    }
   },
   "acceptance": {
     "per_checkpoint_limits": {
@@ -54,11 +70,11 @@
     "schedule_vectors_match_fixture": true,
     "passed": true
   },
-  "interpretation": "The final 1.00775% latent nRMSE is accumulated complete-runtime divergence from official BF16 execution, not a quantization-only number. The native path retains FP32 accumulation and transformer outputs but converts matrix operands to FP16 for Apple SIMD-group matrix operations; it also reproduces the scheduler's BF16 cast-back after each Euler update. The checkpoint-specific gates preserve the observed growth instead of masking early regressions behind one loose final tolerance. Production-shaped SIMD-group GEMM plus one-SIMD-group attention reduced summed GPU time from 97428.8 ms to 46282.6 ms (52.5%).",
+  "interpretation": "The final 1.00775% latent nRMSE is accumulated complete-runtime divergence from official BF16 execution, not a quantization-only number. MPS preserves FP32 outputs but, like the accepted custom kernels, consumes FP16 operands. Exact production-shape probes selected a hybrid: custom Metal remains faster for BF16 square attention projections, while MPS wins on both MLP shapes and all measured Q8 shapes. Applying MPS to cached MLPs reduced summed GPU time from 46282.6 ms to 37778.1 ms (18.4%) without changing any checkpoint nRMSE. Dynamic conversion is retained because preconverting every MLP weight would require roughly 9.7 GB of additional persistent memory.",
   "limitations": [
     "The 1-step and 2-step commands validate prefixes of the official 40-step schedule; they are not separate one-step or two-step schedules.",
     "The trajectory is 256px so a 40-step regression remains practical. The earlier independent scale gate covers 512px and 1024px single-step execution.",
-    "Summed GPU time excludes packed-file validation, pipeline compilation, CPU scheduler work, and process startup; each transformer step is batched into one command buffer.",
+    "Summed GPU time excludes packed-file validation, pipeline compilation, CPU scheduler work, and process startup; each transformer block is batched into one command buffer containing ordered custom-Metal and MPS encoders.",
     "Prompt embeddings and initial noise are precomputed fixtures. Native prompt encoding and RNG remain later boundaries.",
     "No VAE decode is included; this gate ends at the latent after scheduler step 40."
   ]
