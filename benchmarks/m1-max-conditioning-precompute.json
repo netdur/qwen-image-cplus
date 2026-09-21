@@ -66,6 +66,20 @@
     "rgba_nrmse": 0.0100307,
     "passed": true
   },
+  "rejected_followup": {
+    "candidate": "Use 256 threads per threadgroup for every generic one-dimensional dispatch instead of the pipeline SIMD width of 32.",
+    "isolated_gpu_ms": {
+      "residual_before": 0.0494583,
+      "residual_candidate": 0.0307834,
+      "swiglu_before": 0.148721,
+      "swiglu_candidate": 0.113817
+    },
+    "two_step_integrated_gpu_ms": {
+      "before": 2103.8,
+      "candidate": 2139.41
+    },
+    "decision": "Rejected and reverted. A blanket launch-size change helps wide elementwise kernels but harms serial row reductions and small conditioning dispatches; any future change must select threadgroup size per kernel."
+  },
   "verification": {
     "cpc_fmt_check": true,
     "cpc_check": true,

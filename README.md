@@ -525,6 +525,12 @@ Inspect a shard, optionally filtering tensor names:
   decoded-image gate remains unchanged. Exact timings and the reason for not
   using the faster FP16 kernel are in
   `benchmarks/m1-max-conditioning-precompute.json`.
+- A blanket increase from 32 to 256 threads per elementwise threadgroup was
+  also measured and rejected. It reduced isolated residual and SwiGLU time,
+  but made the serial row-reduction and small conditioning dispatches slower;
+  the two-step integrated GPU total regressed from 2,103.8 to 2,139.4 ms.
+  Kernel-specific launch sizes remain a possible later refinement, but 256 is
+  not a safe global default.
 - Cache-DiT is available as an explicit, off-by-default approximation. It
   follows the upstream
   [DBCache block flow](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_blocks/pattern_base.py)
