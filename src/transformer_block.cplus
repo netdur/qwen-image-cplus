@@ -102,6 +102,25 @@ struct AttentionParams {
     value_offset: u32,
 }
 
+#[repr(C)]
+struct FlashAttentionParams {
+    query_rows: u32,
+    key_rows: u32,
+    padded_key_rows: u32,
+    query_position_offset: u32,
+    block_causal: u32,
+}
+
+#[repr(C)]
+struct FlashPrepareParams {
+    rows: u32,
+    prefix_rows: u32,
+    padded_rows: u32,
+    cache_mode: u32,
+    value_stride: u32,
+    value_offset: u32,
+}
+
 struct LinearWeight {
     storage: metal::Buffer,
     scheme: u32,
@@ -864,6 +883,67 @@ fn dispatch_attention(
     );
 }
 
+fn dispatch_flash_attention(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    output: metal::Buffer,
+    value: metal::Buffer,
+    image_ids: metal::Buffer,
+    key_valid: metal::Buffer,
+    query_rows: usize,
+    key_rows: usize,
+    padded_key_rows: usize,
+    query_position_offset: usize = 0 as usize,
+    block_causal: bool = true,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: FlashAttentionParams = FlashAttentionParams {
+        query_rows: query_rows as u32,
+        key_rows: key_rows as u32,
+        padded_key_rows: padded_key_rows as u32,
+        query_position_offset: query_position_offset as u32,
+        block_causal: if block_causal { 1 as u32 } else { 0 as u32 },
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(query, 0 as u64, 0 as u64);
+    encoder.set_buffer(key, 0 as u64, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_buffer(value, 0 as u64, 3 as u64);
+    encoder.set_bytes(
+        #addr_of(params) as *u8, #size_of::[FlashAttentionParams]() as u64, 4 as u64,
+    );
+    encoder.set_buffer(image_ids, 0 as u64, 5 as u64);
+    encoder.set_buffer(key_valid, 0 as u64, 6 as u64);
+    encoder.set_threadgroup_memory_length(10 as u64 *% 1024 as u64, 0 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: (round_up(query_rows, 8 as usize) / (8 as usize) *% HEADS) as u64,
+            height: 1 as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 128 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
 fn dispatch_copy_prefix(
     queue: metal::CommandQueue,
     pipeline: metal::ComputePipelineState,
@@ -1221,6 +1301,99 @@ fn encode_attention(
     encoder.dispatch_threadgroups(
         metal::Size { width: (round_up(query_rows, queries_per_group) / queries_per_group *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: threads_per_group as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_flash_prepare_kv(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    prepared_key: metal::Buffer,
+    prepared_value: metal::Buffer,
+    cache_key: metal::Buffer,
+    cache_value: metal::Buffer,
+    cache_offset: u64,
+    rows: usize,
+    prefix_rows: usize,
+    cache_mode: u32,
+    value_stride: usize,
+    value_offset: usize,
+) {
+    let key_rows: usize = if cache_mode == (2 as u32) {
+        prefix_rows +% rows
+    } else {
+        rows
+    };
+    let padded_rows: usize = round_up(key_rows, 64 as usize);
+    var params: FlashPrepareParams = FlashPrepareParams {
+        rows: rows as u32,
+        prefix_rows: prefix_rows as u32,
+        padded_rows: padded_rows as u32,
+        cache_mode: cache_mode,
+        value_stride: value_stride as u32,
+        value_offset: value_offset as u32,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(key, 0 as u64, 0 as u64);
+    encoder.set_buffer(value, 0 as u64, 1 as u64);
+    encoder.set_buffer(prepared_key, 0 as u64, 2 as u64);
+    encoder.set_buffer(prepared_value, 0 as u64, 3 as u64);
+    encoder.set_bytes(
+        #addr_of(params) as *u8, #size_of::[FlashPrepareParams]() as u64, 4 as u64,
+    );
+    encoder.set_buffer(cache_key, cache_offset, 5 as u64);
+    encoder.set_buffer(cache_value, cache_offset, 6 as u64);
+    let threads: u64 = pipeline.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size {
+            width: (padded_rows *% WIDTH) as u64,
+            height: 1 as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: threads, height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_flash_attention(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    output: metal::Buffer,
+    value: metal::Buffer,
+    image_ids: metal::Buffer,
+    key_valid: metal::Buffer,
+    query_rows: usize,
+    key_rows: usize,
+    query_position_offset: usize,
+) {
+    let padded_key_rows: usize = round_up(key_rows, 64 as usize);
+    var params: FlashAttentionParams = FlashAttentionParams {
+        query_rows: query_rows as u32,
+        key_rows: key_rows as u32,
+        padded_key_rows: padded_key_rows as u32,
+        query_position_offset: query_position_offset as u32,
+        block_causal: 1 as u32,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(query, 0 as u64, 0 as u64);
+    encoder.set_buffer(key, 0 as u64, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_buffer(value, 0 as u64, 3 as u64);
+    encoder.set_bytes(
+        #addr_of(params) as *u8, #size_of::[FlashAttentionParams]() as u64, 4 as u64,
+    );
+    encoder.set_buffer(image_ids, 0 as u64, 5 as u64);
+    encoder.set_buffer(key_valid, 0 as u64, 6 as u64);
+    encoder.set_threadgroup_memory_length(10 as u64 *% 1024 as u64, 0 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: (round_up(query_rows, 8 as usize) / (8 as usize) *% HEADS) as u64,
+            height: 1 as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 128 as u64, height: 1 as u64, depth: 1 as u64 },
     );
 }
 
@@ -2225,29 +2398,48 @@ fn encode_mps_mlp_runtime_block(
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
     encode_buffer_barrier(attention_encoder);
-    if cache_mode == (1 as u32) {
-        encode_copy_prefix(
+    let cached: bool = cache_mode == (2 as u32);
+    if pipelines.attention_threads == (128 as usize) {
+        encode_flash_prepare_kv(
             attention_encoder, cache_copy_pipeline, workspace.key_rope,
             if mps_qkv { workspace.gate } else { workspace.value },
-            cache_key, cache_value, cache_offset, prefix_rows, workspace.dummy,
+            workspace.key, workspace.projected, cache_key, cache_value, cache_offset,
+            rows, prefix_rows, cache_mode,
             if mps_qkv { (3 as usize) *% WIDTH } else { WIDTH },
             if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
         );
         encode_buffer_barrier(attention_encoder);
+        encode_flash_attention(
+            attention_encoder, pipelines.attention, workspace.query_rope,
+            workspace.key, workspace.attended, workspace.projected,
+            workspace.image_ids, workspace.key_valid, rows,
+            if cached { prefix_rows +% rows } else { rows },
+            if cached { prefix_rows } else { 0 as usize },
+        );
+    } else {
+        if cache_mode == (1 as u32) {
+            encode_copy_prefix(
+                attention_encoder, cache_copy_pipeline, workspace.key_rope,
+                if mps_qkv { workspace.gate } else { workspace.value },
+                cache_key, cache_value, cache_offset, prefix_rows, workspace.dummy,
+                if mps_qkv { (3 as usize) *% WIDTH } else { WIDTH },
+                if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
+            );
+            encode_buffer_barrier(attention_encoder);
+        }
+        encode_attention(
+            attention_encoder, pipelines.attention, workspace.query_rope, workspace.key_rope,
+            workspace.attended, if mps_qkv { workspace.gate } else { workspace.value },
+            workspace.image_ids, workspace.key_valid,
+            rows, if cached { prefix_rows +% rows } else { rows },
+            cache_key, cache_value, cache_offset,
+            if cached { prefix_rows } else { 0 as usize }, true,
+            if cached { prefix_rows } else { 0 as usize }, pipelines.attention_threads,
+            if mps_qkv { (3 as usize) *% WIDTH } else { WIDTH },
+            if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
+            pipelines.attention_queries_per_group,
+        );
     }
-    let cached: bool = cache_mode == (2 as u32);
-    encode_attention(
-        attention_encoder, pipelines.attention, workspace.query_rope, workspace.key_rope,
-        workspace.attended, if mps_qkv { workspace.gate } else { workspace.value },
-        workspace.image_ids, workspace.key_valid,
-        rows, if cached { prefix_rows +% rows } else { rows },
-        cache_key, cache_value, cache_offset,
-        if cached { prefix_rows } else { 0 as usize }, true,
-        if cached { prefix_rows } else { 0 as usize }, pipelines.attention_threads,
-        if mps_qkv { (3 as usize) *% WIDTH } else { WIDTH },
-        if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
-        pipelines.attention_queries_per_group,
-    );
     encode_buffer_barrier(attention_encoder);
     encode_weighted_linear(
         attention_encoder, pipelines, workspace.attended, weights.attention_output,
@@ -4159,7 +4351,7 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
     let attention_kernel_name: str = if pixels == (1024 as usize) {
-        "qi_block_attention_simdgroup4"
+        "qi_block_attention_flash128"
     } else {
         "qi_block_attention_simdgroup"
     };
@@ -4174,6 +4366,7 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(assemble_owner) = pipeline(device, library, "qi_joint_assemble") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(final_norm_owner) = pipeline(device, library, "qi_final_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_copy_owner) = pipeline(device, library, "qi_copy_prefix_kv") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(flash_prepare_owner) = pipeline(device, library, "qi_flash_prepare_kv") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_input_owner) = pipeline(device, library, "qi_mps_input_to_half") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_first_residual_owner) = pipeline(device, library, "qi_cache_first_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_store_residual_owner) = pipeline(device, library, "qi_cache_store_residual") else { return 1; };
@@ -4192,9 +4385,13 @@ fn run_trajectory_packed_impl(
         norm: metal::ComputePipelineState::from_raw(norm_owner.raw()),
         qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
-        attention_threads: 32 as usize,
+        attention_threads: if pixels == (1024 as usize) {
+            128 as usize
+        } else {
+            32 as usize
+        },
         attention_queries_per_group: if pixels == (1024 as usize) {
-            4 as usize
+            8 as usize
         } else {
             2 as usize
         },
@@ -4207,7 +4404,11 @@ fn run_trajectory_packed_impl(
     let text_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(text_norm_owner.raw());
     let assemble_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(assemble_owner.raw());
     let final_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(final_norm_owner.raw());
-    let cache_copy_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_copy_owner.raw());
+    let cache_copy_pipeline: metal::ComputePipelineState = if pixels == (1024 as usize) {
+        metal::ComputePipelineState::from_raw(flash_prepare_owner.raw())
+    } else {
+        metal::ComputePipelineState::from_raw(cache_copy_owner.raw())
+    };
     let mps_input_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_input_owner.raw());
     let mps_bf16_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_bf16_owner.raw());
     let mps_q8_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_q8_owner.raw());
@@ -4239,7 +4440,11 @@ fn run_trajectory_packed_impl(
     let image_input_bytes: u64 = (latent_count *% #size_of::[f32]()) as u64;
     let image_projected_bytes: u64 = (target_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let mlp_bytes: u64 = (rows *% MLP_WIDTH *% #size_of::[f32]()) as u64;
-    let per_block_cache_bytes: u64 = (text_rows *% WIDTH *% #size_of::[f32]()) as u64;
+    let per_block_cache_bytes: u64 = (text_rows *% WIDTH *% if pixels == (1024 as usize) {
+        #size_of::[u16]()
+    } else {
+        #size_of::[f32]()
+    }) as u64;
     let cache_arena_bytes: u64 = (32 as u64) *% per_block_cache_bytes;
 
     guard let option::Option[metal::Buffer]::Some(dummy) = new_buffer(device, 4 as u64) else { return 1; }; let dummy_owner: OwnedObjc = OwnedObjc::new(dummy.raw());
@@ -5806,6 +6011,7 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         return 2;
     }
     let full_rows: usize = prefix_rows +% target_rows;
+    let padded_key_rows: usize = round_up(full_rows, 64 as usize);
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return 1; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
@@ -5832,31 +6038,41 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         pipeline(device, library, "qi_block_attention_simdgroup") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(four_query_attention_owner) =
         pipeline(device, library, "qi_block_attention_simdgroup4") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(flash_attention_owner) =
+        pipeline(device, library, "qi_block_attention_flash128") else { return 1; };
     let attention_pipeline: metal::ComputePipelineState =
         metal::ComputePipelineState::from_raw(attention_owner.raw());
     let simdgroup_attention_pipeline: metal::ComputePipelineState =
         metal::ComputePipelineState::from_raw(simdgroup_attention_owner.raw());
     let four_query_attention_pipeline: metal::ComputePipelineState =
         metal::ComputePipelineState::from_raw(four_query_attention_owner.raw());
+    let flash_attention_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(flash_attention_owner.raw());
     let full_bytes: u64 = (full_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let target_bytes: u64 = (target_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let prefix_bytes: u64 = (prefix_rows *% WIDTH *% #size_of::[f32]()) as u64;
+    let flash_kv_bytes: u64 =
+        (padded_key_rows *% WIDTH *% #size_of::[u16]()) as u64;
     guard let option::Option[metal::Buffer]::Some(full_query) = new_buffer(device, full_bytes) else { return 1; }; let full_query_owner: OwnedObjc = OwnedObjc::new(full_query.raw());
     guard let option::Option[metal::Buffer]::Some(full_key) = new_buffer(device, full_bytes) else { return 1; }; let full_key_owner: OwnedObjc = OwnedObjc::new(full_key.raw());
     guard let option::Option[metal::Buffer]::Some(full_value) = new_buffer(device, full_bytes) else { return 1; }; let full_value_owner: OwnedObjc = OwnedObjc::new(full_value.raw());
     guard let option::Option[metal::Buffer]::Some(full_output) = new_buffer(device, full_bytes) else { return 1; }; let full_output_owner: OwnedObjc = OwnedObjc::new(full_output.raw());
     guard let option::Option[metal::Buffer]::Some(full_simdgroup_output) = new_buffer(device, full_bytes) else { return 1; }; let full_simdgroup_output_owner: OwnedObjc = OwnedObjc::new(full_simdgroup_output.raw());
     guard let option::Option[metal::Buffer]::Some(full_four_query_output) = new_buffer(device, full_bytes) else { return 1; }; let full_four_query_output_owner: OwnedObjc = OwnedObjc::new(full_four_query_output.raw());
+    guard let option::Option[metal::Buffer]::Some(full_flash_output) = new_buffer(device, full_bytes) else { return 1; }; let full_flash_output_owner: OwnedObjc = OwnedObjc::new(full_flash_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_query) = new_buffer(device, target_bytes) else { return 1; }; let target_query_owner: OwnedObjc = OwnedObjc::new(target_query.raw());
     guard let option::Option[metal::Buffer]::Some(target_key) = new_buffer(device, target_bytes) else { return 1; }; let target_key_owner: OwnedObjc = OwnedObjc::new(target_key.raw());
     guard let option::Option[metal::Buffer]::Some(target_value) = new_buffer(device, target_bytes) else { return 1; }; let target_value_owner: OwnedObjc = OwnedObjc::new(target_value.raw());
     guard let option::Option[metal::Buffer]::Some(target_output) = new_buffer(device, target_bytes) else { return 1; }; let target_output_owner: OwnedObjc = OwnedObjc::new(target_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_simdgroup_output) = new_buffer(device, target_bytes) else { return 1; }; let target_simdgroup_output_owner: OwnedObjc = OwnedObjc::new(target_simdgroup_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_four_query_output) = new_buffer(device, target_bytes) else { return 1; }; let target_four_query_output_owner: OwnedObjc = OwnedObjc::new(target_four_query_output.raw());
+    guard let option::Option[metal::Buffer]::Some(target_flash_output) = new_buffer(device, target_bytes) else { return 1; }; let target_flash_output_owner: OwnedObjc = OwnedObjc::new(target_flash_output.raw());
+    guard let option::Option[metal::Buffer]::Some(flash_key) = new_buffer(device, flash_kv_bytes) else { return 1; }; let flash_key_owner: OwnedObjc = OwnedObjc::new(flash_key.raw());
+    guard let option::Option[metal::Buffer]::Some(flash_value) = new_buffer(device, flash_kv_bytes) else { return 1; }; let flash_value_owner: OwnedObjc = OwnedObjc::new(flash_value.raw());
     guard let option::Option[metal::Buffer]::Some(cache_key) = new_buffer(device, prefix_bytes) else { return 1; }; let cache_key_owner: OwnedObjc = OwnedObjc::new(cache_key.raw());
     guard let option::Option[metal::Buffer]::Some(cache_value) = new_buffer(device, prefix_bytes) else { return 1; }; let cache_value_owner: OwnedObjc = OwnedObjc::new(cache_value.raw());
-    guard let option::Option[metal::Buffer]::Some(image_ids) = new_buffer(device, (full_rows *% #size_of::[i32]()) as u64) else { return 1; }; let image_ids_owner: OwnedObjc = OwnedObjc::new(image_ids.raw());
-    guard let option::Option[metal::Buffer]::Some(key_valid) = new_buffer(device, full_rows as u64) else { return 1; }; let key_valid_owner: OwnedObjc = OwnedObjc::new(key_valid.raw());
+    guard let option::Option[metal::Buffer]::Some(image_ids) = new_buffer(device, (padded_key_rows *% #size_of::[i32]()) as u64) else { return 1; }; let image_ids_owner: OwnedObjc = OwnedObjc::new(image_ids.raw());
+    guard let option::Option[metal::Buffer]::Some(key_valid) = new_buffer(device, padded_key_rows as u64) else { return 1; }; let key_valid_owner: OwnedObjc = OwnedObjc::new(key_valid.raw());
 
     let full_query_values: *f32 = full_query.contents() as *f32;
     let full_key_values: *f32 = full_key.contents() as *f32;
@@ -5866,11 +6082,20 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     let target_value_values: *f32 = target_value.contents() as *f32;
     let cache_key_values: *f32 = cache_key.contents() as *f32;
     let cache_value_values: *f32 = cache_value.contents() as *f32;
+    let flash_key_values: *u16 = flash_key.contents() as *u16;
+    let flash_value_values: *u16 = flash_value.contents() as *u16;
     var index: usize = 0 as usize;
     while index < full_rows *% WIDTH {
         full_query_values[index] = ((index % (251 as usize)) as f32 - 125.0f32) / 512.0f32;
-        full_key_values[index] = ((index % (239 as usize)) as f32 - 119.0f32) / 512.0f32;
-        full_value_values[index] = ((index % (233 as usize)) as f32 - 116.0f32) / 256.0f32;
+        full_key_values[index] = ((index % (239 as usize)) as f32 - 119.0f32) / 509.0f32;
+        full_value_values[index] = ((index % (233 as usize)) as f32 - 116.0f32) / 251.0f32;
+        flash_key_values[index] = cpu::f32_to_fp16(full_key_values[index]);
+        flash_value_values[index] = cpu::f32_to_fp16(full_value_values[index]);
+        index = index +% (1 as usize);
+    }
+    while index < padded_key_rows *% WIDTH {
+        flash_key_values[index] = 0 as u16;
+        flash_value_values[index] = 0 as u16;
         index = index +% (1 as usize);
     }
     index = 0 as usize;
@@ -5889,9 +6114,11 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     }
     let ids: *i32 = image_ids.contents() as *i32;
     index = 0 as usize;
-    while index < full_rows {
-        ids[index] = if index < prefix_rows { 0 -% (index as i32) -% (1 as i32) } else { 0 as i32 };
-        (key_valid.contents())[index] = 1 as u8;
+    while index < padded_key_rows {
+        ids[index] = if index < prefix_rows {
+            0 -% (index as i32) -% (1 as i32)
+        } else { 0 as i32 };
+        (key_valid.contents())[index] = if index < full_rows { 1 as u8 } else { 0 as u8 };
         index = index +% (1 as usize);
     }
 
@@ -5924,12 +6151,23 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         target_value, image_ids, key_valid, target_rows, full_rows, cache_key, cache_value,
         0 as u64, prefix_rows, true, prefix_rows, 32 as usize, WIDTH, 0 as usize, 4 as usize,
     ) else { return 1; };
+    guard let option::Option[f64]::Some(_prefill_flash_warmup) = dispatch_flash_attention(
+        queue, flash_attention_pipeline, full_query, flash_key, full_flash_output,
+        flash_value, image_ids, key_valid, full_rows, full_rows, padded_key_rows,
+    ) else { return 1; };
+    guard let option::Option[f64]::Some(_cached_flash_warmup) = dispatch_flash_attention(
+        queue, flash_attention_pipeline, target_query, flash_key, target_flash_output,
+        flash_value, image_ids, key_valid, target_rows, full_rows, padded_key_rows,
+        prefix_rows,
+    ) else { return 1; };
     var prefill_total_ms: f64 = 0.0f64;
     var cached_total_ms: f64 = 0.0f64;
     var prefill_simdgroup_total_ms: f64 = 0.0f64;
     var cached_simdgroup_total_ms: f64 = 0.0f64;
     var prefill_four_query_total_ms: f64 = 0.0f64;
     var cached_four_query_total_ms: f64 = 0.0f64;
+    var prefill_flash_total_ms: f64 = 0.0f64;
+    var cached_flash_total_ms: f64 = 0.0f64;
     index = 0 as usize;
     while index < iterations {
         guard let option::Option[f64]::Some(prefill_ms) = dispatch_attention(
@@ -5953,6 +6191,15 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
             0 as u64, prefix_rows, true, prefix_rows, 32 as usize, WIDTH, 0 as usize,
             4 as usize,
         ) else { return 1; };
+        guard let option::Option[f64]::Some(prefill_flash_ms) = dispatch_flash_attention(
+            queue, flash_attention_pipeline, full_query, flash_key, full_flash_output,
+            flash_value, image_ids, key_valid, full_rows, full_rows, padded_key_rows,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(cached_flash_ms) = dispatch_flash_attention(
+            queue, flash_attention_pipeline, target_query, flash_key, target_flash_output,
+            flash_value, image_ids, key_valid, target_rows, full_rows, padded_key_rows,
+            prefix_rows,
+        ) else { return 1; };
         guard let option::Option[f64]::Some(prefill_simdgroup_ms) = dispatch_attention(
             queue, simdgroup_attention_pipeline, full_query, full_key, full_simdgroup_output,
             full_value, image_ids, key_valid, full_rows, full_rows, cache_key, cache_value, 0 as u64,
@@ -5970,12 +6217,16 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         cached_simdgroup_total_ms = cached_simdgroup_total_ms + cached_simdgroup_ms;
         prefill_four_query_total_ms = prefill_four_query_total_ms + prefill_four_query_ms;
         cached_four_query_total_ms = cached_four_query_total_ms + cached_four_query_ms;
+        prefill_flash_total_ms = prefill_flash_total_ms + prefill_flash_ms;
+        cached_flash_total_ms = cached_flash_total_ms + cached_flash_ms;
         index = index +% (1 as usize);
     }
     if !finite("production attention prefill", full_output, full_rows *% WIDTH)
         || !finite("production attention cached", target_output, target_rows *% WIDTH)
         || !finite("production attention four-query prefill", full_four_query_output, full_rows *% WIDTH)
-        || !finite("production attention four-query cached", target_four_query_output, target_rows *% WIDTH) {
+        || !finite("production attention four-query cached", target_four_query_output, target_rows *% WIDTH)
+        || !finite("production attention flash prefill", full_flash_output, full_rows *% WIDTH)
+        || !finite("production attention flash cached", target_flash_output, target_rows *% WIDTH) {
         return 1;
     }
     let prefill_average_ms: f64 = prefill_total_ms / iterations as f64;
@@ -5984,12 +6235,16 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     let cached_simdgroup_average_ms: f64 = cached_simdgroup_total_ms / iterations as f64;
     let prefill_four_query_average_ms: f64 = prefill_four_query_total_ms / iterations as f64;
     let cached_four_query_average_ms: f64 = cached_four_query_total_ms / iterations as f64;
+    let prefill_flash_average_ms: f64 = prefill_flash_total_ms / iterations as f64;
+    let cached_flash_average_ms: f64 = cached_flash_total_ms / iterations as f64;
     let projected_trajectory_ms: f64 = (prefill_average_ms
         + (39 as f64) * cached_average_ms) * (32 as f64);
     let simdgroup_projected_trajectory_ms: f64 = (prefill_simdgroup_average_ms
         + (39 as f64) * cached_simdgroup_average_ms) * (32 as f64);
     let four_query_projected_trajectory_ms: f64 = (prefill_four_query_average_ms
         + (39 as f64) * cached_four_query_average_ms) * (32 as f64);
+    let flash_projected_trajectory_ms: f64 = (prefill_flash_average_ms
+        + (39 as f64) * cached_flash_average_ms) * (32 as f64);
     let prefill_error: f64 = normalized_rms_buffers(
         full_simdgroup_output, 0 as usize, full_output, 0 as usize, full_rows *% WIDTH,
     );
@@ -6002,6 +6257,12 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     let four_query_cached_error: f64 = normalized_rms_buffers(
         target_four_query_output, 0 as usize, target_output, 0 as usize, target_rows *% WIDTH,
     );
+    let flash_prefill_error: f64 = normalized_rms_buffers(
+        full_flash_output, 0 as usize, full_output, 0 as usize, full_rows *% WIDTH,
+    );
+    let flash_cached_error: f64 = normalized_rms_buffers(
+        target_flash_output, 0 as usize, target_output, 0 as usize, target_rows *% WIDTH,
+    );
     io::println(
         "production attention benchmark: pixels=${pixels} prefill_rows=${full_rows} prefill_gpu_ms=${prefill_average_ms} cached_query_rows=${target_rows} cached_key_rows=${full_rows} cached_gpu_ms=${cached_average_ms} projected_40_step_32_block_gpu_ms=${projected_trajectory_ms} iterations=${iterations}",
     );
@@ -6011,8 +6272,12 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     io::println(
         "production attention benchmark: kernel=simdgroup4 prefill_gpu_ms=${prefill_four_query_average_ms} speedup_vs_simdgroup=${prefill_simdgroup_average_ms / prefill_four_query_average_ms} prefill_nRMSE=${four_query_prefill_error} cached_gpu_ms=${cached_four_query_average_ms} cached_speedup_vs_simdgroup=${cached_simdgroup_average_ms / cached_four_query_average_ms} cached_nRMSE=${four_query_cached_error} projected_40_step_32_block_gpu_ms=${four_query_projected_trajectory_ms}",
     );
+    io::println(
+        "production attention benchmark: kernel=flash128-fp16-kv prefill_gpu_ms=${prefill_flash_average_ms} speedup_vs_simdgroup4=${prefill_four_query_average_ms / prefill_flash_average_ms} prefill_nRMSE=${flash_prefill_error} cached_gpu_ms=${cached_flash_average_ms} cached_speedup_vs_simdgroup4=${cached_four_query_average_ms / cached_flash_average_ms} cached_nRMSE=${flash_cached_error} projected_40_step_32_block_gpu_ms=${flash_projected_trajectory_ms}",
+    );
     return if prefill_error <= 0.00001f64 && cached_error <= 0.00001f64
-        && four_query_prefill_error <= 0.00001f64 && four_query_cached_error <= 0.00001f64 {
+        && four_query_prefill_error <= 0.00001f64 && four_query_cached_error <= 0.00001f64
+        && flash_prefill_error <= 0.001f64 && flash_cached_error <= 0.001f64 {
         0
     } else { 1 };
 }

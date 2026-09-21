@@ -79,7 +79,47 @@
         "candidate_cached_gpu_ms": 752.371,
         "cached_speedup": 1.19111
       },
-      "decision": "Use four queries per SIMD group only at 1024px; retain two queries at 256px and 512px."
+      "decision": "Use four queries per SIMD group only at 1024px until superseded there by Flash Attention; retain two queries at 256px and 512px."
+    },
+    "rejected_fp16_kv_scalar": {
+      "design": "Retain scalar four-query online attention but store K/V in FP16.",
+      "representative_prefill_gpu_ms": 707.234,
+      "four_query_prefill_gpu_ms": 732.129,
+      "representative_cached_gpu_ms": 708.893,
+      "four_query_cached_gpu_ms": 730.427,
+      "prefill_nrmse": 0.000269969,
+      "cached_nrmse": 0.000434644,
+      "reason": "Only 3-3.5% faster in the favorable run, with no cached win in a hotter repeat. Flash Attention captures FP16 bandwidth with an order-of-magnitude kernel gain."
+    },
+    "rejected_scalar_eight_query": {
+      "design": "One SIMD group retains eight independent scalar online-softmax states to maximize K/V reuse.",
+      "four_query_prefill_gpu_ms": 753.884,
+      "candidate_prefill_gpu_ms": 1124.77,
+      "four_query_cached_gpu_ms": 751.919,
+      "candidate_cached_gpu_ms": 1207.8,
+      "reason": "Register pressure caused a 33-38% regression."
+    },
+    "rejected_fast_mask": {
+      "design": "Hoist the fact that every image query can attend every valid key, removing image-ID comparisons from the scalar inner loop.",
+      "integrated_candidate_gpu_ms": 33319.8,
+      "adjacent_four_query_control_gpu_ms": 33886.7,
+      "integrated_speedup": 1.017,
+      "reason": "The exact 1.7% full-step win is too small to retain beside the much faster flash path."
+    },
+    "accepted_flash128_fp16_kv": {
+      "design": "Fixed 32-head, dimension-128 Flash Attention with eight queries, 64 keys per tile, four SIMD groups, FP16 matrix operands, and FP32 score/softmax/output accumulation.",
+      "reference": "llama.cpp Metal Flash Attention structure at commit 2f3fd0252 (MIT), specialized without its GGML runtime or generic template machinery.",
+      "isolated_1024": {
+        "four_query_prefill_gpu_ms": 745.523,
+        "flash_prefill_gpu_ms": 75.223,
+        "prefill_speedup": 9.91084,
+        "prefill_nrmse_vs_scalar_fp32": 0.000269969,
+        "four_query_cached_gpu_ms": 776.494,
+        "flash_cached_gpu_ms": 74.5834,
+        "cached_speedup": 10.4111,
+        "cached_nrmse_vs_scalar_fp32": 0.000434663
+      },
+      "decision": "Use Flash Attention only at 1024px. Keep the exact two-query kernel at 256px and 512px."
     }
   },
   "integrated_four_query_1024": {
@@ -101,9 +141,34 @@
     "accuracy": "The isolated production-shape attention outputs are bit-exact to the scalar reference (nRMSE 0). The unchanged 256px two-step trajectory passes official latent gates at 0.000906469 and 0.00130081 nRMSE.",
     "unit_tests": "334 passed, 0 failed"
   },
+  "integrated_flash128_1024": {
+    "one_step": {
+      "startup_buffers_and_prefix_ms": 6956,
+      "step_1_gpu_ms": 11426.1,
+      "step_1_wall_ms": 11512,
+      "loop_gpu_ms": 11445.0,
+      "loop_wall_ms": 11526,
+      "observed_process_wall_ms": 19098
+    },
+    "two_step": {
+      "startup_buffers_and_prefix_ms": 6550,
+      "step_1_gpu_ms": 11168.9,
+      "step_1_wall_ms": 11281,
+      "step_2_gpu_ms": 11700.7,
+      "step_2_wall_ms": 11726,
+      "loop_gpu_ms": 22887.2,
+      "loop_wall_ms": 23023,
+      "observed_process_wall_ms": 29677
+    },
+    "one_step_gpu_speedup_vs_integrated_four_query_range": "2.82x to 2.85x",
+    "prefix_cache_bytes": 16252928,
+    "accuracy": "The isolated production-shape prefill and cached operators pass a 0.001 nRMSE gate against scalar FP32. No official complete 1024 trajectory oracle exists yet. The unchanged 256px two-step path passes its official latent gates at 0.000906469 and 0.00130081 nRMSE.",
+    "unit_tests": "334 passed, 0 failed"
+  },
   "limitations": [
     "One-step timings intentionally exclude text encoding, VAE decoding, and image output.",
     "GPU frequency varies between runs, so acceptance requires both dispatch-order measurements and the integrated repeat rather than a single percentage.",
-    "This optimization improves full transformer steps; Cache-DiT-skipped steps do not execute attention and therefore do not receive the same saving."
+    "This optimization improves full transformer steps; Cache-DiT-skipped steps do not execute attention and therefore do not receive the same saving.",
+    "The 1024 Flash Attention result has isolated operator accuracy coverage but not a complete official 1024 trajectory oracle; adding that oracle remains a separate phase."
   ]
 }

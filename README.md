@@ -764,6 +764,32 @@ Inspect a shard, optionally filtering tensor names:
   candidate was also exact but 5% slower at 1024 because its barriers outweighed
   reduced reads, and was removed. Measurements and caveats are in
   `benchmarks/m1-max-transformer-trajectory-1024-short.json`.
+- The scalar attention line is now superseded at 1024 by a fixed-shape Metal
+  Flash Attention kernel. It specializes the MIT-licensed llama.cpp
+  8-query/64-key/four-SIMD-group structure to 32 heads of width 128: Q and
+  padded contiguous K/V matrix operands are FP16, while scores, online-softmax
+  state, and output accumulation stay FP32. The isolated production shape fell
+  from 745.523 to 75.223 ms for prefill and from 776.494 to 74.583 ms for the
+  cached query, **9.91x and 10.41x faster**. Relative to the scalar FP32
+  reference, nRMSE is 0.000269969 and 0.000434663. Those are conversion error,
+  not a change to the Qwen block-causal mask; the corrected benchmark avoids
+  power-of-two fixture denominators that had accidentally hidden FP16 loss.
+- The production 1024 path prepares padded FP16 K/V in reusable scratch,
+  caches each block's text prefix directly in FP16, and restores it ahead of
+  target K/V on later steps. It does not allocate another full K/V pair. The
+  integrated one-step transformer fell from 32.216-32.553 s GPU to **11.426 s
+  GPU / 11.512 s step wall**. A separate two-step run measured 11.169 s for
+  joint cache extraction and 11.701 s for the cached-prefix step, 22.887 s GPU
+  / 23.023 s loop wall total. Prefix K/V storage fell from about 31 MiB to
+  **15.5 MiB**. Process wall still includes roughly 6.5-7.0 s of startup buffer
+  work, which is intentionally reported separately from transformer execution.
+- Smaller scalar variations were closed before adopting flash: FP16 K/V alone
+  saved only 3-3.5% and introduced the same numerical loss; eight queries in
+  one scalar SIMD group regressed 33-38% from register pressure; and a
+  model-specific fast mask saved only 1.7% in an adjacent full-step control.
+  They are not retained because flash captures the useful FP16 bandwidth change
+  and removes the dominant repeated K/V pass. The 256 path remains unchanged
+  and its two-step oracle still passes at 0.000906469 and 0.00130081 nRMSE.
 
 ## Remaining optimization phases
 
@@ -776,16 +802,19 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    data outside Git. Cache-off remains the reproducible path; independently
    assess Cache-DiT image quality because the existing thresholds were
    calibrated only at 256.
-2. **1024 transformer throughput.** Continue after the accepted four-query
-   attention crossover. The online attention kernel still accounts for roughly
-   24 seconds across 32 blocks in an isolated full step, so a genuinely tiled
-   QK/PV implementation or FP16 K/V storage remains the highest-leverage work.
-   Accept changes only with full-shape timing and numerical gates.
+2. **1024 transformer throughput.** Flash Attention has removed the former
+   roughly 24-second attention wall: a complete step is now about 11.2-11.7 s
+   GPU. Profile this new shape before acting. The next plausible work is direct
+   FP16 K/V production (removing the preparation pass), then the remaining QKV,
+   output, and MLP GEMMs; scalar attention variants are closed. Accept changes
+   only with full-shape timing and numerical gates.
 3. **1024 working memory.** Right-size and safely alias VAE activation arenas;
    the initial decoder path deliberately favors simple ownership and currently
    reserves several maximum-size buffers. Measure peak footprint after every
    change so transformer, text, and VAE phases remain safe on the 32 GB M1 Max.
-4. **Shared startup and small-kernel work.** Return to text-encoder GPU
+4. **Shared startup and small-kernel work.** The short-run process still spends
+   about 6.5-7.0 seconds in buffer/prefix setup before denoising. Separate
+   allocation, first-touch, and page-residency costs, then return to text-encoder GPU
    efficiency and kernel-specific elementwise fusion only after the dominant
    1024 costs are measured. Whole-shard readahead stays accepted; tensor-order
    selective advice, broad text Q8, four-query attention at 256, and blanket

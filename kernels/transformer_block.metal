@@ -30,6 +30,23 @@ struct AttentionParams {
     uint value_offset;
 };
 
+struct FlashAttentionParams {
+    uint query_rows;
+    uint key_rows;
+    uint padded_key_rows;
+    uint query_position_offset;
+    uint block_causal;
+};
+
+struct FlashPrepareParams {
+    uint rows;
+    uint prefix_rows;
+    uint padded_rows;
+    uint cache_mode;
+    uint value_stride;
+    uint value_offset;
+};
+
 struct BlockParams {
     uint rows;
     uint width;
@@ -57,6 +74,49 @@ kernel void qi_mps_input_to_half(
     const uint count = params.rows * params.input_columns;
     if (index < count) {
         output[index] = half(input[index]);
+    }
+}
+
+// Builds the contiguous padded FP16 K/V tensors consumed by Flash Attention.
+// On the joint pass it also saves the text prefix; on target-only passes it
+// restores that prefix before appending the current image K/V.
+kernel void qi_flash_prepare_kv(
+    device const float *key [[buffer(0)]],
+    device const float *value [[buffer(1)]],
+    device half *prepared_key [[buffer(2)]],
+    device half *prepared_value [[buffer(3)]],
+    constant FlashPrepareParams &params [[buffer(4)]],
+    device half *cache_key [[buffer(5)]],
+    device half *cache_value [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+    constexpr uint width = 4096;
+    const uint count = params.padded_rows * width;
+    if (index >= count) {
+        return;
+    }
+    const uint row = index / width;
+    const uint column = index % width;
+    if (params.cache_mode == 2 && row < params.prefix_rows) {
+        prepared_key[index] = cache_key[index];
+        prepared_value[index] = cache_value[index];
+        return;
+    }
+    const uint source_row = params.cache_mode == 2
+        ? row - params.prefix_rows : row;
+    if (source_row >= params.rows) {
+        prepared_key[index] = 0.0h;
+        prepared_value[index] = 0.0h;
+        return;
+    }
+    const uint source_index = source_row * width + column;
+    const half key_element = half(key[source_index]);
+    const half value_element = half(value[
+        source_row * params.value_stride + params.value_offset + column]);
+    prepared_key[index] = key_element;
+    prepared_value[index] = value_element;
+    if (params.cache_mode == 1 && row < params.prefix_rows) {
+        cache_key[index] = key_element;
+        cache_value[index] = value_element;
     }
 }
 
@@ -1701,6 +1761,212 @@ kernel void qi_block_attention_simdgroup4(
             output[query_start + channel_1] = result.y;
             output[query_start + channel_2] = result.z;
             output[query_start + channel_3] = result.w;
+        }
+    }
+}
+
+// Fixed-shape Flash Attention for Qwen-Image's 32 heads with dimension 128.
+// The 8-query/64-key/four-SIMD-group structure follows llama.cpp's MIT-licensed
+// Metal Flash Attention kernel, specialized here to contiguous FP16 K/V and
+// this model's block-causal image mask. Scores, softmax state, and output
+// accumulation remain FP32; no quadratic score tensor is materialized.
+kernel void qi_block_attention_flash128(
+    device const float *query [[buffer(0)]],
+    device const half *key [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const half *value [[buffer(3)]],
+    device const int *image_ids [[buffer(5)]],
+    device const uchar *key_valid [[buffer(6)]],
+    constant FlashAttentionParams &params [[buffer(4)]],
+    threadgroup half *shared [[threadgroup(0)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+    constexpr uint heads = 32;
+    constexpr uint head_dimension = 128;
+    constexpr uint width = heads * head_dimension;
+    constexpr uint queries_per_group = 8;
+    constexpr uint keys_per_tile = 64;
+    constexpr uint score_stride = 128;
+
+    const uint query_group_base = (group / heads) * queries_per_group;
+    const uint head = group % heads;
+    if (query_group_base >= params.query_rows) {
+        return;
+    }
+
+    threadgroup half *query_shared = shared;
+    threadgroup float *output_shared =
+        reinterpret_cast<threadgroup float *>(shared + queries_per_group * head_dimension);
+    threadgroup float *score_shared = reinterpret_cast<threadgroup float *>(
+        shared + 3 * queries_per_group * head_dimension);
+    threadgroup half4 *query_shared4 =
+        reinterpret_cast<threadgroup half4 *>(query_shared);
+    threadgroup float4 *output_shared4 =
+        reinterpret_cast<threadgroup float4 *>(output_shared);
+
+    // Each SIMD group stages two of the eight query rows.
+    for (uint query_slot = 0; query_slot < 2; ++query_slot) {
+        const uint local_query = query_slot * 4 + simd_group;
+        const uint query_row = query_group_base + local_query;
+        if (query_row < params.query_rows) {
+            const uint query_start = (query_row * heads + head) * head_dimension;
+            device const float4 *query4 =
+                reinterpret_cast<device const float4 *>(query + query_start);
+            query_shared4[local_query * 32 + lane] = half4(query4[lane]);
+        } else {
+            query_shared4[local_query * 32 + lane] = half4(0.0h);
+        }
+        output_shared4[local_query * 32 + lane] = float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float maximums[2] = { -INFINITY, -INFINITY };
+    float denominators[2] = { 0.0f, 0.0f };
+    const float scale = rsqrt(float(head_dimension));
+
+    for (uint key_base = 0; key_base < params.padded_key_rows;
+            key_base += keys_per_tile) {
+        // Q.K^T: each SIMD group produces two 8-key stripes for all 8 queries.
+        device const half *key_tile =
+            key + (key_base * heads + head) * head_dimension
+            + simd_group * 8 * width;
+        threadgroup float *score_tile = score_shared + simd_group * 8;
+        for (uint key_stripe = 0; key_stripe < 2; ++key_stripe) {
+            simdgroup_float8x8 scores(0.0f);
+#pragma unroll(8)
+            for (uint channels = 0; channels < head_dimension; channels += 16) {
+                simdgroup_half8x8 query_matrix_0;
+                simdgroup_half8x8 query_matrix_1;
+                simdgroup_half8x8 key_matrix_0;
+                simdgroup_half8x8 key_matrix_1;
+                simdgroup_load(
+                    query_matrix_0, query_shared + channels, head_dimension);
+                simdgroup_load(
+                    query_matrix_1, query_shared + channels + 8, head_dimension);
+                simdgroup_load(
+                    key_matrix_0, key_tile + channels, width, 0, true);
+                simdgroup_load(
+                    key_matrix_1, key_tile + channels + 8, width, 0, true);
+                simdgroup_multiply_accumulate(
+                    scores, query_matrix_0, key_matrix_0, scores);
+                simdgroup_multiply_accumulate(
+                    scores, query_matrix_1, key_matrix_1, scores);
+            }
+            simdgroup_store(scores, score_tile, score_stride);
+            key_tile += 32 * width;
+            score_tile += 32;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online FP32 softmax. Each SIMD group owns two query rows.
+        for (uint query_slot = 0; query_slot < 2; ++query_slot) {
+            const uint local_query = query_slot * 4 + simd_group;
+            const uint query_row = query_group_base + local_query;
+            const uint global_query_row = query_row + params.query_position_offset;
+            const uint key_row_0 = key_base + lane * 2;
+            const uint key_row_1 = key_row_0 + 1;
+            float2 scores = reinterpret_cast<threadgroup float2 *>(
+                score_shared + local_query * score_stride)[lane] * scale;
+            const bool valid_query = query_row < params.query_rows;
+            const int query_image = valid_query ? image_ids[global_query_row] : -1;
+            const bool allowed_0 = valid_query && key_row_0 < params.key_rows
+                && key_valid[key_row_0] != 0
+                && (params.block_causal == 0 || global_query_row >= key_row_0
+                    || (query_image >= 0 && query_image == image_ids[key_row_0]));
+            const bool allowed_1 = valid_query && key_row_1 < params.key_rows
+                && key_valid[key_row_1] != 0
+                && (params.block_causal == 0 || global_query_row >= key_row_1
+                    || (query_image >= 0 && query_image == image_ids[key_row_1]));
+            // A partial final query group still participates in matrix MMAs.
+            // Give its unused rows a finite softmax so NaNs never enter shared
+            // matrices, even though those rows are not written to output.
+            scores[0] = !valid_query ? 0.0f : (allowed_0 ? scores[0] : -INFINITY);
+            scores[1] = !valid_query ? 0.0f : (allowed_1 ? scores[1] : -INFINITY);
+
+            const float previous_maximum = maximums[query_slot];
+            maximums[query_slot] = simd_max(max(
+                previous_maximum, max(scores[0], scores[1])));
+            const float previous_scale = isinf(previous_maximum)
+                ? 0.0f : exp(previous_maximum - maximums[query_slot]);
+            const float2 weights = exp(scores - maximums[query_slot]);
+            denominators[query_slot] = denominators[query_slot] * previous_scale
+                + simd_sum(weights[0] + weights[1]);
+            reinterpret_cast<threadgroup float2 *>(
+                score_shared + local_query * score_stride)[lane] = weights;
+            output_shared4[local_query * 32 + lane] *= previous_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P.V: four SIMD groups jointly cover all 128 output channels.
+        simdgroup_float8x8 accumulators[4];
+        threadgroup float *output_tile = output_shared + 8 * simd_group;
+#pragma unroll(4)
+        for (uint output_matrix = 0; output_matrix < 4; ++output_matrix) {
+            simdgroup_load(
+                accumulators[output_matrix], output_tile, head_dimension);
+            output_tile += 32;
+        }
+        device const half *value_tile =
+            value + (key_base * heads + head) * head_dimension + 8 * simd_group;
+#pragma unroll(4)
+        for (uint key_pair = 0; key_pair < 4; ++key_pair) {
+            simdgroup_float8x8 weights_0;
+            simdgroup_float8x8 weights_1;
+            simdgroup_load(
+                weights_0, score_shared + key_pair * 16, score_stride);
+            simdgroup_load(
+                weights_1, score_shared + key_pair * 16 + 8, score_stride);
+#pragma unroll(2)
+            for (uint output_pair = 0; output_pair < 2; ++output_pair) {
+                simdgroup_half8x8 value_matrix_0;
+                simdgroup_half8x8 value_matrix_1;
+                simdgroup_half8x8 value_matrix_2;
+                simdgroup_half8x8 value_matrix_3;
+                const uint channel_offset = output_pair * 64;
+                simdgroup_load(
+                    value_matrix_0, value_tile + channel_offset, width);
+                simdgroup_load(
+                    value_matrix_1, value_tile + channel_offset + 32, width);
+                simdgroup_load(
+                    value_matrix_2, value_tile + channel_offset + 8 * width, width);
+                simdgroup_load(
+                    value_matrix_3,
+                    value_tile + channel_offset + 8 * width + 32, width);
+                simdgroup_multiply_accumulate(
+                    accumulators[output_pair * 2], weights_0,
+                    value_matrix_0, accumulators[output_pair * 2]);
+                simdgroup_multiply_accumulate(
+                    accumulators[output_pair * 2 + 1], weights_0,
+                    value_matrix_1, accumulators[output_pair * 2 + 1]);
+                simdgroup_multiply_accumulate(
+                    accumulators[output_pair * 2], weights_1,
+                    value_matrix_2, accumulators[output_pair * 2]);
+                simdgroup_multiply_accumulate(
+                    accumulators[output_pair * 2 + 1], weights_1,
+                    value_matrix_3, accumulators[output_pair * 2 + 1]);
+            }
+            value_tile += 16 * width;
+        }
+        output_tile = output_shared + 8 * simd_group;
+#pragma unroll(4)
+        for (uint output_matrix = 0; output_matrix < 4; ++output_matrix) {
+            simdgroup_store(
+                accumulators[output_matrix], output_tile, head_dimension);
+            output_tile += 32;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint query_slot = 0; query_slot < 2; ++query_slot) {
+        const uint local_query = query_slot * 4 + simd_group;
+        const uint query_row = query_group_base + local_query;
+        if (query_row < params.query_rows) {
+            const uint output_start = (query_row * heads + head) * head_dimension;
+            device float4 *destination =
+                reinterpret_cast<device float4 *>(output + output_start);
+            destination[lane] = output_shared4[local_query * 32 + lane]
+                / denominators[query_slot];
         }
     }
 }
