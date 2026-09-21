@@ -365,14 +365,24 @@ Inspect a shard, optionally filtering tensor names:
   148,823 ms, while every recorded error metric remains identical. Full
   measurements and rationale are in
   `benchmarks/m1-max-native-prompt-pipeline-256.json`.
-- The application now records actual phase wall times in addition to summed
-  GPU timestamps. The batched canonical run takes 175,625 ms from prompt
-  processing through the completed PNG: 13,823 ms in the text phase, 158,794
-  ms in the transformer phase, 2,978 ms in the VAE phase, and 23 ms in image
-  output. Only 99,734 ms of the transformer phase is the denoising loop; the
-  remaining roughly 59.1 seconds is packed-file validation, mapping, Metal
-  setup, and other pre-loop work. That startup cost is now a measured
-  optimization target rather than being hidden outside GPU timing.
+- Runtime transformer loading now maps QIPACK1 once, validates its exact model
+  identity, tensor inventory, ordering, dimensions, quantization schemes, and
+  byte layout, then checks every tensor's stored checksum across eight worker
+  ranges. Previously it mapped for verification, serially hashed the complete
+  13.33 GB payload, serially hashed nearly the same bytes again tensor by
+  tensor, unmapped, and mapped once more for inference. Runtime omits only the
+  redundant whole-payload pass and its unused alignment padding; the explicit
+  `verify-packed` audit retains both checksum layers and still passes the full
+  13,334,843,392-byte artifact.
+- The canonical prompt-to-PNG run now takes 131,262 ms, down from 175,625 ms
+  (25.3%), with every numerical metric unchanged. Transformer pre-loop time
+  fell from 59,060 ms to 13,881 ms (76.5%): 9,809 ms of parallel packed
+  validation, 7 ms of Metal setup, no measurable storage/weight-view cost, and
+  3,949 ms of buffers plus text-prefix projection were directly instrumented.
+  The transformer phase fell from 158,794 ms to 113,161 ms while its denoising
+  loop remained within normal run-to-run variation at 99,280 ms. Results,
+  integrity boundaries, and caveats are recorded in
+  `benchmarks/m1-max-packed-runtime-validation.json`.
 
 ## Quantization decision log
 
@@ -430,8 +440,7 @@ noise, denoising, VAE decode, postprocessing, and PNG output now form one
 native `generate-256` command. The pinned fox case verifies the complete path;
 arbitrary prompts use the same path but naturally have no numeric oracle unless
 a matching reference fixture is generated. Production use still needs larger
-output sizes, text-encoder quantization, and further kernel/command-submission
-optimization.
+output sizes, text-encoder quantization, and further kernel optimization.
 The current VAE path intentionally implements the pinned one-frame first-chunk
 semantics; temporal continuation and tiled decode remain outside its verified
 scope.

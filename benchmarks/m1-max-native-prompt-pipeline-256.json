@@ -24,16 +24,20 @@
     "packed_transformer": "/private/tmp/qwen-image-2.1-mixed.qipack"
   },
   "native": {
-    "text_encoder_gpu_kernel_ms": 758.089,
-    "transformer_gpu_kernel_ms": 98854.8,
-    "vae_gpu_kernel_ms": 2297.21,
-    "summed_gpu_kernel_ms": 101910.099,
-    "text_phase_wall_ms": 13823,
-    "transformer_phase_wall_ms": 158794,
-    "transformer_loop_wall_ms": 99734,
-    "vae_phase_wall_ms": 2978,
-    "image_output_wall_ms": 23,
-    "end_to_end_wall_ms": 175625,
+    "text_encoder_gpu_kernel_ms": 773.617,
+    "transformer_gpu_kernel_ms": 98326.7,
+    "vae_gpu_kernel_ms": 2319.06,
+    "summed_gpu_kernel_ms": 101419.377,
+    "text_phase_wall_ms": 15004,
+    "transformer_phase_wall_ms": 113161,
+    "transformer_loop_wall_ms": 99280,
+    "transformer_packed_validation_wall_ms": 9809,
+    "transformer_metal_pipeline_wall_ms": 7,
+    "transformer_storage_and_weights_wall_ms": 0,
+    "transformer_buffers_and_prefix_wall_ms": 3949,
+    "vae_phase_wall_ms": 3059,
+    "image_output_wall_ms": 30,
+    "end_to_end_wall_ms": 131262,
     "seeded_noise_nrmse": 0.0,
     "dynamic_rope_nrmse": 8.30726e-8,
     "latent_step_1_nrmse": 0.000896293,
@@ -78,13 +82,14 @@
     "final_image": "The canonical generated image remains within 0.957296% normalized RMS in RGBA byte space, with a 0.5574 mean absolute byte error. This is the downstream prompt-equivalence gate rather than an assertion that the text encoder is bit-identical across PyTorch backends.",
     "transformer_optimization": "A 16x16 threadgroup now computes a 32x32 output tile with four accumulators per thread while retaining a 16-wide K tile and the original inner accumulation order. Transformer GPU time fell from 148823 ms to about 98855 ms (33.6%) with every numerical metric unchanged.",
     "wall_time_scope": "End-to-end wall time begins before tokenization and ends after the PNG is installed. Transformer phase wall time includes packed-file validation, no-copy mapping, Metal setup, and the denoising loop; the separately reported loop time begins immediately before step 1.",
-    "command_submission": "One command buffer and compute encoder now cover each transformer block. A direct two-step A/B reduced wall time beyond summed GPU work from 319.0 ms to 46.64 ms; the complete native-prompt loop measured 98854.8 ms GPU and 99734 ms wall."
+    "command_submission": "One command buffer and compute encoder now cover each transformer block. A direct two-step A/B reduced wall time beyond summed GPU work from 319.0 ms to 46.64 ms.",
+    "startup_validation": "Runtime loading maps the packed transformer once, validates its exact header, inventory, ordering, dimensions, schemes, and byte ranges, then verifies every stored tensor checksum across eight byte-balanced workers. The explicit verify-packed command retains its additional whole-payload checksum pass. Relative to the prior canonical run, transformer pre-loop time fell from 59060 ms to 13881 ms and end-to-end wall time fell from 175625 ms to 131262 ms; output metrics are unchanged."
   },
   "limitations": [
     "Generation is currently fixed to 256x256, batch size one, text-to-image, and 40 denoising steps.",
     "Prompts are limited to 498 post-template tokens because the text encoder currently accepts at most 512 full-template tokens.",
     "Only the canonical prompt has a pinned end-to-end image oracle; arbitrary prompts are checked for finite execution but cannot be numerically compared without a matching reference fixture.",
-    "The optimized transformer still takes roughly 99 seconds of summed GPU kernel time at 256px and is not interactive.",
-    "Text weights remain original BF16 and require a separate 17.5 GB residency phase; text quantization, command-buffer batching, and further kernel optimization remain future work."
+    "The optimized transformer still takes roughly 100 seconds of summed GPU kernel time at 256px and is not interactive.",
+    "Text weights remain original BF16 and require a separate 17.5 GB residency phase; text quantization and further kernel optimization remain future work."
   ]
 }

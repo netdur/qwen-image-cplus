@@ -7,6 +7,7 @@ import "stdlib/option" as option;
 import "stdlib/text" as text;
 import "stdlib/vec" as vec;
 import "stdlib/status" as status;
+import "stdlib/thread" as thread;
 
 #[link_name = "open"]
 extern fn qi_pack_open(path: *u8, flags: i32, mode: i32) -> i32;
@@ -133,6 +134,17 @@ struct TensorData {
     scheme: u32,
     group_size: u32,
 }
+
+struct RuntimeHashJob {
+    opaque file_pointer: *u8,
+    opaque records: *PackedRecord,
+    start: usize,
+    end: usize,
+}
+
+// The mapped file remains owned by load() until every worker is joined. Jobs
+// only read disjoint record ranges and immutable mapped bytes.
+impl RuntimeHashJob: Send {}
 
 enum LoadResult {
     Ok(File),
@@ -674,6 +686,179 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
     return 0;
 }
 
+// Runtime loading validates the same exact header, inventory, layouts, and
+// every tensor checksum as verify_full_packed. It omits only the redundant
+// whole-payload FNV pass (which covers the same tensor bytes plus unused
+// alignment padding) and evaluates independent tensor hashes in parallel.
+// The explicit verify-packed command retains both checksum layers.
+fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
+    let header: *PackedHeader = file.pointer() as *PackedHeader;
+    let expected_data_offset: u64 = align_up(
+        HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64,
+        DATA_ALIGNMENT,
+    );
+    if !magic_matches(header) || (*header).version != VERSION
+        || (*header).header_bytes != HEADER_BYTES as u32
+        || (*header).tensor_count != FULL_TENSOR_COUNT as u32
+        || (*header).scope != SCOPE_TRANSFORMER
+        || (*header).directory_offset != HEADER_BYTES
+        || (*header).data_offset != expected_data_offset
+        || (*header).file_bytes != FULL_FILE_BYTES
+        || (*header).file_bytes != file.length() as u64
+        || !fixed_matches(#addr_of((*header).model_snapshot[0]), 40 as usize, SNAPSHOT)
+        || !fixed_matches(#addr_of((*header).diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT)
+        || !fixed_matches(#addr_of((*header).policy[0]), 32 as usize, FULL_POLICY) {
+        if !quiet { io::eprintln("packed transformer: invalid runtime header or model identity"); }
+        return 1;
+    }
+
+    let records: *PackedRecord =
+        (file.pointer() + (*header).directory_offset as usize) as *PackedRecord;
+    var cursor: u64 = (*header).data_offset;
+    var parameter_count: u64 = 0 as u64;
+    var quantized_count: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < FULL_TENSOR_COUNT {
+        let record: *PackedRecord = records + index;
+        let name: text::Text = full_tensor_name(index);
+        let spec: FullTensorSpec = full_tensor_spec(index);
+        let expected_rank: u32 = if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 };
+        let expected_elements: u64 = if spec.input == (0 as u64) {
+            spec.output
+        } else {
+            spec.output *% spec.input
+        };
+        parameter_count = parameter_count +% expected_elements;
+        if spec.quantized { quantized_count = quantized_count +% (1 as usize); }
+        if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, name.view())
+            || (*record).rank != expected_rank
+            || (*record).dimensions[0] != spec.output
+            || (expected_rank == (2 as u32) && (*record).dimensions[1] != spec.input)
+            || (*record).elements != expected_elements
+            || (spec.quantized && (*record).scheme != SCHEME_INT8_AFFINE)
+            || (!spec.quantized && (*record).scheme != SCHEME_BF16)
+            || (spec.quantized && (*record).weights_length != expected_elements)
+            || (*record).weights_offset % TENSOR_ALIGNMENT != (0 as u64)
+            || (*record).weights_offset < cursor
+            || (*record).weights_offset > (*header).file_bytes
+            || (*record).weights_length > (*header).file_bytes -% (*record).weights_offset {
+            if !quiet { io::eprintln("packed transformer: invalid runtime tensor record ${index} (${name})"); }
+            return 1;
+        }
+        cursor = (*record).weights_offset +% (*record).weights_length;
+        if (*record).scheme == SCHEME_INT8_AFFINE {
+            let groups: u64 = spec.output *% (spec.input / (64 as u64));
+            if (*record).group_axis != (1 as u32) || (*record).group_size != (64 as u32)
+                || (*record).scale_type != TYPE_F16 || (*record).zero_type != TYPE_U8
+                || (*record).scales_length != groups *% (2 as u64)
+                || (*record).zeros_length != groups
+                || (*record).scales_offset % TENSOR_ALIGNMENT != (0 as u64)
+                || (*record).zeros_offset % TENSOR_ALIGNMENT != (0 as u64)
+                || (*record).scales_offset < cursor
+                || (*record).scales_offset > (*header).file_bytes
+                || (*record).scales_length > (*header).file_bytes -% (*record).scales_offset {
+                if !quiet { io::eprintln("packed transformer: invalid runtime quantization metadata ${index}"); }
+                return 1;
+            }
+            cursor = (*record).scales_offset +% (*record).scales_length;
+            if (*record).zeros_offset < cursor
+                || (*record).zeros_offset > (*header).file_bytes
+                || (*record).zeros_length > (*header).file_bytes -% (*record).zeros_offset {
+                if !quiet { io::eprintln("packed transformer: invalid runtime zero-point range ${index}"); }
+                return 1;
+            }
+            cursor = (*record).zeros_offset +% (*record).zeros_length;
+        } else if (*record).scheme != SCHEME_BF16
+            || (*record).weights_length != expected_elements *% (2 as u64)
+            || (*record).scales_offset != (0 as u64)
+            || (*record).scales_length != (0 as u64)
+            || (*record).zeros_offset != (0 as u64)
+            || (*record).zeros_length != (0 as u64) {
+            if !quiet { io::eprintln("packed transformer: unsupported runtime scheme ${(*record).scheme}"); }
+            return 1;
+        }
+        index = index +% (1 as usize);
+    }
+    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != (40 as usize)
+        || align_up(cursor, TENSOR_ALIGNMENT) != (*header).file_bytes {
+        if !quiet { io::eprintln("packed transformer: runtime inventory or trailing data mismatch"); }
+        return 1;
+    }
+    return 0;
+}
+
+fn verify_runtime_hash_range(take job: RuntimeHashJob) -> i32 {
+    var index: usize = job.start;
+    while index < job.end {
+        let record: *PackedRecord = job.records + index;
+        var tensor_hash: u64 = hash_update(
+            FNV_OFFSET,
+            job.file_pointer + (*record).weights_offset as usize,
+            (*record).weights_length as usize,
+        );
+        if (*record).scheme == SCHEME_INT8_AFFINE {
+            tensor_hash = hash_update(
+                tensor_hash,
+                job.file_pointer + (*record).scales_offset as usize,
+                (*record).scales_length as usize,
+            );
+            tensor_hash = hash_update(
+                tensor_hash,
+                job.file_pointer + (*record).zeros_offset as usize,
+                (*record).zeros_length as usize,
+            );
+        }
+        if tensor_hash != (*record).tensor_checksum {
+            return 1;
+        }
+        index = index +% (1 as usize);
+    }
+    return 0;
+}
+
+fn verify_full_runtime_hashes(file: mapped::MappedFile) -> i32 {
+    let header: *PackedHeader = file.pointer() as *PackedHeader;
+    let records: *PackedRecord =
+        (file.pointer() + (*header).directory_offset as usize) as *PackedRecord;
+    // Boundaries follow the pinned inventory's stored byte sizes rather than
+    // record counts. Each worker hashes 1.64-1.74 GB.
+    let h0: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 0, end: 41 },
+        verify_runtime_hash_range,
+    );
+    let h1: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 41, end: 74 },
+        verify_runtime_hash_range,
+    );
+    let h2: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 74, end: 107 },
+        verify_runtime_hash_range,
+    );
+    let h3: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 107, end: 143 },
+        verify_runtime_hash_range,
+    );
+    let h4: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 143, end: 178 },
+        verify_runtime_hash_range,
+    );
+    let h5: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 178, end: 213 },
+        verify_runtime_hash_range,
+    );
+    let h6: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 213, end: 250 },
+        verify_runtime_hash_range,
+    );
+    let h7: thread::JoinHandle[i32] = thread::spawn_with::[RuntimeHashJob, i32](
+        RuntimeHashJob { file_pointer: file.pointer(), records: records, start: 250, end: 297 },
+        verify_runtime_hash_range,
+    );
+    let failures: i32 = h0.join() +% h1.join() +% h2.join() +% h3.join()
+        +% h4.join() +% h5.join() +% h6.join() +% h7.join();
+    return if failures == (0 as i32) { 0 } else { 1 };
+}
+
 fn verify_packed(path: str, quiet: bool = false) -> i32 {
     guard let mapped::MapResult::Ok(file) = mapped::map_readonly(path) else {
         if !quiet { io::eprintln("packed model: could not map ${path}"); }
@@ -806,12 +991,25 @@ fn verify_packed(path: str, quiet: bool = false) -> i32 {
 }
 
 fn load(path: str) -> LoadResult {
-    if verify_packed(path, true) != (0 as i32) {
-        return LoadResult::Err;
-    }
     guard let mapped::MapResult::Ok(mapping) = mapped::map_readonly(path) else {
         return LoadResult::Err;
     };
+    if mapping.length() < DATA_ALIGNMENT as usize {
+        return LoadResult::Err;
+    }
+    let header: *PackedHeader = mapping.pointer() as *PackedHeader;
+    if magic_matches(header) && (*header).scope == SCOPE_TRANSFORMER {
+        if verify_full_runtime_structure(mapping, true) != (0 as i32)
+            || verify_full_runtime_hashes(mapping) != (0 as i32) {
+            return LoadResult::Err;
+        }
+        return LoadResult::Ok(File { _mapping: mapping });
+    }
+    // The compact block fixture is not on the product startup path. Keep its
+    // exhaustive verifier, including the whole-payload checksum.
+    if verify_packed(path, true) != (0 as i32) {
+        return LoadResult::Err;
+    }
     return LoadResult::Ok(File { _mapping: mapping });
 }
 
@@ -1496,4 +1694,41 @@ fn packed_checksum_detects_a_bit_flip() {
     bytes[2] = bytes[2] ^ (1 as u8);
     let corrupted: u64 = hash_update(FNV_OFFSET, #addr_of(bytes[0]), 4 as usize);
     assert original != corrupted;
+}
+
+#[test]
+fn runtime_tensor_verifier_detects_a_bit_flip() {
+    var bytes: [u8; 4] = [1 as u8, 2 as u8, 3 as u8, 4 as u8];
+    var record: PackedRecord = PackedRecord {
+        name: [0 as u8; 128],
+        scheme: SCHEME_BF16,
+        rank: 1 as u32,
+        dimensions: [2 as u64, 0 as u64, 0 as u64, 0 as u64],
+        group_axis: 0xFFFFFFFF as u32,
+        group_size: 0 as u32,
+        scale_type: TYPE_NONE,
+        zero_type: TYPE_NONE,
+        weights_offset: 0 as u64,
+        weights_length: 4 as u64,
+        scales_offset: 0 as u64,
+        scales_length: 0 as u64,
+        zeros_offset: 0 as u64,
+        zeros_length: 0 as u64,
+        elements: 2 as u64,
+        tensor_checksum: hash_update(FNV_OFFSET, #addr_of(bytes[0]), 4 as usize),
+        reserved: [0 as u8; 8],
+    };
+    assert verify_runtime_hash_range(RuntimeHashJob {
+        file_pointer: #addr_of(bytes[0]),
+        records: #addr_of(record),
+        start: 0 as usize,
+        end: 1 as usize,
+    }) == (0 as i32);
+    bytes[2] = bytes[2] ^ (1 as u8);
+    assert verify_runtime_hash_range(RuntimeHashJob {
+        file_pointer: #addr_of(bytes[0]),
+        records: #addr_of(record),
+        start: 0 as usize,
+        end: 1 as usize,
+    }) != (0 as i32);
 }

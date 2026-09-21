@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "artifact": {
+    "format": "QIPACK1",
+    "bytes": 13334843392,
+    "tensors": 297,
+    "parameters": 7115124736,
+    "quantized_matrices": 40
+  },
+  "change": {
+    "before": "Runtime load mapped the artifact for exhaustive verification, hashed the entire 13.33 GB payload serially, hashed every tensor serially, unmapped it, and then mapped it again for inference.",
+    "after": "Runtime load maps once, validates the exact transformer identity and directory structure, and verifies every tensor checksum in eight byte-balanced worker ranges. The redundant whole-payload pass remains available in the explicit verify-packed command but is not repeated during inference startup.",
+    "runtime_worker_count": 8,
+    "consumed_tensor_bytes_covered": "all",
+    "alignment_padding_covered_at_runtime": false,
+    "alignment_padding_covered_by_explicit_verifier": true
+  },
+  "canonical_native_prompt_before": {
+    "transformer_phase_wall_ms": 158794,
+    "transformer_loop_wall_ms": 99734,
+    "inferred_transformer_preloop_wall_ms": 59060,
+    "end_to_end_wall_ms": 175625
+  },
+  "canonical_native_prompt_after": {
+    "packed_validation_wall_ms": 9809,
+    "metal_pipeline_wall_ms": 7,
+    "storage_and_weights_wall_ms": 0,
+    "buffers_and_prefix_wall_ms": 3949,
+    "instrumented_startup_wall_ms": 13765,
+    "transformer_phase_wall_ms": 113161,
+    "transformer_loop_wall_ms": 99280,
+    "transformer_preloop_wall_ms": 13881,
+    "end_to_end_wall_ms": 131262,
+    "preloop_wall_reduction_percent": 76.4968,
+    "transformer_phase_wall_reduction_percent": 28.7372,
+    "end_to_end_wall_reduction_percent": 25.2601
+  },
+  "additional_measurement": {
+    "equal_record_partition_packed_validation_wall_ms": 7918,
+    "byte_balanced_partition_packed_validation_wall_ms": 6937,
+    "byte_balancing_reduction_percent": 12.3895,
+    "byte_balanced_metal_pipeline_wall_ms": 73,
+    "byte_balanced_storage_and_weights_wall_ms": 1,
+    "byte_balanced_buffers_and_prefix_wall_ms": 3862,
+    "note": "The back-to-back one-step commands isolate worker partitioning. The canonical full pipeline was a separate execution; page-cache, thermal, and system-load variation make its startup time non-identical."
+  },
+  "integrity_validation": {
+    "explicit_full_verifier_passed": true,
+    "runtime_bit_flip_unit_test_passed": true,
+    "exact_header_and_model_identity_checked": true,
+    "exact_tensor_inventory_order_dimensions_schemes_and_ranges_checked": true,
+    "per_tensor_checksums_checked": true,
+    "explicit_whole_payload_checksum_checked": true
+  },
+  "numerical_gate": {
+    "latent_step_1_nrmse": 0.000896293,
+    "latent_step_2_nrmse": 0.00128607,
+    "latent_step_40_nrmse": 0.0175609,
+    "decoded_fp32_nrmse": 0.0169086,
+    "rgba_u8_nrmse": 0.00957296,
+    "metrics_identical_to_before": true,
+    "passed": true
+  },
+  "reasoning": "The payload checksum and concatenated per-tensor checksums previously reread nearly the same weight bytes twice. Inference consumes tensor regions, not alignment padding, so exact structural validation plus every tensor checksum protects all consumed bytes without the redundant serial payload scan. Packaging and offline audit still use the exhaustive verifier, preserving detection of padding corruption as well.",
+  "limitations": [
+    "FNV-1a is retained for compatibility with QIPACK1; this phase changes verification scheduling, not the on-disk checksum algorithm.",
+    "The fixed eight-way byte-balanced partition is tuned for this pinned 297-record transformer inventory.",
+    "Runtime startup still spends roughly 10 seconds reading and hashing packed tensor data on the measured machine."
+  ]
+}

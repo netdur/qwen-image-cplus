@@ -2866,11 +2866,14 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: could not construct the 40-step FlowMatch schedule");
         return 1;
     }
+    let packed_load_start_ms: i64 = time::now_millis();
     guard let packed::LoadResult::Ok(weight_file) = packed::load(packed_path) else {
         io::eprintln("trajectory: could not load validated packed file ${packed_path}");
         return 1;
     };
+    let packed_load_wall_ms: i64 = time::now_millis() - packed_load_start_ms;
 
+    let metal_pipeline_start_ms: i64 = time::now_millis();
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return 1; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
@@ -2926,7 +2929,9 @@ fn run_trajectory_packed_impl(
     let assemble_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(assemble_owner.raw());
     let final_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(final_norm_owner.raw());
     let cache_copy_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_copy_owner.raw());
+    let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
 
+    let storage_and_weights_start_ms: i64 = time::now_millis();
     guard let option::Option[metal::Buffer]::Some(storage) = packed_storage_buffer(device, weight_file) else { return 1; };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
     guard let option::Option[LinearWeight]::Some(img_in_weight) = packed_linear_weight(weight_file, storage, "img_in.weight", WIDTH as u64, IMAGE_CHANNELS as u64) else { return 1; };
@@ -2939,7 +2944,9 @@ fn run_trajectory_packed_impl(
     guard let option::Option[LinearWeight]::Some(proj_out_weight) = packed_linear_weight(weight_file, storage, "proj_out.weight", IMAGE_CHANNELS as u64, WIDTH as u64) else { return 1; };
     guard let option::Option[metal::Buffer]::Some(text_norm_weight) = packed_vector_buffer(device, weight_file, "txt_in.text_norm.weight", WIDTH as u64) else { return 1; };
     let text_norm_weight_owner: OwnedObjc = OwnedObjc::new(text_norm_weight.raw());
+    let storage_and_weights_wall_ms: i64 = time::now_millis() - storage_and_weights_start_ms;
 
+    let buffers_and_prefix_start_ms: i64 = time::now_millis();
     let activation_bytes: u64 = (rows *% WIDTH *% #size_of::[f32]()) as u64;
     let text_bytes: u64 = (text_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let image_input_bytes: u64 = (latent_count *% #size_of::[f32]()) as u64;
@@ -3086,6 +3093,10 @@ fn run_trajectory_packed_impl(
 
     var all_ok: bool = true;
     var total_quantized_matrices: usize = 0 as usize;
+    let buffers_and_prefix_wall_ms: i64 = time::now_millis() - buffers_and_prefix_start_ms;
+    io::println(
+        "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms}",
+    );
     let trajectory_wall_start_ms: i64 = time::now_millis();
     var step: usize = 0 as usize;
     while step < step_limit {
