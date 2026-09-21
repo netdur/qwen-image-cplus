@@ -41,6 +41,10 @@ inline float qi_bf16(ushort bits) {
     return as_type<float>(uint(bits) << 16);
 }
 
+inline float qi_dense_weight(ushort bits, uint weight_mode) {
+    return weight_mode == 1 ? float(as_type<half>(bits)) : qi_bf16(bits);
+}
+
 kernel void qi_mps_input_to_half(
     device const float *input [[buffer(0)]],
     device half *output [[buffer(1)]],
@@ -247,11 +251,11 @@ kernel void qi_block_linear_32x32(
         const uint weight_input_column = input_base + thread_position.y;
         weight_tile[thread_position.y][thread_position.x] =
             output_column0 < params.output_columns && weight_input_column < params.input_columns
-                ? qi_bf16(weights[output_column0 * params.input_columns + weight_input_column])
+                ? qi_dense_weight(weights[output_column0 * params.input_columns + weight_input_column], params.weight_mode)
                 : 0.0f;
         weight_tile[thread_position.y][thread_position.x + 16] =
             output_column1 < params.output_columns && weight_input_column < params.input_columns
-                ? qi_bf16(weights[output_column1 * params.input_columns + weight_input_column])
+                ? qi_dense_weight(weights[output_column1 * params.input_columns + weight_input_column], params.weight_mode)
                 : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint inner = 0; inner < QI_K_TILE; ++inner) {
@@ -312,7 +316,7 @@ kernel void qi_block_linear_simdgroup_32x32(
             const uint output_column = output_base + local_row;
             weight_tile[local_input][local_row] =
                 output_column < params.output_columns && input_column < params.input_columns
-                    ? qi_bf16(weights[output_column * params.input_columns + input_column])
+                    ? qi_dense_weight(weights[output_column * params.input_columns + input_column], params.weight_mode)
                     : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -378,7 +382,7 @@ kernel void qi_block_linear_simdgroup_half_32x32(
             const uint output_column = output_base + local_row;
             weight_tile[local_input][local_row] =
                 output_column < params.output_columns && input_column < params.input_columns
-                    ? half(qi_bf16(weights[output_column * params.input_columns + input_column]))
+                    ? half(qi_dense_weight(weights[output_column * params.input_columns + input_column], params.weight_mode))
                     : half(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -445,7 +449,7 @@ kernel void qi_block_linear_simdgroup_half_64x32(
             const uint input_column = input_base + local_input;
             weight_tile[local_input][local_output] =
                 output_column < params.output_columns && input_column < params.input_columns
-                    ? half(qi_bf16(weights[output_column * params.input_columns + input_column]))
+                    ? half(qi_dense_weight(weights[output_column * params.input_columns + input_column], params.weight_mode))
                     : half(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -592,9 +596,9 @@ kernel void qi_block_linear_simdgroup_half_64x32_direct(
         for (uint linear = thread_index; linear < 1024; linear += 256) {
             const uint local_output = linear / 32;
             const uint local_input = linear % 32;
-            weight_tile[local_input][local_output] = half(qi_bf16(
+            weight_tile[local_input][local_output] = half(qi_dense_weight(
                 weights[(output_base + local_output) * params.input_columns
-                    + input_base + local_input]
+                    + input_base + local_input], params.weight_mode
             ));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -746,9 +750,9 @@ kernel void qi_block_linear_simdgroup_half_64x64_direct(
         for (uint linear = thread_index; linear < 2048; linear += 512) {
             const uint local_output = linear / 32;
             const uint local_input = linear % 32;
-            weight_tile[local_input][local_output] = half(qi_bf16(
+            weight_tile[local_input][local_output] = half(qi_dense_weight(
                 weights[(output_base + local_output) * params.input_columns
-                    + input_base + local_input]
+                    + input_base + local_input], params.weight_mode
             ));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -901,7 +905,7 @@ kernel void qi_block_linear_simdgroup_half_128x32(
             const uint input_column = input_base + local_input;
             weight_tile[local_input][local_output] =
                 output_column < params.output_columns && input_column < params.input_columns
-                    ? half(qi_bf16(weights[output_column * params.input_columns + input_column]))
+                    ? half(qi_dense_weight(weights[output_column * params.input_columns + input_column], params.weight_mode))
                     : half(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

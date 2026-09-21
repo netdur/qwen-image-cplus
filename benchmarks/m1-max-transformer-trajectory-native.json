@@ -6,10 +6,12 @@
   "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
   "machine": "Apple M1 Max, 32 GB unified memory",
   "artifact": {
-    "path_used_for_measurement": "/private/tmp/qwen-image-2.1-mixed.qipack",
+    "path_used_for_measurement": "/private/tmp/qwen-image-2.1-mixed-fp16.qipack",
     "logical_bytes": 13334843392,
     "mapped_bytes": 13334855680,
-    "q8_matrices_per_model_evaluation": 40
+    "q8_matrices_per_model_evaluation": 40,
+    "fp16_mlp_matrices": 88,
+    "policy": "transformer:q8-g64-f16-v2"
   },
   "method": {
     "pixels": 256,
@@ -20,7 +22,7 @@
     "steps": 40,
     "scheduler": "Pinned FlowMatchEulerDiscreteScheduler with dynamic exponential shift and terminal sigma 0.02",
     "reference": "Pinned official Diffusers BF16 transformer on MPS; FP32 Euler update cast back to BF16 after every step",
-    "native": "FP32 activations and outputs; custom FP16 SIMD-group GEMM for the 278-row prefix and cached attention projections; MPSMatrixMultiplication with dynamic BF16/Q8-to-FP16 weight conversion for cached MLPs; 32-lane SIMD-group attention; and identical per-step BF16 latent rounding",
+    "native": "FP32 activations and outputs; custom FP16 SIMD-group GEMM for the 278-row prefix and cached attention projections; directly mapped FP16 MLP weights or dynamic Q8-to-FP16 conversion feeding MPSMatrixMultiplication; 32-lane SIMD-group attention; and identical per-step BF16 latent rounding",
     "cache": "Step 1 extracts post-RoPE prefix K and raw V; steps 2-40 execute target rows only from the same 32-layer cache",
     "checkpoint_steps": [1, 2, 40]
   },
@@ -34,11 +36,11 @@
     "prefix_cache_bytes": 23068672,
     "mps_scratch_bytes": 106954752,
     "q8_dispatch_matrices": 1600,
-    "summed_gpu_kernel_ms": 37778.1,
-    "summed_loop_wall_ms": 39437,
-    "step_1_gpu_ms": 1578.76,
-    "step_2_gpu_ms": 930.462,
-    "step_40_gpu_ms": 927.6,
+    "summed_gpu_kernel_ms": 33092.1,
+    "summed_loop_wall_ms": 34239,
+    "step_1_gpu_ms": 1554.72,
+    "step_2_gpu_ms": 800.251,
+    "step_40_gpu_ms": 805.291,
     "checkpoint_latent_nrmse": {
       "1": 0.000903863,
       "2": 0.00130082,
@@ -49,8 +51,12 @@
   "comparison": {
     "previous_custom_metal_gpu_ms": 46282.6,
     "previous_custom_metal_wall_ms": 47989,
-    "gpu_reduction_percent": 18.4,
-    "wall_reduction_percent": 17.8,
+    "previous_dynamic_mps_gpu_ms": 37778.1,
+    "previous_dynamic_mps_wall_ms": 39437,
+    "gpu_reduction_vs_dynamic_mps_percent": 12.4,
+    "wall_reduction_vs_dynamic_mps_percent": 13.2,
+    "gpu_reduction_vs_custom_metal_percent": 28.5,
+    "wall_reduction_vs_custom_metal_percent": 28.7,
     "mps_exact_shape_probe": {
       "bf16_256x4096x4096_dynamic_ms": 2.82792,
       "bf16_256x12288x4096_dynamic_ms": 4.24375,
@@ -70,7 +76,7 @@
     "schedule_vectors_match_fixture": true,
     "passed": true
   },
-  "interpretation": "The final 1.00775% latent nRMSE is accumulated complete-runtime divergence from official BF16 execution, not a quantization-only number. MPS preserves FP32 outputs but, like the accepted custom kernels, consumes FP16 operands. Exact production-shape probes selected a hybrid: custom Metal remains faster for BF16 square attention projections, while MPS wins on both MLP shapes and all measured Q8 shapes. Applying MPS to cached MLPs reduced summed GPU time from 46282.6 ms to 37778.1 ms (18.4%) without changing any checkpoint nRMSE. Dynamic conversion is retained because preconverting every MLP weight would require roughly 9.7 GB of additional persistent memory.",
+  "interpretation": "The final 1.00775% latent nRMSE is accumulated complete-runtime divergence from official BF16 execution, not a quantization-only number. MPS preserves FP32 outputs but, like the accepted custom kernels, consumes FP16 operands. Exact production-shape probes selected a hybrid: custom Metal remains faster for BF16 square attention projections, while MPS wins on both MLP shapes and all measured Q8 shapes. QIPACK v2 stores the 88 non-Q8 MLP matrices directly as FP16, which is the exact operand representation previously produced dynamically from the BF16 source. Direct mapped binding eliminates their repeated conversion without a second 9.7 GB runtime copy, reducing summed GPU time from 37778.1 ms to 33092.1 ms (12.4%) while every checkpoint nRMSE remains identical.",
   "limitations": [
     "The 1-step and 2-step commands validate prefixes of the official 40-step schedule; they are not separate one-step or two-step schedules.",
     "The trajectory is 256px so a 40-step regression remains practical. The earlier independent scale gate covers 512px and 1024px single-step execution.",

@@ -29,6 +29,7 @@ const MLP_WIDTH: usize = 12288;
 const TILE: usize = 16;
 const OUTPUT_TILE: usize = 32;
 const PACKED_SCHEME_BF16: u32 = 0;
+const PACKED_SCHEME_FP16: u32 = 1;
 const PACKED_SCHEME_INT8_AFFINE: u32 = 3;
 const VM_PAGE_BYTES: usize = 16384;
 
@@ -207,6 +208,7 @@ fn dispatch_linear(
     input_columns: usize,
     rows: usize,
     weights_offset: u64 = 0 as u64,
+    weight_mode: u32 = 0 as u32,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() {
@@ -226,7 +228,7 @@ fn dispatch_linear(
         rows: rows as u32,
         output_columns: output_columns as u32,
         input_columns: input_columns as u32,
-        weight_mode: 0 as u32,
+        weight_mode: weight_mode,
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(input, 0 as u64, 0 as u64);
@@ -263,6 +265,7 @@ fn dispatch_simdgroup_linear(
     row_tile: usize = 32 as usize,
     threads_per_group: usize = 512 as usize,
     output_tile: usize = OUTPUT_TILE,
+    weight_mode: u32 = 0 as u32,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
@@ -277,7 +280,7 @@ fn dispatch_simdgroup_linear(
         rows: rows as u32,
         output_columns: output_columns as u32,
         input_columns: input_columns as u32,
-        weight_mode: 0 as u32,
+        weight_mode: weight_mode,
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(input, 0 as u64, 0 as u64);
@@ -506,6 +509,7 @@ fn encode_mps_weight_conversion(
     output_columns: usize,
     input_columns: usize,
 ) {
+    if weight.scheme == PACKED_SCHEME_FP16 { return; }
     let count: usize = output_columns *% input_columns;
     if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
         var params: Int8LinearParams = Int8LinearParams {
@@ -622,17 +626,23 @@ fn dispatch_weighted_linear(
             rows,
         );
     }
+    let weight_mode: u32 = if weight.scheme == PACKED_SCHEME_FP16 {
+        1 as u32
+    } else {
+        0 as u32
+    };
     if rows == (256 as usize) {
         return dispatch_simdgroup_linear(
             queue, pipelines.dense_linear_cached, input, weight.storage, output,
             output_columns, input_columns, rows, weight.weights_offset,
-            64 as usize, 512 as usize, 64 as usize,
+            64 as usize, 512 as usize, 64 as usize, weight_mode,
         );
     }
     if rows >= (64 as usize) {
         return dispatch_simdgroup_linear(
             queue, pipelines.dense_linear_fast, input, weight.storage, output,
             output_columns, input_columns, rows, weight.weights_offset, 64 as usize,
+            512 as usize, OUTPUT_TILE, weight_mode,
         );
     }
     return dispatch_linear(
@@ -645,6 +655,7 @@ fn dispatch_weighted_linear(
         input_columns,
         rows,
         weight.weights_offset,
+        weight_mode,
     );
 }
 
@@ -818,12 +829,13 @@ fn encode_linear(
     input_columns: usize,
     rows: usize,
     weights_offset: u64 = 0 as u64,
+    weight_mode: u32 = 0 as u32,
 ) {
     var params: LinearParams = LinearParams {
         rows: rows as u32,
         output_columns: output_columns as u32,
         input_columns: input_columns as u32,
-        weight_mode: 0 as u32,
+        weight_mode: weight_mode,
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(input, 0 as u64, 0 as u64);
@@ -884,12 +896,13 @@ fn encode_simdgroup_linear(
     rows: usize,
     weights_offset: u64 = 0 as u64,
     output_tile: usize = OUTPUT_TILE,
+    weight_mode: u32 = 0 as u32,
 ) {
     var params: LinearParams = LinearParams {
         rows: rows as u32,
         output_columns: output_columns as u32,
         input_columns: input_columns as u32,
-        weight_mode: 0 as u32,
+        weight_mode: weight_mode,
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(input, 0 as u64, 0 as u64);
@@ -977,17 +990,24 @@ fn encode_weighted_linear(
         );
         return;
     }
+    let weight_mode: u32 = if weight.scheme == PACKED_SCHEME_FP16 {
+        1 as u32
+    } else {
+        0 as u32
+    };
     if rows == (256 as usize) {
         encode_simdgroup_linear(
             encoder, pipelines.dense_linear_cached, input, weight.storage, output,
             output_columns, input_columns, rows, weight.weights_offset, 64 as usize,
+            weight_mode,
         );
         return;
     }
     if rows >= (64 as usize) {
         encode_simdgroup_linear(
             encoder, pipelines.dense_linear_fast, input, weight.storage, output,
-            output_columns, input_columns, rows, weight.weights_offset,
+            output_columns, input_columns, rows, weight.weights_offset, OUTPUT_TILE,
+            weight_mode,
         );
         return;
     }
@@ -1001,6 +1021,7 @@ fn encode_weighted_linear(
         input_columns,
         rows,
         weight.weights_offset,
+        weight_mode,
     );
 }
 
@@ -1227,7 +1248,8 @@ fn packed_linear_weight(
     };
     let elements: u64 = output_columns *% input_columns;
     let groups: u64 = output_columns *% (input_columns / (64 as u64));
-    let dense_ok: bool = tensor.scheme == PACKED_SCHEME_BF16
+    let dense_ok: bool = (tensor.scheme == PACKED_SCHEME_BF16
+        || tensor.scheme == PACKED_SCHEME_FP16)
         && tensor.weights_length == elements *% (2 as u64)
         && tensor.scales_length == (0 as u64) && tensor.zeros_length == (0 as u64);
     let int8_ok: bool = tensor.scheme == PACKED_SCHEME_INT8_AFFINE
@@ -1931,19 +1953,53 @@ fn execute_mps_mlp_runtime_block(
     guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
         queue.command_buffer() else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    let gate_weight_buffer: metal::Buffer = if weights.gate.scheme == PACKED_SCHEME_FP16 {
+        weights.gate.storage
+    } else {
+        mps_workspace.half_weight
+    };
+    let gate_weight_offset: u64 = if weights.gate.scheme == PACKED_SCHEME_FP16 {
+        weights.gate.weights_offset
+    } else {
+        0 as u64
+    };
+    let projected_weight_buffer: metal::Buffer =
+        if weights.projected.scheme == PACKED_SCHEME_FP16 {
+        weights.projected.storage
+    } else {
+        mps_workspace.half_weight
+    };
+    let projected_weight_offset: u64 =
+        if weights.projected.scheme == PACKED_SCHEME_FP16 {
+        weights.projected.weights_offset
+    } else {
+        0 as u64
+    };
+    let output_weight_buffer: metal::Buffer =
+        if weights.mlp_output.scheme == PACKED_SCHEME_FP16 {
+        weights.mlp_output.storage
+    } else {
+        mps_workspace.half_weight
+    };
+    let output_weight_offset: u64 =
+        if weights.mlp_output.scheme == PACKED_SCHEME_FP16 {
+        weights.mlp_output.weights_offset
+    } else {
+        0 as u64
+    };
     guard let option::Option[mps::Multiplication]::Some(gate_operation) = mps::create(
         mps_workspace.device, mps_workspace.half_input, 0 as u64,
-        mps_workspace.half_weight, 0 as u64, workspace.gate, 0 as u64,
+        gate_weight_buffer, gate_weight_offset, workspace.gate, 0 as u64,
         rows, MLP_WIDTH, WIDTH,
     ) else { return option::Option[f64]::None; };
     guard let option::Option[mps::Multiplication]::Some(projected_operation) = mps::create(
         mps_workspace.device, mps_workspace.half_input, 0 as u64,
-        mps_workspace.half_weight, 0 as u64, workspace.projected, 0 as u64,
+        projected_weight_buffer, projected_weight_offset, workspace.projected, 0 as u64,
         rows, MLP_WIDTH, WIDTH,
     ) else { return option::Option[f64]::None; };
     guard let option::Option[mps::Multiplication]::Some(output_operation) = mps::create(
         mps_workspace.device, mps_workspace.half_input, 0 as u64,
-        mps_workspace.half_weight, 0 as u64, workspace.mlp_projected, 0 as u64,
+        output_weight_buffer, output_weight_offset, workspace.mlp_projected, 0 as u64,
         rows, WIDTH, MLP_WIDTH,
     ) else { return option::Option[f64]::None; };
 
@@ -4564,17 +4620,32 @@ fn benchmark_mps_gemm_case(
         dispatch_linear(
                 queue, dense_pipeline, input, weight.storage, reference,
             output_columns, input_columns, rows, weight.weights_offset,
+            if weight.scheme == PACKED_SCHEME_FP16 { 1 as u32 } else { 0 as u32 },
         )
     };
     guard let option::Option[f64]::Some(reference_ms) = reference_result else {
         return false;
     };
-    guard let option::Option[f64]::Some(weight_conversion_ms) = convert_mps_weight(
-        queue, bf16_conversion_pipeline, q8_conversion_pipeline, weight, half_weight,
-        output_columns, input_columns,
-    ) else { return false; };
+    var weight_conversion_ms: f64 = 0.0f64;
+    if weight.scheme != PACKED_SCHEME_FP16 {
+        guard let option::Option[f64]::Some(conversion_ms) = convert_mps_weight(
+            queue, bf16_conversion_pipeline, q8_conversion_pipeline, weight, half_weight,
+            output_columns, input_columns,
+        ) else { return false; };
+        weight_conversion_ms = conversion_ms;
+    }
+    let mps_weight_buffer: metal::Buffer = if weight.scheme == PACKED_SCHEME_FP16 {
+        weight.storage
+    } else {
+        half_weight
+    };
+    let mps_weight_offset: u64 = if weight.scheme == PACKED_SCHEME_FP16 {
+        weight.weights_offset
+    } else {
+        0 as u64
+    };
     guard let option::Option[mps::Multiplication]::Some(created_operation) = mps::create(
-        device, half_input, 0 as u64, half_weight, 0 as u64,
+        device, half_input, 0 as u64, mps_weight_buffer, mps_weight_offset,
         output, 0 as u64, rows, output_columns, input_columns,
     ) else {
         io::eprintln("MPS GEMM benchmark: could not create matrix multiplication");
@@ -4601,8 +4672,13 @@ fn benchmark_mps_gemm_case(
     );
     let operations: f64 = 2.0f64 * rows as f64
         * output_columns as f64 * input_columns as f64;
-    let scheme_name: str =
-        if weight.scheme == PACKED_SCHEME_INT8_AFFINE { "q8" } else { "bf16" };
+    let scheme_name: str = if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
+        "q8"
+    } else if weight.scheme == PACKED_SCHEME_FP16 {
+        "fp16"
+    } else {
+        "bf16"
+    };
     io::println(
         "production MPS GEMM: scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} scalar_gpu_ms=${reference_ms} weight_conversion_gpu_ms=${weight_conversion_ms} preconverted_gpu_ms=${average_ms} dynamic_conversion_gpu_ms=${average_ms + weight_conversion_ms} preconverted_tflops=${operations / (average_ms * 1000000000.0f64)} nRMSE=${error} tensor=${tensor_name}",
     );
@@ -4710,14 +4786,14 @@ fn benchmark_mps_gemm(packed_path: str) -> i32 {
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
         "transformer_blocks.0.img_mlp.gate_layer.weight",
-        MLP_WIDTH, WIDTH, PACKED_SCHEME_BF16,
+        MLP_WIDTH, WIDTH, PACKED_SCHEME_FP16,
     ) && all_ok;
     all_ok = benchmark_mps_gemm_case(
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
         "transformer_blocks.0.img_mlp.out.weight",
-        WIDTH, MLP_WIDTH, PACKED_SCHEME_BF16,
+        WIDTH, MLP_WIDTH, PACKED_SCHEME_FP16,
     ) && all_ok;
     all_ok = benchmark_mps_gemm_case(
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,

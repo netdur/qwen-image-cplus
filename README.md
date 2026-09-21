@@ -130,8 +130,11 @@ Inspect a shard, optionally filtering tensor names:
   in `benchmarks/m1-max-mixed-quantization.json`.
 - A full-transformer QIPACK1 writer/reader for that mixed policy. It generates
   the complete 297-tensor inventory from nine global tensor definitions and a
-  nine-role block schema, preserving BF16 everywhere except the measured 40
-  Q8 matrices. The writer refuses a source other than the exact 7,115,124,736-
+  nine-role block schema. QIPACK policy v2 preserves BF16 for vectors, global
+  matrices, and attention; stores the 88 non-Q8 MLP matrices as the FP16
+  operands consumed by Metal/MPS; and retains the measured 40 Q8 matrices.
+  The reader remains compatible with the original all-BF16/Q8 v1 policy. The
+  writer refuses a source other than the exact 7,115,124,736-
   parameter, two-shard inventory; installs atomically only after structure,
   payload, per-tensor, and exact source round-trip checks; and produced a
   verified 13,334,843,392-byte artifact from the pinned snapshot. The layout
@@ -409,22 +412,27 @@ Inspect a shard, optionally filtering tensor names:
   versus 6.03-6.51 ms for the accepted custom kernels. The custom kernel stays
   faster on BF16 4096x4096 attention projections (2.00 ms versus 2.83 ms), so
   those remain custom Metal. Isolated MPS output nRMSE is at most 0.02095%.
-- Cached MLPs now convert their FP32 activations and BF16/Q8 packed weights to
-  FP16 scratch storage and invoke `MPSMatrixMultiplication` with FP32 output.
+- Cached MLPs convert FP32 activations and only Q8 packed weights to FP16
+  scratch storage, bind v2 FP16 weights directly from the read-only QIPACK
+  mapping, and invoke `MPSMatrixMultiplication` with FP32 output.
   Conversion, MPS GEMM, SwiGLU, and residual work remain ordered in one command
   buffer per transformer block; there is no CPU inference fallback or host
-  synchronization between operations. One reusable 96 MiB weight buffer and
-  6 MiB activation buffer avoid a roughly 9.7 GiB persistent copy of all MLP
-  weights. The 278-row first step deliberately retains the bounds-safe custom
-  path, while steps 2-40 use MPS for all three MLP matrices.
-- The verified fixture-fed 40-step loop now takes 37,778 ms of summed GPU time
-  and 39,437 ms wall time, down from 46,283 ms and 47,989 ms respectively
-  (18.4% GPU, 17.8% wall). Step 2 fell from 1,145.57 ms to 930.46 ms GPU and
-  step 40 to 927.60 ms. Exact latent nRMSE remains unchanged at 0.09039%,
-  0.13008%, and 1.00775% for steps 1, 2, and 40. This is substantial but still
-  above the 25-30-second target: eliminating dynamic conversion could approach
-  the low-30-second range only at a large memory cost, so further progress also
-  needs broader quantization or fusion. Detailed trajectory measurements are
+  synchronization between operations. One reusable 96 MiB weight buffer still
+  handles Q8 matrices, while a 6 MiB activation buffer feeds every MPS GEMM.
+  The 278-row first step deliberately retains the bounds-safe custom path; its
+  kernels distinguish BF16 and FP16 records and produce the same FP16 operands
+  as before. Steps 2-40 use MPS for all three MLP matrices.
+- Direct FP16 storage removes 88 repeated BF16 conversion dispatches per step
+  without a second 9.7 GiB runtime weight copy or any increase in artifact
+  size. The verified fixture-fed 40-step loop now takes 33,092 ms of summed
+  GPU time and 34,239 ms wall time, down from the dynamic-conversion MPS result
+  of 37,778 ms and 39,437 ms (12.4% GPU, 13.2% wall), and from the custom-Metal
+  baseline of 46,283 ms and 47,989 ms (28.5% GPU, 28.7% wall). Step 2 is
+  800.25 ms GPU and step 40 is 805.29 ms. Exact latent nRMSE remains unchanged
+  at 0.09039%, 0.13008%, and 1.00775% for steps 1, 2, and 40. The loop is now
+  near the low-30-second range but still above the 25-30-second target; the
+  remaining gap needs broader quantization, fusion, or an opt-in algorithmic
+  shortcut such as the separately evaluated Cache-DiT. Measurements are
   in `benchmarks/m1-max-transformer-trajectory-native.json`; custom-kernel
   baselines remain in `benchmarks/m1-max-production-kernel-profile.json`.
 
@@ -467,10 +475,10 @@ of about 61 MiB more block-matrix storage.
 
 The full writer intentionally keeps the nine non-block tensors in BF16: they
 were not part of the 224-matrix calibration, so quantizing them would extend
-the policy beyond its evidence. Likewise, MLP gates remain BF16 because the
-role search showed that exchanging projection/output for the gate crossed the
-1% error threshold. QIPACK1 still accepts the original block-0 scope so the
-existing isolated Metal fixture remains reproducible.
+the policy beyond its evidence. MLP gates are not quantized; v2 merely stores
+their already-selected FP16 execution operands instead of converting BF16 on
+every denoising step. QIPACK1 still accepts both the legacy full-transformer
+policy and the original block-0 scope, preserving existing fixtures.
 
 The original four-token fixture remains useful as a cheap block-chain
 regression. The newer 15-token fixture proves the whole transformer boundary
