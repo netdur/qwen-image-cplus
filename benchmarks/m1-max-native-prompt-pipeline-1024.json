@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "case": {
+    "pixels": 1024,
+    "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+    "latent_seed": 1301,
+    "text_rows": 31,
+    "target_rows": 4096,
+    "steps": 40,
+    "cache_dit_threshold": 0.24,
+    "packed_transformer": "/private/tmp/qwen-image-2.1-qkv-fp16.qipack"
+  },
+  "native": {
+    "text_encoder_gpu_kernel_ms": 734.021,
+    "text_phase_wall_ms": 13316,
+    "transformer_startup_wall_ms": 7490,
+    "transformer_loop_gpu_ms": 651573,
+    "transformer_loop_wall_ms": 654686,
+    "transformer_phase_wall_ms": 662176,
+    "vae_gpu_ms": 11279.1,
+    "vae_phase_wall_ms": 12095,
+    "image_output_wall_ms": 308,
+    "end_to_end_wall_ms": 687920,
+    "cached_steps": 27,
+    "full_steps": 13,
+    "q8_dispatch_matrices": 520,
+    "prefix_cache_bytes": 32505856,
+    "png_bytes": 4195716,
+    "png_sha256": "5c0910a0d9007d2bf7e0a13566a83977c9faae644efadb577a8f10831fdd59f6",
+    "finite_output": true,
+    "visually_coherent": true,
+    "requested_text_substantially_legible": true
+  },
+  "one_step_functional_smoke": {
+    "scope": "Temporary one-step diagnostic using the first timestep of the canonical 40-step schedule; it proves the full 1024 handoff and PNG shape, not image convergence.",
+    "text_phase_wall_ms": 15341,
+    "transformer_startup_wall_ms": 6385,
+    "transformer_step_gpu_ms": 42001.7,
+    "transformer_step_wall_ms": 42058,
+    "transformer_phase_wall_ms": 48575,
+    "vae_gpu_ms": 9344.31,
+    "vae_phase_wall_ms": 10073,
+    "image_output_wall_ms": 300,
+    "end_to_end_wall_ms": 74313,
+    "png_shape": "1024x1024 RGBA",
+    "finite_output": true
+  },
+  "vae_scratch_right_sizing": {
+    "method": "Size buffer_b and the preserved block shortcut for the 1024x1024x288 maximum; size the other four activation arenas for their 1024x1024x144 maximum.",
+    "before_scratch_bytes": 7389315072,
+    "after_scratch_bytes": 5577375744,
+    "bytes_saved": 1811939328,
+    "gib_saved": 1.6875,
+    "after_zero_latent_smoke_gpu_ms": 9390.94,
+    "after_zero_latent_smoke_finite": true,
+    "note": "The first 4,973,395,968-byte sizing attempt under-allocated the block-4 norm1 buffer and was rejected by the 256 oracle. The corrected allocation gives that buffer its 288-channel maximum and passes both the 256 numerical oracle and a direct finite 1024 smoke. The full end-to-end timing above preceded this allocation-only change."
+  },
+  "prior_correctness_evidence": {
+    "single_noise_prediction_target_nrmse": 0.008794,
+    "single_noise_prediction_gpu_ms": 144597,
+    "scope": "Pinned official BF16 reference gate for one complete 1024 noise prediction before the later MPS, SIMD normalization, submission, and fused-QKV optimizations. It is correctness evidence, not a current speed baseline."
+  },
+  "interpretation": {
+    "dominant_cost": "The 654.686-second transformer loop accounts for 95.2% of end-to-end wall time. Quadratic 4096-token attention and production-shape transformer compute are therefore the first optimization target.",
+    "cache_dit": "Threshold 0.24 reached the same 27-of-40 cached-step count seen in the measured 256 case, but this 1024 prompt has no official end-to-end oracle. The coherent result is a product smoke observation, not an equivalence gate.",
+    "resolution": "The PNG encoder, transformer latent grid, scheduler, VAE decode, and host buffers all use the real 1024x1024 path; this is not an upscaled 256 image."
+  },
+  "limitations": [
+    "No official 40-step 1024 trajectory or decoded-image oracle has been generated yet.",
+    "Cache-DiT intentionally changes the denoising trajectory and remains opt-in.",
+    "The cache-off 40-step 1024 end-to-end path is implemented but was not timed in this phase because one full step costs roughly 40-55 seconds.",
+    "The recorded full run used the original 7.39 GB VAE scratch allocation; the corrected smaller allocation was verified afterward with a direct 1024 VAE smoke test."
+  ]
+}

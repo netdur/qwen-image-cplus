@@ -11,6 +11,8 @@ import "stdlib/vec" as vec;
 
 const LATENT_VALUES: usize = 16 * 16 * 64;
 const DECODED_VALUES: usize = 256 * 256 * 4;
+const LATENT_VALUES_1024: usize = 64 * 64 * 64;
+const DECODED_VALUES_1024: usize = 1024 * 1024 * 4;
 const TEXT_WIDTH: usize = 4096;
 const SYSTEM_PREFIX_TOKENS: usize = 14;
 
@@ -137,12 +139,13 @@ fn run_fixture_cache_dit_256(
     return 0;
 }
 
-fn run_native_256_impl(
+fn run_native_impl(
     packed_path: str,
     model_root: str,
     output_path: str,
     prompt: str,
     seed: u64,
+    pixels: usize,
     validate_reference: bool,
     cache_dit: bool,
     cache_dit_threshold: f64,
@@ -152,12 +155,13 @@ fn run_native_256_impl(
         tokenizer::tokenize_full_prompt(model_root, prompt) else {
         return 1;
     };
-    return run_native_256_tokens_impl(
+    return run_native_tokens_impl(
         packed_path,
         model_root,
         output_path,
         full_tokens,
         seed,
+        pixels,
         validate_reference,
         cache_dit,
         cache_dit_threshold,
@@ -166,18 +170,27 @@ fn run_native_256_impl(
     );
 }
 
-fn run_native_256_tokens_impl(
+fn run_native_tokens_impl(
     packed_path: str,
     model_root: str,
     output_path: str,
     full_tokens: vec::Vec[u32],
     seed: u64,
+    pixels: usize,
     validate_reference: bool,
     cache_dit: bool,
     cache_dit_threshold: f64,
     pipeline_wall_start_ms: i64,
     text_wall_start_ms: i64,
 ) -> i32 {
+    if !(pixels == (256 as usize) || pixels == (1024 as usize)) {
+        io::eprintln("pipeline: pixels must be 256 or 1024");
+        return 2;
+    }
+    if validate_reference && pixels != (256 as usize) {
+        io::eprintln("pipeline: native reference validation is available only at 256px");
+        return 2;
+    }
     let vae_fixture: str = "tests/fixtures/vae_decoder_fp32/trajectory_256";
     if validate_reference && !image_output::validate_reference_postprocess(vae_fixture) {
         return 1;
@@ -212,16 +225,45 @@ fn run_native_256_tokens_impl(
     }
     io::println("pipeline timing: text_wall_ms=${time::now_millis() - text_wall_start_ms}");
 
-    var latent: [f32; 16384] = [0.0f32; 16384];
-    io::println("pipeline: phase=transformer-scheduler text_rows=${text_rows} seed=${seed}");
+    let latent_values: usize = if pixels == (1024 as usize) {
+        LATENT_VALUES_1024
+    } else {
+        LATENT_VALUES
+    };
+    var latent: vec::Vec[f32] = vec::Vec[f32]::with_capacity(latent_values);
+    value_index = 0 as usize;
+    while value_index < latent_values {
+        latent.append(0.0f32);
+        value_index = value_index +% (1 as usize);
+    }
+    io::println("pipeline: phase=transformer-scheduler pixels=${pixels} text_rows=${text_rows} seed=${seed}");
     let transformer_wall_start_ms: i64 = time::now_millis();
-    let transformer_status: i32 = if cache_dit {
+    let transformer_status: i32 = if pixels == (1024 as usize) {
+        if cache_dit {
+            transformer::run_prompt_trajectory_cache_dit_1024_to_host(
+                packed_path,
+                #slice_ptr(text_embeddings.as_slice()),
+                text_rows,
+                seed,
+                #slice_ptr(latent.as_slice()),
+                cache_dit_threshold,
+            )
+        } else {
+            transformer::run_prompt_trajectory_1024_to_host(
+                packed_path,
+                #slice_ptr(text_embeddings.as_slice()),
+                text_rows,
+                seed,
+                #slice_ptr(latent.as_slice()),
+            )
+        }
+    } else if cache_dit {
         transformer::run_prompt_trajectory_cache_dit_256_to_host(
             packed_path,
             #slice_ptr(text_embeddings.as_slice()),
             text_rows,
             seed,
-            #addr_of(latent[0]),
+            #slice_ptr(latent.as_slice()),
             cache_dit_threshold,
         )
     } else {
@@ -230,7 +272,7 @@ fn run_native_256_tokens_impl(
             #slice_ptr(text_embeddings.as_slice()),
             text_rows,
             seed,
-            #addr_of(latent[0]),
+            #slice_ptr(latent.as_slice()),
             validate_reference,
         )
     };
@@ -239,20 +281,36 @@ fn run_native_256_tokens_impl(
     }
     io::println("pipeline timing: transformer_wall_ms=${time::now_millis() - transformer_wall_start_ms}");
 
-    var decoded: [f32; 262144] = [0.0f32; 262144];
+    let decoded_values: usize = if pixels == (1024 as usize) {
+        DECODED_VALUES_1024
+    } else {
+        DECODED_VALUES
+    };
+    var decoded: vec::Vec[f32] = vec::Vec[f32]::with_capacity(decoded_values);
+    value_index = 0 as usize;
+    while value_index < decoded_values {
+        decoded.append(0.0f32);
+        value_index = value_index +% (1 as usize);
+    }
     io::println("pipeline: phase=vae model=${model_root}");
     let vae_wall_start_ms: i64 = time::now_millis();
-    let decode_status: i32 = if validate_reference {
+    let decode_status: i32 = if pixels == (1024 as usize) {
+        vae::decode_1024_from_host(
+            model_root,
+            #slice_ptr(latent.as_slice()),
+            #slice_ptr(decoded.as_slice()),
+        )
+    } else if validate_reference {
         vae::decode_native_prompt_256_from_host(
             model_root,
-            #addr_of(latent[0]),
-            #addr_of(decoded[0]),
+            #slice_ptr(latent.as_slice()),
+            #slice_ptr(decoded.as_slice()),
         )
     } else {
         vae::decode_256_from_host(
             model_root,
-            #addr_of(latent[0]),
-            #addr_of(decoded[0]),
+            #slice_ptr(latent.as_slice()),
+            #slice_ptr(decoded.as_slice()),
         )
     };
     if decode_status != (0 as i32) {
@@ -262,21 +320,23 @@ fn run_native_256_tokens_impl(
     let image_wall_start_ms: i64 = time::now_millis();
     let write_ok: bool = if validate_reference {
         image_output::write_png_and_compare(
-            #addr_of(decoded[0]),
+            #slice_ptr(decoded.as_slice()),
             vae_fixture,
             output_path,
             0.013f64,
         )
     } else {
-        image_output::write_png(#addr_of(decoded[0]), output_path)
+        image_output::write_png_sized(
+            #slice_ptr(decoded.as_slice()), output_path, pixels, pixels,
+        )
     };
     if !write_ok { return 1; }
     io::println("pipeline timing: image_output_wall_ms=${time::now_millis() - image_wall_start_ms}");
     io::println("pipeline timing: total_wall_ms=${time::now_millis() - pipeline_wall_start_ms}");
     if validate_reference {
-        io::println("Qwen-Image-2.1 native prompt 256px pipeline: verified");
+        io::println("Qwen-Image-2.1 native prompt ${pixels}px pipeline: verified");
     } else {
-        io::println("Qwen-Image-2.1 native prompt 256px generation: complete");
+        io::println("Qwen-Image-2.1 native prompt ${pixels}px generation: complete");
     }
     return 0;
 }
@@ -322,12 +382,13 @@ fn benchmark_process_reuse_256(
             return 1;
         };
         io::println("resident session: request=${request +% (1 as usize)} begin");
-        let status: i32 = run_native_256_tokens_impl(
+        let status: i32 = run_native_tokens_impl(
             packed_path,
             model_root,
             output_path,
             full_tokens,
             seed,
+            256 as usize,
             false,
             true,
             threshold,
@@ -353,8 +414,9 @@ fn generate_256(
     prompt: str,
     seed: u64 = 1101 as u64,
 ) -> i32 {
-    return run_native_256_impl(
-        packed_path, model_root, output_path, prompt, seed, false, false, 0.0f64,
+    return run_native_impl(
+        packed_path, model_root, output_path, prompt, seed, 256 as usize,
+        false, false, 0.0f64,
     );
 }
 
@@ -366,8 +428,36 @@ fn generate_256_cache_dit(
     seed: u64 = 1101 as u64,
     threshold: f64 = 0.12f64,
 ) -> i32 {
-    return run_native_256_impl(
-        packed_path, model_root, output_path, prompt, seed, false, true, threshold,
+    return run_native_impl(
+        packed_path, model_root, output_path, prompt, seed, 256 as usize,
+        false, true, threshold,
+    );
+}
+
+fn generate_1024(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+) -> i32 {
+    return run_native_impl(
+        packed_path, model_root, output_path, prompt, seed, 1024 as usize,
+        false, false, 0.0f64,
+    );
+}
+
+fn generate_1024_cache_dit(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    threshold: f64 = 0.12f64,
+) -> i32 {
+    return run_native_impl(
+        packed_path, model_root, output_path, prompt, seed, 1024 as usize,
+        false, true, threshold,
     );
 }
 
@@ -376,12 +466,13 @@ fn test_native_256(
     model_root: str,
     output_path: str,
 ) -> i32 {
-    return run_native_256_impl(
+    return run_native_impl(
         packed_path,
         model_root,
         output_path,
         "A red fox asleep beside a mossy stone in soft morning light.",
         1101 as u64,
+        256 as usize,
         true,
         false,
         0.0f64,
@@ -392,4 +483,6 @@ fn test_native_256(
 fn vertical_slice_shapes_match_handoff_contract() {
     assert LATENT_VALUES == (16384 as usize);
     assert DECODED_VALUES == (262144 as usize);
+    assert LATENT_VALUES_1024 == (262144 as usize);
+    assert DECODED_VALUES_1024 == (4194304 as usize);
 }

@@ -135,6 +135,58 @@ kernel void qi_cache_apply_residual(
     }
 }
 
+// Two-pass relative-L1 reduction for Cache-DiT. The product trajectory must
+// synchronize after block 0 to make its cache decision, but only these two
+// totals need to cross to the CPU rather than the entire residual tensor.
+kernel void qi_cache_relative_l1_partials(
+    device const float *previous [[buffer(0)]],
+    device const float *current [[buffer(1)]],
+    device float2 *partials [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float2 sums[256];
+    const uint count = params.rows * params.width;
+    const uint group_count = params.heads;
+    float2 local = float2(0.0f);
+    for (uint index = group * 256 + lane; index < count;
+         index += group_count * 256) {
+        const float prior = previous[index];
+        local.x += fabs(current[index] - prior);
+        local.y += fabs(prior);
+    }
+    sums[lane] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            sums[lane] += sums[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        partials[group] = sums[0];
+    }
+}
+
+kernel void qi_cache_relative_l1_finish(
+    device const float2 *partials [[buffer(0)]],
+    device float2 *output [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float2 sums[256];
+    sums[lane] = lane < params.heads ? partials[lane] : float2(0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            sums[lane] += sums[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        output[0] = sums[0];
+    }
+}
+
 kernel void qi_time_projection(
     device const float *timestep [[buffer(0)]],
     device float *output [[buffer(2)]],

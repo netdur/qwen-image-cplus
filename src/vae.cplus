@@ -7,6 +7,7 @@ import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
+import "stdlib/vec" as vec;
 
 extern fn MTLCreateSystemDefaultDevice() -> *u8;
 
@@ -706,6 +707,28 @@ fn run(
     requested_case: str,
     fixture_root: str = "tests/fixtures/vae_decoder_fp32",
 ) -> i32 {
+    // The checked-in oracle covers the small diagnostic and 256px product
+    // case. A 1024 request is a finite-execution and allocation-shape smoke
+    // test with a deterministic zero normalized latent; its numerical oracle
+    // is intentionally a separate phase rather than a large Git fixture.
+    if requested_case == "1024" {
+        let latent_values: usize = (64 as usize) *% (64 as usize) *% (64 as usize);
+        var latent: vec::Vec[f32] = vec::Vec[f32]::with_capacity(latent_values);
+        var index: usize = 0 as usize;
+        while index < latent_values {
+            latent.append(0.0f32);
+            index = index +% (1 as usize);
+        }
+        return run_impl(
+            model_root,
+            requested_case,
+            "",
+            #slice_ptr(latent.as_slice()),
+            0 as *f32,
+            false,
+            false,
+        );
+    }
     return run_impl(
         model_root,
         requested_case,
@@ -759,6 +782,22 @@ fn decode_256_from_host(
     return run_impl(model_root, "256", "", normalized_latent, decoded_output, false, false);
 }
 
+// Decodes a caller-owned normalized [64,64,64] latent into a clamped
+// [1024,1024,4] HWC tensor. This uses the same still-image first-chunk VAE
+// semantics as the verified 256px path; model-scale reference validation is a
+// separate gate because committing a 16 MiB output fixture is undesirable.
+fn decode_1024_from_host(
+    model_root: str,
+    normalized_latent: *f32,
+    decoded_output: *f32,
+) -> i32 {
+    if normalized_latent.is_null() || decoded_output.is_null() {
+        io::eprintln("VAE: 1024px generation received a null host buffer");
+        return 2;
+    }
+    return run_impl(model_root, "1024", "", normalized_latent, decoded_output, false, false);
+}
+
 fn run_impl(
     model_root: str,
     requested_case: str,
@@ -776,8 +815,11 @@ fn run_impl(
     } else if requested_case == "256" {
         input_height = 16 as usize;
         case_directory = "trajectory_256";
+    } else if requested_case == "1024" {
+        input_height = 64 as usize;
+        case_directory = "";
     } else {
-        io::eprintln("VAE: case must be small or 256");
+        io::eprintln("VAE: case must be small, 256, or 1024");
         return 2;
     }
     let input_width: usize = input_height;
@@ -855,17 +897,24 @@ fn run_impl(
 
     let output_height: usize = input_height *% (16 as usize);
     let output_width: usize = input_width *% (16 as usize);
-    let max_elements: usize = output_height *% output_width *% (288 as usize);
-    let activation_bytes: u64 = (max_elements *% #size_of::[f32]()) as u64;
+    // The final two up blocks establish two different maxima. buffer_b and
+    // block_shortcut must hold the 288-channel 1024px block-3 upsample, while
+    // buffer_c must also hold the 288-channel block-4 norm1 input; the other
+    // three residual temporaries peak at the following 144-channel shape.
+    // Sizing all six arenas to the larger shape wastes 1.6875 GiB at 1024px.
+    let wide_activation_elements: usize = output_height *% output_width *% (288 as usize);
+    let narrow_activation_elements: usize = output_height *% output_width *% (144 as usize);
+    let wide_activation_bytes: u64 = (wide_activation_elements *% #size_of::[f32]()) as u64;
+    let narrow_activation_bytes: u64 = (narrow_activation_elements *% #size_of::[f32]()) as u64;
     let qkv_bytes: u64 = (input_height *% input_width *% (3456 as usize) *% #size_of::[f32]()) as u64;
     let upsample_weight_bytes: u64 = ((16 as usize) *% (1152 as usize)
         *% (1152 as usize) *% #size_of::[f32]()) as u64;
-    guard let option::Option[metal::Buffer]::Some(buffer_a) = new_buffer(device, activation_bytes) else { return 1; }; let buffer_a_owner: OwnedObjc = OwnedObjc::new(buffer_a.raw());
-    guard let option::Option[metal::Buffer]::Some(buffer_b) = new_buffer(device, activation_bytes) else { return 1; }; let buffer_b_owner: OwnedObjc = OwnedObjc::new(buffer_b.raw());
-    guard let option::Option[metal::Buffer]::Some(buffer_c) = new_buffer(device, activation_bytes) else { return 1; }; let buffer_c_owner: OwnedObjc = OwnedObjc::new(buffer_c.raw());
-    guard let option::Option[metal::Buffer]::Some(buffer_d) = new_buffer(device, activation_bytes) else { return 1; }; let buffer_d_owner: OwnedObjc = OwnedObjc::new(buffer_d.raw());
-    guard let option::Option[metal::Buffer]::Some(shortcut) = new_buffer(device, activation_bytes) else { return 1; }; let shortcut_owner: OwnedObjc = OwnedObjc::new(shortcut.raw());
-    guard let option::Option[metal::Buffer]::Some(block_shortcut) = new_buffer(device, activation_bytes) else { return 1; }; let block_shortcut_owner: OwnedObjc = OwnedObjc::new(block_shortcut.raw());
+    guard let option::Option[metal::Buffer]::Some(buffer_a) = new_buffer(device, narrow_activation_bytes) else { return 1; }; let buffer_a_owner: OwnedObjc = OwnedObjc::new(buffer_a.raw());
+    guard let option::Option[metal::Buffer]::Some(buffer_b) = new_buffer(device, wide_activation_bytes) else { return 1; }; let buffer_b_owner: OwnedObjc = OwnedObjc::new(buffer_b.raw());
+    guard let option::Option[metal::Buffer]::Some(buffer_c) = new_buffer(device, wide_activation_bytes) else { return 1; }; let buffer_c_owner: OwnedObjc = OwnedObjc::new(buffer_c.raw());
+    guard let option::Option[metal::Buffer]::Some(buffer_d) = new_buffer(device, narrow_activation_bytes) else { return 1; }; let buffer_d_owner: OwnedObjc = OwnedObjc::new(buffer_d.raw());
+    guard let option::Option[metal::Buffer]::Some(shortcut) = new_buffer(device, narrow_activation_bytes) else { return 1; }; let shortcut_owner: OwnedObjc = OwnedObjc::new(shortcut.raw());
+    guard let option::Option[metal::Buffer]::Some(block_shortcut) = new_buffer(device, wide_activation_bytes) else { return 1; }; let block_shortcut_owner: OwnedObjc = OwnedObjc::new(block_shortcut.raw());
     guard let option::Option[metal::Buffer]::Some(qkv) = new_buffer(device, qkv_bytes) else { return 1; }; let qkv_owner: OwnedObjc = OwnedObjc::new(qkv.raw());
     guard let option::Option[metal::Buffer]::Some(packed_upsample_weight) = new_buffer(device, upsample_weight_bytes) else { return 1; }; let packed_upsample_weight_owner: OwnedObjc = OwnedObjc::new(packed_upsample_weight.raw());
     guard let option::Option[metal::CommandBuffer]::Some(decode_command_buffer) =
@@ -875,7 +924,7 @@ fn run_impl(
     // The 256px path has no intermediate host reads, so encode its entire
     // dependency chain before one commit/wait. The small diagnostic path keeps
     // synchronous dispatches because every boundary is compared on the CPU.
-    let deferred: *u8 = if requested_case == "256" {
+    let deferred: *u8 = if requested_case != "small" {
         decode_command_buffer.raw()
     } else {
         0 as *u8
@@ -1032,9 +1081,9 @@ fn run_impl(
         }
     }
     if validate_reference {
-        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(3 as u64) *% wide_activation_bytes + (3 as u64) *% narrow_activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
     } else {
-        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms}");
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(3 as u64) *% wide_activation_bytes + (3 as u64) *% narrow_activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms}");
     }
     if all_ok {
         if validate_reference {

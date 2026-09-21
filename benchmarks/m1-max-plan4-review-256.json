@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Measured review of plan-4-speedup.md at the requested 256x256 production shape",
+  "accepted": {
+    "cache_dit_gpu_relative_l1": {
+      "design": "Two Metal reductions return the absolute-difference and absolute-reference sums as two FP32 scalars instead of scanning the full first-block residual on the CPU.",
+      "elements_reduced_per_decision": 1048576,
+      "validation_decisions": 27,
+      "maximum_absolute_ratio_error_vs_f64_cpu": 1.76089e-8,
+      "cache_decisions_unchanged": true,
+      "step_40_latent_nrmse_vs_official": 0.10079,
+      "immediate_pre_change": {
+        "transformer_loop_gpu_ms": 9116.31,
+        "transformer_loop_wall_ms": 9570
+      },
+      "clean_repeats": [
+        {
+          "transformer_loop_gpu_ms": 8900.39,
+          "transformer_loop_wall_ms": 9104
+        },
+        {
+          "transformer_loop_gpu_ms": 9062.79,
+          "transformer_loop_wall_ms": 9479
+        }
+      ],
+      "interpretation": "GPU-frequency variation moves the full-step totals. The clean repeats save 91-466 ms wall versus the immediate baseline, while cached-step wall readings fall from roughly 26-36 ms to 22-27 ms. The change is accepted primarily because it removes a resolution-squared CPU readback and is more valuable at 4096 target rows."
+    },
+    "production_attention_dispatch_extent": {
+      "design": "Dispatch ceil(query_rows/2) groups for the two-query production kernel instead of launching a second half of groups that return immediately.",
+      "arithmetic_changed": false,
+      "standalone_speed_claim": false,
+      "reason": "The 256 full-loop difference was within run-to-run noise, but avoiding known-empty groups is correct and becomes more relevant at larger query counts."
+    },
+    "vae_arena_right_sizing": {
+      "before_scratch_bytes": 541458432,
+      "after_scratch_bytes": 428212224,
+      "bytes_saved": 113246208,
+      "mib_saved": 108,
+      "gpu_ms": 571.539,
+      "output_nrmse": 6.64769e-7,
+      "limit": 3e-6,
+      "small_boundary_oracle_passed": true,
+      "note": "A first, smaller allocation was rejected after the 256 oracle exposed the block-4 norm1 buffer's 288-channel requirement."
+    }
+  },
+  "rejected": {
+    "flash8_cooperative_matrix_attention": {
+      "design": "One SIMD group owns eight queries; a first QK pass finds row maxima and a second QK pass computes normalized P*V using simdgroup 8x8 matrices.",
+      "current_prefill_gpu_ms": 3.00681,
+      "candidate_prefill_gpu_ms": 10.6787,
+      "current_cached_gpu_ms": 3.23575,
+      "candidate_cached_gpu_ms": 10.0971,
+      "candidate_prefill_nrmse": 7.98622e-8,
+      "candidate_cached_nrmse": 6.27741e-7,
+      "reason": "Numerics pass, but the extra QK pass, threadgroup staging, barriers, and lower occupancy make cached attention 3.12x slower at 256. The prototype was removed rather than adding runtime compile cost."
+    }
+  },
+  "deferred": {
+    "text_weight_ring": "Potentially the largest 256 startup win, but it is a separate text-runtime storage redesign. At the measured 1024 Cache-DiT runtime, the entire text phase is under 2% of end-to-end wall time, so transformer attention remains higher leverage.",
+    "pack_prefetch": "Do not implement independently while whole-shard text readahead competes for SSD bandwidth and page cache; the plan itself depends on landing the text ring first.",
+    "vae_overlap": "Could hide part of VAE setup, but overlapping the 1.35 GB mapping and multi-GB 1024 scratch with the transformer needs an explicit 32 GB peak-memory gate.",
+    "mps_attention_output": "Requires another full packed-weight policy/artifact change and was not justified before the dominant 1024 attention work."
+  },
+  "end_to_end_smoke": {
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "seed": 42,
+    "cache_dit_threshold": 0.24,
+    "cached_steps": 27,
+    "text_phase_wall_ms": 19679,
+    "transformer_phase_wall_ms": 16406,
+    "transformer_loop_gpu_ms": 8882.85,
+    "transformer_loop_wall_ms": 9083,
+    "vae_phase_wall_ms": 1286,
+    "image_output_wall_ms": 22,
+    "end_to_end_wall_ms": 37395,
+    "png_sha256": "a06e813beed8938f460f36b11ea55a63777f0cc632da136b7452114416061dd3",
+    "png_shape": "256x256 RGBA",
+    "note": "The total is dominated by a 19.679-second text paging outlier and is not used as the optimization comparison."
+  }
+}

@@ -55,6 +55,7 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-cache-dit transformer.qipack 0.12
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
+./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024
 ./target/debug/qwen-image-cplus test-image-output reference.png
 ./target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./target/debug/qwen-image-cplus test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
@@ -62,6 +63,8 @@ cpc test
 ./target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
 ./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101
+./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
+./target/debug/qwen-image-cplus generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101
 ./target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
 ./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
@@ -699,27 +702,75 @@ Inspect a shard, optionally filtering tensor names:
   processes still benefit from macOS's filesystem page cache and always repeat
   structural QIPACK validation and runtime setup, but payload checksum scans
   are explicit verification work rather than a cost paid by every generation.
+- The Plan 4 I/O/attention review was tested at 256 rather than accepted from
+  projections. Its straightforward cooperative-matrix flash prototype reused
+  K/V across eight queries and stayed within 6.28e-7 nRMSE, but regressed
+  cached attention from 3.236 to 10.097 ms (3.12x slower); the two QK passes,
+  threadgroup staging, barriers, and occupancy cost more than the reuse saves.
+  The prototype was removed. A different item was accepted: Cache-DiT now
+  reduces its relative-L1 decision on Metal and reads back two scalars instead
+  of scanning 1,048,576 FP32 values on the CPU. All 27 ratios agree with the
+  former FP64 host calculation within 1.77e-8 and all decisions are unchanged.
+  Two clean 40-step loops measured 9,104 and 9,479 ms wall versus an immediate
+  9,570 ms pre-change run; GPU-frequency variation prevents attributing the
+  whole spread, but cached-step wall readings consistently fell from roughly
+  26-36 to 22-27 ms. This also removes a resolution-squared CPU cost before
+  returning to 1024. Exact measurements and deferred findings are in
+  `benchmarks/m1-max-plan4-review-256.json`.
+- Native prompt generation now has real 1024x1024 product paths, not a 256px
+  decode followed by upscaling. `generate-1024` runs the reproducible cache-off
+  trajectory; `generate-1024-cache-dit` selects the explicit approximation.
+  Both derive a centered 64x64 latent grid, 4,096 target rows, prompt-sized
+  metadata/RoPE and prefix caches, decode to `[1024,1024,4]`, and write a
+  correctly dimensioned RGBA PNG. A one-step diagnostic completed the full
+  handoff in 74.313 s and produced a valid 1024px PNG.
+- The first complete 40-step 1024 run used Cache-DiT 0.24 on a 31-row poster
+  prompt. It cached 27 steps and produced a coherent, substantially legible
+  1024px result in **687.920 s end to end**: 13.316 s text, 662.176 s for the
+  transformer phase (651.573 s GPU / 654.686 s wall in the denoising loop),
+  12.095 s VAE, and 0.308 s PNG output. This is a functional and perceptual
+  smoke result, not an equivalence claim: the Cache-DiT thresholds were
+  measured at 256 and no official 40-step 1024 image oracle exists yet.
+- The 1024 VAE initially reserved every activation arena for the largest
+  `[1024,1024,288]` boundary. Shape-specific maxima reduce its explicit scratch
+  from 7,389,315,072 to **5,577,375,744 bytes**, saving exactly 1.6875 GiB.
+  The block-4 normalization temporary must retain the larger 288-channel
+  capacity; a more aggressive first attempt was rejected by the 256 oracle.
+  The corrected layout passes the 256 oracle at 6.65e-7 nRMSE and a direct
+  finite 1024 smoke in 9,390.94 ms GPU. Full timing, the output checksum,
+  prior single-prediction correctness evidence, and limitations are recorded in
+  `benchmarks/m1-max-native-prompt-pipeline-1024.json`.
 
 ## Remaining optimization phases
 
-The original timing target is no longer a stopping condition. The remaining
-work is ordered by architectural leverage and evidence, not by whether a
-particular total has already been reached:
+The active product target is now 1024x1024 generation. Work is ordered by its
+effect at the 4,096-target-token shape; an optimization that only helps the
+256x256 benchmark is no longer sufficient evidence:
 
-1. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
-   hundreds of synchronous dispatches without changing its BF16 store
-   boundaries. Whole-shard readahead stays accepted; tensor-order selective
-   advice and broad Q8 text policies stay rejected unless a materially new
-   layout or calibration method is introduced.
-2. **Kernel-specific elementwise fusion.** Fuse attention residual with the
-   following LayerNorm and evaluate a cooperative final LayerNorm. A global
-   256-thread elementwise launch was measured and rejected, so residual,
-   SwiGLU, final norm, and small conditioning kernels must be tuned separately.
-3. **End-to-end remeasurement.** After the structural phases, repeat both
-   cache-off and Cache-DiT native prompts with warm-filesystem and cold-page
-   conditions reported separately. Transformer loop time, phase wall time,
-   process wall time, memory footprint, and numerical/perceptual gates remain
-   separate measurements.
+1. **1024 correctness and reproducibility gates.** Add official 40-step
+   trajectory and VAE oracles at 1024, while keeping their large generated
+   data outside Git. Cache-off remains the reproducible path; independently
+   assess Cache-DiT image quality because the existing thresholds were
+   calibrated only at 256.
+2. **1024 transformer throughput.** Profile the 4,096-token production path,
+   especially quadratic attention. Revisit query reuse specifically at this
+   shape: four-query attention lost at 256 from register pressure, but the
+   much longer key loop may change that tradeoff. Accept changes only with a
+   full-shape timing and numerical gate.
+3. **1024 working memory.** Right-size and safely alias VAE activation arenas;
+   the initial decoder path deliberately favors simple ownership and currently
+   reserves several maximum-size buffers. Measure peak footprint after every
+   change so transformer, text, and VAE phases remain safe on the 32 GB M1 Max.
+4. **Shared startup and small-kernel work.** Return to text-encoder GPU
+   efficiency and kernel-specific elementwise fusion only after the dominant
+   1024 costs are measured. Whole-shard readahead stays accepted; tensor-order
+   selective advice, broad text Q8, four-query attention at 256, and blanket
+   256-thread elementwise groups stay rejected unless new evidence changes
+   their tradeoffs.
+5. **End-to-end remeasurement.** Repeat cache-off and Cache-DiT 1024 prompts
+   with warm-filesystem and cold-page conditions reported separately.
+   Transformer loop, phase wall time, process wall time, memory footprint, and
+   numerical/perceptual gates remain separate measurements.
 
 Completed transformer submission batching, fused QKV, and the remaining VAE
 work are no longer remaining phases. Other closed branches are not remaining phases: selective text readahead

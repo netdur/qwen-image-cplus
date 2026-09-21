@@ -169,6 +169,11 @@ struct MpsWorkspace {
     half_weight: metal::Buffer,
 }
 
+struct CacheDiffResult {
+    difference: f64,
+    gpu_ms: f64,
+}
+
 #[repr(C)]
 struct BlockParams {
     rows: u32,
@@ -1209,8 +1214,13 @@ fn encode_attention(
     encoder.set_buffer(key_valid, 0 as u64, 6 as u64);
     encoder.set_buffer(cache_key, cache_offset, 7 as u64);
     encoder.set_buffer(cache_value, cache_offset, 8 as u64);
+    let queries_per_group: usize = if threads_per_group == (32 as usize) {
+        2 as usize
+    } else {
+        1 as usize
+    };
     encoder.dispatch_threadgroups(
-        metal::Size { width: (query_rows *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: (round_up(query_rows, queries_per_group) / queries_per_group *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: threads_per_group as u64, height: 1 as u64, depth: 1 as u64 },
     );
 }
@@ -3542,9 +3552,15 @@ fn run_scale_packed(
     return 1;
 }
 
-fn fill_target_rope_256(destination: *f32, text_rows: usize) -> bool {
+fn fill_target_rope(
+    destination: *f32,
+    text_rows: usize,
+    side: usize,
+) -> bool {
     if destination.is_null() { return false; }
-    let side: usize = 16 as usize;
+    if side == (0 as usize) || side % (2 as usize) != (0 as usize) {
+        return false;
+    }
     let target_rows: usize = side *% side;
     let rows: usize = text_rows +% target_rows;
     let theta_log: f32 = (10000.0f32).ln();
@@ -3554,12 +3570,12 @@ fn fill_target_rope_256(destination: *f32, text_rows: usize) -> bool {
         let image_row: usize = if is_image { row -% text_rows } else { 0 as usize };
         let frame_position: i32 = if is_image { text_rows as i32 } else { row as i32 };
         let height_position: i32 = if is_image {
-            (image_row / side) as i32 - (8 as i32)
+            (image_row / side) as i32 - (side / (2 as usize)) as i32
         } else {
             row as i32
         };
         let width_position: i32 = if is_image {
-            (image_row % side) as i32 - (8 as i32)
+            (image_row % side) as i32 - (side / (2 as usize)) as i32
         } else {
             row as i32
         };
@@ -3586,6 +3602,10 @@ fn fill_target_rope_256(destination: *f32, text_rows: usize) -> bool {
         row = row +% (1 as usize);
     }
     return true;
+}
+
+fn fill_target_rope_256(destination: *f32, text_rows: usize) -> bool {
+    return fill_target_rope(destination, text_rows, 16 as usize);
 }
 
 fn fill_seeded_latent(destination: *f32, count: usize, seed: u64) -> bool {
@@ -3629,6 +3649,73 @@ fn host_relative_l1(previous: *f32, current: *f32, count: usize) -> f64 {
         return if absolute_difference == 0.0f64 { 0.0f64 } else { 1.0f64 };
     }
     return absolute_difference / absolute_previous;
+}
+
+fn gpu_relative_l1(
+    queue: metal::CommandQueue,
+    partial_pipeline: metal::ComputePipelineState,
+    finish_pipeline: metal::ComputePipelineState,
+    previous: metal::Buffer,
+    current: metal::Buffer,
+    partials: metal::Buffer,
+    result: metal::Buffer,
+    count: usize,
+) -> option::Option[CacheDiffResult] {
+    let group_count: usize = 256 as usize;
+    var params: BlockParams = BlockParams {
+        rows: 1 as u32,
+        width: count as u32,
+        heads: group_count as u32,
+        head_dimension: 0 as u32,
+        epsilon: 0.0f32,
+        slot: 0 as u32,
+        input_stride: 0 as u32,
+        input_offset: 0 as u32,
+    };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[CacheDiffResult]::None; };
+    let command_buffer_owner: OwnedObjc =
+        OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[CacheDiffResult]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(partial_pipeline);
+    encoder.set_buffer(previous, 0 as u64, 0 as u64);
+    encoder.set_buffer(current, 0 as u64, 1 as u64);
+    encoder.set_buffer(partials, 0 as u64, 2 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[BlockParams]() as u64, 4 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size { width: group_count as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: 256 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    encoder.memory_barrier_with_scope(metal::barrier_scope_buffers);
+    encoder.set_compute_pipeline_state(finish_pipeline);
+    encoder.set_buffer(partials, 0 as u64, 0 as u64);
+    encoder.set_buffer(result, 0 as u64, 2 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[BlockParams]() as u64, 4 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size { width: 1 as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: 256 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let values: *f32 = result.contents() as *f32;
+    let absolute_difference: f64 = values[0] as f64;
+    let absolute_previous: f64 = values[1] as f64;
+    let difference: f64 = if absolute_previous == 0.0f64 {
+        if absolute_difference == 0.0f64 { 0.0f64 } else { 1.0f64 }
+    } else {
+        absolute_difference / absolute_previous
+    };
+    return option::Option[CacheDiffResult]::Some(CacheDiffResult {
+        difference: difference,
+        gpu_ms: (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time())
+            * 1000.0f64,
+    });
 }
 
 fn cache_dit_should_cache(
@@ -3868,6 +3955,62 @@ fn run_prompt_trajectory_cache_dit_256_to_host(
     );
 }
 
+fn run_prompt_trajectory_1024_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+) -> i32 {
+    if text_input.is_null() || final_latent.is_null() {
+        io::eprintln("trajectory: 1024px prompt handoff received a null buffer");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        "",
+        final_latent,
+        text_input,
+        text_rows,
+        seed,
+        true,
+        false,
+        false,
+        0.0f64,
+        1024 as usize,
+    );
+}
+
+fn run_prompt_trajectory_cache_dit_1024_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+    threshold: f64 = 0.12f64,
+) -> i32 {
+    if text_input.is_null() || final_latent.is_null()
+        || !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("trajectory: invalid 1024px Cache-DiT prompt handoff");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        "",
+        final_latent,
+        text_input,
+        text_rows,
+        seed,
+        true,
+        false,
+        true,
+        threshold,
+        1024 as usize,
+    );
+}
+
 fn run_trajectory_packed_impl(
     packed_path: str,
     requested_steps: str,
@@ -3880,6 +4023,7 @@ fn run_trajectory_packed_impl(
     validate_reference: bool,
     cache_dit_enabled: bool,
     cache_dit_threshold_value: f64,
+    pixels: usize = 256 as usize,
 ) -> i32 {
     if !mps::load_framework() {
         io::eprintln("trajectory: could not load MetalPerformanceShaders");
@@ -3901,7 +4045,17 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: text row count must be 1..512, got ${text_rows}");
         return 2;
     }
-    let target_rows: usize = 256 as usize;
+    if !(pixels == (256 as usize) || pixels == (512 as usize)
+        || pixels == (1024 as usize)) {
+        io::eprintln("trajectory: pixels must be 256, 512, or 1024");
+        return 2;
+    }
+    if validate_reference && pixels != (256 as usize) {
+        io::eprintln("trajectory: reference checkpoints are available only at 256px");
+        return 2;
+    }
+    let latent_side: usize = pixels / (16 as usize);
+    let target_rows: usize = latent_side *% latent_side;
     let rows: usize = text_rows +% target_rows;
     let latent_count: usize = target_rows *% IMAGE_CHANNELS;
     var sigmas: [f32; 41] = [0.0f32; 41];
@@ -3970,6 +4124,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(cache_first_residual_owner) = pipeline(device, library, "qi_cache_first_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_store_residual_owner) = pipeline(device, library, "qi_cache_store_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_apply_residual_owner) = pipeline(device, library, "qi_cache_apply_residual") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(cache_relative_l1_partials_owner) = pipeline(device, library, "qi_cache_relative_l1_partials") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(cache_relative_l1_finish_owner) = pipeline(device, library, "qi_cache_relative_l1_finish") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_bf16_owner) = pipeline(device, library, "qi_mps_bf16_weight_to_half") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_q8_owner) = pipeline(device, library, "qi_mps_q8_weight_to_half") else { return 1; };
     let pipelines: Pipelines = Pipelines {
@@ -3999,6 +4155,8 @@ fn run_trajectory_packed_impl(
     let cache_first_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_first_residual_owner.raw());
     let cache_store_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_store_residual_owner.raw());
     let cache_apply_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_apply_residual_owner.raw());
+    let cache_relative_l1_partials_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_relative_l1_partials_owner.raw());
+    let cache_relative_l1_finish_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_relative_l1_finish_owner.raw());
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
 
     let storage_and_weights_start_ms: i64 = time::now_millis();
@@ -4053,7 +4211,9 @@ fn run_trajectory_packed_impl(
         fixture_buffer(device, fixture_directory, "rope", rope_bytes)
     } else { return 1; };
     let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
-    if native_inputs && !fill_target_rope_256(rope.contents() as *f32, text_rows) {
+    if native_inputs && !fill_target_rope(
+        rope.contents() as *f32, text_rows, latent_side,
+    ) {
         io::eprintln("trajectory: could not construct dynamic RoPE");
         return 1;
     }
@@ -4170,6 +4330,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(cache_fn_a) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_fn_a_owner: OwnedObjc = OwnedObjc::new(cache_fn_a.raw());
     guard let option::Option[metal::Buffer]::Some(cache_fn_b) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_fn_b_owner: OwnedObjc = OwnedObjc::new(cache_fn_b.raw());
     guard let option::Option[metal::Buffer]::Some(cache_middle_residual) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_middle_residual_owner: OwnedObjc = OwnedObjc::new(cache_middle_residual.raw());
+    guard let option::Option[metal::Buffer]::Some(cache_diff_partials) = new_buffer(device, ((256 as usize) *% (2 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let cache_diff_partials_owner: OwnedObjc = OwnedObjc::new(cache_diff_partials.raw());
+    guard let option::Option[metal::Buffer]::Some(cache_diff_result) = new_buffer(device, ((2 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let cache_diff_result_owner: OwnedObjc = OwnedObjc::new(cache_diff_result.raw());
 
     var all_ok: bool = true;
     var total_quantized_matrices: usize = 0 as usize;
@@ -4363,11 +4525,26 @@ fn run_trajectory_packed_impl(
                     || !have_cache_residual
                     || continuous_cached_steps >= (3 as usize);
                 if !forced_full {
-                    cache_dit_diff = host_relative_l1(
-                        previous_fn_residual.contents() as *f32,
-                        current_fn_residual.contents() as *f32,
+                    guard let option::Option[CacheDiffResult]::Some(diff_result) = gpu_relative_l1(
+                        queue,
+                        cache_relative_l1_partials_pipeline,
+                        cache_relative_l1_finish_pipeline,
+                        previous_fn_residual,
+                        current_fn_residual,
+                        cache_diff_partials,
+                        cache_diff_result,
                         target_rows *% WIDTH,
-                    );
+                    ) else { return 1; };
+                    cache_dit_diff = diff_result.difference;
+                    step_ms = step_ms + diff_result.gpu_ms;
+                    if env::has_var("QI_VALIDATE_GPU_CACHE_DIFF") {
+                        let host_difference: f64 = host_relative_l1(
+                            previous_fn_residual.contents() as *f32,
+                            current_fn_residual.contents() as *f32,
+                            target_rows *% WIDTH,
+                        );
+                        io::println("trajectory cache diff validation: gpu=${cache_dit_diff} host=${host_difference} absolute_error=${(cache_dit_diff - host_difference).abs()}");
+                    }
                 }
                 cache_dit_cached_step = cache_dit_should_cache(
                     step,
@@ -4516,7 +4693,7 @@ fn run_trajectory_packed_impl(
         }
     }
     let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
-    io::println("trajectory: pixels=256 steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} total_wall_ms=${trajectory_wall_ms}");
+    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
         if cache_dit_enabled {
             io::println("Qwen-Image-2.1 Cache-DiT trajectory: complete; quality requires measured acceptance");

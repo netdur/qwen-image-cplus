@@ -82,6 +82,8 @@ fn append_png_chunk(
 fn encode_png_rgba(
     scanlines: vec::Vec[u8],
     output_path: str,
+    width: usize = IMAGE_WIDTH,
+    height: usize = IMAGE_HEIGHT,
 ) -> option::Option[usize] {
     var adler_a: u32 = 1 as u32;
     var adler_b: u32 = 0 as u32;
@@ -118,8 +120,14 @@ fn encode_png_rgba(
     png.append(137 as u8); png.append(80 as u8); png.append(78 as u8); png.append(71 as u8);
     png.append(13 as u8); png.append(10 as u8); png.append(26 as u8); png.append(10 as u8);
     var header: [u8; 13] = [0 as u8; 13];
-    header[2] = 1 as u8;
-    header[6] = 1 as u8;
+    header[0] = ((width as u32 >> (24 as u32)) & (255 as u32)) as u8;
+    header[1] = ((width as u32 >> (16 as u32)) & (255 as u32)) as u8;
+    header[2] = ((width as u32 >> (8 as u32)) & (255 as u32)) as u8;
+    header[3] = (width as u32 & (255 as u32)) as u8;
+    header[4] = ((height as u32 >> (24 as u32)) & (255 as u32)) as u8;
+    header[5] = ((height as u32 >> (16 as u32)) & (255 as u32)) as u8;
+    header[6] = ((height as u32 >> (8 as u32)) & (255 as u32)) as u8;
+    header[7] = (height as u32 & (255 as u32)) as u8;
     header[8] = 8 as u8;
     header[9] = 6 as u8;
     append_png_chunk(png, 0x49484452 as u32, #addr_of(header[0]), 13 as usize);
@@ -176,30 +184,46 @@ fn validate_reference_postprocess(fixture_directory: str) -> bool {
 }
 
 fn write_png(decoded: *f32, output_path: str) -> bool {
+    return write_png_sized(decoded, output_path, IMAGE_WIDTH, IMAGE_HEIGHT);
+}
+
+fn write_png_sized(
+    decoded: *f32,
+    output_path: str,
+    width: usize,
+    height: usize,
+) -> bool {
     if decoded.is_null() {
         io::eprintln("image output: decoded tensor is null");
         return false;
     }
+    if width == (0 as usize) || height == (0 as usize)
+        || width > (16384 as usize) || height > (16384 as usize) {
+        io::eprintln("image output: invalid dimensions ${width}x${height}");
+        return false;
+    }
     var scanlines: vec::Vec[u8] = vec::Vec[u8]::with_capacity(
-        IMAGE_HEIGHT *% ((IMAGE_WIDTH *% IMAGE_CHANNELS) +% (1 as usize)),
+        height *% ((width *% IMAGE_CHANNELS) +% (1 as usize)),
     );
     var index: usize = 0 as usize;
     var row: usize = 0 as usize;
-    while row < IMAGE_HEIGHT {
+    while row < height {
         scanlines.append(0 as u8);
         var row_byte: usize = 0 as usize;
-        while row_byte < IMAGE_WIDTH *% IMAGE_CHANNELS {
+        while row_byte < width *% IMAGE_CHANNELS {
             scanlines.append(postprocess_sample(decoded[index]));
             index = index +% (1 as usize);
             row_byte = row_byte +% (1 as usize);
         }
         row = row +% (1 as usize);
     }
-    guard let option::Option[usize]::Some(png_bytes) = encode_png_rgba(scanlines, output_path) else {
+    guard let option::Option[usize]::Some(png_bytes) = encode_png_rgba(
+        scanlines, output_path, width, height,
+    ) else {
         io::eprintln("image output: PNG encoding failed");
         return false;
     };
-    io::println("image output: path=${output_path} bytes=${png_bytes} pixels=${IMAGE_WIDTH}x${IMAGE_HEIGHT}");
+    io::println("image output: path=${output_path} bytes=${png_bytes} pixels=${width}x${height}");
     return true;
 }
 
