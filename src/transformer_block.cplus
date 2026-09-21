@@ -2299,6 +2299,36 @@ fn run_trajectory_packed(
     requested_steps: str,
     fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
 ) -> i32 {
+    return run_trajectory_packed_impl(
+        packed_path,
+        requested_steps,
+        fixture_directory,
+        0 as *f32,
+    );
+}
+
+// Runs the canonical 40-step 256px trajectory and copies the final
+// BF16-rounded normalized latent into caller-owned memory. All Metal resources
+// and the 12.42 GiB packed mapping are released when this function returns, so
+// the caller can begin the VAE memory phase without overlapping model weights.
+fn run_trajectory_256_to_host(
+    packed_path: str,
+    final_latent: *f32,
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+) -> i32 {
+    if final_latent.is_null() {
+        io::eprintln("trajectory: final latent destination is null");
+        return 2;
+    }
+    return run_trajectory_packed_impl(packed_path, "40", fixture_directory, final_latent);
+}
+
+fn run_trajectory_packed_impl(
+    packed_path: str,
+    requested_steps: str,
+    fixture_directory: str,
+    final_latent: *f32,
+) -> i32 {
     var step_limit: usize = 0 as usize;
     if requested_steps == "1" {
         step_limit = 1 as usize;
@@ -2608,6 +2638,14 @@ fn run_trajectory_packed(
             io::println("trajectory step ${completed_step}: mode=cached timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms}");
         }
         step = step +% (1 as usize);
+    }
+    if !final_latent.is_null() {
+        let latent_values: *f32 = latents.contents() as *f32;
+        var latent_index: usize = 0 as usize;
+        while latent_index < latent_count {
+            final_latent[latent_index] = latent_values[latent_index];
+            latent_index = latent_index +% (1 as usize);
+        }
     }
     io::println("trajectory: pixels=256 steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} cache_bytes=${(2 as u64) *% cache_arena_bytes} total_gpu_ms=${total_ms}");
     if all_ok { io::println("Qwen-Image-2.1 latent trajectory prefix: verified"); return 0; }

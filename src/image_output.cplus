@@ -1,0 +1,282 @@
+import "./mmap_macos" as mapped;
+import "stdlib/fs" as fs;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+const IMAGE_WIDTH: usize = 256;
+const IMAGE_HEIGHT: usize = 256;
+const IMAGE_CHANNELS: usize = 4;
+const PIXEL_BYTES: usize = IMAGE_WIDTH * IMAGE_HEIGHT * IMAGE_CHANNELS;
+
+// NumPy's rint, used by Diffusers' numpy_to_pil, rounds an exact half to the
+// nearest even integer. C's roundf rounds halves away from zero, so keep the
+// tie behavior explicit rather than depending on the platform function.
+fn round_u8_even(value: f32) -> u8 {
+    let base_value: f32 = value.floor();
+    var base: u32 = base_value as u32;
+    let fraction: f32 = value - base_value;
+    if fraction > 0.5f32 || (fraction == 0.5f32 && base % (2 as u32) != (0 as u32)) {
+        base = base +% (1 as u32);
+    }
+    if base > (255 as u32) { return 255 as u8; }
+    return base as u8;
+}
+
+fn postprocess_sample(sample: f32) -> u8 {
+    var normalized: f32 = sample * 0.5f32 + 0.5f32;
+    if normalized < 0.0f32 { normalized = 0.0f32; }
+    if normalized > 1.0f32 { normalized = 1.0f32; }
+    return round_u8_even(normalized * 255.0f32);
+}
+
+fn append_u32_be(ref output: vec::Vec[u8], value: u32) {
+    output.append(((value >> (24 as u32)) & (255 as u32)) as u8);
+    output.append(((value >> (16 as u32)) & (255 as u32)) as u8);
+    output.append(((value >> (8 as u32)) & (255 as u32)) as u8);
+    output.append((value & (255 as u32)) as u8);
+}
+
+fn crc32_byte(crc: u32, byte: u8) -> u32 {
+    var value: u32 = crc ^ byte as u32;
+    var bit: usize = 0 as usize;
+    while bit < (8 as usize) {
+        if (value & (1 as u32)) != (0 as u32) {
+            value = (value >> (1 as u32)) ^ (0xEDB88320 as u32);
+        } else {
+            value = value >> (1 as u32);
+        }
+        bit = bit +% (1 as usize);
+    }
+    return value;
+}
+
+fn append_png_chunk(
+    ref output: vec::Vec[u8],
+    kind: u32,
+    data: *u8,
+    count: usize,
+) {
+    append_u32_be(output, count as u32);
+    var crc: u32 = 0xFFFFFFFF as u32;
+    var kind_index: usize = 0 as usize;
+    while kind_index < (4 as usize) {
+        let shift: u32 = ((3 as usize) -% kind_index) as u32 *% (8 as u32);
+        let byte: u8 = ((kind >> shift) & (255 as u32)) as u8;
+        output.append(byte);
+        crc = crc32_byte(crc, byte);
+        kind_index = kind_index +% (1 as usize);
+    }
+    var index: usize = 0 as usize;
+    while index < count {
+        output.append(data[index]);
+        crc = crc32_byte(crc, data[index]);
+        index = index +% (1 as usize);
+    }
+    append_u32_be(output, crc ^ (0xFFFFFFFF as u32));
+}
+
+fn encode_png_rgba(
+    scanlines: vec::Vec[u8],
+    output_path: str,
+) -> option::Option[usize] {
+    var adler_a: u32 = 1 as u32;
+    var adler_b: u32 = 0 as u32;
+    let scanline_values: *u8 = { #slice_ptr(scanlines.as_slice()) };
+    var scanline_index: usize = 0 as usize;
+    while scanline_index < scanlines.count() {
+        adler_a = (adler_a +% scanline_values[scanline_index] as u32) % (65521 as u32);
+        adler_b = (adler_b +% adler_a) % (65521 as u32);
+        scanline_index = scanline_index +% (1 as usize);
+    }
+
+    var idat: vec::Vec[u8] = vec::Vec[u8]::with_capacity(scanlines.count() +% (32 as usize));
+    idat.append(0x78 as u8);
+    idat.append(0x01 as u8);
+    var offset: usize = 0 as usize;
+    while offset < scanlines.count() {
+        let remaining: usize = scanlines.count() -% offset;
+        let block_length: usize = if remaining > (65535 as usize) { 65535 as usize } else { remaining };
+        let final_block: bool = offset +% block_length == scanlines.count();
+        idat.append(if final_block { 1 as u8 } else { 0 as u8 });
+        let length: u32 = block_length as u32;
+        let inverse: u32 = (0xFFFF as u32) -% length;
+        idat.append((length & (255 as u32)) as u8);
+        idat.append(((length >> (8 as u32)) & (255 as u32)) as u8);
+        idat.append((inverse & (255 as u32)) as u8);
+        idat.append(((inverse >> (8 as u32)) & (255 as u32)) as u8);
+        let source: *u8 = { scanline_values + offset };
+        idat.extend_from_raw(source, block_length);
+        offset = offset +% block_length;
+    }
+    append_u32_be(idat, (adler_b << (16 as u32)) | adler_a);
+
+    var png: vec::Vec[u8] = vec::Vec[u8]::with_capacity(idat.count() +% (64 as usize));
+    png.append(137 as u8); png.append(80 as u8); png.append(78 as u8); png.append(71 as u8);
+    png.append(13 as u8); png.append(10 as u8); png.append(26 as u8); png.append(10 as u8);
+    var header: [u8; 13] = [0 as u8; 13];
+    header[2] = 1 as u8;
+    header[6] = 1 as u8;
+    header[8] = 8 as u8;
+    header[9] = 6 as u8;
+    append_png_chunk(png, 0x49484452 as u32, #addr_of(header[0]), 13 as usize);
+    append_png_chunk(png, 0x49444154 as u32, #slice_ptr(idat.as_slice()), idat.count());
+    append_png_chunk(png, 0x49454E44 as u32, 0 as *u8, 0 as usize);
+    let png_bytes: usize = png.count();
+    let temporary_path: text::Text = "${output_path}.tmp";
+    guard let result::Result[fs::File, result::IoError]::Ok(file_value) = fs::create(temporary_path.view()) else {
+        return option::Option[usize]::None;
+    };
+    var file: fs::File = file_value;
+    guard let result::Result[usize, result::IoError]::Ok(written) = file.write_all(png) else {
+        return option::Option[usize]::None;
+    };
+    if written != png_bytes { return option::Option[usize]::None; }
+    file.close();
+    guard let result::Result[bool, result::IoError]::Ok(installed) = fs::rename(
+        temporary_path.view(),
+        output_path,
+    ) else {
+        return option::Option[usize]::None;
+    };
+    if !installed { return option::Option[usize]::None; }
+    return option::Option[usize]::Some(png_bytes);
+}
+
+fn validate_reference_postprocess(fixture_directory: str) -> bool {
+    let output_path = "${fixture_directory}/output.f32";
+    let rgba_path = "${fixture_directory}/rgba_u8.bin";
+    guard let mapped::MapResult::Ok(output) = mapped::map_readonly(output_path.view()) else {
+        io::eprintln("image output: missing ${output_path}");
+        return false;
+    };
+    guard let mapped::MapResult::Ok(expected) = mapped::map_readonly(rgba_path.view()) else {
+        io::eprintln("image output: missing ${rgba_path}");
+        return false;
+    };
+    if output.length() != PIXEL_BYTES *% #size_of::[f32]() || expected.length() != PIXEL_BYTES {
+        io::eprintln("image output: invalid postprocess fixture sizes");
+        return false;
+    }
+    let source: *f32 = output.pointer() as *f32;
+    let reference: *u8 = expected.pointer();
+    var mismatches: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < PIXEL_BYTES {
+        if postprocess_sample(source[index]) != reference[index] {
+            mismatches = mismatches +% (1 as usize);
+        }
+        index = index +% (1 as usize);
+    }
+    io::println("image postprocess oracle: pixels=${IMAGE_WIDTH}x${IMAGE_HEIGHT} channels=RGBA mismatched_bytes=${mismatches}");
+    return mismatches == (0 as usize);
+}
+
+fn write_png_and_compare(
+    decoded: *f32,
+    fixture_directory: str,
+    output_path: str,
+    error_limit: f64,
+) -> bool {
+    if decoded.is_null() {
+        io::eprintln("image output: decoded tensor is null");
+        return false;
+    }
+    let rgba_path = "${fixture_directory}/rgba_u8.bin";
+    guard let mapped::MapResult::Ok(expected) = mapped::map_readonly(rgba_path.view()) else {
+        io::eprintln("image output: missing ${rgba_path}");
+        return false;
+    };
+    if expected.length() != PIXEL_BYTES {
+        io::eprintln("image output: invalid RGBA fixture size ${expected.length()}");
+        return false;
+    }
+
+    var scanlines: vec::Vec[u8] = vec::Vec[u8]::with_capacity(
+        IMAGE_HEIGHT *% ((IMAGE_WIDTH *% IMAGE_CHANNELS) +% (1 as usize)),
+    );
+    let reference: *u8 = expected.pointer();
+    var squared_error: f64 = 0.0f64;
+    var squared_reference: f64 = 0.0f64;
+    var absolute_error: u64 = 0 as u64;
+    var maximum_error: u8 = 0 as u8;
+    var mismatches: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    var row: usize = 0 as usize;
+    while row < IMAGE_HEIGHT {
+        scanlines.append(0 as u8);
+        var row_byte: usize = 0 as usize;
+        while row_byte < IMAGE_WIDTH *% IMAGE_CHANNELS {
+            let actual: u8 = postprocess_sample(decoded[index]);
+            scanlines.append(actual);
+            let actual_i32: i32 = actual as i32;
+            let expected_i32: i32 = reference[index] as i32;
+            let difference_i32: i32 = actual_i32 - expected_i32;
+            let magnitude: u8 = if difference_i32 < (0 as i32) {
+                (0 -% difference_i32) as u8
+            } else {
+                difference_i32 as u8
+            };
+            if magnitude != (0 as u8) { mismatches = mismatches +% (1 as usize); }
+            if magnitude > maximum_error { maximum_error = magnitude; }
+            absolute_error = absolute_error +% magnitude as u64;
+            let difference: f64 = difference_i32 as f64;
+            squared_error = squared_error + difference * difference;
+            squared_reference = squared_reference + expected_i32 as f64 * expected_i32 as f64;
+            index = index +% (1 as usize);
+            row_byte = row_byte +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    let error: f64 = (squared_error / squared_reference.max(0.000000000001f64)).sqrt();
+    let mean_absolute_error: f64 = absolute_error as f64 / PIXEL_BYTES as f64;
+
+    guard let option::Option[usize]::Some(png_bytes) = encode_png_rgba(scanlines, output_path) else {
+        io::eprintln("image output: PNG encoding failed");
+        return false;
+    };
+    io::println("image output: path=${output_path} bytes=${png_bytes} rgba_nRMSE=${error} limit=${error_limit} mean_abs_u8=${mean_absolute_error} max_abs_u8=${maximum_error} mismatched_bytes=${mismatches}");
+    return error <= error_limit;
+}
+
+fn run_reference(
+    output_path: str,
+    fixture_directory: str = "tests/fixtures/vae_decoder_fp32/trajectory_256",
+) -> i32 {
+    if !validate_reference_postprocess(fixture_directory) { return 1; }
+    let decoded_path = "${fixture_directory}/output.f32";
+    guard let mapped::MapResult::Ok(decoded) = mapped::map_readonly(decoded_path.view()) else {
+        return 1;
+    };
+    if decoded.length() != PIXEL_BYTES *% #size_of::[f32]() {
+        return 1;
+    }
+    if !write_png_and_compare(
+        decoded.pointer() as *f32,
+        fixture_directory,
+        output_path,
+        0.0f64,
+    ) {
+        return 1;
+    }
+    io::println("Qwen-Image-2.1 RGBA postprocessing and PNG output: verified");
+    return 0;
+}
+
+#[test]
+fn postprocess_clamps_and_maps_endpoints() {
+    assert postprocess_sample(-2.0f32) == (0 as u8);
+    assert postprocess_sample(-1.0f32) == (0 as u8);
+    assert postprocess_sample(1.0f32) == (255 as u8);
+    assert postprocess_sample(2.0f32) == (255 as u8);
+}
+
+#[test]
+fn postprocess_uses_numpy_ties_to_even() {
+    assert round_u8_even(2.5f32) == (2 as u8);
+    assert round_u8_even(3.5f32) == (4 as u8);
+    assert round_u8_even(254.5f32) == (254 as u8);
+}

@@ -211,6 +211,22 @@ fn fixture_buffer(
     );
 }
 
+fn normalized_input_buffer(
+    device: metal::Device,
+    fixture_directory: str,
+    source: *f32,
+    expected_bytes: u64,
+) -> option::Option[metal::Buffer] {
+    if source.is_null() {
+        return fixture_buffer(device, fixture_directory, "normalized_latent", expected_bytes);
+    }
+    return device.new_buffer_with_bytes(
+        source as *u8,
+        expected_bytes,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    );
+}
+
 fn conv_weight(
     file: safetensors::File,
     prefix: str,
@@ -587,6 +603,39 @@ fn run(
     requested_case: str,
     fixture_root: str = "tests/fixtures/vae_decoder_fp32",
 ) -> i32 {
+    return run_impl(
+        model_root,
+        requested_case,
+        fixture_root,
+        0 as *f32,
+        0 as *f32,
+    );
+}
+
+// Decodes a caller-owned normalized [16,16,64] latent and copies the final
+// clamped [256,256,4] HWC tensor back to caller-owned memory. The source is
+// copied into a Metal shared buffer before dispatch, so it only needs to remain
+// valid for this call.
+fn decode_trajectory_256_from_host(
+    model_root: str,
+    normalized_latent: *f32,
+    decoded_output: *f32,
+    fixture_root: str = "tests/fixtures/vae_decoder_fp32",
+) -> i32 {
+    if normalized_latent.is_null() || decoded_output.is_null() {
+        io::eprintln("VAE: integrated decode received a null host buffer");
+        return 2;
+    }
+    return run_impl(model_root, "256", fixture_root, normalized_latent, decoded_output);
+}
+
+fn run_impl(
+    model_root: str,
+    requested_case: str,
+    fixture_root: str,
+    normalized_source: *f32,
+    decoded_destination: *f32,
+) -> i32 {
     var input_height: usize = 0 as usize;
     var case_directory: str = "";
     if requested_case == "small" {
@@ -656,7 +705,12 @@ fn run(
     };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
     let input_elements: usize = input_height *% input_width *% (64 as usize);
-    guard let option::Option[metal::Buffer]::Some(normalized) = fixture_buffer(device, fixture_directory, "normalized_latent", (input_elements *% #size_of::[f32]()) as u64) else { return 1; };
+    guard let option::Option[metal::Buffer]::Some(normalized) = normalized_input_buffer(
+        device,
+        fixture_directory,
+        normalized_source,
+        (input_elements *% #size_of::[f32]()) as u64,
+    ) else { return 1; };
     let normalized_owner: OwnedObjc = OwnedObjc::new(normalized.raw());
     guard let option::Option[metal::Buffer]::Some(mean) = device.new_buffer_with_bytes(#addr_of(LATENTS_MEAN[0]) as *u8, (64 as u64) *% (4 as u64), metal::resource_options_m_t_l_resource_storage_mode_shared) else { return 1; };
     let mean_owner: OwnedObjc = OwnedObjc::new(mean.raw());
@@ -786,8 +840,23 @@ fn run(
     guard let option::Option[f64]::Some(clamp_ms) = dispatch_clamp(queue, pipelines.clamp, buffer_b, buffer_a, height *% width *% (4 as usize)) else { return 1; };
     total_ms = total_ms + clamp_ms;
     guard let option::Option[f64]::Some(output_error) = normalized_rms_fixture(buffer_a, fixture_directory, "output", height *% width *% (4 as usize)) else { return 1; };
-    let output_limit: f64 = if requested_case == "small" { 0.000002f64 } else { 0.000003f64 };
+    let output_limit: f64 = if requested_case == "small" {
+        0.000002f64
+    } else if normalized_source.is_null() {
+        0.000003f64
+    } else {
+        0.013f64
+    };
     all_ok = output_error <= output_limit && finite(buffer_a, height *% width *% (4 as usize)) && all_ok;
+    if !decoded_destination.is_null() {
+        let decoded_values: *f32 = buffer_a.contents() as *f32;
+        let decoded_count: usize = height *% width *% (4 as usize);
+        var decoded_index: usize = 0 as usize;
+        while decoded_index < decoded_count {
+            decoded_destination[decoded_index] = decoded_values[decoded_index];
+            decoded_index = decoded_index +% (1 as usize);
+        }
+    }
     io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
     if all_ok { io::println("Qwen-Image-2.1 still-image VAE decoder: verified"); return 0; }
     return 1;

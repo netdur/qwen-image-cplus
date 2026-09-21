@@ -1,0 +1,58 @@
+import "./image_output" as image_output;
+import "./transformer_block" as transformer;
+import "./vae" as vae;
+import "stdlib/io" as io;
+
+const LATENT_VALUES: usize = 16 * 16 * 64;
+const DECODED_VALUES: usize = 256 * 256 * 4;
+
+fn run_fixture_256(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    trajectory_fixture: str = "tests/fixtures/trajectory_256_fp32",
+    vae_fixture_root: str = "tests/fixtures/vae_decoder_fp32",
+) -> i32 {
+    let vae_fixture = "${vae_fixture_root}/trajectory_256";
+    if !image_output::validate_reference_postprocess(vae_fixture.view()) {
+        return 1;
+    }
+
+    var latent: [f32; 16384] = [0.0f32; 16384];
+    io::println("pipeline: phase=transformer-scheduler weights=${packed_path}");
+    if transformer::run_trajectory_256_to_host(
+        packed_path,
+        #addr_of(latent[0]),
+        trajectory_fixture,
+    ) != (0 as i32) {
+        return 1;
+    }
+
+    var decoded: [f32; 262144] = [0.0f32; 262144];
+    io::println("pipeline: phase=vae model=${model_root}");
+    if vae::decode_trajectory_256_from_host(
+        model_root,
+        #addr_of(latent[0]),
+        #addr_of(decoded[0]),
+        vae_fixture_root,
+    ) != (0 as i32) {
+        return 1;
+    }
+
+    if !image_output::write_png_and_compare(
+        #addr_of(decoded[0]),
+        vae_fixture.view(),
+        output_path,
+        0.008f64,
+    ) {
+        return 1;
+    }
+    io::println("Qwen-Image-2.1 fixture-driven 256px pipeline: verified");
+    return 0;
+}
+
+#[test]
+fn vertical_slice_shapes_match_handoff_contract() {
+    assert LATENT_VALUES == (16384 as usize);
+    assert DECODED_VALUES == (262144 as usize);
+}

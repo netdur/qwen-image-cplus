@@ -52,6 +52,8 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
+./target/debug/qwen-image-cplus test-image-output reference.png
+./target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -267,6 +269,30 @@ Inspect a shard, optionally filtering tensor names:
   scratch storage plus the no-copy weights and took 2,297.53 ms of summed GPU
   kernel time. Results, scope, and limitations are recorded in
   `benchmarks/m1-max-vae-decoder-native.json`.
+- The first complete vertical slice now executes the committed prompt and
+  initial-noise fixture through all 40 transformer/scheduler steps, hands the
+  resulting `[16,16,64]` normalized latent to the VAE in caller-owned memory,
+  converts the decoded tensor to RGBA, and writes a PNG in one process. The
+  transformer function returns before VAE setup, deliberately releasing the
+  12.42 GiB packed mapping and its workspaces before the 1.258 GiB VAE mapping
+  is opened. The handoff is in memory but not claimed as a GPU zero-copy
+  optimization: the shared Metal latent is copied into a 64 KiB host array and
+  then into the VAE's shared input buffer.
+- Image postprocessing exactly reproduces Diffusers' `(x * 0.5 + 0.5)` clamp,
+  HWC conversion, multiplication by 255, and NumPy ties-to-even rounding. The
+  independent official-output gate matches all 262,144 RGBA bytes. PNG output
+  is implemented directly in C+ with RGBA scanlines, stored DEFLATE blocks,
+  Adler-32, CRC-32, and atomic installation. An earlier AppKit encoder was
+  rejected because its alpha/color handling changed 23,602 official RGB bytes
+  by one; independently decoding the final C+ PNG preserves the input RGBA
+  bytes exactly.
+- On the final M1 Max run, the fixture-driven slice used 147,340 ms of summed
+  transformer GPU time and 2,373.82 ms in the VAE. Native error versus the
+  official pipeline was 1.0048% at the final normalized latent, 1.1579% in the
+  decoded FP32 tensor, and 0.6752% after RGBA quantization. The pixel result has
+  0.504 mean absolute byte error and a maximum error of 25 under measured gates
+  of 1.3% FP32 and 0.8% RGBA. Results and limitations are recorded in
+  `benchmarks/m1-max-pipeline-256-native.json`.
 
 ## Quantization decision log
 
@@ -319,10 +345,10 @@ claim. The packed mapping is exposed to Metal without copying 12.42 GiB of
 weights; only activations, cache arenas, and 128-element Q/K norm vectors are
 copied.
 
-The denoising trajectory and still-image VAE decode are now separately
-validated through the final four-channel image tensor. They are not yet one
-user-facing generation command: native prompt encoding, pipeline orchestration,
-and exact image postprocessing/file output remain independent boundaries. The
-current VAE path intentionally implements the pinned one-frame first-chunk
-semantics; temporal continuation and tiled decode are outside its verified
-scope.
+The denoising trajectory, VAE decode, postprocessing, and PNG output now form
+one verified process, but the command remains fixture-driven. Arbitrary native
+prompts still require the tokenizer/processor and the text-only Qwen3-VL
+encoder; production use also needs native seeded noise and substantial kernel
+optimization. The current VAE path intentionally implements the pinned
+one-frame first-chunk semantics; temporal continuation and tiled decode remain
+outside its verified scope.

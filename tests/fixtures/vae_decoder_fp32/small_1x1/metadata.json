@@ -32,7 +32,14 @@
     "minimum": -0.9947165846824646,
     "rms": 0.6254112124443054
   },
-  "reference_seconds": 0.3684101670514792,
+  "reference_png": {
+    "bytes": 258,
+    "file": "reference.png",
+    "format": "PNG",
+    "mode": "RGBA",
+    "sha256": "3341f8b6ad6f2fb4a2791a82c672e018e769277db4912f38e4ffbd423f9d0fd8"
+  },
+  "reference_seconds": 0.38414145912975073,
   "schema_version": 1,
   "still_image_specialization": {
     "causal_conv": "squeeze time and execute checkpoint Conv2d",
@@ -336,6 +343,18 @@
         1,
         1,
         64
+      ]
+    },
+    "rgba_u8": {
+      "bytes": 1024,
+      "dtype": "U8",
+      "file": "rgba_u8.bin",
+      "layout": "RGBA",
+      "sha256": "dc6ee62d7e064230173881274c5845093a0bee86690972cb5714383e7fab3670",
+      "shape": [
+        16,
+        16,
+        4
       ]
     },
     "up_block_00": {

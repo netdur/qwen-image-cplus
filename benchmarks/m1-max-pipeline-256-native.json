@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "case": {
+    "pixels": 256,
+    "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+    "latent_seed": 1101,
+    "text_rows": 22,
+    "target_rows": 256,
+    "steps": 40,
+    "transformer_fixture": "tests/fixtures/trajectory_256_fp32",
+    "pixel_fixture": "tests/fixtures/vae_decoder_fp32/trajectory_256"
+  },
+  "method": {
+    "input_scope": "Committed official prompt embeddings, RoPE, and seeded initial noise",
+    "execution": "One native process: mixed packed transformer and BF16-rounded FlowMatch trajectory, caller-owned latent handoff, FP32 VAE, exact Diffusers RGBA postprocessing, pure-C+ PNG output",
+    "memory_phases": "The transformer function returns and releases its packed mapping/workspaces before the VAE mapping is opened",
+    "png": "RGBA8, filter-none scanlines, zlib stored DEFLATE blocks, Adler-32 and PNG CRC-32, atomically installed"
+  },
+  "native": {
+    "transformer_gpu_kernel_ms": 147340.0,
+    "vae_gpu_kernel_ms": 2373.82,
+    "summed_gpu_kernel_ms": 149713.82,
+    "final_normalized_latent_nrmse": 0.0100476,
+    "decoded_fp32_nrmse": 0.0115787,
+    "rgba_u8_nrmse": 0.00675215,
+    "rgba_mean_absolute_error": 0.504349,
+    "rgba_maximum_absolute_error": 25,
+    "rgba_mismatched_bytes": 97773,
+    "rgba_bytes": 262144,
+    "png_bytes": 262488,
+    "finite_output": true
+  },
+  "acceptance": {
+    "official_postprocess_mismatched_bytes": 0,
+    "decoded_fp32_limit": 0.013,
+    "rgba_u8_limit": 0.008,
+    "png_independently_decoded_as": "256x256 RGBA",
+    "png_decoded_metrics_match_in_process": true,
+    "passed": true
+  },
+  "interpretation": "The 1.00476% accumulated latent divergence remains controlled through VAE decode and pixel quantization. Keeping postprocessing under an exact independent gate distinguishes model arithmetic error from byte conversion or image encoding errors.",
+  "limitations": [
+    "The command is fixture-driven and does not yet tokenize or encode an arbitrary prompt.",
+    "Initial noise, prompt embeddings, and RoPE are committed inputs; native seeded random generation is not implemented.",
+    "The latent handoff is in process and in memory, but copies from shared Metal memory into a 64 KiB host array before the VAE input buffer is created.",
+    "The fixed vertical slice is 256x256 RGBA and uses the verified still-image first-chunk VAE path.",
+    "Summed GPU time excludes packed-file validation, Metal compilation, CPU scheduler work, PNG encoding, fixture I/O, and process startup.",
+    "The correctness-first transformer remains far too slow for interactive 1024px generation."
+  ]
+}

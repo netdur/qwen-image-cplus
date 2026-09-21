@@ -21,6 +21,7 @@ import torch
 from accelerate import __version__ as accelerate_version
 from diffusers import AutoencoderKLQwenImage21
 from diffusers import __version__ as diffusers_version
+from PIL import Image
 from transformers import __version__ as transformers_version
 
 from calibrate_transformer_quantization import DIFFUSERS_COMMIT, MODEL_SNAPSHOT, validate_model_root
@@ -38,6 +39,32 @@ def write_tensor(directory: Path, name: str, value: np.ndarray, records: dict) -
         "shape": list(value.shape),
         "bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def write_rgba(directory: Path, value: torch.Tensor, records: dict) -> dict:
+    pixels = np.clip(hwc(value) * 0.5 + 0.5, 0.0, 1.0)
+    pixels = np.rint(pixels * 255.0).astype(np.uint8)
+    raw = pixels.tobytes()
+    filename = "rgba_u8.bin"
+    (directory / filename).write_bytes(raw)
+    png_path = directory / "reference.png"
+    Image.fromarray(pixels, mode="RGBA").save(png_path)
+    records["rgba_u8"] = {
+        "file": filename,
+        "dtype": "U8",
+        "layout": "RGBA",
+        "shape": list(pixels.shape),
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    png = png_path.read_bytes()
+    return {
+        "file": png_path.name,
+        "format": "PNG",
+        "mode": "RGBA",
+        "bytes": len(png),
+        "sha256": hashlib.sha256(png).hexdigest(),
     }
 
 
@@ -115,6 +142,7 @@ def run_case(
         for label, _module in modules:
             write_tensor(directory, label, hwc(captures[label]), records)
     write_tensor(directory, "output", hwc(output), records)
+    reference_png = write_rgba(directory, output, records)
 
     metadata = {
         "schema_version": 1,
@@ -143,6 +171,7 @@ def run_case(
         },
         "summaries": {label: summary(value) for label, value in captures.items()},
         "output_summary": summary(output),
+        "reference_png": reference_png,
         "tensors": records,
     }
     (directory / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
