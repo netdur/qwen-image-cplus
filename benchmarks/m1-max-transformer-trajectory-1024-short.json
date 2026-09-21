@@ -119,7 +119,7 @@
         "cached_speedup": 10.4111,
         "cached_nrmse_vs_scalar_fp32": 0.000434663
       },
-      "decision": "Use Flash Attention only at 1024px. Keep the exact two-query kernel at 256px and 512px."
+      "decision": "Use Flash Attention at 256px and 1024px after independent production gates. Keep the exact two-query kernel at 512px until that shape is measured."
     }
   },
   "integrated_four_query_1024": {

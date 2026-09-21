@@ -788,8 +788,24 @@ Inspect a shard, optionally filtering tensor names:
   one scalar SIMD group regressed 33-38% from register pressure; and a
   model-specific fast mask saved only 1.7% in an adjacent full-step control.
   They are not retained because flash captures the useful FP16 bandwidth change
-  and removes the dominant repeated K/V pass. The 256 path remains unchanged
-  and its two-step oracle still passes at 0.000906469 and 0.00130081 nRMSE.
+  and removes the dominant repeated K/V pass.
+- The same flash kernel is now accepted at 256 after a separate production
+  gate. Isolated prefill/cached attention fell from 3.140/3.228 ms to
+  **0.441/0.378 ms**, with 0.000266/0.000339 nRMSE against scalar FP32. The
+  official 1-, 2-, and 40-step trajectory gates all pass; step-40 latent nRMSE
+  is 1.04073% under the 1.1% limit. The reproducible 40-step loop fell from
+  25.627 s GPU / 26.263 s wall to **21.727 s GPU / 22.083 s wall**. Cache-DiT
+  0.24 retains all 27 decisions and falls from 9.067/9.582 s to **7.700/7.919
+  s**. Its measured final latent nRMSE improves slightly from 10.079% to
+  10.024%; it remains an explicit approximation rather than an equivalence
+  path. FP16 prefix storage halves the canonical cache from 22 to 11 MiB.
+- Current blue-teapot prompt-to-PNG measurements at 256 are **44.675 s** for
+  cache-off and **27.681 s** for Cache-DiT 0.24. The cache-off run comprised
+  13.851 s text, 29.495 s transformer phase including a thermally variable
+  23.478 s loop, 1.306 s VAE, and 21 ms PNG output. Cache-DiT comprised 12.368
+  s text, 14.056 s transformer phase including a 7.876 s loop, 1.236 s VAE,
+  and 19 ms PNG output. Exact isolated, oracle, and end-to-end measurements are
+  in `benchmarks/m1-max-flash-attention-256.json`.
 
 ## Remaining optimization phases
 

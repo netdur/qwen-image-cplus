@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Production adoption of the fixed-shape Metal Flash Attention kernel at 256x256",
+  "implementation": {
+    "kernel": "qi_block_attention_flash128",
+    "shape": "32 heads, dimension 128, eight queries and 64 keys per tile, four SIMD groups",
+    "precision": "FP16 Q/K/V matrix operands with FP32 score, online-softmax, and output accumulation",
+    "prefix_cache": "FP16 per-block text K/V, restored into contiguous padded K/V scratch on cached steps",
+    "resolution_policy": "Flash Attention at 256 and 1024; exact two-query attention remains at unmeasured 512"
+  },
+  "isolated_attention": {
+    "prefill_rows": 278,
+    "cached_query_rows": 256,
+    "key_rows": 278,
+    "two_query_prefill_gpu_ms": 3.13979,
+    "flash_prefill_gpu_ms": 0.440583,
+    "prefill_speedup": 7.126,
+    "prefill_nrmse_vs_scalar_fp32": 0.00026602,
+    "two_query_cached_gpu_ms": 3.22821,
+    "flash_cached_gpu_ms": 0.377583,
+    "cached_speedup": 8.549,
+    "cached_nrmse_vs_scalar_fp32": 0.000338519,
+    "projected_two_query_40_step_32_block_gpu_ms": 4129.28,
+    "projected_flash_40_step_32_block_gpu_ms": 485.323
+  },
+  "official_trajectory_gates": {
+    "step_1": {
+      "gpu_ms": 702.693,
+      "wall_ms": 756,
+      "latent_nrmse": 0.000894272,
+      "limit": 0.001
+    },
+    "step_2": {
+      "gpu_ms": 562.278,
+      "wall_ms": 571,
+      "latent_nrmse": 0.00127067,
+      "limit": 0.0015
+    },
+    "step_40": {
+      "latent_nrmse": 0.0104073,
+      "limit": 0.011
+    },
+    "cache_off_40_step": {
+      "prior_gpu_ms": 25626.5,
+      "flash_gpu_ms": 21726.5,
+      "prior_wall_ms": 26263,
+      "flash_wall_ms": 22083,
+      "gpu_reduction_percent": 15.22,
+      "wall_reduction_percent": 15.92
+    },
+    "prefix_cache_bytes": 11534336,
+    "passed": true
+  },
+  "cache_dit_0_24": {
+    "cached_steps": 27,
+    "prior_gpu_ms": 9067.43,
+    "flash_gpu_ms": 7700.32,
+    "prior_wall_ms": 9582,
+    "flash_wall_ms": 7919,
+    "gpu_reduction_percent": 15.08,
+    "wall_reduction_percent": 17.36,
+    "prior_final_latent_nrmse": 0.10079,
+    "flash_final_latent_nrmse": 0.100241,
+    "quality_policy": "Measured-only approximation; cache-off remains the reproducible default"
+  },
+  "native_prompt_to_png": {
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "seed": 42,
+    "steps": 40,
+    "cache_off": {
+      "text_wall_ms": 13851,
+      "transformer_loop_gpu_ms": 23087,
+      "transformer_loop_wall_ms": 23478,
+      "transformer_phase_wall_ms": 29495,
+      "vae_wall_ms": 1306,
+      "image_output_wall_ms": 21,
+      "end_to_end_wall_ms": 44675
+    },
+    "cache_dit_0_24": {
+      "text_wall_ms": 12368,
+      "transformer_loop_gpu_ms": 7680.53,
+      "transformer_loop_wall_ms": 7876,
+      "transformer_phase_wall_ms": 14056,
+      "vae_wall_ms": 1236,
+      "image_output_wall_ms": 19,
+      "end_to_end_wall_ms": 27681,
+      "cached_steps": 27
+    },
+    "note": "Fresh-process warm-filesystem measurements. Text paging and GPU frequency vary between runs; transformer-only oracle timings are the controlled kernel comparison."
+  },
+  "validation": {
+    "unit_tests": "334 passed, 0 failed",
+    "metal_runtime_compile": true,
+    "one_two_forty_step_oracles": true,
+    "cache_dit_decisions_unchanged": true
+  }
+}

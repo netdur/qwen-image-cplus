@@ -4350,7 +4350,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(int8_cached_owner) = pipeline(device, library, "qi_block_int8_simdgroup_half_64x64_direct") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
-    let attention_kernel_name: str = if pixels == (1024 as usize) {
+    let flash_attention: bool = pixels == (256 as usize) || pixels == (1024 as usize);
+    let attention_kernel_name: str = if flash_attention {
         "qi_block_attention_flash128"
     } else {
         "qi_block_attention_simdgroup"
@@ -4385,12 +4386,12 @@ fn run_trajectory_packed_impl(
         norm: metal::ComputePipelineState::from_raw(norm_owner.raw()),
         qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
-        attention_threads: if pixels == (1024 as usize) {
+        attention_threads: if flash_attention {
             128 as usize
         } else {
             32 as usize
         },
-        attention_queries_per_group: if pixels == (1024 as usize) {
+        attention_queries_per_group: if flash_attention {
             8 as usize
         } else {
             2 as usize
@@ -4404,7 +4405,7 @@ fn run_trajectory_packed_impl(
     let text_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(text_norm_owner.raw());
     let assemble_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(assemble_owner.raw());
     let final_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(final_norm_owner.raw());
-    let cache_copy_pipeline: metal::ComputePipelineState = if pixels == (1024 as usize) {
+    let cache_copy_pipeline: metal::ComputePipelineState = if flash_attention {
         metal::ComputePipelineState::from_raw(flash_prepare_owner.raw())
     } else {
         metal::ComputePipelineState::from_raw(cache_copy_owner.raw())
@@ -4440,7 +4441,7 @@ fn run_trajectory_packed_impl(
     let image_input_bytes: u64 = (latent_count *% #size_of::[f32]()) as u64;
     let image_projected_bytes: u64 = (target_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let mlp_bytes: u64 = (rows *% MLP_WIDTH *% #size_of::[f32]()) as u64;
-    let per_block_cache_bytes: u64 = (text_rows *% WIDTH *% if pixels == (1024 as usize) {
+    let per_block_cache_bytes: u64 = (text_rows *% WIDTH *% if flash_attention {
         #size_of::[u16]()
     } else {
         #size_of::[f32]()
