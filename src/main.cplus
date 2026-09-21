@@ -74,7 +74,7 @@ fn decimal_seed_parser_checks_syntax_and_overflow() {
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -119,7 +119,14 @@ fn main() -> i32 {
         return transformer_block::benchmark_attention();
     }
     if command == "benchmark-production-attention" {
-        return transformer_block::benchmark_production_attention();
+        match env::arg(2 as usize) {
+            option::Option[text::Text]::Some(pixels) => {
+                return transformer_block::benchmark_production_attention(pixels.view());
+            }
+            option::Option[text::Text]::None => {
+                return transformer_block::benchmark_production_attention();
+            }
+        }
     }
     if command == "benchmark-transformer-small-kernels" {
         return transformer_block::benchmark_transformer_small_kernels();
@@ -137,6 +144,28 @@ fn main() -> i32 {
             return 2;
         };
         return transformer_block::benchmark_mps_gemm(path.view());
+    }
+    if command == "benchmark-transformer-trajectory-1024" {
+        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2 [FIXTURE_ROOT]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(steps) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2 [FIXTURE_ROOT]");
+            return 2;
+        };
+        match env::arg(4 as usize) {
+            option::Option[text::Text]::Some(fixtures) => {
+                return transformer_block::benchmark_trajectory_1024(
+                    path.view(), steps.view(), fixtures.view(),
+                );
+            }
+            option::Option[text::Text]::None => {
+                return transformer_block::benchmark_trajectory_1024(
+                    path.view(), steps.view(),
+                );
+            }
+        }
     }
     if command == "test-native-inputs" {
         match env::arg(2 as usize) {

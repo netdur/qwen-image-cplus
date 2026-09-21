@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Short native 1024x1024 transformer optimization loop using one or two prefixes of the canonical 40-step schedule",
+  "fixture": {
+    "text_rows": 31,
+    "target_rows": 4096,
+    "latent_seed": 1301,
+    "text_input": "tests/fixtures/transformer_scale_fp32/1024/text_input.f32",
+    "packed_model": "qwen-image-2.1-qkv-fp16.qipack",
+    "excluded_phases": [
+      "text encoder",
+      "VAE decoder",
+      "PNG output"
+    ],
+    "semantics": "Step 1 performs full joint attention and extracts the prompt K/V cache. Step 2 exercises target-only attention with that cached prefix. Both are the first steps of the normal 40-step schedule."
+  },
+  "baseline_two_query_attention": {
+    "one_step": {
+      "step_1_gpu_ms": 39605.5,
+      "step_1_wall_ms": 39765,
+      "loop_gpu_ms": 39624.3,
+      "loop_wall_ms": 39779
+    },
+    "two_step": {
+      "step_1_gpu_ms": 35584.2,
+      "step_1_wall_ms": 35715,
+      "step_2_gpu_ms": 37935.1,
+      "step_2_wall_ms": 37998,
+      "loop_gpu_ms": 73538.3,
+      "loop_wall_ms": 73729
+    },
+    "interpretation": "The cached prompt prefix does not materially reduce the 4096-token quadratic attention work; per-step transformer compute is the dominant target."
+  },
+  "attention_candidates": {
+    "rejected_shared_kv8": {
+      "design": "Four SIMD groups shared an eight-key FP32 threadgroup tile, loading K/V once for eight queries while preserving each two-query online-softmax calculation.",
+      "nrmse": 0,
+      "pixels_256": {
+        "current_prefill_gpu_ms": 3.61364,
+        "candidate_prefill_gpu_ms": 4.00847,
+        "current_cached_gpu_ms": 3.42442,
+        "candidate_cached_gpu_ms": 4.07704
+      },
+      "pixels_1024": {
+        "current_prefill_gpu_ms": 763.843,
+        "candidate_prefill_gpu_ms": 806.324,
+        "current_cached_gpu_ms": 787.71,
+        "candidate_cached_gpu_ms": 827.489
+      },
+      "reason": "Two barriers per eight-key tile and threadgroup synchronization outweighed the reduced device reads. The prototype was removed."
+    },
+    "accepted_four_query": {
+      "design": "One 32-lane SIMD group owns four queries of one head, reusing every K/V vector across four independent online softmax states without barriers.",
+      "nrmse": 0,
+      "pixels_256": {
+        "current_prefill_gpu_ms": 3.05049,
+        "candidate_prefill_gpu_ms": 3.71257,
+        "current_cached_gpu_ms": 3.40717,
+        "candidate_cached_gpu_ms": 3.76917,
+        "decision": "Retain the two-query kernel."
+      },
+      "pixels_1024_candidate_first": {
+        "current_prefill_gpu_ms": 872.079,
+        "candidate_prefill_gpu_ms": 755.425,
+        "prefill_speedup": 1.15442,
+        "current_cached_gpu_ms": 885.127,
+        "candidate_cached_gpu_ms": 748.425,
+        "cached_speedup": 1.18265
+      },
+      "pixels_1024_candidate_second": {
+        "current_prefill_gpu_ms": 891.303,
+        "candidate_prefill_gpu_ms": 757.21,
+        "prefill_speedup": 1.17709,
+        "current_cached_gpu_ms": 896.16,
+        "candidate_cached_gpu_ms": 752.371,
+        "cached_speedup": 1.19111
+      },
+      "decision": "Use four queries per SIMD group only at 1024px; retain two queries at 256px and 512px."
+    }
+  },
+  "integrated_four_query_1024": {
+    "one_step_repeats": [
+      {
+        "step_1_gpu_ms": 32216.1,
+        "step_1_wall_ms": 32316,
+        "loop_gpu_ms": 32234.6,
+        "loop_wall_ms": 32329
+      },
+      {
+        "step_1_gpu_ms": 32553.4,
+        "step_1_wall_ms": 32653,
+        "loop_gpu_ms": 32570.0,
+        "loop_wall_ms": 32666
+      }
+    ],
+    "gpu_speedup_range_vs_baselines": "9.5% to 18.7%",
+    "accuracy": "The isolated production-shape attention outputs are bit-exact to the scalar reference (nRMSE 0). The unchanged 256px two-step trajectory passes official latent gates at 0.000906469 and 0.00130081 nRMSE.",
+    "unit_tests": "334 passed, 0 failed"
+  },
+  "limitations": [
+    "One-step timings intentionally exclude text encoding, VAE decoding, and image output.",
+    "GPU frequency varies between runs, so acceptance requires both dispatch-order measurements and the integrated repeat rather than a single percentage.",
+    "This optimization improves full transformer steps; Cache-DiT-skipped steps do not execute attention and therefore do not receive the same saving."
+  ]
+}

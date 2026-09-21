@@ -36,6 +36,10 @@ cpc test
 ./target/debug/qwen-image-cplus benchmark-int8-linear
 ./target/debug/qwen-image-cplus test-attention-cache
 ./target/debug/qwen-image-cplus benchmark-attention
+./target/debug/qwen-image-cplus benchmark-production-attention 256
+./target/debug/qwen-image-cplus benchmark-production-attention 1024
+./target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 1
+./target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 2
 ./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
 ./target/debug/qwen-image-cplus quantize-transformer /path/to/model/snapshot transformer.qipack
@@ -740,6 +744,26 @@ Inspect a shard, optionally filtering tensor names:
   finite 1024 smoke in 9,390.94 ms GPU. Full timing, the output checksum,
   prior single-prediction correctness evidence, and limitations are recorded in
   `benchmarks/m1-max-native-prompt-pipeline-1024.json`.
+- Short 1024 transformer runs now make optimization practical without decoding
+  an image: `benchmark-transformer-trajectory-1024 ... 1|2` uses the committed
+  31-row text fixture, seed 1301, and the first one or two steps of the normal
+  40-step schedule. The pre-change one-step measurements were 35.584-39.606 s
+  GPU; the two-step run measured 35.584 s for cache extraction and 37.935 s for
+  the cached-prefix step. Prompt K/V caching therefore does not remove the
+  dominant 4,096-token work.
+- The first 1024-specific attention change is accepted. One SIMD group now owns
+  four queries at 1024, reusing each K/V vector twice as broadly as the existing
+  two-query kernel while retaining separate online-softmax state. It is
+  bit-exact to the scalar attention reference at the measured production shape.
+  Reversing benchmark order still measured 755/748 ms for four-query
+  prefill/cached attention versus 872/885 ms for two-query, a 15-18% speedup.
+  Integrated one-step transformer repeats measured 32.216 and 32.553 s GPU.
+  The policy is resolution-specific: at 256 the same kernel regressed
+  prefill/cached attention from 3.050/3.407 to 3.713/3.769 ms, so 256 and 512
+  retain two-query attention. A separate eight-query shared-threadgroup
+  candidate was also exact but 5% slower at 1024 because its barriers outweighed
+  reduced reads, and was removed. Measurements and caveats are in
+  `benchmarks/m1-max-transformer-trajectory-1024-short.json`.
 
 ## Remaining optimization phases
 
@@ -752,11 +776,11 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    data outside Git. Cache-off remains the reproducible path; independently
    assess Cache-DiT image quality because the existing thresholds were
    calibrated only at 256.
-2. **1024 transformer throughput.** Profile the 4,096-token production path,
-   especially quadratic attention. Revisit query reuse specifically at this
-   shape: four-query attention lost at 256 from register pressure, but the
-   much longer key loop may change that tradeoff. Accept changes only with a
-   full-shape timing and numerical gate.
+2. **1024 transformer throughput.** Continue after the accepted four-query
+   attention crossover. The online attention kernel still accounts for roughly
+   24 seconds across 32 blocks in an isolated full step, so a genuinely tiled
+   QK/PV implementation or FP16 K/V storage remains the highest-leverage work.
+   Accept changes only with full-shape timing and numerical gates.
 3. **1024 working memory.** Right-size and safely alias VAE activation arenas;
    the initial decoder path deliberately favors simple ownership and currently
    reserves several maximum-size buffers. Measure peak footprint after every
@@ -776,8 +800,8 @@ Completed transformer submission batching, fused QKV, and the remaining VAE
 work are no longer remaining phases. Other closed branches are not remaining phases: selective text readahead
 regressed wall time; the calibrated text-Q8 policies failed the downstream latent gate;
 process reuse without simultaneous model residency provided no warm-request
-gain; four-query attention and blanket 256-thread elementwise groups regressed
-throughput.
+gain; four-query attention remains rejected at 256 (but is now selected at
+1024), and blanket 256-thread elementwise groups regressed throughput.
 
 ## Quantization decision log
 

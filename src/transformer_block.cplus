@@ -133,6 +133,7 @@ struct Pipelines {
     qk: metal::ComputePipelineState,
     attention: metal::ComputePipelineState,
     attention_threads: usize,
+    attention_queries_per_group: usize,
     residual: metal::ComputePipelineState,
     swiglu: metal::ComputePipelineState,
 }
@@ -808,6 +809,7 @@ fn dispatch_attention(
     threads_per_group: usize = HEAD_DIMENSION,
     value_stride: usize = WIDTH,
     value_offset: usize = 0 as usize,
+    explicit_queries_per_group: usize = 0 as usize,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
@@ -842,11 +844,9 @@ fn dispatch_attention(
     encoder.set_buffer(key_valid, 0 as u64, 6 as u64);
     encoder.set_buffer(cache_key, cache_offset, 7 as u64);
     encoder.set_buffer(cache_value, cache_offset, 8 as u64);
-    let queries_per_group: usize = if threads_per_group == (32 as usize) {
-        2 as usize
-    } else {
-        1 as usize
-    };
+    let queries_per_group: usize = if explicit_queries_per_group > (0 as usize) {
+        explicit_queries_per_group
+    } else if threads_per_group == (32 as usize) { 2 as usize } else { 1 as usize };
     encoder.dispatch_threadgroups(
         metal::Size {
             width: (round_up(query_rows, queries_per_group) / queries_per_group *% HEADS) as u64,
@@ -1192,6 +1192,7 @@ fn encode_attention(
     threads_per_group: usize = HEAD_DIMENSION,
     value_stride: usize = WIDTH,
     value_offset: usize = 0 as usize,
+    explicit_queries_per_group: usize = 0 as usize,
 ) {
     var params: AttentionParams = AttentionParams {
         query_rows: query_rows as u32,
@@ -1214,11 +1215,9 @@ fn encode_attention(
     encoder.set_buffer(key_valid, 0 as u64, 6 as u64);
     encoder.set_buffer(cache_key, cache_offset, 7 as u64);
     encoder.set_buffer(cache_value, cache_offset, 8 as u64);
-    let queries_per_group: usize = if threads_per_group == (32 as usize) {
-        2 as usize
-    } else {
-        1 as usize
-    };
+    let queries_per_group: usize = if explicit_queries_per_group > (0 as usize) {
+        explicit_queries_per_group
+    } else if threads_per_group == (32 as usize) { 2 as usize } else { 1 as usize };
     encoder.dispatch_threadgroups(
         metal::Size { width: (round_up(query_rows, queries_per_group) / queries_per_group *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: threads_per_group as u64, height: 1 as u64, depth: 1 as u64 },
@@ -1826,6 +1825,9 @@ fn execute_runtime_block(
         true,
         if cached { prefix_rows } else { 0 as usize },
         pipelines.attention_threads,
+        WIDTH,
+        0 as usize,
+        pipelines.attention_queries_per_group,
     ) else { return option::Option[f64]::None; };
     total_ms = total_ms + attention_ms;
     guard let option::Option[f64]::Some(attention_output_ms) = dispatch_weighted_linear(
@@ -2244,6 +2246,7 @@ fn encode_mps_mlp_runtime_block(
         if cached { prefix_rows } else { 0 as usize }, pipelines.attention_threads,
         if mps_qkv { (3 as usize) *% WIDTH } else { WIDTH },
         if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
+        pipelines.attention_queries_per_group,
     );
     encode_buffer_barrier(attention_encoder);
     encode_weighted_linear(
@@ -2638,6 +2641,7 @@ fn run_packed(packed_path: str, fixture_directory: str = "tests/fixtures/block0_
         qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         attention_threads: HEAD_DIMENSION,
+        attention_queries_per_group: 1 as usize,
         residual: metal::ComputePipelineState::from_raw(residual_owner.raw()),
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
@@ -2742,6 +2746,7 @@ fn run_full_packed(
         qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         attention_threads: HEAD_DIMENSION,
+        attention_queries_per_group: 1 as usize,
         residual: metal::ComputePipelineState::from_raw(residual_owner.raw()),
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
@@ -3029,6 +3034,7 @@ fn run_complete_packed(
         qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         attention_threads: HEAD_DIMENSION,
+        attention_queries_per_group: 1 as usize,
         residual: metal::ComputePipelineState::from_raw(residual_owner.raw()),
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
@@ -3376,6 +3382,7 @@ fn run_scale_packed(
         qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         attention_threads: HEAD_DIMENSION,
+        attention_queries_per_group: 1 as usize,
         residual: metal::ComputePipelineState::from_raw(residual_owner.raw()),
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
@@ -3813,6 +3820,47 @@ fn run_trajectory_packed(
     );
 }
 
+// Short 1024px optimization loop using the committed 31-row scale fixture as
+// text conditioning and its pinned seed. Steps 1 and 2 are prefixes of the
+// canonical 40-step schedule: step 1 builds every layer's prefix K/V cache;
+// step 2 exercises the target-only cached-prefix path. No VAE or text encoder
+// is involved, so the reported time isolates transformer startup and compute.
+fn benchmark_trajectory_1024(
+    packed_path: str,
+    requested_steps: str,
+    fixture_root: str = "tests/fixtures/transformer_scale_fp32",
+) -> i32 {
+    if !(requested_steps == "1" || requested_steps == "2") {
+        io::eprintln("1024 trajectory benchmark: steps must be 1 or 2");
+        return 2;
+    }
+    let text_path: text::Text = "${fixture_root}/1024/text_input.f32";
+    guard let mapped::MapResult::Ok(text_mapping) = mapped::map_readonly(text_path.view()) else {
+        io::eprintln("1024 trajectory benchmark: could not map ${text_path}");
+        return 1;
+    };
+    let text_rows: usize = 31 as usize;
+    let expected_bytes: usize = text_rows *% WIDTH *% #size_of::[f32]();
+    if text_mapping.length() != expected_bytes {
+        io::eprintln("1024 trajectory benchmark: text fixture has ${text_mapping.length()} bytes, expected ${expected_bytes}");
+        return 1;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        requested_steps,
+        "",
+        0 as *f32,
+        text_mapping.pointer() as *f32,
+        text_rows,
+        1301 as u64,
+        true,
+        false,
+        false,
+        0.0f64,
+        1024 as usize,
+    );
+}
+
 fn cache_dit_threshold(value: str) -> option::Option[f64] {
     if value == "0.12" { return option::Option[f64]::Some(0.12f64); }
     if value == "0.24" { return option::Option[f64]::Some(0.24f64); }
@@ -4110,7 +4158,13 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(int8_cached_owner) = pipeline(device, library, "qi_block_int8_simdgroup_half_64x64_direct") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
-    guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qi_block_attention_simdgroup") else { return 1; };
+    let attention_kernel_name: str = if pixels == (1024 as usize) {
+        "qi_block_attention_simdgroup4"
+    } else {
+        "qi_block_attention_simdgroup"
+    };
+    guard let option::Option[OwnedObjc]::Some(attention_owner) =
+        pipeline(device, library, attention_kernel_name) else { return 1; };
     guard let option::Option[OwnedObjc]::Some(residual_owner) = pipeline(device, library, "qi_block_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(swiglu_owner) = pipeline(device, library, "qi_block_swiglu") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(time_owner) = pipeline(device, library, "qi_time_projection") else { return 1; };
@@ -4139,6 +4193,11 @@ fn run_trajectory_packed_impl(
         qk: metal::ComputePipelineState::from_raw(qk_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         attention_threads: 32 as usize,
+        attention_queries_per_group: if pixels == (1024 as usize) {
+            4 as usize
+        } else {
+            2 as usize
+        },
         residual: metal::ComputePipelineState::from_raw(residual_owner.raw()),
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
@@ -5730,9 +5789,22 @@ fn benchmark_transformer_small_kernels() -> i32 {
     return if norm_error <= 0.00001f64 && qk_error <= 0.00001f64 { 0 } else { 1 };
 }
 
-fn benchmark_production_attention() -> i32 {
-    let prefix_rows: usize = 22 as usize;
-    let target_rows: usize = 256 as usize;
+fn benchmark_production_attention(pixels: str = "256") -> i32 {
+    var prefix_rows: usize = 0 as usize;
+    var target_rows: usize = 0 as usize;
+    var iterations: usize = 0 as usize;
+    if pixels == "256" {
+        prefix_rows = 22 as usize;
+        target_rows = 256 as usize;
+        iterations = 3 as usize;
+    } else if pixels == "1024" {
+        prefix_rows = 31 as usize;
+        target_rows = 4096 as usize;
+        iterations = 1 as usize;
+    } else {
+        io::eprintln("production attention benchmark: pixels must be 256 or 1024");
+        return 2;
+    }
     let full_rows: usize = prefix_rows +% target_rows;
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return 1; }
@@ -5758,10 +5830,14 @@ fn benchmark_production_attention() -> i32 {
         pipeline(device, library, "qi_block_attention") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(simdgroup_attention_owner) =
         pipeline(device, library, "qi_block_attention_simdgroup") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(four_query_attention_owner) =
+        pipeline(device, library, "qi_block_attention_simdgroup4") else { return 1; };
     let attention_pipeline: metal::ComputePipelineState =
         metal::ComputePipelineState::from_raw(attention_owner.raw());
     let simdgroup_attention_pipeline: metal::ComputePipelineState =
         metal::ComputePipelineState::from_raw(simdgroup_attention_owner.raw());
+    let four_query_attention_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(four_query_attention_owner.raw());
     let full_bytes: u64 = (full_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let target_bytes: u64 = (target_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let prefix_bytes: u64 = (prefix_rows *% WIDTH *% #size_of::[f32]()) as u64;
@@ -5770,11 +5846,13 @@ fn benchmark_production_attention() -> i32 {
     guard let option::Option[metal::Buffer]::Some(full_value) = new_buffer(device, full_bytes) else { return 1; }; let full_value_owner: OwnedObjc = OwnedObjc::new(full_value.raw());
     guard let option::Option[metal::Buffer]::Some(full_output) = new_buffer(device, full_bytes) else { return 1; }; let full_output_owner: OwnedObjc = OwnedObjc::new(full_output.raw());
     guard let option::Option[metal::Buffer]::Some(full_simdgroup_output) = new_buffer(device, full_bytes) else { return 1; }; let full_simdgroup_output_owner: OwnedObjc = OwnedObjc::new(full_simdgroup_output.raw());
+    guard let option::Option[metal::Buffer]::Some(full_four_query_output) = new_buffer(device, full_bytes) else { return 1; }; let full_four_query_output_owner: OwnedObjc = OwnedObjc::new(full_four_query_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_query) = new_buffer(device, target_bytes) else { return 1; }; let target_query_owner: OwnedObjc = OwnedObjc::new(target_query.raw());
     guard let option::Option[metal::Buffer]::Some(target_key) = new_buffer(device, target_bytes) else { return 1; }; let target_key_owner: OwnedObjc = OwnedObjc::new(target_key.raw());
     guard let option::Option[metal::Buffer]::Some(target_value) = new_buffer(device, target_bytes) else { return 1; }; let target_value_owner: OwnedObjc = OwnedObjc::new(target_value.raw());
     guard let option::Option[metal::Buffer]::Some(target_output) = new_buffer(device, target_bytes) else { return 1; }; let target_output_owner: OwnedObjc = OwnedObjc::new(target_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_simdgroup_output) = new_buffer(device, target_bytes) else { return 1; }; let target_simdgroup_output_owner: OwnedObjc = OwnedObjc::new(target_simdgroup_output.raw());
+    guard let option::Option[metal::Buffer]::Some(target_four_query_output) = new_buffer(device, target_bytes) else { return 1; }; let target_four_query_output_owner: OwnedObjc = OwnedObjc::new(target_four_query_output.raw());
     guard let option::Option[metal::Buffer]::Some(cache_key) = new_buffer(device, prefix_bytes) else { return 1; }; let cache_key_owner: OwnedObjc = OwnedObjc::new(cache_key.raw());
     guard let option::Option[metal::Buffer]::Some(cache_value) = new_buffer(device, prefix_bytes) else { return 1; }; let cache_value_owner: OwnedObjc = OwnedObjc::new(cache_value.raw());
     guard let option::Option[metal::Buffer]::Some(image_ids) = new_buffer(device, (full_rows *% #size_of::[i32]()) as u64) else { return 1; }; let image_ids_owner: OwnedObjc = OwnedObjc::new(image_ids.raw());
@@ -5836,11 +5914,22 @@ fn benchmark_production_attention() -> i32 {
         target_value, image_ids, key_valid, target_rows, full_rows, cache_key, cache_value,
         0 as u64, prefix_rows, true, prefix_rows, 32 as usize,
     ) else { return 1; };
-    let iterations: usize = 3 as usize;
+    guard let option::Option[f64]::Some(_prefill_four_query_warmup) = dispatch_attention(
+        queue, four_query_attention_pipeline, full_query, full_key, full_four_query_output,
+        full_value, image_ids, key_valid, full_rows, full_rows, cache_key, cache_value, 0 as u64,
+        0 as usize, true, 0 as usize, 32 as usize, WIDTH, 0 as usize, 4 as usize,
+    ) else { return 1; };
+    guard let option::Option[f64]::Some(_cached_four_query_warmup) = dispatch_attention(
+        queue, four_query_attention_pipeline, target_query, target_key, target_four_query_output,
+        target_value, image_ids, key_valid, target_rows, full_rows, cache_key, cache_value,
+        0 as u64, prefix_rows, true, prefix_rows, 32 as usize, WIDTH, 0 as usize, 4 as usize,
+    ) else { return 1; };
     var prefill_total_ms: f64 = 0.0f64;
     var cached_total_ms: f64 = 0.0f64;
     var prefill_simdgroup_total_ms: f64 = 0.0f64;
     var cached_simdgroup_total_ms: f64 = 0.0f64;
+    var prefill_four_query_total_ms: f64 = 0.0f64;
+    var cached_four_query_total_ms: f64 = 0.0f64;
     index = 0 as usize;
     while index < iterations {
         guard let option::Option[f64]::Some(prefill_ms) = dispatch_attention(
@@ -5851,6 +5940,18 @@ fn benchmark_production_attention() -> i32 {
             queue, attention_pipeline, target_query, target_key, target_output, target_value,
             image_ids, key_valid, target_rows, full_rows, cache_key, cache_value, 0 as u64,
             prefix_rows, true, prefix_rows,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(prefill_four_query_ms) = dispatch_attention(
+            queue, four_query_attention_pipeline, full_query, full_key, full_four_query_output,
+            full_value, image_ids, key_valid, full_rows, full_rows, cache_key, cache_value,
+            0 as u64, 0 as usize, true, 0 as usize, 32 as usize, WIDTH, 0 as usize,
+            4 as usize,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(cached_four_query_ms) = dispatch_attention(
+            queue, four_query_attention_pipeline, target_query, target_key, target_four_query_output,
+            target_value, image_ids, key_valid, target_rows, full_rows, cache_key, cache_value,
+            0 as u64, prefix_rows, true, prefix_rows, 32 as usize, WIDTH, 0 as usize,
+            4 as usize,
         ) else { return 1; };
         guard let option::Option[f64]::Some(prefill_simdgroup_ms) = dispatch_attention(
             queue, simdgroup_attention_pipeline, full_query, full_key, full_simdgroup_output,
@@ -5867,33 +5968,53 @@ fn benchmark_production_attention() -> i32 {
         cached_total_ms = cached_total_ms + cached_ms;
         prefill_simdgroup_total_ms = prefill_simdgroup_total_ms + prefill_simdgroup_ms;
         cached_simdgroup_total_ms = cached_simdgroup_total_ms + cached_simdgroup_ms;
+        prefill_four_query_total_ms = prefill_four_query_total_ms + prefill_four_query_ms;
+        cached_four_query_total_ms = cached_four_query_total_ms + cached_four_query_ms;
         index = index +% (1 as usize);
     }
     if !finite("production attention prefill", full_output, full_rows *% WIDTH)
-        || !finite("production attention cached", target_output, target_rows *% WIDTH) {
+        || !finite("production attention cached", target_output, target_rows *% WIDTH)
+        || !finite("production attention four-query prefill", full_four_query_output, full_rows *% WIDTH)
+        || !finite("production attention four-query cached", target_four_query_output, target_rows *% WIDTH) {
         return 1;
     }
     let prefill_average_ms: f64 = prefill_total_ms / iterations as f64;
     let cached_average_ms: f64 = cached_total_ms / iterations as f64;
     let prefill_simdgroup_average_ms: f64 = prefill_simdgroup_total_ms / iterations as f64;
     let cached_simdgroup_average_ms: f64 = cached_simdgroup_total_ms / iterations as f64;
+    let prefill_four_query_average_ms: f64 = prefill_four_query_total_ms / iterations as f64;
+    let cached_four_query_average_ms: f64 = cached_four_query_total_ms / iterations as f64;
     let projected_trajectory_ms: f64 = (prefill_average_ms
         + (39 as f64) * cached_average_ms) * (32 as f64);
     let simdgroup_projected_trajectory_ms: f64 = (prefill_simdgroup_average_ms
         + (39 as f64) * cached_simdgroup_average_ms) * (32 as f64);
+    let four_query_projected_trajectory_ms: f64 = (prefill_four_query_average_ms
+        + (39 as f64) * cached_four_query_average_ms) * (32 as f64);
     let prefill_error: f64 = normalized_rms_buffers(
         full_simdgroup_output, 0 as usize, full_output, 0 as usize, full_rows *% WIDTH,
     );
     let cached_error: f64 = normalized_rms_buffers(
         target_simdgroup_output, 0 as usize, target_output, 0 as usize, target_rows *% WIDTH,
     );
+    let four_query_prefill_error: f64 = normalized_rms_buffers(
+        full_four_query_output, 0 as usize, full_output, 0 as usize, full_rows *% WIDTH,
+    );
+    let four_query_cached_error: f64 = normalized_rms_buffers(
+        target_four_query_output, 0 as usize, target_output, 0 as usize, target_rows *% WIDTH,
+    );
     io::println(
-        "production attention benchmark: prefill_rows=${full_rows} prefill_gpu_ms=${prefill_average_ms} cached_query_rows=${target_rows} cached_key_rows=${full_rows} cached_gpu_ms=${cached_average_ms} projected_40_step_32_block_gpu_ms=${projected_trajectory_ms} iterations=${iterations}",
+        "production attention benchmark: pixels=${pixels} prefill_rows=${full_rows} prefill_gpu_ms=${prefill_average_ms} cached_query_rows=${target_rows} cached_key_rows=${full_rows} cached_gpu_ms=${cached_average_ms} projected_40_step_32_block_gpu_ms=${projected_trajectory_ms} iterations=${iterations}",
     );
     io::println(
         "production attention benchmark: kernel=simdgroup prefill_gpu_ms=${prefill_simdgroup_average_ms} prefill_speedup=${prefill_average_ms / prefill_simdgroup_average_ms} prefill_nRMSE=${prefill_error} cached_gpu_ms=${cached_simdgroup_average_ms} cached_speedup=${cached_average_ms / cached_simdgroup_average_ms} cached_nRMSE=${cached_error} projected_40_step_32_block_gpu_ms=${simdgroup_projected_trajectory_ms}",
     );
-    return if prefill_error <= 0.00001f64 && cached_error <= 0.00001f64 { 0 } else { 1 };
+    io::println(
+        "production attention benchmark: kernel=simdgroup4 prefill_gpu_ms=${prefill_four_query_average_ms} speedup_vs_simdgroup=${prefill_simdgroup_average_ms / prefill_four_query_average_ms} prefill_nRMSE=${four_query_prefill_error} cached_gpu_ms=${cached_four_query_average_ms} cached_speedup_vs_simdgroup=${cached_simdgroup_average_ms / cached_four_query_average_ms} cached_nRMSE=${four_query_cached_error} projected_40_step_32_block_gpu_ms=${four_query_projected_trajectory_ms}",
+    );
+    return if prefill_error <= 0.00001f64 && cached_error <= 0.00001f64
+        && four_query_prefill_error <= 0.00001f64 && four_query_cached_error <= 0.00001f64 {
+        0
+    } else { 1 };
 }
 
 fn benchmark_attention(rows: usize = 4096 as usize) -> i32 {

@@ -1599,6 +1599,112 @@ kernel void qi_block_attention_simdgroup(
     }
 }
 
+// One SIMD group owns four queries of one head. This doubles K/V reuse over
+// the production two-query kernel without threadgroup staging or barriers.
+// The long 4096-key path is benchmarked separately because its bandwidth
+// savings may outweigh the additional register pressure that loses at 256px.
+kernel void qi_block_attention_simdgroup4(
+    device const float *query [[buffer(0)]],
+    device const float *key [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const float *value [[buffer(3)]],
+    device const int *image_ids [[buffer(5)]],
+    device const uchar *key_valid [[buffer(6)]],
+    device const float *cache_key [[buffer(7)]],
+    device const float *cache_value [[buffer(8)]],
+    constant AttentionParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+    const uint query_group_base = (group / params.heads) * 4;
+    const uint head = group % params.heads;
+    if (query_group_base >= params.query_rows) {
+        return;
+    }
+    const uint channel_0 = lane;
+    const uint channel_1 = lane + 32;
+    const uint channel_2 = lane + 64;
+    const uint channel_3 = lane + 96;
+    float4 query_channels[4];
+    float4 accumulators[4];
+    float maximums[4];
+    float denominators[4];
+    for (uint query_slot = 0; query_slot < 4; ++query_slot) {
+        const uint query_row = query_group_base + query_slot;
+        if (query_row < params.query_rows) {
+            const uint query_start =
+                (query_row * params.heads + head) * params.head_dimension;
+            query_channels[query_slot] = float4(
+                query[query_start + channel_0],
+                query[query_start + channel_1],
+                query[query_start + channel_2],
+                query[query_start + channel_3]);
+        } else {
+            query_channels[query_slot] = float4(0.0f);
+        }
+        accumulators[query_slot] = float4(0.0f);
+        maximums[query_slot] = -INFINITY;
+        denominators[query_slot] = 0.0f;
+    }
+    const float scale = rsqrt(float(params.head_dimension));
+
+    for (uint key_row = 0; key_row < params.key_rows; ++key_row) {
+        const bool from_cache = key_row < params.cached_prefix_rows;
+        const uint local_key_row = from_cache ? key_row : key_row - params.cached_prefix_rows;
+        const uint key_start = (local_key_row * params.heads + head) * params.head_dimension;
+        const uint value_start = from_cache ? key_start
+            : local_key_row * params.value_stride + params.value_offset
+                + head * params.head_dimension;
+        device const float *key_source = from_cache ? cache_key : key;
+        device const float *value_source = from_cache ? cache_value : value;
+        const float4 key_channels = float4(
+            key_source[key_start + channel_0],
+            key_source[key_start + channel_1],
+            key_source[key_start + channel_2],
+            key_source[key_start + channel_3]);
+        const float4 value_channels = float4(
+            value_source[value_start + channel_0],
+            value_source[value_start + channel_1],
+            value_source[value_start + channel_2],
+            value_source[value_start + channel_3]);
+        for (uint query_slot = 0; query_slot < 4; ++query_slot) {
+            const uint query_row = query_group_base + query_slot;
+            if (query_row >= params.query_rows) {
+                continue;
+            }
+            const uint global_query_row = query_row + params.query_position_offset;
+            const bool same_image = image_ids[global_query_row] >= 0 &&
+                image_ids[global_query_row] == image_ids[key_row];
+            const bool allowed = key_valid[key_row] != 0 &&
+                (params.block_causal == 0 || global_query_row >= key_row || same_image);
+            if (!allowed) {
+                continue;
+            }
+            const float score = simd_sum(dot(query_channels[query_slot], key_channels)) * scale;
+            const float next_maximum = max(maximums[query_slot], score);
+            const float old_scale = isinf(maximums[query_slot])
+                ? 0.0f : exp(maximums[query_slot] - next_maximum);
+            const float new_weight = exp(score - next_maximum);
+            maximums[query_slot] = next_maximum;
+            denominators[query_slot] = denominators[query_slot] * old_scale + new_weight;
+            accumulators[query_slot] = fma(
+                accumulators[query_slot], old_scale, new_weight * value_channels);
+        }
+    }
+    for (uint query_slot = 0; query_slot < 4; ++query_slot) {
+        const uint query_row = query_group_base + query_slot;
+        if (query_row < params.query_rows) {
+            const uint query_start =
+                (query_row * params.heads + head) * params.head_dimension;
+            const float4 result =
+                accumulators[query_slot] / denominators[query_slot];
+            output[query_start + channel_0] = result.x;
+            output[query_start + channel_1] = result.y;
+            output[query_start + channel_2] = result.z;
+            output[query_start + channel_3] = result.w;
+        }
+    }
+}
+
 kernel void qi_block_residual(
     device const float *input [[buffer(0)]],
     device const float *modulation [[buffer(1)]],
