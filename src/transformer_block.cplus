@@ -758,8 +758,17 @@ fn dispatch_attention(
     encoder.set_buffer(key_valid, 0 as u64, 6 as u64);
     encoder.set_buffer(cache_key, cache_offset, 7 as u64);
     encoder.set_buffer(cache_value, cache_offset, 8 as u64);
+    let queries_per_group: usize = if threads_per_group == (32 as usize) {
+        2 as usize
+    } else {
+        1 as usize
+    };
     encoder.dispatch_threadgroups(
-        metal::Size { width: (query_rows *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size {
+            width: (round_up(query_rows, queries_per_group) / queries_per_group *% HEADS) as u64,
+            height: 1 as u64,
+            depth: 1 as u64,
+        },
         metal::Size { width: threads_per_group as u64, height: 1 as u64, depth: 1 as u64 },
     );
     let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());

@@ -136,6 +136,22 @@
     "checksum_policy": "Structure, identity, inventory, layout, and ranges are always checked. QI_VERIFY_PACKED_CHECKSUMS=1 checks all tensor hashes during load; verify-packed checks tensor and whole-payload hashes.",
     "memory_tradeoff": "Text-shard readahead increased maximum RSS by about 4.24 GB in the controlled A/B; madvise is advisory and does not affect correctness."
   },
+  "two_query_attention_optimization": {
+    "date": "2026-09-21",
+    "threshold": 0.24,
+    "cached_steps": 27,
+    "full_steps": 13,
+    "baseline_summed_gpu_kernel_ms": 12162.2,
+    "optimized_summed_gpu_kernel_ms": 11942.0,
+    "gpu_ms_saved": 220.2,
+    "baseline_loop_wall_ms": 12737,
+    "optimized_loop_wall_ms": 12530,
+    "wall_ms_saved": 207,
+    "step_40_latent_nrmse_vs_official": 0.100713,
+    "prior_step_40_latent_nrmse_vs_official": 0.100793,
+    "cached_step_count_unchanged": true,
+    "interpretation": "The isolated 9.3% attention gain translates to 0.207 s wall in Cache-DiT because only 13 steps execute all 32 blocks and cached steps execute block 0 only."
+  },
   "validation": {
     "cache_off_two_step_oracle_unchanged": true,
     "cache_off_step_1_nrmse": 0.000903863,

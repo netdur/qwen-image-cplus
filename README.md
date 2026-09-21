@@ -443,14 +443,20 @@ Inspect a shard, optionally filtering tensor names:
   4.0-4.3 TFLOP/s on the three dominant matrix shapes. A 128x32 experiment
   was rejected because register and threadgroup pressure reduced throughput to
   2.0-2.9 TFLOP/s despite greater weight reuse.
-- Attention uses one 32-lane SIMD group per query/head. Each lane owns four of
-  the 128 head channels, `simd_sum` replaces the shared-memory dot-product
-  tree, and online-softmax state remains in registers. It is bit-identical to
-  the prior kernel on the production benchmark and reduces the projected
-  40-step, 32-block attention total from 14,986 ms to 4,233 ms (3.54-3.69x).
-  The corrected 32-thread launch is material: launching the same kernel with
-  the old 128-thread geometry duplicated the work across four SIMD groups and
-  hid almost all of the gain.
+- Attention uses one 32-lane SIMD group per two queries of one head. Each lane
+  owns four of the 128 head channels for both queries, `simd_sum` replaces the
+  shared-memory dot-product tree, and a K/V load feeds both independent online
+  softmax states. The two-query path is bit-identical to the prior one-query
+  kernel in the production benchmark and reduces cached attention from 3.312
+  to 3.003 ms (9.3%); projected cache-off attention falls from 4,233 to 3,846
+  ms. A four-query version was rejected at 3.687 ms because register pressure
+  and lower occupancy outweighed reuse. The full cache-off trajectory fell
+  from 33,092.1 to 32,712.5 ms GPU and from 34,239 to 33,733 ms wall; step-40
+  nRMSE is 1.01756% under the unchanged 1.1% gate. On Cache-DiT 0.24 the same
+  change saves 220.2 ms GPU / 207 ms wall because only 13 steps run all 32
+  blocks; its 27 cached decisions are unchanged. Measurements are in
+  `benchmarks/m1-max-production-kernel-profile.json` and
+  `benchmarks/m1-max-cache-dit-native.json`.
 - Exact production-shape MPS probes established a hybrid rather than a blanket
   replacement. MPS on this M1 Max rejects BF16 matrix inputs, but accepts FP16
   inputs with FP32 outputs. Including the required on-GPU conversion, MPS

@@ -1353,10 +1353,10 @@ kernel void qi_block_attention(
     output[query_start + lane] = accumulator / state[1];
 }
 
-// One 32-lane SIMD group owns one [query, head]. Each lane holds four head
-// channels, so the Q.K reduction uses a hardware SIMD reduction and the
-// online-softmax state stays in registers. This removes all threadgroup
-// barriers and shared memory from the production 128-channel attention path.
+// One 32-lane SIMD group owns two queries of one head. Each lane holds four
+// head channels for every query. The K/V vector is loaded once per key and
+// reused across both online softmaxes, reducing the dominant cache traffic
+// without allocating a score tensor or changing the per-query reduction order.
 kernel void qi_block_attention_simdgroup(
     device const float *query [[buffer(0)]],
     device const float *key [[buffer(1)]],
@@ -1369,66 +1369,91 @@ kernel void qi_block_attention_simdgroup(
     constant AttentionParams &params [[buffer(4)]],
     uint lane [[thread_index_in_simdgroup]],
     uint group [[threadgroup_position_in_grid]]) {
-    const uint query_row = group / params.heads;
+    const uint query_base = (group / params.heads) * 2;
     const uint head = group % params.heads;
-    if (query_row >= params.query_rows) {
+    if (query_base >= params.query_rows) {
         return;
     }
-    const uint global_query_row = query_row + params.query_position_offset;
-    const uint query_start = (query_row * params.heads + head) * params.head_dimension;
     const uint channel_0 = lane;
     const uint channel_1 = lane + 32;
     const uint channel_2 = lane + 64;
     const uint channel_3 = lane + 96;
-    const float query_0 = query[query_start + channel_0];
-    const float query_1 = query[query_start + channel_1];
-    const float query_2 = query[query_start + channel_2];
-    const float query_3 = query[query_start + channel_3];
+    float4 query_channels[2];
+    float4 accumulators[2];
+    float maximums[2];
+    float denominators[2];
+    for (uint query_slot = 0; query_slot < 2; ++query_slot) {
+        const uint query_row = query_base + query_slot;
+        if (query_row < params.query_rows) {
+            const uint query_start =
+                (query_row * params.heads + head) * params.head_dimension;
+            query_channels[query_slot] = float4(
+                query[query_start + channel_0],
+                query[query_start + channel_1],
+                query[query_start + channel_2],
+                query[query_start + channel_3]);
+        } else {
+            query_channels[query_slot] = float4(0.0f);
+        }
+        accumulators[query_slot] = float4(0.0f);
+        maximums[query_slot] = -INFINITY;
+        denominators[query_slot] = 0.0f;
+    }
     const float scale = rsqrt(float(params.head_dimension));
-    float maximum = -INFINITY;
-    float denominator = 0.0f;
-    float accumulator_0 = 0.0f;
-    float accumulator_1 = 0.0f;
-    float accumulator_2 = 0.0f;
-    float accumulator_3 = 0.0f;
 
     for (uint key_row = 0; key_row < params.key_rows; ++key_row) {
-        const bool same_image = image_ids[global_query_row] >= 0 &&
-            image_ids[global_query_row] == image_ids[key_row];
-        const bool allowed = key_valid[key_row] != 0 &&
-            (params.block_causal == 0 || global_query_row >= key_row || same_image);
-        if (!allowed) {
-            continue;
-        }
         const bool from_cache = key_row < params.cached_prefix_rows;
         const uint local_key_row = from_cache ? key_row : key_row - params.cached_prefix_rows;
         const uint key_start = (local_key_row * params.heads + head) * params.head_dimension;
         device const float *key_source = from_cache ? cache_key : key;
-        const float partial =
-            query_0 * key_source[key_start + channel_0] +
-            query_1 * key_source[key_start + channel_1] +
-            query_2 * key_source[key_start + channel_2] +
-            query_3 * key_source[key_start + channel_3];
-        const float score = simd_sum(partial) * scale;
-        const float next_maximum = max(maximum, score);
-        const float old_scale = isinf(maximum) ? 0.0f : exp(maximum - next_maximum);
-        const float new_weight = exp(score - next_maximum);
-        maximum = next_maximum;
-        denominator = denominator * old_scale + new_weight;
         device const float *value_source = from_cache ? cache_value : value;
-        accumulator_0 = fma(accumulator_0, old_scale,
-            new_weight * value_source[key_start + channel_0]);
-        accumulator_1 = fma(accumulator_1, old_scale,
-            new_weight * value_source[key_start + channel_1]);
-        accumulator_2 = fma(accumulator_2, old_scale,
-            new_weight * value_source[key_start + channel_2]);
-        accumulator_3 = fma(accumulator_3, old_scale,
-            new_weight * value_source[key_start + channel_3]);
+        const float4 key_channels = float4(
+            key_source[key_start + channel_0],
+            key_source[key_start + channel_1],
+            key_source[key_start + channel_2],
+            key_source[key_start + channel_3]);
+        const float4 value_channels = float4(
+            value_source[key_start + channel_0],
+            value_source[key_start + channel_1],
+            value_source[key_start + channel_2],
+            value_source[key_start + channel_3]);
+        for (uint query_slot = 0; query_slot < 2; ++query_slot) {
+            const uint query_row = query_base + query_slot;
+            if (query_row >= params.query_rows) {
+                continue;
+            }
+            const uint global_query_row = query_row + params.query_position_offset;
+            const bool same_image = image_ids[global_query_row] >= 0 &&
+                image_ids[global_query_row] == image_ids[key_row];
+            const bool allowed = key_valid[key_row] != 0 &&
+                (params.block_causal == 0 || global_query_row >= key_row || same_image);
+            if (!allowed) {
+                continue;
+            }
+            const float score = simd_sum(dot(query_channels[query_slot], key_channels)) * scale;
+            const float next_maximum = max(maximums[query_slot], score);
+            const float old_scale = isinf(maximums[query_slot])
+                ? 0.0f : exp(maximums[query_slot] - next_maximum);
+            const float new_weight = exp(score - next_maximum);
+            maximums[query_slot] = next_maximum;
+            denominators[query_slot] =
+                denominators[query_slot] * old_scale + new_weight;
+            accumulators[query_slot] = fma(
+                accumulators[query_slot], old_scale, new_weight * value_channels);
+        }
     }
-    output[query_start + channel_0] = accumulator_0 / denominator;
-    output[query_start + channel_1] = accumulator_1 / denominator;
-    output[query_start + channel_2] = accumulator_2 / denominator;
-    output[query_start + channel_3] = accumulator_3 / denominator;
+    for (uint query_slot = 0; query_slot < 2; ++query_slot) {
+        const uint query_row = query_base + query_slot;
+        if (query_row < params.query_rows) {
+            const uint query_start =
+                (query_row * params.heads + head) * params.head_dimension;
+            const float4 result = accumulators[query_slot] / denominators[query_slot];
+            output[query_start + channel_0] = result.x;
+            output[query_start + channel_1] = result.y;
+            output[query_start + channel_2] = result.z;
+            output[query_start + channel_3] = result.w;
+        }
+    }
 }
 
 kernel void qi_block_residual(

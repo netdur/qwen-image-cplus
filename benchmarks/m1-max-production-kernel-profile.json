@@ -44,7 +44,16 @@
     "cached_speedup": 3.53695,
     "nrmse": 0.0,
     "previous_projected_40_step_32_block_gpu_ms": 14986.4,
-    "simdgroup_projected_40_step_32_block_gpu_ms": 4232.71
+    "simdgroup_projected_40_step_32_block_gpu_ms": 4232.71,
+    "two_query_shared_kv": {
+      "prefill_gpu_ms": 3.07346,
+      "cached_gpu_ms": 3.00308,
+      "prefill_speedup_vs_one_query": 1.009,
+      "cached_speedup_vs_one_query": 1.103,
+      "nrmse_vs_one_query": 0.0,
+      "projected_40_step_32_block_gpu_ms": 3846.2,
+      "algorithm": "One 32-lane SIMD group owns two queries of one head and reuses each four-float-per-lane K/V load across both online softmax states."
+    }
   },
   "trajectory": {
     "summed_gpu_ms": 46282.6,
@@ -57,12 +66,34 @@
       "2": 0.00130082,
       "40": 0.0100775
     },
-    "passed": true
+    "passed": true,
+    "two_query_shared_kv": {
+      "summed_gpu_ms": 32712.5,
+      "loop_wall_ms": 33733,
+      "baseline_summed_gpu_ms": 33092.1,
+      "baseline_loop_wall_ms": 34239,
+      "gpu_ms_saved": 379.6,
+      "wall_ms_saved": 506,
+      "checkpoint_nrmse": {
+        "1": 0.000904154,
+        "2": 0.0012994,
+        "40": 0.0101756
+      },
+      "limits": {
+        "1": 0.001,
+        "2": 0.0015,
+        "40": 0.011
+      },
+      "native_pipeline_rgba_nrmse": 0.0101604,
+      "native_pipeline_rgba_limit": 0.013,
+      "passed": true
+    }
   },
   "rejected": [
     "A 128x32 SIMD-group tile reduced occupancy and measured only 2.0-2.9 TFLOP/s.",
     "A direct BF16 SIMD-matrix path was bit-identical but slower than FP16 operands.",
-    "Launching the 32-lane attention kernel with 128 threads duplicated work across four SIMD groups."
+    "Launching the 32-lane attention kernel with 128 threads duplicated work across four SIMD groups.",
+    "Sharing K/V across four queries was numerically exact but increased cached attention from 3.31207 ms to 3.68737 ms because register pressure and lower occupancy outweighed reuse."
   ],
   "next_probe": {
     "backend": "MPSMatrixMultiplication",
