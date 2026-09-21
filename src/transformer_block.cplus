@@ -98,6 +98,8 @@ struct AttentionParams {
     query_position_offset: u32,
     block_causal: u32,
     cached_prefix_rows: u32,
+    value_stride: u32,
+    value_offset: u32,
 }
 
 struct LinearWeight {
@@ -175,6 +177,8 @@ struct BlockParams {
     head_dimension: u32,
     epsilon: f32,
     slot: u32,
+    input_stride: u32,
+    input_offset: u32,
 }
 
 fn round_up(value: usize, multiple: usize) -> usize {
@@ -797,6 +801,8 @@ fn dispatch_attention(
     block_causal: bool = true,
     cached_prefix_rows: usize = 0 as usize,
     threads_per_group: usize = HEAD_DIMENSION,
+    value_stride: usize = WIDTH,
+    value_offset: usize = 0 as usize,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
@@ -818,6 +824,8 @@ fn dispatch_attention(
         query_position_offset: query_position_offset as u32,
         block_causal: if block_causal { 1 as u32 } else { 0 as u32 },
         cached_prefix_rows: cached_prefix_rows as u32,
+        value_stride: value_stride as u32,
+        value_offset: value_offset as u32,
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(query, 0 as u64, 0 as u64);
@@ -873,7 +881,7 @@ fn dispatch_copy_prefix(
         return option::Option[f64]::None;
     };
     let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
-    var params: BlockParams = BlockParams { rows: rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
+    var params: BlockParams = BlockParams { rows: rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32, input_stride: WIDTH as u32, input_offset: 0 as u32 };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(key, 0 as u64, 0 as u64);
     encoder.set_buffer(value, 0 as u64, 1 as u64);
@@ -1177,6 +1185,8 @@ fn encode_attention(
     block_causal: bool = true,
     cached_prefix_rows: usize = 0 as usize,
     threads_per_group: usize = HEAD_DIMENSION,
+    value_stride: usize = WIDTH,
+    value_offset: usize = 0 as usize,
 ) {
     var params: AttentionParams = AttentionParams {
         query_rows: query_rows as u32,
@@ -1186,6 +1196,8 @@ fn encode_attention(
         query_position_offset: query_position_offset as u32,
         block_causal: if block_causal { 1 as u32 } else { 0 as u32 },
         cached_prefix_rows: cached_prefix_rows as u32,
+        value_stride: value_stride as u32,
+        value_offset: value_offset as u32,
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(query, 0 as u64, 0 as u64);
@@ -1213,8 +1225,10 @@ fn encode_copy_prefix(
     cache_offset: u64,
     rows: usize,
     dummy: metal::Buffer,
+    value_stride: usize = WIDTH,
+    value_offset: usize = 0 as usize,
 ) {
-    var params: BlockParams = BlockParams { rows: rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
+    var params: BlockParams = BlockParams { rows: rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32, input_stride: value_stride as u32, input_offset: value_offset as u32 };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(key, 0 as u64, 0 as u64);
     encoder.set_buffer(value, 0 as u64, 1 as u64);
@@ -1629,7 +1643,7 @@ fn execute_block(
     guard let option::Option[metal::Buffer]::Some(mlp_projected) = new_buffer(device, activation_bytes) else { return 1; }; let mlp_projected_owner: OwnedObjc = OwnedObjc::new(mlp_projected.raw());
     guard let option::Option[metal::Buffer]::Some(output) = new_buffer(device, activation_bytes) else { return 1; }; let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
 
-    var params: BlockParams = BlockParams { rows: ROWS as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
+    var params: BlockParams = BlockParams { rows: ROWS as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32, input_stride: WIDTH as u32, input_offset: 0 as u32 };
     var all_ok: bool = true;
     var total_ms: f64 = 0.0f64;
     guard let option::Option[f64]::Some(elapsed) = dispatch_simdgroup_1d(queue, pipelines.norm, hidden, modulation, norm1, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; };
@@ -1717,6 +1731,8 @@ fn execute_runtime_block(
         head_dimension: HEAD_DIMENSION as u32,
         epsilon: 0.000001f32,
         slot: 0 as u32,
+        input_stride: WIDTH as u32,
+        input_offset: 0 as u32,
     };
     var total_ms: f64 = 0.0f64;
     guard let option::Option[f64]::Some(norm1_ms) = dispatch_simdgroup_1d(
@@ -1933,6 +1949,8 @@ fn execute_batched_runtime_block(
         head_dimension: HEAD_DIMENSION as u32,
         epsilon: 0.000001f32,
         slot: 0 as u32,
+        input_stride: WIDTH as u32,
+        input_offset: 0 as u32,
     };
 
     encode_simdgroup_1d(
@@ -2106,9 +2124,6 @@ fn encode_mps_mlp_runtime_block(
         rows, WIDTH, MLP_WIDTH,
     ) else { return false; };
 
-    guard let option::Option[metal::ComputeCommandEncoder]::Some(attention_encoder) =
-        command_buffer.compute_command_encoder() else { return false; };
-    let attention_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(attention_encoder.raw()));
     var params: BlockParams = BlockParams {
         rows: rows as u32,
         width: WIDTH as u32,
@@ -2116,49 +2131,109 @@ fn encode_mps_mlp_runtime_block(
         head_dimension: HEAD_DIMENSION as u32,
         epsilon: 0.000001f32,
         slot: 0 as u32,
+        input_stride: WIDTH as u32,
+        input_offset: 0 as u32,
     };
+    let matrix_bytes: u64 = (WIDTH *% WIDTH *% (2 as usize)) as u64;
+    let mps_qkv: bool = weights.q.scheme == PACKED_SCHEME_FP16
+        && weights.k.scheme == PACKED_SCHEME_FP16
+        && weights.v.scheme == PACKED_SCHEME_FP16
+        && weights.k.weights_offset == weights.q.weights_offset + matrix_bytes
+        && weights.v.weights_offset == weights.k.weights_offset + matrix_bytes;
+    if mps_qkv {
+        guard let option::Option[mps::Multiplication]::Some(qkv_operation) = mps::create(
+            mps_workspace.device, mps_workspace.half_input, 0 as u64,
+            weights.q.storage, weights.q.weights_offset, workspace.gate, 0 as u64,
+            rows, MLP_WIDTH, WIDTH,
+        ) else { return false; };
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(norm_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let norm_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(norm_encoder.raw()));
+        encode_simdgroup_1d(
+            norm_encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
+            workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
+        );
+        let norm_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(norm_encoder.raw());
+        norm_command_encoder.end_encoding();
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(conversion_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let conversion_encoder_owner: OwnedObjc =
+            OwnedObjc::new(rt::retain(conversion_encoder.raw()));
+        encode_mps_input_conversion(
+            conversion_encoder, mps_workspace.input_pipeline, workspace.norm1,
+            mps_workspace.half_input, rows, WIDTH,
+        );
+        let conversion_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(conversion_encoder.raw());
+        conversion_command_encoder.end_encoding();
+        qkv_operation.encode(command_buffer);
+    }
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(attention_encoder) =
+        command_buffer.compute_command_encoder() else { return false; };
+    let attention_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(attention_encoder.raw()));
+    if !mps_qkv {
+        encode_simdgroup_1d(
+            attention_encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
+            workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
+        );
+        encode_buffer_barrier(attention_encoder);
+        encode_weighted_linear(
+            attention_encoder, pipelines, workspace.norm1, weights.q, workspace.query,
+            WIDTH, WIDTH, rows,
+        );
+        encode_weighted_linear(
+            attention_encoder, pipelines, workspace.norm1, weights.k, workspace.key,
+            WIDTH, WIDTH, rows,
+        );
+        encode_weighted_linear(
+            attention_encoder, pipelines, workspace.norm1, weights.v, workspace.value,
+            WIDTH, WIDTH, rows,
+        );
+        encode_buffer_barrier(attention_encoder);
+    }
+    params.input_stride = if mps_qkv {
+        ((3 as usize) *% WIDTH) as u32
+    } else {
+        WIDTH as u32
+    };
+    params.input_offset = 0 as u32;
     encode_simdgroup_1d(
-        attention_encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
-        workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
-    );
-    encode_buffer_barrier(attention_encoder);
-    encode_weighted_linear(
-        attention_encoder, pipelines, workspace.norm1, weights.q, workspace.query,
-        WIDTH, WIDTH, rows,
-    );
-    encode_weighted_linear(
-        attention_encoder, pipelines, workspace.norm1, weights.k, workspace.key,
-        WIDTH, WIDTH, rows,
-    );
-    encode_weighted_linear(
-        attention_encoder, pipelines, workspace.norm1, weights.v, workspace.value,
-        WIDTH, WIDTH, rows,
-    );
-    encode_buffer_barrier(attention_encoder);
-    encode_simdgroup_1d(
-        attention_encoder, pipelines.qk, workspace.query, weights.norm_q, workspace.query_rope,
+        attention_encoder, pipelines.qk,
+        if mps_qkv { workspace.gate } else { workspace.query },
+        weights.norm_q, workspace.query_rope,
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
+    params.input_offset = if mps_qkv { WIDTH as u32 } else { 0 as u32 };
     encode_simdgroup_1d(
-        attention_encoder, pipelines.qk, workspace.key, weights.norm_k, workspace.key_rope,
+        attention_encoder, pipelines.qk,
+        if mps_qkv { workspace.gate } else { workspace.key },
+        weights.norm_k, workspace.key_rope,
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
     encode_buffer_barrier(attention_encoder);
     if cache_mode == (1 as u32) {
         encode_copy_prefix(
-            attention_encoder, cache_copy_pipeline, workspace.key_rope, workspace.value,
+            attention_encoder, cache_copy_pipeline, workspace.key_rope,
+            if mps_qkv { workspace.gate } else { workspace.value },
             cache_key, cache_value, cache_offset, prefix_rows, workspace.dummy,
+            if mps_qkv { (3 as usize) *% WIDTH } else { WIDTH },
+            if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
         );
         encode_buffer_barrier(attention_encoder);
     }
     let cached: bool = cache_mode == (2 as u32);
     encode_attention(
         attention_encoder, pipelines.attention, workspace.query_rope, workspace.key_rope,
-        workspace.attended, workspace.value, workspace.image_ids, workspace.key_valid,
+        workspace.attended, if mps_qkv { workspace.gate } else { workspace.value },
+        workspace.image_ids, workspace.key_valid,
         rows, if cached { prefix_rows +% rows } else { rows },
         cache_key, cache_value, cache_offset,
         if cached { prefix_rows } else { 0 as usize }, true,
         if cached { prefix_rows } else { 0 as usize }, pipelines.attention_threads,
+        if mps_qkv { (3 as usize) *% WIDTH } else { WIDTH },
+        if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
     );
     encode_buffer_barrier(attention_encoder);
     encode_weighted_linear(
@@ -2438,6 +2513,8 @@ fn run(model_directory: str, fixture_directory: str = "tests/fixtures/block0_fp3
         head_dimension: HEAD_DIMENSION as u32,
         epsilon: 0.000001f32,
         slot: 0 as u32,
+        input_stride: WIDTH as u32,
+        input_offset: 0 as u32,
     };
     var all_ok: bool = true;
     var total_ms: f64 = 0.0f64;
@@ -3009,7 +3086,7 @@ fn run_complete_packed(
     guard let option::Option[metal::Buffer]::Some(second_hidden) = new_buffer(device, activation_bytes) else { return 1; };
     let second_hidden_owner: OwnedObjc = OwnedObjc::new(second_hidden.raw());
 
-    var params: BlockParams = BlockParams { rows: COMPLETE_IMAGE_ROWS as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
+    var params: BlockParams = BlockParams { rows: COMPLETE_IMAGE_ROWS as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32, input_stride: WIDTH as u32, input_offset: 0 as u32 };
     var total_ms: f64 = 0.0f64;
     guard let option::Option[f64]::Some(img_ms) = dispatch_weighted_linear(queue, pipelines, image_input, img_in_weight, image_projected, WIDTH, IMAGE_CHANNELS, COMPLETE_IMAGE_ROWS) else { return 1; };
     total_ms = total_ms + img_ms;
@@ -3351,7 +3428,7 @@ fn run_scale_packed(
     guard let option::Option[metal::Buffer]::Some(first_hidden) = new_buffer(device, activation_bytes) else { return 1; }; let first_hidden_owner: OwnedObjc = OwnedObjc::new(first_hidden.raw());
     guard let option::Option[metal::Buffer]::Some(second_hidden) = new_buffer(device, activation_bytes) else { return 1; }; let second_hidden_owner: OwnedObjc = OwnedObjc::new(second_hidden.raw());
 
-    var params: BlockParams = BlockParams { rows: target_rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
+    var params: BlockParams = BlockParams { rows: target_rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32, input_stride: WIDTH as u32, input_offset: 0 as u32 };
     var total_ms: f64 = 0.0f64;
     guard let option::Option[f64]::Some(img_ms) = dispatch_weighted_linear(queue, pipelines, image_input, img_in_weight, image_projected, WIDTH, IMAGE_CHANNELS, target_rows) else { return 1; }; total_ms = total_ms + img_ms;
     params.rows = text_rows as u32;
@@ -4030,7 +4107,7 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(first_hidden) = new_buffer(device, activation_bytes) else { return 1; }; let first_hidden_owner: OwnedObjc = OwnedObjc::new(first_hidden.raw());
     guard let option::Option[metal::Buffer]::Some(second_hidden) = new_buffer(device, activation_bytes) else { return 1; }; let second_hidden_owner: OwnedObjc = OwnedObjc::new(second_hidden.raw());
 
-    var params: BlockParams = BlockParams { rows: text_rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
+    var params: BlockParams = BlockParams { rows: text_rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32, input_stride: WIDTH as u32, input_offset: 0 as u32 };
     var total_ms: f64 = 0.0f64;
     guard let option::Option[f64]::Some(text_norm_ms) = dispatch_1d(queue, text_norm_pipeline, text_input, text_norm_weight, text_normalized, dummy, dummy, dummy, #addr_of(params), text_rows) else { return 1; }; total_ms = total_ms + text_norm_ms;
     guard let option::Option[f64]::Some(text_in_ms) = dispatch_weighted_linear(queue, pipelines, text_normalized, text_in_weight, text_hidden, WIDTH, WIDTH, text_rows) else { return 1; }; total_ms = total_ms + text_in_ms;
@@ -5435,6 +5512,7 @@ fn benchmark_transformer_small_kernels() -> i32 {
     var params: BlockParams = BlockParams {
         rows: rows as u32, width: WIDTH as u32, heads: HEADS as u32,
         head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32,
+        input_stride: WIDTH as u32, input_offset: 0 as u32,
     };
     guard let option::Option[f64]::Some(_norm_warmup) = dispatch_1d(queue, norm_pipeline, input, modulation, reference, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; };
     guard let option::Option[f64]::Some(_norm_simd_warmup) = dispatch_simdgroup_1d(queue, norm_simd_pipeline, input, modulation, candidate, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; };

@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "status": "mixed_policy_native_compact_validated",
+  "schema_version": 3,
+  "status": "mixed_policy_qkv_fp16_native_validated",
   "scope": "seven matrix roles in 32 transformer blocks",
   "model_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
   "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
@@ -46,6 +46,19 @@
     "worst_final_normalized_rms_error": 0.009849076395253302,
     "gate_passed": true
   },
+  "runtime_storage_policy": {
+    "qipack_policy": "transformer:qkv-f16-q8-g64-v3",
+    "dense_qkv_fp16_blocks": [0, 23],
+    "qkv_record_order": ["q", "k", "v"],
+    "dense_mlp_fp16_records": 88,
+    "dense_qkv_fp16_records": 72,
+    "q8_matrix_count_unchanged": 40,
+    "artifact_bytes_unchanged": 13334843392,
+    "backward_compatible_policies": [
+      "transformer:q8-g64-f16-v2",
+      "transformer:mixed-q8-g64-v1"
+    ]
+  },
   "search_evidence": {
     "first_16_blocks_all_roles_nrmse": 0.018855168238296895,
     "last_16_blocks_all_roles_nrmse": 0.013823835950402045,
@@ -66,10 +79,10 @@
     "worst_final_normalized_rms_error": 0.00905720935461897
   },
   "native_validation": {
-    "report": "benchmarks/m1-max-transformer-mixed-native.json",
+    "report": "benchmarks/m1-max-qkv-mps.json",
     "artifact_tensor_count": 297,
     "artifact_quantized_matrix_count": 40,
-    "execution": "all 32 blocks directly from a read-only no-copy QIPACK1 Metal buffer",
+    "execution": "dense Q/K/V use one MPS 4096-to-12288 operation from adjacent FP16 records; the calibrated late Q8 matrices retain custom Metal",
     "fixture_rows": 4,
     "capture_blocks": [0, 23, 24, 27, 28, 31],
     "final_normalized_rms_error": 0.00130011,

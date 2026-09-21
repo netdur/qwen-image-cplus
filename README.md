@@ -134,10 +134,11 @@ Inspect a shard, optionally filtering tensor names:
   in `benchmarks/m1-max-mixed-quantization.json`.
 - A full-transformer QIPACK1 writer/reader for that mixed policy. It generates
   the complete 297-tensor inventory from nine global tensor definitions and a
-  nine-role block schema. QIPACK policy v2 preserves BF16 for vectors, global
-  matrices, and attention; stores the 88 non-Q8 MLP matrices as the FP16
-  operands consumed by Metal/MPS; and retains the measured 40 Q8 matrices.
-  The reader remains compatible with the original all-BF16/Q8 v1 policy. The
+  nine-role block schema. QIPACK policy v3 stores the 88 non-Q8 MLP matrices
+  and 72 dense Q/K/V matrices as the FP16 operands consumed by MPS, orders Q,
+  K, and V adjacently per block, and retains the measured 40 Q8 matrices.
+  Vectors, global matrices, and other dense attention matrices remain BF16.
+  The reader remains compatible with the v2 MLP-FP16 and original v1 policies. The
   writer refuses a source other than the exact 7,115,124,736-
   parameter, two-shard inventory; installs atomically only after structure,
   payload, per-tensor, and exact source round-trip checks; and produced a
@@ -462,18 +463,19 @@ Inspect a shard, optionally filtering tensor names:
   inputs with FP32 outputs. Including the required on-GPU conversion, MPS
   completes the cached 4096->12288 and 12288->4096 MLP shapes in 4.24-4.56 ms,
   versus 6.03-6.51 ms for the accepted custom kernels. The custom kernel stays
-  faster on BF16 4096x4096 attention projections (2.00 ms versus 2.83 ms), so
-  those remain custom Metal. Isolated MPS output nRMSE is at most 0.02095%.
+  faster on an isolated BF16 4096x4096 attention projection (2.00 ms versus
+  2.83 ms). That result still governs non-fused and Q8 projections; QIPACK v3
+  later makes one adjacent FP16 4096-to-12288 QKV operation profitable.
+  Isolated MPS output nRMSE is at most 0.02095%.
 - Cached MLPs convert FP32 activations and only Q8 packed weights to FP16
-  scratch storage, bind v2 FP16 weights directly from the read-only QIPACK
+  scratch storage, bind v2/v3 FP16 weights directly from the read-only QIPACK
   mapping, and invoke `MPSMatrixMultiplication` with FP32 output.
   Conversion, MPS GEMM, SwiGLU, and residual work remain ordered in one command
   buffer per transformer block; there is no CPU inference fallback or host
   synchronization between operations. One reusable 96 MiB weight buffer still
   handles Q8 matrices, while a 6 MiB activation buffer feeds every MPS GEMM.
-  The 278-row first step deliberately retains the bounds-safe custom path; its
-  kernels distinguish BF16 and FP16 records and produce the same FP16 operands
-  as before. Steps 2-40 use MPS for all three MLP matrices.
+  Both the 278-row first step and 256-row steady-state steps use MPS for all
+  three MLP matrices; the first step also extracts prefix K/V in-buffer.
 - Direct FP16 storage removes 88 repeated BF16 conversion dispatches per step
   without a second 9.7 GiB runtime weight copy or any increase in artifact
   size. The verified fixture-fed 40-step loop now takes 33,092 ms of summed
@@ -560,6 +562,23 @@ Inspect a shard, optionally filtering tensor names:
   loop wall, 1.7982% latent nRMSE, 1.77651% decoded-FP32 nRMSE, and 1.00307%
   RGBA nRMSE. Full measurements and rationale are in
   `benchmarks/m1-max-transformer-step-submission.json`.
+- Dense Q, K, and V now execute as one MPS 4096-to-12288 multiplication. QIPACK
+  v3 places each block's Q/K/V records adjacently and stores the 72 dense
+  records in FP16; blocks 24-31 retain their calibrated Q8 records and custom
+  kernels. The fused `[row,Q|K|V]` activation reuses the existing MLP-sized
+  scratch, while Q/K normalization, attention V reads, and first-step prefix-V
+  extraction consume explicit row strides and offsets. A custom fused Metal
+  prototype was rejected: 64x32 and 64x64 tiles regressed step 2 because
+  register pressure and occupancy outweighed activation reuse. The MPS path is
+  both faster and exact at every printed checkpoint. Cache-off fell from
+  28,413.6 to **25,626.5 ms GPU** and from 28,824 to **26,263 ms wall**.
+  Cache-DiT 0.24 retained all 27 decisions and fell from 10,075.7 to **9,067.4
+  ms GPU** and from 10,452 to **9,582 ms wall**. The native prompt pipeline
+  passed unchanged at 25,696.8 ms GPU / 26,051 ms transformer-loop wall,
+  1.7982% latent nRMSE, 1.77651% decoded-FP32 nRMSE, and 1.00307% RGBA nRMSE.
+  The v3 artifact remains 13,334,843,392 bytes, passed exact source round-trip
+  verification, and old v2 artifacts still pass. Measurements and rejected
+  alternatives are in `benchmarks/m1-max-qkv-mps.json`.
 - Cache-DiT is available as an explicit, off-by-default approximation. It
   follows the upstream
   [DBCache block flow](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_blocks/pattern_base.py)
@@ -666,34 +685,28 @@ The original timing target is no longer a stopping condition. The remaining
 work is ordered by architectural leverage and evidence, not by whether a
 particular total has already been reached:
 
-1. **Fused QKV with FP16 attention storage.** Define a versioned QIPACK policy
-   that stores dense attention matrices in the same FP16 operand form already
-   consumed by the accepted custom kernels. Fuse Q, K, and V into a wider
-   projection and add row-stride/offset support to Q/K norm, attention, and V
-   consumers. Keep the existing Q8 policy for its calibrated late-block
-   matrices. This requires regenerating and validating the packed artifact.
-2. **Remaining VAE work.** The dominant convolution is already a verified
+1. **Remaining VAE work.** The dominant convolution is already a verified
    FP32 SIMD-group kernel. Still open are fewer command-buffer waits, persistent
    pipeline/scratch reuse where the phase lifetime permits it, and the
    parity-decomposed nearest-upsample convolution experiment. The 3e-6 decoder
    and RGBA byte gates remain stricter than the transformer gates.
-3. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
+2. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
    hundreds of synchronous dispatches without changing its BF16 store
    boundaries. Whole-shard readahead stays accepted; tensor-order selective
    advice and broad Q8 text policies stay rejected unless a materially new
    layout or calibration method is introduced.
-4. **Kernel-specific elementwise fusion.** Fuse attention residual with the
+3. **Kernel-specific elementwise fusion.** Fuse attention residual with the
    following LayerNorm and evaluate a cooperative final LayerNorm. A global
    256-thread elementwise launch was measured and rejected, so residual,
    SwiGLU, final norm, and small conditioning kernels must be tuned separately.
-5. **End-to-end remeasurement.** After the structural phases, repeat both
+4. **End-to-end remeasurement.** After the structural phases, repeat both
    cache-off and Cache-DiT native prompts with warm-filesystem and cold-page
    conditions reported separately. Transformer loop time, phase wall time,
    process wall time, memory footprint, and numerical/perceptual gates remain
    separate measurements.
 
-Completed transformer submission batching is also no longer a remaining
-phase. Other closed branches are not remaining phases: selective text readahead
+Completed transformer submission batching and fused QKV are no longer
+remaining phases. Other closed branches are not remaining phases: selective text readahead
 regressed wall time; the calibrated text-Q8 policies failed the downstream latent gate;
 process reuse without simultaneous model residency provided no warm-request
 gain; four-query attention and blanket 256-thread elementwise groups regressed
@@ -738,10 +751,10 @@ of about 61 MiB more block-matrix storage.
 
 The full writer intentionally keeps the nine non-block tensors in BF16: they
 were not part of the 224-matrix calibration, so quantizing them would extend
-the policy beyond its evidence. MLP gates are not quantized; v2 merely stores
-their already-selected FP16 execution operands instead of converting BF16 on
-every denoising step. QIPACK1 still accepts both the legacy full-transformer
-policy and the original block-0 scope, preserving existing fixtures.
+the policy beyond its evidence. MLP gates and dense Q/K/V are not quantized;
+v3 stores their already-selected FP16 execution operands instead of converting
+BF16 on every denoising step. QIPACK1 still accepts v1, v2, and the original
+block-0 scope, preserving existing artifacts and fixtures.
 
 The original four-token fixture remains useful as a cheap block-chain
 regression. The newer 15-token fixture proves the whole transformer boundary

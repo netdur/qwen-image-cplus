@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "qipack_v3": {
+    "policy": "transformer:qkv-f16-q8-g64-v3",
+    "tensor_count": 297,
+    "parameter_count": 7115124736,
+    "file_bytes": 13334843392,
+    "dense_qkv_fp16_records": 72,
+    "dense_mlp_fp16_records": 88,
+    "q8_matrix_count": 40,
+    "source_round_trip_verified": true,
+    "v1_v2_reader_compatibility_verified": true
+  },
+  "implementation": {
+    "dense_blocks": "Q, K, and V records are adjacent and bound as one FP16 4096-to-12288 MPSMatrixMultiplication. One FP32-to-FP16 input conversion feeds the operation.",
+    "q8_tail": "Blocks 24-31 retain the calibrated Q8 Q/K/V records and existing custom Metal projections.",
+    "activation_layout": "The fused output is row-major [row,Q|K|V]; Q/K normalization, attention V reads, and first-step prefix-V extraction use explicit stride and offset metadata.",
+    "persistent_scratch_growth_bytes": 0,
+    "direct_custom_fusion_rejected": "A 64x32 custom fused tile measured 722.085 ms at step 2 and a 64x64 tile measured 809.256 ms, versus about 703 ms for the prior path. Register pressure and occupancy outweighed input reuse."
+  },
+  "cache_off_trajectory": {
+    "baseline_summed_gpu_ms": 28413.6,
+    "qkv_summed_gpu_ms": 25626.5,
+    "gpu_ms_saved": 2787.1,
+    "baseline_loop_wall_ms": 28824,
+    "qkv_loop_wall_ms": 26263,
+    "wall_ms_saved": 2561,
+    "checkpoint_nrmse": {
+      "1": 0.000906469,
+      "2": 0.00130081,
+      "40": 0.0103288
+    },
+    "checkpoint_values_unchanged": true,
+    "passed": true
+  },
+  "cache_dit_0_24": {
+    "baseline_summed_gpu_ms": 10075.7,
+    "qkv_summed_gpu_ms": 9067.43,
+    "gpu_ms_saved": 1008.27,
+    "baseline_loop_wall_ms": 10452,
+    "qkv_loop_wall_ms": 9582,
+    "wall_ms_saved": 870,
+    "cached_steps": 27,
+    "step_40_latent_nrmse_vs_official": 0.10079,
+    "cached_decisions_unchanged": true
+  },
+  "native_prompt_pipeline": {
+    "transformer_summed_gpu_ms": 25696.8,
+    "transformer_loop_wall_ms": 26051,
+    "transformer_phase_wall_ms": 33125,
+    "end_to_end_wall_ms": 49515,
+    "final_latent_nrmse": 0.017982,
+    "decoded_fp32_nrmse": 0.0177651,
+    "rgba_nrmse": 0.0100307,
+    "passed": true
+  },
+  "verification": {
+    "unit_tests_passed": 334,
+    "unit_tests_failed": 0,
+    "one_two_forty_step_gates": true,
+    "cache_dit_gate": true,
+    "native_prompt_pipeline_gate": true,
+    "old_v2_two_step_gate": true
+  }
+}

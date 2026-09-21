@@ -26,6 +26,8 @@ struct AttentionParams {
     uint query_position_offset;
     uint block_causal;
     uint cached_prefix_rows;
+    uint value_stride;
+    uint value_offset;
 };
 
 struct BlockParams {
@@ -35,6 +37,8 @@ struct BlockParams {
     uint head_dimension;
     float epsilon;
     uint slot;
+    uint input_stride;
+    uint input_offset;
 };
 
 inline float qi_bf16(ushort bits) {
@@ -254,8 +258,11 @@ kernel void qi_copy_prefix_kv(
     const uint count = params.rows * params.width;
     if (index < count) {
         // K reaches this point after learned RMSNorm and RoPE; V is raw.
+        const uint row = index / params.width;
+        const uint column = index % params.width;
         cache_key[index] = key[index];
-        cache_value[index] = value[index];
+        cache_value[index] =
+            value[row * params.input_stride + params.input_offset + column];
     }
 }
 
@@ -1293,7 +1300,9 @@ kernel void qi_block_qk_norm_rope_scalar(
     }
     const uint row = index / params.heads;
     const uint head = index % params.heads;
-    const uint start = (row * params.heads + head) * params.head_dimension;
+    const uint start = row * params.input_stride + params.input_offset
+        + head * params.head_dimension;
+    const uint output_start = (row * params.heads + head) * params.head_dimension;
     float mean_square = 0.0f;
     for (uint column = 0; column < params.head_dimension; ++column) {
         const float value = input[start + column];
@@ -1310,8 +1319,8 @@ kernel void qi_block_qk_norm_rope_scalar(
             input[start + imaginary_column] * inverse_rms * qi_bf16(norm_weight[imaginary_column]);
         const float cosine = rope[rope_start + pair];
         const float sine = rope[rope_start + complex_count + pair];
-        output[start + real_column] = real * cosine - imaginary * sine;
-        output[start + imaginary_column] = real * sine + imaginary * cosine;
+        output[output_start + real_column] = real * cosine - imaginary * sine;
+        output[output_start + imaginary_column] = real * sine + imaginary * cosine;
     }
 }
 
@@ -1331,7 +1340,9 @@ kernel void qi_block_qk_norm_rope(
     }
     const uint row = index / params.heads;
     const uint head = index % params.heads;
-    const uint start = index * params.head_dimension;
+    const uint start = row * params.input_stride + params.input_offset
+        + head * params.head_dimension;
+    const uint output_start = index * params.head_dimension;
     float partial_square = 0.0f;
     for (uint column = lane; column < params.head_dimension; column += 32) {
         const float value = input[start + column];
@@ -1350,8 +1361,8 @@ kernel void qi_block_qk_norm_rope(
             qi_bf16(norm_weight[imaginary_column]);
         const float cosine = rope[rope_start + pair];
         const float sine = rope[rope_start + complex_count + pair];
-        output[start + real_column] = real * cosine - imaginary * sine;
-        output[start + imaginary_column] = real * sine + imaginary * cosine;
+        output[output_start + real_column] = real * cosine - imaginary * sine;
+        output[output_start + imaginary_column] = real * sine + imaginary * cosine;
     }
 }
 
@@ -1419,7 +1430,10 @@ kernel void qi_block_attention(
             state[3] = new_weight;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint value_index = key_start + lane;
+        const uint value_index = from_cache
+            ? key_start + lane
+            : local_key_row * params.value_stride + params.value_offset
+                + head * params.head_dimension + lane;
         const float value_element = from_cache ? cache_value[value_index] : value[value_index];
         accumulator = fma(accumulator, state[2], state[3] * value_element);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1479,6 +1493,9 @@ kernel void qi_block_attention_simdgroup(
         const bool from_cache = key_row < params.cached_prefix_rows;
         const uint local_key_row = from_cache ? key_row : key_row - params.cached_prefix_rows;
         const uint key_start = (local_key_row * params.heads + head) * params.head_dimension;
+        const uint value_start = from_cache ? key_start
+            : local_key_row * params.value_stride + params.value_offset
+                + head * params.head_dimension;
         device const float *key_source = from_cache ? cache_key : key;
         device const float *value_source = from_cache ? cache_value : value;
         const float4 key_channels = float4(
@@ -1487,10 +1504,10 @@ kernel void qi_block_attention_simdgroup(
             key_source[key_start + channel_2],
             key_source[key_start + channel_3]);
         const float4 value_channels = float4(
-            value_source[key_start + channel_0],
-            value_source[key_start + channel_1],
-            value_source[key_start + channel_2],
-            value_source[key_start + channel_3]);
+            value_source[value_start + channel_0],
+            value_source[value_start + channel_1],
+            value_source[value_start + channel_2],
+            value_source[value_start + channel_3]);
         for (uint query_slot = 0; query_slot < 2; ++query_slot) {
             const uint query_row = query_base + query_slot;
             if (query_row >= params.query_rows) {
