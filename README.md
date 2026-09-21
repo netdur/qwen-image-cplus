@@ -52,13 +52,16 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 1
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 2
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
+./target/debug/qwen-image-cplus test-transformer-cache-dit transformer.qipack 0.12
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus test-image-output reference.png
 ./target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./target/debug/qwen-image-cplus test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
 ./target/debug/qwen-image-cplus test-native-inputs
 ./target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
+./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101
 ./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
@@ -430,11 +433,32 @@ Inspect a shard, optionally filtering tensor names:
   baseline of 46,283 ms and 47,989 ms (28.5% GPU, 28.7% wall). Step 2 is
   800.25 ms GPU and step 40 is 805.29 ms. Exact latent nRMSE remains unchanged
   at 0.09039%, 0.13008%, and 1.00775% for steps 1, 2, and 40. The loop is now
-  near the low-30-second range but still above the 25-30-second target; the
-  remaining gap needs broader quantization, fusion, or an opt-in algorithmic
-  shortcut such as the separately evaluated Cache-DiT. Measurements are
+  near the low-30-second range but still above the 25-30-second target.
+  Measurements are
   in `benchmarks/m1-max-transformer-trajectory-native.json`; custom-kernel
   baselines remain in `benchmarks/m1-max-production-kernel-profile.json`.
+- Cache-DiT is available as an explicit, off-by-default approximation. It
+  follows the upstream
+  [DBCache block flow](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_blocks/pattern_base.py)
+  and [relative-L1 decision](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py)
+  rather than the earlier design sketch:
+  block 0 always runs; its residual `h1 - h0` is compared with the residual
+  from the last full step using relative L1; the first four steps are full;
+  and at most three cached steps may run consecutively. A cached step adds the
+  stored blocks-1-through-31 residual to the new block-0 output. The prefix KV
+  cache remains layer-indexed and continues to serve block 0 on every step.
+- At threshold 0.12, 25 of 40 steps are cached and the canonical loop takes
+  13,762 ms GPU / 14,816 ms wall, a 2.41x / 2.31x speedup over cache-off.
+  Threshold 0.24 caches 27 steps and takes 12,162 ms / 12,737 ms, a 2.72x /
+  2.69x speedup. The algorithm intentionally changes output: versus the
+  official fixture, threshold 0.12 measures 9.93% latent, 9.47% decoded-FP32,
+  and 5.22% RGBA nRMSE; threshold 0.24 measures 10.08%, 9.49%, and 5.23%.
+  Both canonical images remain coherent, and an arbitrary blue-teapot prompt
+  completed with 27 cached steps, but these measurements are not an
+  equivalence gate. Keep cache-off for reproducibility and choose Cache-DiT
+  only when this quality tradeoff is acceptable. Detailed results and the
+  reason for retaining both thresholds are in
+  `benchmarks/m1-max-cache-dit-native.json`.
 
 ## Quantization decision log
 

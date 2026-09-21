@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "case": {
+    "pixels": 256,
+    "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+    "latent_seed": 1101,
+    "text_rows": 22,
+    "target_rows": 256,
+    "steps": 40,
+    "packed_transformer": "/private/tmp/qwen-image-2.1-mixed-fp16.qipack"
+  },
+  "algorithm": {
+    "name": "Cache-DiT DBCache",
+    "enabled_by_default": false,
+    "Fn_compute_blocks": 1,
+    "Bn_compute_blocks": 0,
+    "max_warmup_steps": 4,
+    "max_continuous_cached_steps": 3,
+    "decision": "relative_L1(current_block0_residual, last_full_block0_residual) below threshold",
+    "normalization": "sum(abs(current - previous)) / sum(abs(previous))",
+    "cached_value": "last full blocks-1-through-31 residual, added to the current block-0 output",
+    "comparison_reference_updates": "full steps only"
+  },
+  "cache_off_reference": {
+    "summed_gpu_kernel_ms": 33092.1,
+    "summed_loop_wall_ms": 34239,
+    "step_40_latent_nrmse_vs_official": 0.0100775,
+    "default_path_unchanged": true
+  },
+  "threshold_0_12": {
+    "cached_steps": 25,
+    "full_steps": 15,
+    "q8_dispatch_matrices": 600,
+    "summed_gpu_kernel_ms": 13761.5,
+    "summed_loop_wall_ms": 14816,
+    "gpu_speedup_vs_cache_off": 2.405,
+    "wall_speedup_vs_cache_off": 2.311,
+    "gpu_reduction_percent": 58.41,
+    "wall_reduction_percent": 56.73,
+    "step_40_latent_nrmse_vs_official": 0.0993329,
+    "decoded_fp32_nrmse_vs_official": 0.0947469,
+    "rgba_u8_nrmse_vs_official": 0.0522309,
+    "rgba_mean_absolute_error": 3.71632,
+    "rgba_maximum_absolute_error": 127,
+    "rgba_mismatched_bytes": 183120
+  },
+  "threshold_0_24": {
+    "cached_steps": 27,
+    "full_steps": 13,
+    "q8_dispatch_matrices": 520,
+    "summed_gpu_kernel_ms": 12162.2,
+    "summed_loop_wall_ms": 12737,
+    "gpu_speedup_vs_cache_off": 2.721,
+    "wall_speedup_vs_cache_off": 2.688,
+    "gpu_reduction_percent": 63.25,
+    "wall_reduction_percent": 62.80,
+    "step_40_latent_nrmse_vs_official": 0.100793,
+    "decoded_fp32_nrmse_vs_official": 0.0949385,
+    "rgba_u8_nrmse_vs_official": 0.0523422,
+    "rgba_mean_absolute_error": 3.80553,
+    "rgba_maximum_absolute_error": 137,
+    "rgba_mismatched_bytes": 183686
+  },
+  "arbitrary_prompt_smoke": {
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "latent_seed": 42,
+    "threshold": 0.24,
+    "text_rows": 18,
+    "cached_steps": 27,
+    "transformer_gpu_kernel_ms": 12004.2,
+    "transformer_loop_wall_ms": 12554,
+    "png_bytes": 262488,
+    "finite_output": true,
+    "visually_coherent": true
+  },
+  "validation": {
+    "cache_off_two_step_oracle_unchanged": true,
+    "cache_off_step_1_nrmse": 0.000903863,
+    "cache_off_step_2_nrmse": 0.00130082,
+    "cache_dit_is_equivalence_gated": false,
+    "reason": "Cache-DiT intentionally changes the denoising trajectory; metrics are reported for product-quality review rather than accepted under the exact cache-off oracle."
+  },
+  "interpretation": "Both thresholds exceed the requested speed target at 256px. Threshold 0.24 reaches the three-consecutive-step cap throughout most of the schedule and is about 2.1 seconds faster than 0.12, while the canonical decoded and RGBA errors are nearly identical. Both remain explicit choices because one prompt cannot establish a universal perceptual-quality policy; cache-off remains the default and reproducible path."
+}

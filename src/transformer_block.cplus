@@ -3382,6 +3382,58 @@ fn host_normalized_rms(actual: *f32, expected: *f32, count: usize) -> f64 {
     return (squared_error / squared_reference.max(0.000000000001f64)).sqrt();
 }
 
+// Cache-DiT's DBCache decision compares the current first-block residual with
+// the residual from the last full-compute step. The means share the same
+// element count, so their ratio is exactly the ratio of these two sums.
+fn host_relative_l1(previous: *f32, current: *f32, count: usize) -> f64 {
+    var absolute_difference: f64 = 0.0f64;
+    var absolute_previous: f64 = 0.0f64;
+    var index: usize = 0 as usize;
+    while index < count {
+        let previous_value: f64 = previous[index] as f64;
+        absolute_difference = absolute_difference
+            + (current[index] as f64 - previous_value).abs();
+        absolute_previous = absolute_previous + previous_value.abs();
+        index = index +% (1 as usize);
+    }
+    if absolute_previous == 0.0f64 {
+        return if absolute_difference == 0.0f64 { 0.0f64 } else { 1.0f64 };
+    }
+    return absolute_difference / absolute_previous;
+}
+
+fn cache_dit_should_cache(
+    step: usize,
+    have_residual: bool,
+    continuous_cached_steps: usize,
+    difference: f64,
+    threshold: f64,
+) -> bool {
+    return step >= (4 as usize)
+        && have_residual
+        && continuous_cached_steps < (3 as usize)
+        && difference < threshold;
+}
+
+#[test]
+fn cache_dit_relative_l1_matches_reference_formula() {
+    var previous: [f32; 4] = [1.0f32, 0.0f32 - 2.0f32, 3.0f32, 0.0f32];
+    var current: [f32; 4] = [2.0f32, 0.0f32 - 1.0f32, 1.0f32, 0.0f32];
+    let difference: f64 = host_relative_l1(
+        #addr_of(previous[0]), #addr_of(current[0]), 4 as usize,
+    );
+    assert (difference - (4.0f64 / 6.0f64)).abs() < 0.000001f64;
+}
+
+#[test]
+fn cache_dit_decision_preserves_warmup_and_continuous_cap() {
+    assert !cache_dit_should_cache(3 as usize, true, 0 as usize, 0.01f64, 0.12f64);
+    assert !cache_dit_should_cache(4 as usize, false, 0 as usize, 0.01f64, 0.12f64);
+    assert cache_dit_should_cache(4 as usize, true, 0 as usize, 0.11f64, 0.12f64);
+    assert !cache_dit_should_cache(4 as usize, true, 0 as usize, 0.12f64, 0.12f64);
+    assert !cache_dit_should_cache(4 as usize, true, 3 as usize, 0.01f64, 0.12f64);
+}
+
 fn test_native_inputs_256(
     fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
 ) -> i32 {
@@ -3440,6 +3492,63 @@ fn run_trajectory_packed(
         0 as u64,
         false,
         true,
+        false,
+        0.0f64,
+    );
+}
+
+fn cache_dit_threshold(value: str) -> option::Option[f64] {
+    if value == "0.12" { return option::Option[f64]::Some(0.12f64); }
+    if value == "0.24" { return option::Option[f64]::Some(0.24f64); }
+    return option::Option[f64]::None;
+}
+
+fn run_trajectory_cache_dit_packed(
+    packed_path: str,
+    threshold_text: str,
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+) -> i32 {
+    guard let option::Option[f64]::Some(threshold) = cache_dit_threshold(threshold_text) else {
+        io::eprintln("trajectory Cache-DiT: threshold must be 0.12 or 0.24");
+        return 2;
+    };
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        fixture_directory,
+        0 as *f32,
+        0 as *f32,
+        0 as usize,
+        0 as u64,
+        false,
+        true,
+        true,
+        threshold,
+    );
+}
+
+fn run_trajectory_cache_dit_256_to_host(
+    packed_path: str,
+    final_latent: *f32,
+    threshold: f64,
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+) -> i32 {
+    if final_latent.is_null() || !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("trajectory: invalid Cache-DiT fixture handoff");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        fixture_directory,
+        final_latent,
+        0 as *f32,
+        0 as usize,
+        0 as u64,
+        false,
+        true,
+        true,
+        threshold,
     );
 }
 
@@ -3466,6 +3575,8 @@ fn run_trajectory_256_to_host(
         0 as u64,
         false,
         true,
+        false,
+        0.0f64,
     );
 }
 
@@ -3495,6 +3606,36 @@ fn run_prompt_trajectory_256_to_host(
         seed,
         true,
         validate_reference,
+        false,
+        0.0f64,
+    );
+}
+
+fn run_prompt_trajectory_cache_dit_256_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+    threshold: f64 = 0.12f64,
+) -> i32 {
+    if text_input.is_null() || final_latent.is_null()
+        || !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("trajectory: invalid Cache-DiT prompt handoff");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        "tests/fixtures/trajectory_256_fp32",
+        final_latent,
+        text_input,
+        text_rows,
+        seed,
+        true,
+        false,
+        true,
+        threshold,
     );
 }
 
@@ -3508,6 +3649,8 @@ fn run_trajectory_packed_impl(
     latent_seed: u64,
     native_inputs: bool,
     validate_reference: bool,
+    cache_dit_enabled: bool,
+    cache_dit_threshold_value: f64,
 ) -> i32 {
     if !mps::load_framework() {
         io::eprintln("trajectory: could not load MetalPerformanceShaders");
@@ -3595,6 +3738,9 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(final_norm_owner) = pipeline(device, library, "qi_final_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_copy_owner) = pipeline(device, library, "qi_copy_prefix_kv") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_input_owner) = pipeline(device, library, "qi_mps_input_to_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(cache_first_residual_owner) = pipeline(device, library, "qi_cache_first_residual") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(cache_store_residual_owner) = pipeline(device, library, "qi_cache_store_residual") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(cache_apply_residual_owner) = pipeline(device, library, "qi_cache_apply_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_bf16_owner) = pipeline(device, library, "qi_mps_bf16_weight_to_half") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_q8_owner) = pipeline(device, library, "qi_mps_q8_weight_to_half") else { return 1; };
     let pipelines: Pipelines = Pipelines {
@@ -3621,6 +3767,9 @@ fn run_trajectory_packed_impl(
     let mps_input_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_input_owner.raw());
     let mps_bf16_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_bf16_owner.raw());
     let mps_q8_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_q8_owner.raw());
+    let cache_first_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_first_residual_owner.raw());
+    let cache_store_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_store_residual_owner.raw());
+    let cache_apply_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_apply_residual_owner.raw());
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
 
     let storage_and_weights_start_ms: i64 = time::now_millis();
@@ -3785,9 +3934,18 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(final_scale) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_owner: OwnedObjc = OwnedObjc::new(final_scale.raw());
     guard let option::Option[metal::Buffer]::Some(final_normalized) = new_buffer(device, activation_bytes) else { return 1; }; let final_normalized_owner: OwnedObjc = OwnedObjc::new(final_normalized.raw());
     guard let option::Option[metal::Buffer]::Some(noise_output) = new_buffer(device, (rows *% IMAGE_CHANNELS *% #size_of::[f32]()) as u64) else { return 1; }; let noise_output_owner: OwnedObjc = OwnedObjc::new(noise_output.raw());
+    guard let option::Option[metal::Buffer]::Some(cache_first_output) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_first_output_owner: OwnedObjc = OwnedObjc::new(cache_first_output.raw());
+    guard let option::Option[metal::Buffer]::Some(cache_fn_a) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_fn_a_owner: OwnedObjc = OwnedObjc::new(cache_fn_a.raw());
+    guard let option::Option[metal::Buffer]::Some(cache_fn_b) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_fn_b_owner: OwnedObjc = OwnedObjc::new(cache_fn_b.raw());
+    guard let option::Option[metal::Buffer]::Some(cache_middle_residual) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_middle_residual_owner: OwnedObjc = OwnedObjc::new(cache_middle_residual.raw());
 
     var all_ok: bool = true;
     var total_quantized_matrices: usize = 0 as usize;
+    var previous_fn_residual: metal::Buffer = cache_fn_a;
+    var current_fn_residual: metal::Buffer = cache_fn_b;
+    var have_cache_residual: bool = false;
+    var continuous_cached_steps: usize = 0 as usize;
+    var total_cached_steps: usize = 0 as usize;
     let buffers_and_prefix_wall_ms: i64 = time::now_millis() - buffers_and_prefix_start_ms;
     io::println(
         "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms}",
@@ -3824,6 +3982,9 @@ fn run_trajectory_packed_impl(
             current = first_hidden;
             next = second_hidden;
         }
+        let first_block_input: metal::Buffer = current;
+        var cache_dit_cached_step: bool = false;
+        var cache_dit_diff: f64 = 0.0f64 - 1.0f64;
 
         var step_quantized_matrices: usize = 0 as usize;
         var block: usize = 0 as usize;
@@ -3868,13 +4029,99 @@ fn run_trajectory_packed_impl(
             guard let option::Option[f64]::Some(block_ms) = block_result else { return 1; };
             step_ms = step_ms + block_ms;
             let swap: metal::Buffer = current; current = next; next = swap;
+            if cache_dit_enabled && block == (0 as usize) {
+                params.rows = target_rows as u32;
+                params.width = WIDTH as u32;
+                params.slot = if step == (0 as usize) { text_rows as u32 } else { 0 as u32 };
+                guard let option::Option[f64]::Some(first_residual_ms) = dispatch_1d(
+                    queue,
+                    cache_first_residual_pipeline,
+                    first_block_input,
+                    current,
+                    cache_first_output,
+                    current_fn_residual,
+                    dummy,
+                    dummy,
+                    #addr_of(params),
+                    target_rows *% WIDTH,
+                ) else { return 1; };
+                step_ms = step_ms + first_residual_ms;
+
+                let forced_full: bool = step < (4 as usize)
+                    || !have_cache_residual
+                    || continuous_cached_steps >= (3 as usize);
+                if !forced_full {
+                    cache_dit_diff = host_relative_l1(
+                        previous_fn_residual.contents() as *f32,
+                        current_fn_residual.contents() as *f32,
+                        target_rows *% WIDTH,
+                    );
+                }
+                cache_dit_cached_step = cache_dit_should_cache(
+                    step,
+                    have_cache_residual,
+                    continuous_cached_steps,
+                    cache_dit_diff,
+                    cache_dit_threshold_value,
+                );
+                if cache_dit_cached_step {
+                    params.slot = 0 as u32;
+                    guard let option::Option[f64]::Some(apply_ms) = dispatch_1d(
+                        queue,
+                        cache_apply_residual_pipeline,
+                        current,
+                        cache_middle_residual,
+                        next,
+                        dummy,
+                        dummy,
+                        dummy,
+                        #addr_of(params),
+                        target_rows *% WIDTH,
+                    ) else { return 1; };
+                    step_ms = step_ms + apply_ms;
+                    current = next;
+                    continuous_cached_steps = continuous_cached_steps +% (1 as usize);
+                    total_cached_steps = total_cached_steps +% (1 as usize);
+                    break;
+                }
+
+                let fn_swap: metal::Buffer = previous_fn_residual;
+                previous_fn_residual = current_fn_residual;
+                current_fn_residual = fn_swap;
+                continuous_cached_steps = 0 as usize;
+            }
             block = block +% (1 as usize);
         }
-        if step_quantized_matrices != (40 as usize) {
-            io::eprintln("trajectory: expected 40 Q8 matrices at step ${step +% (1 as usize)}, found ${step_quantized_matrices}");
+        let expected_step_quantized: usize = if cache_dit_cached_step {
+            0 as usize
+        } else {
+            40 as usize
+        };
+        if step_quantized_matrices != expected_step_quantized {
+            io::eprintln("trajectory: expected ${expected_step_quantized} Q8 matrices at step ${step +% (1 as usize)}, found ${step_quantized_matrices}");
             return 1;
         }
         total_quantized_matrices = total_quantized_matrices +% step_quantized_matrices;
+
+        if cache_dit_enabled && !cache_dit_cached_step {
+            params.rows = target_rows as u32;
+            params.width = WIDTH as u32;
+            params.slot = if step == (0 as usize) { text_rows as u32 } else { 0 as u32 };
+            guard let option::Option[f64]::Some(store_ms) = dispatch_1d(
+                queue,
+                cache_store_residual_pipeline,
+                current,
+                cache_first_output,
+                cache_middle_residual,
+                dummy,
+                dummy,
+                dummy,
+                #addr_of(params),
+                target_rows *% WIDTH,
+            ) else { return 1; };
+            step_ms = step_ms + store_ms;
+            have_cache_residual = true;
+        }
 
         guard let option::Option[f64]::Some(final_scale_ms) = dispatch_weighted_linear(queue, pipelines, activated_time, final_scale_weight, final_scale, WIDTH, WIDTH, 2) else { return 1; }; step_ms = step_ms + final_scale_ms;
         params.rows = active_rows as u32; params.width = WIDTH as u32;
@@ -3893,13 +4140,21 @@ fn run_trajectory_packed_impl(
         total_ms = total_ms + step_ms;
         let step_wall_ms: i64 = time::now_millis() - step_wall_start_ms;
         let completed_step: usize = step +% (1 as usize);
+        let cache_mode_name: str = if cache_dit_cached_step {
+            "dbcache"
+        } else if step == (0 as usize) {
+            "extract"
+        } else if cache_dit_enabled {
+            "full"
+        } else {
+            "prefix"
+        };
         if validate_reference && (
             completed_step == (1 as usize) || completed_step == (2 as usize)
                 || completed_step == (40 as usize)
         ) {
             let checkpoint_name: text::Text = if completed_step < (10 as usize) { "latent_step_0${completed_step}" } else { "latent_step_${completed_step}" };
             guard let option::Option[f64]::Some(error) = normalized_rms_fixture(latents, fixture_directory, checkpoint_name.view(), latent_count) else { return 1; };
-            let cache_mode_name: str = if step == (0 as usize) { "extract" } else { "cached" };
             let error_limit: f64 = if completed_step == (1 as usize) {
                 0.001f64
             } else if completed_step == (2 as usize) {
@@ -3914,11 +4169,19 @@ fn run_trajectory_packed_impl(
             } else {
                 0.011f64
             };
-            io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} latent_nRMSE=${error} limit=${error_limit}");
-            all_ok = error <= error_limit && finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
+            if cache_dit_enabled && completed_step == (40 as usize) {
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps} latent_nRMSE=${error} validation=measured-only");
+                all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
+            } else {
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} latent_nRMSE=${error} limit=${error_limit}");
+                all_ok = error <= error_limit && finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
+            }
         } else {
-            let cache_mode_name: str = if step == (0 as usize) { "extract" } else { "cached" };
-            io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms}");
+            if cache_dit_enabled {
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps}");
+            } else {
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms}");
+            }
             all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         }
         step = step +% (1 as usize);
@@ -3932,9 +4195,11 @@ fn run_trajectory_packed_impl(
         }
     }
     let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
-    io::println("trajectory: pixels=256 steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} cache_bytes=${(2 as u64) *% cache_arena_bytes} total_gpu_ms=${total_ms} total_wall_ms=${trajectory_wall_ms}");
+    io::println("trajectory: pixels=256 steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
-        if validate_reference {
+        if cache_dit_enabled {
+            io::println("Qwen-Image-2.1 Cache-DiT trajectory: complete; quality requires measured acceptance");
+        } else if validate_reference {
             io::println("Qwen-Image-2.1 latent trajectory prefix: verified");
         } else {
             io::println("Qwen-Image-2.1 native-prompt latent trajectory: complete");

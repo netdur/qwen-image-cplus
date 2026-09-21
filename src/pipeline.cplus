@@ -1,4 +1,5 @@
 import "./image_output" as image_output;
+import "./mmap_macos" as mapped;
 import "./qwen3vl_text" as qwen3vl_text;
 import "./tokenizer" as tokenizer;
 import "./transformer_block" as transformer;
@@ -12,6 +13,29 @@ const LATENT_VALUES: usize = 16 * 16 * 64;
 const DECODED_VALUES: usize = 256 * 256 * 4;
 const TEXT_WIDTH: usize = 4096;
 const SYSTEM_PREFIX_TOKENS: usize = 14;
+
+fn normalized_rms_fixture(actual: *f32, path: str, count: usize) -> option::Option[f64] {
+    guard let mapped::MapResult::Ok(expected) = mapped::map_readonly(path) else {
+        return option::Option[f64]::None;
+    };
+    if expected.length() != count *% #size_of::[f32]() {
+        return option::Option[f64]::None;
+    }
+    let expected_values: *f32 = expected.pointer() as *f32;
+    var squared_error: f64 = 0.0f64;
+    var squared_reference: f64 = 0.0f64;
+    var index: usize = 0 as usize;
+    while index < count {
+        let difference: f64 = actual[index] as f64 - expected_values[index] as f64;
+        squared_error = squared_error + difference * difference;
+        squared_reference = squared_reference
+            + expected_values[index] as f64 * expected_values[index] as f64;
+        index = index +% (1 as usize);
+    }
+    return option::Option[f64]::Some(
+        (squared_error / squared_reference.max(0.000000000001f64)).sqrt(),
+    );
+}
 
 fn run_fixture_256(
     packed_path: str,
@@ -58,6 +82,61 @@ fn run_fixture_256(
     return 0;
 }
 
+fn run_fixture_cache_dit_256(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    threshold: f64,
+    trajectory_fixture: str = "tests/fixtures/trajectory_256_fp32",
+    vae_fixture_root: str = "tests/fixtures/vae_decoder_fp32",
+) -> i32 {
+    if !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("pipeline Cache-DiT: threshold must be 0.12 or 0.24");
+        return 2;
+    }
+    let vae_fixture = "${vae_fixture_root}/trajectory_256";
+    if !image_output::validate_reference_postprocess(vae_fixture.view()) {
+        return 1;
+    }
+
+    var latent: [f32; 16384] = [0.0f32; 16384];
+    io::println("pipeline: phase=transformer-scheduler cache_dit=${threshold}");
+    if transformer::run_trajectory_cache_dit_256_to_host(
+        packed_path,
+        #addr_of(latent[0]),
+        threshold,
+        trajectory_fixture,
+    ) != (0 as i32) {
+        return 1;
+    }
+
+    var decoded: [f32; 262144] = [0.0f32; 262144];
+    io::println("pipeline: phase=vae model=${model_root}");
+    if vae::decode_256_from_host(
+        model_root,
+        #addr_of(latent[0]),
+        #addr_of(decoded[0]),
+    ) != (0 as i32) {
+        return 1;
+    }
+    let decoded_path = "${vae_fixture}/output.f32";
+    guard let option::Option[f64]::Some(decoded_error) = normalized_rms_fixture(
+        #addr_of(decoded[0]), decoded_path.view(), DECODED_VALUES,
+    ) else { return 1; };
+    io::println("pipeline Cache-DiT: threshold=${threshold} decoded_fp32_nRMSE=${decoded_error} validation=measured-only");
+
+    if !image_output::write_png_and_compare(
+        #addr_of(decoded[0]),
+        vae_fixture.view(),
+        output_path,
+        1.0f64,
+    ) {
+        return 1;
+    }
+    io::println("Qwen-Image-2.1 fixture-driven Cache-DiT pipeline: complete; quality requires visual acceptance");
+    return 0;
+}
+
 fn run_native_256_impl(
     packed_path: str,
     model_root: str,
@@ -65,6 +144,8 @@ fn run_native_256_impl(
     prompt: str,
     seed: u64,
     validate_reference: bool,
+    cache_dit: bool,
+    cache_dit_threshold: f64,
 ) -> i32 {
     let pipeline_wall_start_ms: i64 = time::now_millis();
     let vae_fixture: str = "tests/fixtures/vae_decoder_fp32/trajectory_256";
@@ -108,14 +189,26 @@ fn run_native_256_impl(
     var latent: [f32; 16384] = [0.0f32; 16384];
     io::println("pipeline: phase=transformer-scheduler text_rows=${text_rows} seed=${seed}");
     let transformer_wall_start_ms: i64 = time::now_millis();
-    if transformer::run_prompt_trajectory_256_to_host(
-        packed_path,
-        #slice_ptr(text_embeddings.as_slice()),
-        text_rows,
-        seed,
-        #addr_of(latent[0]),
-        validate_reference,
-    ) != (0 as i32) {
+    let transformer_status: i32 = if cache_dit {
+        transformer::run_prompt_trajectory_cache_dit_256_to_host(
+            packed_path,
+            #slice_ptr(text_embeddings.as_slice()),
+            text_rows,
+            seed,
+            #addr_of(latent[0]),
+            cache_dit_threshold,
+        )
+    } else {
+        transformer::run_prompt_trajectory_256_to_host(
+            packed_path,
+            #slice_ptr(text_embeddings.as_slice()),
+            text_rows,
+            seed,
+            #addr_of(latent[0]),
+            validate_reference,
+        )
+    };
+    if transformer_status != (0 as i32) {
         return 1;
     }
     io::println("pipeline timing: transformer_wall_ms=${time::now_millis() - transformer_wall_start_ms}");
@@ -169,7 +262,22 @@ fn generate_256(
     prompt: str,
     seed: u64 = 1101 as u64,
 ) -> i32 {
-    return run_native_256_impl(packed_path, model_root, output_path, prompt, seed, false);
+    return run_native_256_impl(
+        packed_path, model_root, output_path, prompt, seed, false, false, 0.0f64,
+    );
+}
+
+fn generate_256_cache_dit(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    threshold: f64 = 0.12f64,
+) -> i32 {
+    return run_native_256_impl(
+        packed_path, model_root, output_path, prompt, seed, false, true, threshold,
+    );
 }
 
 fn test_native_256(
@@ -184,6 +292,8 @@ fn test_native_256(
         "A red fox asleep beside a mossy stone in soft morning light.",
         1101 as u64,
         true,
+        false,
+        0.0f64,
     );
 }
 

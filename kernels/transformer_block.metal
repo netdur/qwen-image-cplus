@@ -87,6 +87,50 @@ kernel void qi_mps_q8_weight_to_half(
         half(int(weights[index]) - int(zeros[group_index])) * scales[group_index];
 }
 
+// Cache-DiT compares the first-block residual h_1 - h_0 and reuses the
+// residual produced by the remaining blocks. `slot` is a row offset used by
+// the first joint text+image pass; subsequent target-only passes use zero.
+kernel void qi_cache_first_residual(
+    device const float *before [[buffer(0)]],
+    device const float *after [[buffer(1)]],
+    device float *first_output [[buffer(2)]],
+    device float *residual [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        const uint source_index = params.slot * params.width + index;
+        const float value = after[source_index];
+        first_output[index] = value;
+        residual[index] = value - before[source_index];
+    }
+}
+
+kernel void qi_cache_store_residual(
+    device const float *final_output [[buffer(0)]],
+    device const float *first_output [[buffer(1)]],
+    device float *residual [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        const uint source_index = params.slot * params.width + index;
+        residual[index] = final_output[source_index] - first_output[index];
+    }
+}
+
+kernel void qi_cache_apply_residual(
+    device const float *first_output [[buffer(0)]],
+    device const float *residual [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        output[index] = first_output[index] + residual[index];
+    }
+}
+
 kernel void qi_time_projection(
     device const float *timestep [[buffer(0)]],
     device float *output [[buffer(2)]],
