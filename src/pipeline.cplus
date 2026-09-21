@@ -5,6 +5,7 @@ import "./transformer_block" as transformer;
 import "./vae" as vae;
 import "stdlib/io" as io;
 import "stdlib/option" as option;
+import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 
 const LATENT_VALUES: usize = 16 * 16 * 64;
@@ -65,10 +66,12 @@ fn run_native_256_impl(
     seed: u64,
     validate_reference: bool,
 ) -> i32 {
+    let pipeline_wall_start_ms: i64 = time::now_millis();
     let vae_fixture: str = "tests/fixtures/vae_decoder_fp32/trajectory_256";
     if validate_reference && !image_output::validate_reference_postprocess(vae_fixture) {
         return 1;
     }
+    let text_wall_start_ms: i64 = time::now_millis();
     guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
         tokenizer::tokenize_full_prompt(model_root, prompt) else {
         return 1;
@@ -100,9 +103,11 @@ fn run_native_256_impl(
         io::eprintln("pipeline: tokenizer/text row disagreement expected=${expected_text_rows} actual=${text_rows}");
         return 1;
     }
+    io::println("pipeline timing: text_wall_ms=${time::now_millis() - text_wall_start_ms}");
 
     var latent: [f32; 16384] = [0.0f32; 16384];
     io::println("pipeline: phase=transformer-scheduler text_rows=${text_rows} seed=${seed}");
+    let transformer_wall_start_ms: i64 = time::now_millis();
     if transformer::run_prompt_trajectory_256_to_host(
         packed_path,
         #slice_ptr(text_embeddings.as_slice()),
@@ -113,9 +118,11 @@ fn run_native_256_impl(
     ) != (0 as i32) {
         return 1;
     }
+    io::println("pipeline timing: transformer_wall_ms=${time::now_millis() - transformer_wall_start_ms}");
 
     var decoded: [f32; 262144] = [0.0f32; 262144];
     io::println("pipeline: phase=vae model=${model_root}");
+    let vae_wall_start_ms: i64 = time::now_millis();
     let decode_status: i32 = if validate_reference {
         vae::decode_native_prompt_256_from_host(
             model_root,
@@ -132,6 +139,8 @@ fn run_native_256_impl(
     if decode_status != (0 as i32) {
         return 1;
     }
+    io::println("pipeline timing: vae_wall_ms=${time::now_millis() - vae_wall_start_ms}");
+    let image_wall_start_ms: i64 = time::now_millis();
     let write_ok: bool = if validate_reference {
         image_output::write_png_and_compare(
             #addr_of(decoded[0]),
@@ -143,6 +152,8 @@ fn run_native_256_impl(
         image_output::write_png(#addr_of(decoded[0]), output_path)
     };
     if !write_ok { return 1; }
+    io::println("pipeline timing: image_output_wall_ms=${time::now_millis() - image_wall_start_ms}");
+    io::println("pipeline timing: total_wall_ms=${time::now_millis() - pipeline_wall_start_ms}");
     if validate_reference {
         io::println("Qwen-Image-2.1 native prompt 256px pipeline: verified");
     } else {

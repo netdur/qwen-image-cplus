@@ -12,6 +12,7 @@ import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
+import "stdlib/time" as time;
 
 extern fn MTLCreateSystemDefaultDevice() -> *u8;
 
@@ -476,6 +477,212 @@ fn dispatch_copy_prefix(
     return option::Option[f64]::Some(
         (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
     );
+}
+
+// Batched transformer blocks keep one compute encoder open and place an
+// explicit buffer barrier between dependent dispatches. The standalone
+// dispatch helpers above remain the unfused regression path used by the
+// operator and boundary tests.
+fn encode_linear(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    output: metal::Buffer,
+    output_columns: usize,
+    input_columns: usize,
+    rows: usize,
+    weights_offset: u64 = 0 as u64,
+) {
+    var params: LinearParams = LinearParams {
+        rows: rows as u32,
+        output_columns: output_columns as u32,
+        input_columns: input_columns as u32,
+        weight_mode: 0 as u32,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weights, weights_offset, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 3 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: (round_up(output_columns, OUTPUT_TILE) / OUTPUT_TILE) as u64,
+            height: (round_up(rows, OUTPUT_TILE) / OUTPUT_TILE) as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: TILE as u64, height: TILE as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_int8_linear(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weight: LinearWeight,
+    output: metal::Buffer,
+    output_columns: usize,
+    input_columns: usize,
+    rows: usize,
+) {
+    var params: Int8LinearParams = Int8LinearParams {
+        rows: rows as u32,
+        output_columns: output_columns as u32,
+        input_columns: input_columns as u32,
+        group_size: 64 as u32,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weight.storage, weight.weights_offset, 1 as u64);
+    encoder.set_buffer(weight.storage, weight.scales_offset, 2 as u64);
+    encoder.set_buffer(weight.storage, weight.zeros_offset, 3 as u64);
+    encoder.set_buffer(output, 0 as u64, 4 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[Int8LinearParams]() as u64, 5 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: (round_up(output_columns, OUTPUT_TILE) / OUTPUT_TILE) as u64,
+            height: (round_up(rows, OUTPUT_TILE) / OUTPUT_TILE) as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: TILE as u64, height: TILE as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_weighted_linear(
+    encoder: metal::ComputeCommandEncoder,
+    pipelines: Pipelines,
+    input: metal::Buffer,
+    weight: LinearWeight,
+    output: metal::Buffer,
+    output_columns: usize,
+    input_columns: usize,
+    rows: usize,
+) {
+    if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
+        encode_int8_linear(
+            encoder,
+            pipelines.int8_linear,
+            input,
+            weight,
+            output,
+            output_columns,
+            input_columns,
+            rows,
+        );
+        return;
+    }
+    encode_linear(
+        encoder,
+        pipelines.dense_linear,
+        input,
+        weight.storage,
+        output,
+        output_columns,
+        input_columns,
+        rows,
+        weight.weights_offset,
+    );
+}
+
+fn encode_1d(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    buffer_0: metal::Buffer,
+    buffer_1: metal::Buffer,
+    buffer_2: metal::Buffer,
+    buffer_3: metal::Buffer,
+    buffer_5: metal::Buffer,
+    buffer_6: metal::Buffer,
+    parameters: *BlockParams,
+    thread_count: usize,
+) {
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(buffer_0, 0 as u64, 0 as u64);
+    encoder.set_buffer(buffer_1, 0 as u64, 1 as u64);
+    encoder.set_buffer(buffer_2, 0 as u64, 2 as u64);
+    encoder.set_buffer(buffer_3, 0 as u64, 3 as u64);
+    encoder.set_bytes(parameters as *u8, #size_of::[BlockParams]() as u64, 4 as u64);
+    encoder.set_buffer(buffer_5, 0 as u64, 5 as u64);
+    encoder.set_buffer(buffer_6, 0 as u64, 6 as u64);
+    let width: u64 = pipeline.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: thread_count as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: width, height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_attention(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    output: metal::Buffer,
+    value: metal::Buffer,
+    image_ids: metal::Buffer,
+    key_valid: metal::Buffer,
+    query_rows: usize,
+    key_rows: usize,
+    cache_key: metal::Buffer,
+    cache_value: metal::Buffer,
+    cache_offset: u64,
+    query_position_offset: usize = 0 as usize,
+    block_causal: bool = true,
+    cached_prefix_rows: usize = 0 as usize,
+) {
+    var params: AttentionParams = AttentionParams {
+        query_rows: query_rows as u32,
+        key_rows: key_rows as u32,
+        heads: HEADS as u32,
+        head_dimension: HEAD_DIMENSION as u32,
+        query_position_offset: query_position_offset as u32,
+        block_causal: if block_causal { 1 as u32 } else { 0 as u32 },
+        cached_prefix_rows: cached_prefix_rows as u32,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(query, 0 as u64, 0 as u64);
+    encoder.set_buffer(key, 0 as u64, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_buffer(value, 0 as u64, 3 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[AttentionParams]() as u64, 4 as u64);
+    encoder.set_buffer(image_ids, 0 as u64, 5 as u64);
+    encoder.set_buffer(key_valid, 0 as u64, 6 as u64);
+    encoder.set_buffer(cache_key, cache_offset, 7 as u64);
+    encoder.set_buffer(cache_value, cache_offset, 8 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size { width: (query_rows *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: HEAD_DIMENSION as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_copy_prefix(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    cache_key: metal::Buffer,
+    cache_value: metal::Buffer,
+    cache_offset: u64,
+    rows: usize,
+    dummy: metal::Buffer,
+) {
+    var params: BlockParams = BlockParams { rows: rows as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(key, 0 as u64, 0 as u64);
+    encoder.set_buffer(value, 0 as u64, 1 as u64);
+    encoder.set_buffer(cache_key, cache_offset, 2 as u64);
+    encoder.set_buffer(cache_value, cache_offset, 3 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[BlockParams]() as u64, 4 as u64);
+    encoder.set_buffer(dummy, 0 as u64, 5 as u64);
+    encoder.set_buffer(dummy, 0 as u64, 6 as u64);
+    let threads: u64 = pipeline.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: (rows *% WIDTH) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: threads, height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_buffer_barrier(encoder: metal::ComputeCommandEncoder) {
+    encoder.memory_barrier_with_scope(metal::barrier_scope_buffers);
 }
 
 fn new_buffer(device: metal::Device, bytes: u64) -> option::Option[metal::Buffer] {
@@ -1140,6 +1347,143 @@ fn execute_runtime_block(
     return option::Option[f64]::Some(total_ms + output_ms);
 }
 
+fn execute_batched_runtime_block(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    weights: BlockWeights,
+    workspace: BlockWorkspace,
+    hidden: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+    cache_mode: u32,
+    cache_copy_pipeline: metal::ComputePipelineState,
+    cache_key: metal::Buffer,
+    cache_value: metal::Buffer,
+    cache_offset: u64,
+    prefix_rows: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: BlockParams = BlockParams {
+        rows: rows as u32,
+        width: WIDTH as u32,
+        heads: HEADS as u32,
+        head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32,
+        slot: 0 as u32,
+    };
+
+    encode_1d(
+        encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
+        workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
+    );
+    encode_buffer_barrier(encoder);
+    encode_weighted_linear(
+        encoder, pipelines, workspace.norm1, weights.q, workspace.query, WIDTH, WIDTH, rows,
+    );
+    encode_weighted_linear(
+        encoder, pipelines, workspace.norm1, weights.k, workspace.key, WIDTH, WIDTH, rows,
+    );
+    encode_weighted_linear(
+        encoder, pipelines, workspace.norm1, weights.v, workspace.value, WIDTH, WIDTH, rows,
+    );
+    encode_buffer_barrier(encoder);
+    encode_1d(
+        encoder, pipelines.qk, workspace.query, weights.norm_q, workspace.query_rope,
+        workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
+    );
+    encode_1d(
+        encoder, pipelines.qk, workspace.key, weights.norm_k, workspace.key_rope,
+        workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
+    );
+    encode_buffer_barrier(encoder);
+    if cache_mode == (1 as u32) {
+        encode_copy_prefix(
+            encoder, cache_copy_pipeline, workspace.key_rope, workspace.value,
+            cache_key, cache_value, cache_offset, prefix_rows, workspace.dummy,
+        );
+        encode_buffer_barrier(encoder);
+    }
+    let cached: bool = cache_mode == (2 as u32);
+    encode_attention(
+        encoder,
+        pipelines.attention,
+        workspace.query_rope,
+        workspace.key_rope,
+        workspace.attended,
+        workspace.value,
+        workspace.image_ids,
+        workspace.key_valid,
+        rows,
+        if cached { prefix_rows +% rows } else { rows },
+        cache_key,
+        cache_value,
+        cache_offset,
+        if cached { prefix_rows } else { 0 as usize },
+        true,
+        if cached { prefix_rows } else { 0 as usize },
+    );
+    encode_buffer_barrier(encoder);
+    encode_weighted_linear(
+        encoder, pipelines, workspace.attended, weights.attention_output,
+        workspace.attention_projected, WIDTH, WIDTH, rows,
+    );
+    encode_buffer_barrier(encoder);
+    params.slot = 1 as u32;
+    encode_1d(
+        encoder, pipelines.residual, hidden, workspace.modulation, workspace.residual1,
+        workspace.attention_projected, workspace.target_mask, workspace.dummy,
+        #addr_of(params), rows *% WIDTH,
+    );
+    encode_buffer_barrier(encoder);
+    params.slot = 2 as u32;
+    encode_1d(
+        encoder, pipelines.norm, workspace.residual1, workspace.modulation, workspace.norm2,
+        workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
+    );
+    encode_buffer_barrier(encoder);
+    encode_weighted_linear(
+        encoder, pipelines, workspace.norm2, weights.gate, workspace.gate,
+        MLP_WIDTH, WIDTH, rows,
+    );
+    encode_weighted_linear(
+        encoder, pipelines, workspace.norm2, weights.projected, workspace.projected,
+        MLP_WIDTH, WIDTH, rows,
+    );
+    encode_buffer_barrier(encoder);
+    encode_1d(
+        encoder, pipelines.swiglu, workspace.gate, workspace.projected, workspace.swiglu,
+        workspace.dummy, workspace.dummy, workspace.dummy, #addr_of(params), rows *% MLP_WIDTH,
+    );
+    encode_buffer_barrier(encoder);
+    encode_weighted_linear(
+        encoder, pipelines, workspace.swiglu, weights.mlp_output, workspace.mlp_projected,
+        WIDTH, MLP_WIDTH, rows,
+    );
+    encode_buffer_barrier(encoder);
+    params.slot = 3 as u32;
+    encode_1d(
+        encoder, pipelines.residual, workspace.residual1, workspace.modulation, output,
+        workspace.mlp_projected, workspace.target_mask, workspace.dummy,
+        #addr_of(params), rows *% WIDTH,
+    );
+
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
 fn captured_block_name(block: usize) -> str {
     if block == (0 as usize) { return "block_00_output"; }
     if block == (23 as usize) { return "block_23_output"; }
@@ -1666,7 +2010,7 @@ fn run_full_packed(
             +% (if projected_weight.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize })
             +% (if mlp_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize });
         quantized_matrices = quantized_matrices +% block_quantized;
-        guard let option::Option[f64]::Some(block_ms) = execute_runtime_block(
+        guard let option::Option[f64]::Some(block_ms) = execute_batched_runtime_block(
             queue,
             pipelines,
             BlockWeights {
@@ -1983,13 +2327,13 @@ fn run_complete_packed(
         quantized_matrices = quantized_matrices +% block_quantized;
         let block_weights: BlockWeights = BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output };
         let cache_offset: u64 = block as u64 *% per_block_cache_bytes;
-        guard let option::Option[f64]::Some(block_ms) = execute_runtime_block(
+        guard let option::Option[f64]::Some(block_ms) = execute_batched_runtime_block(
             queue, pipelines, block_weights, workspace, current, next, COMPLETE_ROWS,
             1 as u32, cache_copy_pipeline, cache_key_arena, cache_value_arena,
             cache_offset, prefix_rows,
         ) else { return 1; };
         total_ms = total_ms + block_ms;
-        guard let option::Option[f64]::Some(cached_block_ms) = execute_runtime_block(
+        guard let option::Option[f64]::Some(cached_block_ms) = execute_batched_runtime_block(
             queue, pipelines, block_weights, cached_workspace, cached_current, cached_next,
             target_rows, 2 as u32, cache_copy_pipeline, cache_key_arena,
             cache_value_arena, cache_offset, prefix_rows,
@@ -2260,7 +2604,7 @@ fn run_scale_packed(
         let block_quantized: usize = (if q.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +% (if k.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +% (if v.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +% (if attention_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +% (if gate_weight.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +% (if projected_weight.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +% (if mlp_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize });
         quantized_matrices = quantized_matrices +% block_quantized;
         let cache_offset: u64 = block as u64 *% per_block_cache_bytes;
-        guard let option::Option[f64]::Some(block_ms) = execute_runtime_block(
+        guard let option::Option[f64]::Some(block_ms) = execute_batched_runtime_block(
             queue, pipelines, BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output }, workspace, current, next, rows,
             1 as u32, cache_copy_pipeline, cache_key_arena, cache_value_arena,
             cache_offset, text_rows,
@@ -2742,8 +3086,10 @@ fn run_trajectory_packed_impl(
 
     var all_ok: bool = true;
     var total_quantized_matrices: usize = 0 as usize;
+    let trajectory_wall_start_ms: i64 = time::now_millis();
     var step: usize = 0 as usize;
     while step < step_limit {
+        let step_wall_start_ms: i64 = time::now_millis();
         var step_ms: f64 = 0.0f64;
         let timestep_values: *f32 = timestep.contents() as *f32;
         timestep_values[0] = cpu::bf16_to_f32(cpu::f32_to_bf16(timesteps[step] / 1000.0f32));
@@ -2799,7 +3145,7 @@ fn run_trajectory_packed_impl(
                 (if projected_weight.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +%
                 (if mlp_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize });
             let cache_offset: u64 = block as u64 *% per_block_cache_bytes;
-            guard let option::Option[f64]::Some(block_ms) = execute_runtime_block(
+            guard let option::Option[f64]::Some(block_ms) = execute_batched_runtime_block(
                 queue, pipelines, BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output }, active_workspace, current, next, active_rows,
                 cache_mode, cache_copy_pipeline, cache_key_arena, cache_value_arena,
                 cache_offset, text_rows,
@@ -2829,6 +3175,7 @@ fn run_trajectory_packed_impl(
             sigmas[step +% (1 as usize)],
         );
         total_ms = total_ms + step_ms;
+        let step_wall_ms: i64 = time::now_millis() - step_wall_start_ms;
         let completed_step: usize = step +% (1 as usize);
         if validate_reference && (
             completed_step == (1 as usize) || completed_step == (2 as usize)
@@ -2851,11 +3198,11 @@ fn run_trajectory_packed_impl(
             } else {
                 0.011f64
             };
-            io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} latent_nRMSE=${error} limit=${error_limit}");
+            io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} latent_nRMSE=${error} limit=${error_limit}");
             all_ok = error <= error_limit && finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         } else {
             let cache_mode_name: str = if step == (0 as usize) { "extract" } else { "cached" };
-            io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms}");
+            io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms}");
             all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         }
         step = step +% (1 as usize);
@@ -2868,7 +3215,8 @@ fn run_trajectory_packed_impl(
             latent_index = latent_index +% (1 as usize);
         }
     }
-    io::println("trajectory: pixels=256 steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} cache_bytes=${(2 as u64) *% cache_arena_bytes} total_gpu_ms=${total_ms}");
+    let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
+    io::println("trajectory: pixels=256 steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} cache_bytes=${(2 as u64) *% cache_arena_bytes} total_gpu_ms=${total_ms} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
         if validate_reference {
             io::println("Qwen-Image-2.1 latent trajectory prefix: verified");

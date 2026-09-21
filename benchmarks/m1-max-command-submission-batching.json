@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "change": {
+    "before": "Each transformer kernel created, committed, and synchronously waited on its own command buffer.",
+    "after": "Each transformer block uses one command buffer and one compute encoder. Explicit buffer barriers separate dependent stages; independent Q/K/V, Q/K normalization, and MLP gate/projection dispatches remain barrier-free between peers.",
+    "command_buffers_per_cached_block_before": 15,
+    "command_buffers_per_prefill_block_before": 16,
+    "command_buffers_per_block_after": 1,
+    "unbatched_path_retained": true
+  },
+  "direct_two_step_ab": {
+    "scope": "The same 256px fixture trajectory prefix, including prefill step 1 and cached step 2. Packed-file validation and Metal setup occur before the measured loop.",
+    "unbatched": {
+      "summed_gpu_ms": 4976.0,
+      "wall_ms": 5295,
+      "non_gpu_overhead_ms": 319.0,
+      "step_1_latent_nrmse": 0.000895723,
+      "step_2_latent_nrmse": 0.00129116
+    },
+    "batched": {
+      "summed_gpu_ms": 5194.36,
+      "wall_ms": 5241,
+      "non_gpu_overhead_ms": 46.64,
+      "step_1_latent_nrmse": 0.000895723,
+      "step_2_latent_nrmse": 0.00129116
+    },
+    "non_gpu_overhead_reduction_percent": 85.3793,
+    "observed_wall_reduction_percent": 1.0198,
+    "gpu_time_warning": "The sequential A/B runs had a 218.36 ms GPU-time difference from normal frequency and thermal variation. Comparing wall minus GPU time isolates submission and CPU synchronization overhead more reliably than comparing raw wall totals."
+  },
+  "complete_fixture_trajectory": {
+    "pixels": 256,
+    "steps": 40,
+    "summed_gpu_ms": 98241.6,
+    "loop_wall_ms": 99577,
+    "non_gpu_overhead_ms": 1335.4,
+    "non_gpu_overhead_percent_of_wall": 1.3411,
+    "step_40_latent_nrmse": 0.0100476,
+    "passed": true
+  },
+  "complete_native_prompt_pipeline": {
+    "pixels": 256,
+    "steps": 40,
+    "text_phase_wall_ms": 13823,
+    "transformer_phase_wall_ms": 158794,
+    "transformer_loop_gpu_ms": 98854.8,
+    "transformer_loop_wall_ms": 99734,
+    "transformer_loop_non_gpu_overhead_ms": 879.2,
+    "vae_phase_wall_ms": 2978,
+    "image_output_wall_ms": 23,
+    "end_to_end_wall_ms": 175625,
+    "latent_step_40_nrmse": 0.0175609,
+    "decoded_fp32_nrmse": 0.0169086,
+    "rgba_u8_nrmse": 0.00957296,
+    "passed": true
+  },
+  "interpretation": "Block-level batching removes most synchronous submission overhead, but matrix multiplication remains the dominant steady-state cost. The first true end-to-end wall breakdown also exposes roughly 59.1 seconds between entering the transformer phase and starting its denoising loop, primarily packed-artifact validation and runtime setup; this is a larger next target than further command submission work.",
+  "limitations": [
+    "Metal GPU timestamps and wall clocks measure different scopes and must not be subtracted across separate runs without accounting for frequency variation.",
+    "The packed artifact is intentionally revalidated on every command today, so process startup is much slower than the measured denoising loop alone.",
+    "Batching is currently per block, not per denoising step. The remaining loop overhead is below 1.4% of measured wall time, so broader batching is not the next dominant optimization."
+  ]
+}

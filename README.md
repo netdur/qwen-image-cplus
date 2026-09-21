@@ -259,6 +259,17 @@ Inspect a shard, optionally filtering tensor names:
   covers one complete noise prediction at 512px and 1024px. Fixture provenance,
   timings, acceptance limits, and limitations are recorded in
   `benchmarks/m1-max-transformer-trajectory-native.json`.
+- Transformer blocks now encode their dependent kernels into one compute
+  encoder and one command buffer, with explicit buffer barriers only at true
+  dependency boundaries. Independent Q/K/V, Q/K normalization, and MLP
+  gate/projection dispatches do not receive barriers between one another. The
+  unfused dispatch functions remain available for operator and boundary
+  regression tests. In a direct two-step A/B, synchronous non-GPU overhead
+  fell from 319.0 ms to 46.6 ms (85.4%); GPU-frequency variation obscures that
+  saving in raw wall time, so both GPU and wall clocks are reported per step.
+  The complete fixture trajectory measured 98,241.6 ms GPU and 99,577 ms wall.
+  Results and caveats are recorded in
+  `benchmarks/m1-max-command-submission-batching.json`.
 - The real Qwen-Image-2.1 VAE still-image decoder now runs natively from its
   1.258 GiB FP32 Safetensors file through one read-only no-copy Metal mapping.
   It applies the exact 64-channel latent mean/std handoff, post-quant and input
@@ -354,6 +365,14 @@ Inspect a shard, optionally filtering tensor names:
   148,823 ms, while every recorded error metric remains identical. Full
   measurements and rationale are in
   `benchmarks/m1-max-native-prompt-pipeline-256.json`.
+- The application now records actual phase wall times in addition to summed
+  GPU timestamps. The batched canonical run takes 175,625 ms from prompt
+  processing through the completed PNG: 13,823 ms in the text phase, 158,794
+  ms in the transformer phase, 2,978 ms in the VAE phase, and 23 ms in image
+  output. Only 99,734 ms of the transformer phase is the denoising loop; the
+  remaining roughly 59.1 seconds is packed-file validation, mapping, Metal
+  setup, and other pre-loop work. That startup cost is now a measured
+  optimization target rather than being hidden outside GPU timing.
 
 ## Quantization decision log
 
