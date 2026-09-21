@@ -371,15 +371,16 @@ Inspect a shard, optionally filtering tensor names:
   148,823 ms, while every recorded error metric remains identical. Full
   measurements and rationale are in
   `benchmarks/m1-max-native-prompt-pipeline-256.json`.
-- Runtime transformer loading now maps QIPACK1 once, validates its exact model
-  identity, tensor inventory, ordering, dimensions, quantization schemes, and
-  byte layout, then checks every tensor's stored checksum across eight worker
-  ranges. Previously it mapped for verification, serially hashed the complete
-  13.33 GB payload, serially hashed nearly the same bytes again tensor by
-  tensor, unmapped, and mapped once more for inference. Runtime omits only the
-  redundant whole-payload pass and its unused alignment padding; the explicit
-  `verify-packed` audit retains both checksum layers and still passes the full
-  13,334,843,392-byte artifact.
+- Runtime transformer loading maps QIPACK1 once and always validates its exact
+  model identity, tensor inventory, ordering, dimensions, quantization schemes,
+  and byte ranges. It no longer rescans the complete 13.33 GB payload on every
+  generation. Set `QI_VERIFY_PACKED_CHECKSUMS=1` when loading an artifact whose
+  provenance is uncertain; that adds all per-tensor checksum checks. The
+  explicit `verify-packed` audit remains exhaustive, checking both the whole
+  payload and every tensor, and passes the full 13,334,843,392-byte artifact.
+  Pack creation already performs an exact source round-trip and installs the
+  completed artifact atomically, so normal inference trusts an artifact that
+  was verified when it was built while retaining deliberate audit paths.
 - The canonical prompt-to-PNG run now takes 131,262 ms, down from 175,625 ms
   (25.3%), with every numerical metric unchanged. Transformer pre-loop time
   fell from 59,060 ms to 13,881 ms (76.5%): 9,809 ms of parallel packed
@@ -459,15 +460,21 @@ Inspect a shard, optionally filtering tensor names:
   only when this quality tradeoff is acceptable. Detailed results and the
   reason for retaining both thresholds are in
   `benchmarks/m1-max-cache-dit-native.json`.
-- The 12.74-second figure is the 40-step transformer/scheduler loop, not a
-  cold end-to-end request. The measured arbitrary-prompt teapot run took
-  **44.831 seconds end to end**, from process start through tokenization, text
-  encoding, transformer, VAE decode, and completed PNG output. Its native text
-  phase took 17,440 ms; the complete transformer phase took 24,236 ms,
-  including 12,554 ms in the denoising loop plus packed-file validation,
-  Metal compilation, and buffer setup; VAE setup and decode took 3,126 ms;
-  and PNG output took 28 ms. A resident service is required to approach the
-  loop time for repeated requests.
+- The 12.74-second figure is the 40-step transformer/scheduler loop, not an
+  end-to-end request. Startup work was subsequently reduced by forwarding the
+  pipeline's existing token IDs into the text encoder, asynchronously paging
+  its four mapped weight shards while Metal is initialized, and moving QIPACK
+  payload hashing out of the default inference path. In a controlled A/B, the
+  last committed implementation took **42.094 seconds** internally while the
+  optimized implementation took **35.693 seconds** (15.2% faster); its repeat
+  took **34.504 seconds internally / 34.52 seconds process wall**. The repeat
+  comprised 12,674 ms for text, 18,837 ms for the complete transformer phase
+  including a 12,503 ms denoising loop, 2,971 ms for VAE setup and decode, and
+  21 ms for PNG output. All A/B and repeat PNGs are byte-identical. Readahead
+  raised maximum resident set size from 13.35 GB to 17.60 GB in the controlled
+  runs, a deliberate speed-for-memory tradeoff on the 32 GB test machine. A
+  resident service is still required to approach the loop time for repeated
+  requests.
 - As an external Apple-Silicon baseline, the locally downloaded
   `mlx-community/Qwen-Image-2.1-MLX-4bit` snapshot `4db4e8c` took
   **36.48 seconds end to end on repeat** for the same blue-teapot prompt at
@@ -490,6 +497,12 @@ Inspect a shard, optionally filtering tensor names:
   initialization in a new process, not a post-reboot disk-cold measurement.
   Exact measurements and the output checksum are in
   `benchmarks/m1-max-mlx-community-qwen-image-2.1-4bit.json`.
+- With the startup changes above, native C+ is effectively tied with and
+  slightly ahead of that MLX baseline on this case: 34.52 seconds process wall
+  versus MLX's 36.48-second repeat, a 1.96-second (5.4%) difference. This is a
+  single prompt and warm-filesystem-cache comparison, not a broad throughput
+  claim; the implementations also use different quantization and caching
+  paths.
 - QIPACK stores persistent packed weights and integrity/model metadata; it is
   not a serialized inference cache. Each generation must rebuild the
   prompt-dependent per-layer prefix K/V cache (about 18-23 MiB in the measured
@@ -497,8 +510,9 @@ Inspect a shard, optionally filtering tensor names:
   state. A resident process can retain the validated memory mapping, compiled
   pipelines, and reusable workspaces between requests, but it must refresh
   both caches for every new prompt and denoising trajectory. New processes
-  still benefit from macOS's filesystem page cache, yet they currently repeat
-  QIPACK checksum validation and runtime setup.
+  still benefit from macOS's filesystem page cache and always repeat structural
+  QIPACK validation and runtime setup, but payload checksum scans are now
+  explicit verification work rather than a cost paid by every generation.
 
 ## Quantization decision log
 

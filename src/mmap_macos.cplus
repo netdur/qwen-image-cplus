@@ -15,8 +15,12 @@ extern fn qi_mmap(address: *u8, length: usize, protection: i32, flags: i32, fd: 
 #[link_name = "munmap"]
 extern fn qi_munmap(address: *u8, length: usize) -> i32;
 
+#[link_name = "madvise"]
+extern fn qi_madvise(address: *u8, length: usize, advice: i32) -> i32;
+
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
 
 enum MapError {
     NotFound,
@@ -52,6 +56,18 @@ impl MappedFile {
 enum MapResult {
     Ok(MappedFile),
     Err(MapError),
+}
+
+// Ask the kernel to start faulting this mapping into the page cache. The call
+// returns immediately and the pages arrive asynchronously, so multi-gigabyte
+// weight I/O overlaps Metal pipeline construction instead of being paid for
+// serially at the first dispatch that touches the buffer. It is only a hint:
+// a failure changes performance, never correctness, so the result is advisory.
+fn advise_range_willneed(pointer: *u8, length: usize) -> bool {
+    if pointer.is_null() || length == (0 as usize) {
+        return false;
+    }
+    return qi_madvise(pointer, length, MADV_WILLNEED) == (0 as i32);
 }
 
 fn map_readonly(path: str) -> MapResult {

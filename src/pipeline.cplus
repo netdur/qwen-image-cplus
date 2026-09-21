@@ -171,9 +171,10 @@ fn run_native_256_impl(
     }
     var text_rows: usize = 0 as usize;
     io::println("pipeline: phase=text prompt_tokens=${expected_text_rows}");
-    if qwen3vl_text::encode_prompt_to_host(
+    if qwen3vl_text::encode_tokens_to_host(
         model_root,
-        prompt,
+        #slice_ptr(full_tokens.as_slice()),
+        full_tokens.count(),
         #slice_ptr(text_embeddings.as_slice()),
         text_capacity,
         #addr_of(text_rows),

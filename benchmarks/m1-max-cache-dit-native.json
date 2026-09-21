@@ -84,6 +84,58 @@
     "finite_output": true,
     "visually_coherent": true
   },
+  "startup_optimization": {
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "latent_seed": 42,
+    "threshold": 0.24,
+    "scope": "Fresh process through completed PNG output with a warm macOS filesystem cache",
+    "changes": [
+      "Reuse the pipeline's already-tokenized IDs instead of parsing tokenizer assets twice",
+      "Issue advisory MADV_WILLNEED for the four text-encoder mappings before Metal setup",
+      "Keep structural QIPACK validation mandatory but make its full payload checksum scan explicit"
+    ],
+    "controlled_committed_baseline": {
+      "text_phase_wall_ms": 15120,
+      "packed_validation_ms": 8530,
+      "transformer_loop_gpu_ms": 11957.5,
+      "transformer_loop_wall_ms": 12505,
+      "transformer_phase_wall_ms": 24014,
+      "vae_phase_wall_ms": 2939,
+      "image_output_wall_ms": 20,
+      "end_to_end_internal_wall_ms": 42094,
+      "process_wall_seconds": 42.53,
+      "maximum_resident_set_bytes": 13351518208
+    },
+    "optimized_first_run": {
+      "text_phase_wall_ms": 13660,
+      "packed_validation_ms": 1,
+      "transformer_loop_gpu_ms": 12116.6,
+      "transformer_loop_wall_ms": 12770,
+      "transformer_phase_wall_ms": 19055,
+      "vae_phase_wall_ms": 2957,
+      "image_output_wall_ms": 20,
+      "end_to_end_internal_wall_ms": 35693,
+      "process_wall_seconds": 36.12,
+      "maximum_resident_set_bytes": 17568579584
+    },
+    "optimized_repeat": {
+      "text_phase_wall_ms": 12674,
+      "packed_validation_ms": 0,
+      "transformer_loop_gpu_ms": 11976.7,
+      "transformer_loop_wall_ms": 12503,
+      "transformer_phase_wall_ms": 18837,
+      "vae_phase_wall_ms": 2971,
+      "image_output_wall_ms": 21,
+      "end_to_end_internal_wall_ms": 34504,
+      "process_wall_seconds": 34.52,
+      "maximum_resident_set_bytes": 17595826176
+    },
+    "controlled_internal_speedup_percent": 15.21,
+    "png_sha256": "4ba4db4de203a5a0a27160454695e93c5c75062406e7d53a4dab74c4abd49a99",
+    "outputs_byte_identical": true,
+    "checksum_policy": "Structure, identity, inventory, layout, and ranges are always checked. QI_VERIFY_PACKED_CHECKSUMS=1 checks all tensor hashes during load; verify-packed checks tensor and whole-payload hashes.",
+    "memory_tradeoff": "Text-shard readahead increased maximum RSS by about 4.24 GB in the controlled A/B; madvise is advisory and does not affect correctness."
+  },
   "validation": {
     "cache_off_two_step_oracle_unchanged": true,
     "cache_off_step_1_nrmse": 0.000903863,

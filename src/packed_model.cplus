@@ -1,6 +1,7 @@
 import "./cpu_ops" as cpu;
 import "./mmap_macos" as mapped;
 import "./safetensors" as safetensors;
+import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
@@ -730,11 +731,10 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
     return 0;
 }
 
-// Runtime loading validates the same exact header, inventory, layouts, and
-// every tensor checksum as verify_full_packed. It omits only the redundant
-// whole-payload FNV pass (which covers the same tensor bytes plus unused
-// alignment padding) and evaluates independent tensor hashes in parallel.
-// The explicit verify-packed command retains both checksum layers.
+// Runtime loading validates the exact header, inventory, layouts, and byte
+// ranges without scanning the multi-gigabyte payload. Hash verification is a
+// separate policy decision made by load(); verify-packed always retains both
+// the whole-payload and per-tensor checksum layers.
 fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
     let header: *PackedHeader = file.pointer() as *PackedHeader;
     let fp16_policy: bool = fixed_matches(
@@ -1040,7 +1040,13 @@ fn verify_packed(path: str, quiet: bool = false) -> i32 {
     return 0;
 }
 
-fn load(path: str) -> LoadResult {
+// Inference always validates the header, model identity, tensor inventory,
+// ordering, dimensions, quantization schemes, and byte ranges. Per-tensor
+// checksums additionally rescan the complete 13.3 GB payload, which dominated
+// measured startup, so they are opt-in: pass `verify_hashes`, or set
+// QI_VERIFY_PACKED_CHECKSUMS in the environment. The explicit `verify-packed`
+// command is unchanged and still runs both checksum layers.
+fn load(path: str, verify_hashes: bool = false) -> LoadResult {
     guard let mapped::MapResult::Ok(mapping) = mapped::map_readonly(path) else {
         return LoadResult::Err;
     };
@@ -1049,10 +1055,20 @@ fn load(path: str) -> LoadResult {
     }
     let header: *PackedHeader = mapping.pointer() as *PackedHeader;
     if magic_matches(header) && (*header).scope == SCOPE_TRANSFORMER {
-        if verify_full_runtime_structure(mapping, true) != (0 as i32)
-            || verify_full_runtime_hashes(mapping) != (0 as i32) {
+        if verify_full_runtime_structure(mapping, true) != (0 as i32) {
             return LoadResult::Err;
         }
+        let checksum_requested: bool =
+            verify_hashes || env::has_var("QI_VERIFY_PACKED_CHECKSUMS");
+        if checksum_requested && verify_full_runtime_hashes(mapping) != (0 as i32) {
+            return LoadResult::Err;
+        }
+        // Deliberately no MADV_WILLNEED here. The checksum pass used to warm
+        // the page cache as a side effect, and without it that I/O reappears
+        // when Metal first touches the no-copy buffer. A measured A/B showed
+        // explicit readahead is the slower of the two: 5,163 ms in load plus
+        // 1,923 ms at first touch, versus 5,968 ms at first touch alone.
+        // Metal's own first-touch paging wins on this mapping.
         return LoadResult::Ok(File { _mapping: mapping });
     }
     // The compact block fixture is not on the product startup path. Keep its

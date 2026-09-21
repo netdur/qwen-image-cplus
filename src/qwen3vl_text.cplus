@@ -333,19 +333,25 @@ fn finite(buffer: metal::Buffer, count: usize) -> bool {
     return true;
 }
 
+// Token IDs are supplied by the caller. The pipeline already tokenizes the
+// prompt to size its embedding buffer, and loading the tokenizer parses
+// 151,643 vocabulary entries plus 151,387 merges, so doing it a second time
+// here was pure duplicated startup work.
 fn run_impl(
     model_root: str,
-    prompt: str,
+    token_ids: *u32,
+    token_count: usize,
     fixture_path: str,
     output: *f32,
     output_capacity: usize,
     output_row_count: *usize,
     validate_reference: bool,
 ) -> i32 {
-    guard let option::Option[vec::Vec[u32]]::Some(token_ids) = tokenizer::tokenize_full_prompt(model_root, prompt) else {
-        return 1;
-    };
-    let rows: usize = token_ids.count();
+    if token_ids.is_null() {
+        io::eprintln("text encoder: token IDs must not be null");
+        return 2;
+    }
+    let rows: usize = token_count;
     if rows <= SYSTEM_PREFIX_TOKENS || rows > (512 as usize) {
         io::eprintln("text encoder: unsupported full token count ${rows}");
         return 1;
@@ -366,6 +372,13 @@ fn run_impl(
     guard let safetensors::LoadResult::Ok(file_1) = safetensors::load(shard_1_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 2: ${error.name()}"); return 1; };
     guard let safetensors::LoadResult::Ok(file_2) = safetensors::load(shard_2_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 3: ${error.name()}"); return 1; };
     guard let safetensors::LoadResult::Ok(file_3) = safetensors::load(shard_3_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 4: ${error.name()}"); return 1; };
+    // These four shards are 17.5 GB of BF16 weights and the phase is disk
+    // bound, not GPU bound. Start the reads now so they proceed while the
+    // Metal device, library, and pipelines are built below.
+    let _advised_0: bool = mapped::advise_range_willneed(file_0.mapping_pointer(), file_0.mapping_length());
+    let _advised_1: bool = mapped::advise_range_willneed(file_1.mapping_pointer(), file_1.mapping_length());
+    let _advised_2: bool = mapped::advise_range_willneed(file_2.mapping_pointer(), file_2.mapping_length());
+    let _advised_3: bool = mapped::advise_range_willneed(file_3.mapping_pointer(), file_3.mapping_length());
 
     let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
     if device_pointer.is_null() { io::eprintln("text encoder: no Metal device"); return 1; }
@@ -421,7 +434,7 @@ fn run_impl(
     let hidden_bytes: u64 = (rows *% WIDTH *% #size_of::[f32]()) as u64;
     let kv_bytes: u64 = (rows *% KV_WIDTH *% #size_of::[f32]()) as u64;
     let intermediate_bytes: u64 = (rows *% INTERMEDIATE_WIDTH *% #size_of::[f32]()) as u64;
-    guard let option::Option[metal::Buffer]::Some(ids) = device.new_buffer_with_bytes(#slice_ptr(token_ids.as_slice()) as *u8, (rows *% #size_of::[u32]()) as u64, metal::resource_options_m_t_l_resource_storage_mode_shared) else { return 1; };
+    guard let option::Option[metal::Buffer]::Some(ids) = device.new_buffer_with_bytes(token_ids as *u8, (rows *% #size_of::[u32]()) as u64, metal::resource_options_m_t_l_resource_storage_mode_shared) else { return 1; };
     let ids_owner: OwnedObjc = OwnedObjc::new(ids.raw());
     guard let option::Option[metal::Buffer]::Some(hidden_a) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_a_owner: OwnedObjc = OwnedObjc::new(hidden_a.raw());
     guard let option::Option[metal::Buffer]::Some(hidden_b) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_b_owner: OwnedObjc = OwnedObjc::new(hidden_b.raw());
@@ -544,6 +557,34 @@ fn run_impl(
     return 0;
 }
 
+// The integrated pipeline entry point: the caller owns the token IDs it
+// already produced, so no tokenizer assets are loaded here.
+fn encode_tokens_to_host(
+    model_root: str,
+    token_ids: *u32,
+    token_count: usize,
+    output: *f32,
+    output_capacity: usize,
+    output_row_count: *usize,
+) -> i32 {
+    if output.is_null() || output_row_count.is_null() {
+        io::eprintln("text encoder: integrated output pointers must not be null");
+        return 2;
+    }
+    return run_impl(
+        model_root,
+        token_ids,
+        token_count,
+        "",
+        output,
+        output_capacity,
+        output_row_count,
+        false,
+    );
+}
+
+// Retained for callers that hold only a prompt string; it tokenizes once and
+// forwards the IDs.
 fn encode_prompt_to_host(
     model_root: str,
     prompt: str,
@@ -555,7 +596,20 @@ fn encode_prompt_to_host(
         io::eprintln("text encoder: integrated output pointers must not be null");
         return 2;
     }
-    return run_impl(model_root, prompt, "", output, output_capacity, output_row_count, false);
+    guard let option::Option[vec::Vec[u32]]::Some(token_ids) =
+        tokenizer::tokenize_full_prompt(model_root, prompt) else {
+        return 1;
+    };
+    return run_impl(
+        model_root,
+        #slice_ptr(token_ids.as_slice()),
+        token_ids.count(),
+        "",
+        output,
+        output_capacity,
+        output_row_count,
+        false,
+    );
 }
 
 fn run(
@@ -563,9 +617,14 @@ fn run(
     prompt: str = "A red fox asleep beside a mossy stone in soft morning light.",
     fixture_path: str = "tests/fixtures/trajectory_256_fp32/text_input.f32",
 ) -> i32 {
+    guard let option::Option[vec::Vec[u32]]::Some(token_ids) =
+        tokenizer::tokenize_full_prompt(model_root, prompt) else {
+        return 1;
+    };
     return run_impl(
         model_root,
-        prompt,
+        #slice_ptr(token_ids.as_slice()),
+        token_ids.count(),
         fixture_path,
         0 as *f32,
         0 as usize,
