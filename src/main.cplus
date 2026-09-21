@@ -10,6 +10,8 @@ import "./scheduler" as scheduler;
 import "./vae" as vae;
 import "./pipeline" as pipeline;
 import "./image_output" as image_output;
+import "./tokenizer" as tokenizer;
+import "./qwen3vl_text" as qwen3vl_text;
 import "./tensor" as tensor;
 import "./cpu_ops" as cpu_ops;
 import "stdlib/env" as env;
@@ -20,7 +22,7 @@ import "stdlib/text" as text;
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -206,6 +208,27 @@ fn main() -> i32 {
                 return image_output::run_reference(output_path.view());
             }
         }
+    }
+    if command == "test-tokenizer" {
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-tokenizer MODEL_DIR [FIXTURE_DIR]");
+            return 2;
+        };
+        match env::arg(3 as usize) {
+            option::Option[text::Text]::Some(fixtures) => {
+                return tokenizer::run(model_path.view(), fixtures.view());
+            }
+            option::Option[text::Text]::None => {
+                return tokenizer::run(model_path.view());
+            }
+        }
+    }
+    if command == "test-text-encoder" {
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-text-encoder MODEL_DIR");
+            return 2;
+        };
+        return qwen3vl_text::run(model_path.view());
     }
     if command == "quantize-block0" {
         guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {

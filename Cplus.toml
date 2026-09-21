@@ -13,3 +13,4 @@ stdlib      = "*"
 [macos.dependencies]
 objc          = "*"
 metal         = "*"
+foundation    = "*"

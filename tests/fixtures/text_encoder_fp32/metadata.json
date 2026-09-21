@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "environment": {
+    "torch": "2.8.0",
+    "transformers": "5.17.0",
+    "device": "mps"
+  },
+  "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+  "full_tokens": 36,
+  "system_prefix_tokens_to_drop": 14,
+  "output_tokens": 22,
+  "capture_semantics": "decoder-layer outputs and final output before final RMSNorm",
+  "elapsed_seconds": 15.0009020420257,
+  "tensors": {
+    "embedding": {
+      "file": "embedding.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "74d74b8a7310bdf764a48d9418c1739dbd312ceb119f0eb93b590d9b81081ff8"
+    },
+    "layer_00": {
+      "file": "layer_00.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "38054692bcb5e92e8fad24a7438c950edf1e85e088d929f7632fdac38b895d61"
+    },
+    "layer_17": {
+      "file": "layer_17.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "185bb7239c8406f2b26cc964350ad09a588987d1c268e7e83fb415c346134f27"
+    },
+    "layer_23": {
+      "file": "layer_23.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "4ab8649a4a38264b0faad6a2e832090cfe51574b7c2816de24cbd69a6a912c5b"
+    },
+    "layer_31": {
+      "file": "layer_31.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "420ec9771bb851da0799829f3b8c95e5478947cba65c51cdc153bf598b707ffb"
+    },
+    "layer_32": {
+      "file": "layer_32.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "838bf990c4caee971f4d52e5252335ea533c414d9b60f613b7a4effe3e596c3b"
+    },
+    "layer_33": {
+      "file": "layer_33.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "94d272c3edfcbdb4f3a0c944371e61afe828eaa380b15293ab85ed97ede52cd4"
+    },
+    "layer_34": {
+      "file": "layer_34.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "a42d97abf707e2be1d3f26183989593d14ab9ee482d1dde6b47fc3cbf0972a00"
+    },
+    "layer_35": {
+      "file": "layer_35.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "0a015e54d3d8c4f2d3999ce34fcab1c80f02a616f4b2092828d9f42632ed35da"
+    },
+    "output": {
+      "file": "output.f32",
+      "dtype": "F32",
+      "shape": [
+        22,
+        4096
+      ],
+      "bytes": 360448,
+      "sha256": "0a015e54d3d8c4f2d3999ce34fcab1c80f02a616f4b2092828d9f42632ed35da"
+    }
+  }
+}

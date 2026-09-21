@@ -1,0 +1,437 @@
+import "foundation/foundation" as foundation;
+import "json/json" as json;
+import "objc/runtime" as rt;
+import "stdlib/fs" as fs;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/status" as status;
+import "stdlib/string_map" as string_map;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+import "./mmap_macos" as mapped;
+
+const IM_START: u32 = 151644 as u32;
+const IM_END: u32 = 151645 as u32;
+const SYSTEM_PREFIX_TOKENS: usize = 14;
+const SPLIT_PATTERN: str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const SYSTEM_TEXT: str = "system\nComprehend and analyze the provided prompt.";
+
+struct Tokenizer {
+    vocab: string_map::StringMap[u32],
+    merge_ranks: string_map::StringMap[u32],
+    split_pattern: foundation::RegularExpression,
+}
+
+enum LoadResult {
+    Ok(Tokenizer),
+    Err,
+}
+
+struct SpecialToken {
+    length: usize,
+    id: u32,
+}
+
+fn json_u32(value: json::Value) -> option::Option[u32] {
+    guard let option::Option[f64]::Some(number) = value.as_number() else {
+        return option::Option[u32]::None;
+    };
+    if number < 0.0f64 || number > 4294967295.0f64 {
+        return option::Option[u32]::None;
+    }
+    let integer: u32 = number as u32;
+    if integer as f64 != number {
+        return option::Option[u32]::None;
+    }
+    return option::Option[u32]::Some(integer);
+}
+
+fn pair_key(left: str, right: str) -> text::Text {
+    var key: text::Text = text::with_capacity(left.count() +% right.count() +% (1 as usize));
+    key.append(left);
+    let separator: [u8; 1] = [0 as u8; 1];
+    key.append({ #str_from_raw_parts(#addr_of(separator[0]), 1 as usize) });
+    key.append(right);
+    return key;
+}
+
+fn load(model_root: str) -> LoadResult {
+    let vocabulary_path = "${model_root}/processor/vocab.json";
+    guard let result::Result[text::Text, result::IoError]::Ok(vocabulary_source) = fs::read_to_string(vocabulary_path.view()) else {
+        io::eprintln("tokenizer: could not read ${vocabulary_path}");
+        return LoadResult::Err;
+    };
+    guard let result::Result[json::Value, json::ParseError]::Ok(vocabulary_json) = json::Value::parse(source: vocabulary_source.view()) else {
+        io::eprintln("tokenizer: vocab.json is invalid JSON");
+        return LoadResult::Err;
+    };
+    if !vocabulary_json.is_object() || vocabulary_json.item_count() != (151643 as usize) {
+        io::eprintln("tokenizer: expected 151643 base vocabulary entries");
+        return LoadResult::Err;
+    }
+    var vocabulary: string_map::StringMap[u32] = string_map::new::[u32]();
+    var vocabulary_index: usize = 0 as usize;
+    while vocabulary_index < vocabulary_json.item_count() {
+        guard let option::Option[text::Text]::Some(token) = vocabulary_json.key(at: vocabulary_index) else {
+            return LoadResult::Err;
+        };
+        guard let option::Option[json::Value]::Some(id_value) = vocabulary_json.object_value(at: vocabulary_index) else {
+            return LoadResult::Err;
+        };
+        guard let option::Option[u32]::Some(id) = json_u32(id_value) else {
+            return LoadResult::Err;
+        };
+        if vocabulary.insert(token, id) != status::Status::Ok {
+            return LoadResult::Err;
+        }
+        vocabulary_index = vocabulary_index +% (1 as usize);
+    }
+
+    let merges_path = "${model_root}/processor/merges.txt";
+    guard let result::Result[text::Text, result::IoError]::Ok(merges_source) = fs::read_to_string(merges_path.view()) else {
+        io::eprintln("tokenizer: could not read ${merges_path}");
+        return LoadResult::Err;
+    };
+    var merge_ranks: string_map::StringMap[u32] = string_map::new::[u32]();
+    var line_start: usize = 0 as usize;
+    var rank: u32 = 0 as u32;
+    while line_start < merges_source.count() {
+        var line_end: usize = line_start;
+        while line_end < merges_source.count() {
+            guard let option::Option[u8]::Some(byte) = merges_source.byte_at(line_end) else {
+                return LoadResult::Err;
+            };
+            if byte == (10 as u8) { break; }
+            line_end = line_end +% (1 as usize);
+        }
+        if line_start != (0 as usize) && line_end > line_start {
+            guard let option::Option[str]::Some(line) = merges_source.slice(line_start, line_end) else {
+                return LoadResult::Err;
+            };
+            guard let option::Option[usize]::Some(space) = line.find(" ") else {
+                io::eprintln("tokenizer: malformed merge at rank ${rank}");
+                return LoadResult::Err;
+            };
+            guard let option::Option[str]::Some(left) = line.slice(0 as usize, space) else {
+                return LoadResult::Err;
+            };
+            guard let option::Option[str]::Some(right) = line.slice(space +% (1 as usize), line.count()) else {
+                return LoadResult::Err;
+            };
+            if merge_ranks.insert(pair_key(left, right), rank) != status::Status::Ok {
+                return LoadResult::Err;
+            }
+            rank = rank +% (1 as u32);
+        }
+        line_start = line_end +% (1 as usize);
+    }
+    if rank != (151387 as u32) {
+        io::eprintln("tokenizer: expected 151387 BPE merges, got ${rank}");
+        return LoadResult::Err;
+    }
+
+    guard let option::Option[foundation::RegularExpression]::Some(pattern) = foundation::RegularExpression::regular_expression_with_pattern(
+        SPLIT_PATTERN,
+        0 as u64,
+        0 as *u8,
+    ) else {
+        io::eprintln("tokenizer: could not compile the pinned Unicode split expression");
+        return LoadResult::Err;
+    };
+    io::println("tokenizer assets: vocab=${vocabulary.count()} merges=${merge_ranks.count()} normalization=NFC");
+    return LoadResult::Ok(Tokenizer {
+        vocab: vocabulary,
+        merge_ranks: merge_ranks,
+        split_pattern: pattern,
+    });
+}
+
+fn byte_is_direct(byte: u8) -> bool {
+    return (byte >= (33 as u8) && byte <= (126 as u8))
+        || (byte >= (161 as u8) && byte <= (172 as u8))
+        || (byte >= (174 as u8));
+}
+
+// GPT-2/Qwen byte-level BPE maps every byte to a printable Unicode scalar.
+// Direct scalars keep their byte value; excluded bytes are assigned U+0100+
+// in byte order.
+fn byte_codepoint(byte: u8) -> u32 {
+    if byte_is_direct(byte) { return byte as u32; }
+    var excluded_before: u32 = 0 as u32;
+    var candidate: u32 = 0 as u32;
+    while candidate < byte as u32 {
+        if !byte_is_direct(candidate as u8) {
+            excluded_before = excluded_before +% (1 as u32);
+        }
+        candidate = candidate +% (1 as u32);
+    }
+    return (256 as u32) +% excluded_before;
+}
+
+fn scalar_text(codepoint: u32) -> text::Text {
+    var bytes: [u8; 4] = [0 as u8; 4];
+    var count: usize = 0 as usize;
+    if codepoint < (128 as u32) {
+        bytes[0] = codepoint as u8;
+        count = 1 as usize;
+    } else if codepoint < (2048 as u32) {
+        bytes[0] = ((192 as u32) | (codepoint >> (6 as u32))) as u8;
+        bytes[1] = ((128 as u32) | (codepoint & (63 as u32))) as u8;
+        count = 2 as usize;
+    } else {
+        bytes[0] = ((224 as u32) | (codepoint >> (12 as u32))) as u8;
+        bytes[1] = ((128 as u32) | ((codepoint >> (6 as u32)) & (63 as u32))) as u8;
+        bytes[2] = ((128 as u32) | (codepoint & (63 as u32))) as u8;
+        count = 3 as usize;
+    }
+    return text::from_str({ #str_from_raw_parts(#addr_of(bytes[0]), count) });
+}
+
+fn append_piece(take piece: text::Text, ref symbols: vec::Vec[text::Text]) -> bool {
+    var byte_index: usize = 0 as usize;
+    while byte_index < piece.count() {
+        guard let option::Option[u8]::Some(byte) = piece.byte_at(byte_index) else { return false; };
+        if symbols.append(scalar_text(byte_codepoint(byte))) != status::Status::Ok {
+            return false;
+        }
+        byte_index = byte_index +% (1 as usize);
+    }
+    return true;
+}
+
+fn bpe_piece(tokenizer: Tokenizer, take piece: text::Text, ref output: vec::Vec[u32]) -> bool {
+    var symbols: vec::Vec[text::Text] = vec::new::[text::Text]();
+    if !append_piece(piece, symbols) { return false; }
+
+    while symbols.count() > (1 as usize) {
+        var best_rank: u32 = 0xFFFFFFFF as u32;
+        var best_index: usize = 0 as usize;
+        var pair_index: usize = 0 as usize;
+        while pair_index +% (1 as usize) < symbols.count() {
+            guard let option::Option[*text::Text]::Some(left) = symbols.at_ptr(pair_index) else { return false; };
+            guard let option::Option[*text::Text]::Some(right) = symbols.at_ptr(pair_index +% (1 as usize)) else { return false; };
+            let key: text::Text = pair_key({ (*left).view() }, { (*right).view() });
+            match tokenizer.merge_ranks.get(key.view()) {
+                option::Option[u32]::Some(candidate_rank) => {
+                    if candidate_rank < best_rank {
+                        best_rank = candidate_rank;
+                        best_index = pair_index;
+                    }
+                }
+                option::Option[u32]::None => {}
+            }
+            pair_index = pair_index +% (1 as usize);
+        }
+        if best_rank == (0xFFFFFFFF as u32) { break; }
+
+        guard let option::Option[*text::Text]::Some(best_left_pointer) = symbols.at_ptr(best_index) else { return false; };
+        guard let option::Option[*text::Text]::Some(best_right_pointer) = symbols.at_ptr(best_index +% (1 as usize)) else { return false; };
+        let best_left: text::Text = { (*best_left_pointer).clone() };
+        let best_right: text::Text = { (*best_right_pointer).clone() };
+        var merged: vec::Vec[text::Text] = vec::Vec[text::Text]::with_capacity(symbols.count());
+        var index: usize = 0 as usize;
+        while index < symbols.count() {
+            guard let option::Option[*text::Text]::Some(current) = symbols.at_ptr(index) else { return false; };
+            var combine: bool = false;
+            if index +% (1 as usize) < symbols.count() && { (*current).equals(best_left.view()) } {
+                guard let option::Option[*text::Text]::Some(next) = symbols.at_ptr(index +% (1 as usize)) else { return false; };
+                combine = { (*next).equals(best_right.view()) };
+            }
+            if combine {
+                var token: text::Text = { (*current).clone() };
+                token.append(best_right.view());
+                if merged.append(token) != status::Status::Ok { return false; }
+                index = index +% (2 as usize);
+            } else {
+                if merged.append({ (*current).clone() }) != status::Status::Ok { return false; }
+                index = index +% (1 as usize);
+            }
+        }
+        symbols = merged;
+    }
+
+    var symbol_index: usize = 0 as usize;
+    while symbol_index < symbols.count() {
+        guard let option::Option[*text::Text]::Some(symbol) = symbols.at_ptr(symbol_index) else { return false; };
+        guard let option::Option[u32]::Some(id) = tokenizer.vocab.get({ (*symbol).view() }) else {
+            io::eprintln("tokenizer: BPE token is absent from vocab: ${(*symbol)}");
+            return false;
+        };
+        if output.append(id) != status::Status::Ok { return false; }
+        symbol_index = symbol_index +% (1 as usize);
+    }
+    return true;
+}
+
+fn encode_ordinary(tokenizer: Tokenizer, source: str, ref output: vec::Vec[u32]) -> bool {
+    if source.count() == (0 as usize) { return true; }
+    let source_string: foundation::String = foundation::String::new_with_string(source);
+    let normalized: text::Text = source_string.precomposed_string_with_canonical_mapping();
+    let normalized_string: foundation::String = foundation::String::new_with_string(normalized.view());
+    let matches: vec::Vec[foundation::TextCheckingResult] = tokenizer.split_pattern.matches_in_string(
+        normalized.view(),
+        0 as u64,
+        rt::Range { location: 0 as u64, length: normalized_string.length() },
+    );
+    var covered: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < matches.count() {
+        guard let option::Option[*foundation::TextCheckingResult]::Some(found) = matches.at_ptr(index) else { return false; };
+        let range: rt::Range = { (*found).range() };
+        if range.location != covered || range.length == (0 as u64) { return false; }
+        let piece: text::Text = normalized_string.substring_with_range(range);
+        if !bpe_piece(tokenizer, piece, output) { return false; }
+        covered = range.location +% range.length;
+        index = index +% (1 as usize);
+    }
+    return covered == normalized_string.length();
+}
+
+fn special_at(source: str, at: usize) -> option::Option[SpecialToken] {
+    guard let option::Option[str]::Some(tail) = source.slice(at, source.count()) else {
+        return option::Option[SpecialToken]::None;
+    };
+    if tail.has_prefix("<|endoftext|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 13 as usize, id: 151643 as u32 }); }
+    if tail.has_prefix("<|im_start|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 12 as usize, id: 151644 as u32 }); }
+    if tail.has_prefix("<|im_end|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 10 as usize, id: 151645 as u32 }); }
+    if tail.has_prefix("<|object_ref_start|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 20 as usize, id: 151646 as u32 }); }
+    if tail.has_prefix("<|object_ref_end|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 18 as usize, id: 151647 as u32 }); }
+    if tail.has_prefix("<|box_start|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 13 as usize, id: 151648 as u32 }); }
+    if tail.has_prefix("<|box_end|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 11 as usize, id: 151649 as u32 }); }
+    if tail.has_prefix("<|quad_start|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 14 as usize, id: 151650 as u32 }); }
+    if tail.has_prefix("<|quad_end|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 12 as usize, id: 151651 as u32 }); }
+    if tail.has_prefix("<|vision_start|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 16 as usize, id: 151652 as u32 }); }
+    if tail.has_prefix("<|vision_end|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 14 as usize, id: 151653 as u32 }); }
+    if tail.has_prefix("<|vision_pad|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 14 as usize, id: 151654 as u32 }); }
+    if tail.has_prefix("<|image_pad|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 13 as usize, id: 151655 as u32 }); }
+    if tail.has_prefix("<|video_pad|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 13 as usize, id: 151656 as u32 }); }
+    if tail.has_prefix("<tool_call>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 11 as usize, id: 151657 as u32 }); }
+    if tail.has_prefix("</tool_call>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 12 as usize, id: 151658 as u32 }); }
+    if tail.has_prefix("<|fim_prefix|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 14 as usize, id: 151659 as u32 }); }
+    if tail.has_prefix("<|fim_middle|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 14 as usize, id: 151660 as u32 }); }
+    if tail.has_prefix("<|fim_suffix|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 14 as usize, id: 151661 as u32 }); }
+    if tail.has_prefix("<|fim_pad|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 11 as usize, id: 151662 as u32 }); }
+    if tail.has_prefix("<|repo_name|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 13 as usize, id: 151663 as u32 }); }
+    if tail.has_prefix("<|file_sep|>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 12 as usize, id: 151664 as u32 }); }
+    if tail.has_prefix("<tool_response>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 15 as usize, id: 151665 as u32 }); }
+    if tail.has_prefix("</tool_response>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 16 as usize, id: 151666 as u32 }); }
+    if tail.has_prefix("<think>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 7 as usize, id: 151667 as u32 }); }
+    if tail.has_prefix("</think>") { return option::Option[SpecialToken]::Some(SpecialToken { length: 8 as usize, id: 151668 as u32 }); }
+    return option::Option[SpecialToken]::None;
+}
+
+fn encode_with_specials(tokenizer: Tokenizer, source: str, ref output: vec::Vec[u32]) -> bool {
+    var ordinary_start: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < source.count() {
+        match special_at(source, index) {
+            option::Option[SpecialToken]::Some(special) => {
+                guard let option::Option[str]::Some(ordinary) = source.slice(ordinary_start, index) else { return false; };
+                if !encode_ordinary(tokenizer, ordinary, output) { return false; }
+                if output.append(special.id) != status::Status::Ok { return false; }
+                index = index +% special.length;
+                ordinary_start = index;
+            }
+            option::Option[SpecialToken]::None => {
+                index = index +% (1 as usize);
+            }
+        }
+    }
+    guard let option::Option[str]::Some(ordinary) = source.slice(ordinary_start, source.count()) else { return false; };
+    return encode_ordinary(tokenizer, ordinary, output);
+}
+
+fn encode_full_prompt(tokenizer: Tokenizer, prompt: str) -> option::Option[vec::Vec[u32]] {
+    var full: vec::Vec[u32] = vec::new::[u32]();
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, SYSTEM_TEXT, full) { return option::Option[vec::Vec[u32]]::None; }
+    full.append(IM_END);
+    if !encode_ordinary(tokenizer, "\n", full) { return option::Option[vec::Vec[u32]]::None; }
+    full.append(IM_START);
+    let user_text: text::Text = "user\n${prompt}";
+    if !encode_with_specials(tokenizer, user_text.view(), full) { return option::Option[vec::Vec[u32]]::None; }
+    full.append(IM_END);
+    if !encode_ordinary(tokenizer, "\n", full) { return option::Option[vec::Vec[u32]]::None; }
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, "assistant\n", full) { return option::Option[vec::Vec[u32]]::None; }
+    return option::Option[vec::Vec[u32]]::Some(full);
+}
+
+fn encode_prompt(tokenizer: Tokenizer, prompt: str) -> option::Option[vec::Vec[u32]] {
+    guard let option::Option[vec::Vec[u32]]::Some(full) = encode_full_prompt(tokenizer, prompt) else {
+        return option::Option[vec::Vec[u32]]::None;
+    };
+    if full.count() < SYSTEM_PREFIX_TOKENS { return option::Option[vec::Vec[u32]]::None; }
+
+    var output: vec::Vec[u32] = vec::Vec[u32]::with_capacity(full.count() -% SYSTEM_PREFIX_TOKENS);
+    var index: usize = SYSTEM_PREFIX_TOKENS;
+    while index < full.count() {
+        guard let option::Option[u32]::Some(id) = full.at(index) else { return option::Option[vec::Vec[u32]]::None; };
+        if output.append(id) != status::Status::Ok { return option::Option[vec::Vec[u32]]::None; }
+        index = index +% (1 as usize);
+    }
+    return option::Option[vec::Vec[u32]]::Some(output);
+}
+
+fn tokenize_full_prompt(model_root: str, prompt: str) -> option::Option[vec::Vec[u32]] {
+    guard let LoadResult::Ok(tokenizer) = load(model_root) else LoadResult::Err {
+        return option::Option[vec::Vec[u32]]::None;
+    };
+    return encode_full_prompt(tokenizer, prompt);
+}
+
+fn validate_case(tokenizer: Tokenizer, fixture_directory: str, name: str, prompt: str) -> bool {
+    guard let option::Option[vec::Vec[u32]]::Some(actual) = encode_prompt(tokenizer, prompt) else {
+        io::eprintln("tokenizer: failed to encode ${name}");
+        return false;
+    };
+    let path = "${fixture_directory}/${name}.i32";
+    guard let mapped::MapResult::Ok(expected) = mapped::map_readonly(path.view()) else {
+        io::eprintln("tokenizer: missing ${path}");
+        return false;
+    };
+    if expected.length() != actual.count() *% #size_of::[u32]() {
+        io::eprintln("tokenizer ${name}: token count mismatch actual=${actual.count()} expected_bytes=${expected.length()}");
+        return false;
+    }
+    let expected_ids: *u32 = expected.pointer() as *u32;
+    var mismatches: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < actual.count() {
+        guard let option::Option[u32]::Some(id) = actual.at(index) else { return false; };
+        if id != expected_ids[index] { mismatches = mismatches +% (1 as usize); }
+        index = index +% (1 as usize);
+    }
+    io::println("tokenizer ${name}: tokens=${actual.count()} mismatches=${mismatches}");
+    return mismatches == (0 as usize);
+}
+
+fn run(
+    model_root: str,
+    fixture_directory: str = "tests/fixtures/tokenizer",
+) -> i32 {
+    guard let LoadResult::Ok(tokenizer) = load(model_root) else LoadResult::Err {
+        return 1;
+    };
+    var all_ok: bool = true;
+    all_ok = validate_case(tokenizer, fixture_directory, "empty", "") && all_ok;
+    all_ok = validate_case(tokenizer, fixture_directory, "canonical_fox", "A red fox asleep beside a mossy stone in soft morning light.") && all_ok;
+    all_ok = validate_case(tokenizer, fixture_directory, "unicode_multiline", "A café's sign says 你好 — déjà vu.\nSecond line!") && all_ok;
+    all_ok = validate_case(tokenizer, fixture_directory, "whitespace", " leading  spaces\tand trailing ") && all_ok;
+    all_ok = validate_case(tokenizer, fixture_directory, "special_tokens", "Show <|im_end|> and <think> literally.") && all_ok;
+    all_ok = validate_case(tokenizer, fixture_directory, "nfc_decomposed", "Café") && all_ok;
+    if all_ok {
+        io::println("Qwen3-VL native prompt tokenizer: verified");
+        return 0;
+    }
+    return 1;
+}
+
+#[test]
+fn byte_level_mapping_matches_gpt2_boundaries() {
+    assert byte_codepoint(33 as u8) == (33 as u32);
+    assert byte_codepoint(32 as u8) == (288 as u32);
+    assert byte_codepoint(0 as u8) == (256 as u32);
+    assert byte_codepoint(255 as u8) == (255 as u32);
+}

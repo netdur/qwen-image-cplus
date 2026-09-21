@@ -18,6 +18,8 @@ Diffusers source; those fixtures are plain binary files consumed by C+ tests.
 - Pinned official [transformer source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/transformers/transformer_qwenimage21.py),
   [VAE source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py),
   and [pipeline source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py)
+- Text model reference: Transformers 5.17.0
+  [Qwen3-VL implementation](https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py)
 
 ## Build and verify
 
@@ -54,6 +56,8 @@ cpc test
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus test-image-output reference.png
 ./target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
+./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
@@ -293,6 +297,29 @@ Inspect a shard, optionally filtering tensor names:
   0.504 mean absolute byte error and a maximum error of 25 under measured gates
   of 1.3% FP32 and 0.8% RGBA. Results and limitations are recorded in
   `benchmarks/m1-max-pipeline-256-native.json`.
+- Native text conditioning now begins at the downloaded tokenizer assets rather
+  than a Python-produced token stream. The implementation performs NFC
+  normalization, the pinned Unicode regex split, GPT-2 byte-to-Unicode mapping,
+  all 151,387 ranked BPE merges, added-special-token recognition, the raw T2I
+  chat template, and exact 14-token system-prefix removal. Six oracle cases
+  cover empty, Unicode/multiline, whitespace-sensitive, special-token, and
+  decomposed-NFC inputs; every output token ID matches Transformers 5.17.0.
+  NFC and Unicode-category regex matching use macOS Foundation so the runtime
+  does not carry an incomplete home-grown Unicode database; byte mapping and
+  BPE execution remain C+ code and the fixture gate checks their combined
+  behavior.
+- The complete text-only Qwen3-VL language path also runs natively from the
+  original four no-copy BF16 Safetensors mappings: 36 decoder layers at width
+  4096, 32 query heads, 8 KV heads, 128-wide RoPE, and 12,288-wide SwiGLU. It
+  omits the unused vision tower, final RMSNorm, and LM head and returns the last
+  decoder-layer state required by Qwen-Image. Explicit ties-to-even BF16
+  activation boundaries were necessary: retaining FP32 between operations was
+  rejected at 8.42% final nRMSE, while the accepted path measures 3.61% against
+  the pinned Torch 2.9 pipeline fixture in 774.971 ms of summed GPU time.
+  A separately regenerated Torch 2.8 MPS reference differs from that Torch 2.9
+  fixture by 3.28% itself; consequently the local 4% gate is not treated as an
+  end-to-end prompt-equivalence claim. Boundaries and limitations are recorded
+  in `benchmarks/m1-max-text-conditioning-native.json`.
 
 ## Quantization decision log
 
@@ -345,10 +372,12 @@ claim. The packed mapping is exposed to Metal without copying 12.42 GiB of
 weights; only activations, cache arenas, and 128-element Q/K norm vectors are
 copied.
 
-The denoising trajectory, VAE decode, postprocessing, and PNG output now form
-one verified process, but the command remains fixture-driven. Arbitrary native
-prompts still require the tokenizer/processor and the text-only Qwen3-VL
-encoder; production use also needs native seeded noise and substantial kernel
-optimization. The current VAE path intentionally implements the pinned
-one-frame first-chunk semantics; temporal continuation and tiled decode remain
-outside its verified scope.
+The denoising trajectory, VAE decode, postprocessing, and PNG output form one
+verified process, while tokenizer and text-only Qwen3-VL encoding are now a
+second verified native process. The image command remains fixture-driven until
+the new prompt embedding is handed into dynamically sized transformer token
+metadata/RoPE; native seeded noise and downstream prompt-equivalence validation
+also remain. Production use additionally needs text-encoder quantization and
+substantial kernel optimization. The current VAE path intentionally implements
+the pinned one-frame first-chunk semantics; temporal continuation and tiled
+decode remain outside its verified scope.

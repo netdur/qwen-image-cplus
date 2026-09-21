@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "case": {
+    "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+    "full_template_tokens": 36,
+    "system_prefix_tokens_removed": 14,
+    "output_tokens": 22,
+    "hidden_width": 4096,
+    "decoder_layers": 36
+  },
+  "tokenizer": {
+    "implementation": "Native NFC, pinned Unicode pre-tokenizer regex, GPT-2 byte mapping, ranked BPE, added-special-token recognition, raw T2I chat template",
+    "vocabulary_entries": 151643,
+    "merge_rules": 151387,
+    "oracle_cases": 6,
+    "oracle_mismatched_ids": 0,
+    "coverage": [
+      "empty prompt",
+      "canonical pipeline prompt",
+      "Unicode and multiline input",
+      "leading, repeated, tab, and trailing whitespace",
+      "added special tokens inside prompt text",
+      "decomposed input requiring NFC"
+    ]
+  },
+  "text_encoder": {
+    "weights": "Original four BF16 Safetensors shards mapped into Metal without copying",
+    "path": "Text-only language model; vision tower, final RMSNorm, and LM head are not executed",
+    "architecture": "36 layers, width 4096, 32 query heads, 8 KV heads, head dimension 128, SwiGLU width 12288, theta 5000000",
+    "activation_semantics": "FP32 computation with explicit round-to-nearest-even BF16 storage boundaries",
+    "summed_gpu_kernel_ms": 774.971,
+    "finite_output": true,
+    "embedding_nrmse_against_torch_2_8": 0.0,
+    "layer_00_nrmse_against_torch_2_8": 0.00510526,
+    "layer_17_nrmse_against_torch_2_8": 0.00681109,
+    "layer_23_nrmse_against_torch_2_8": 0.0068456,
+    "layer_31_nrmse_against_torch_2_8": 0.00749179,
+    "layer_33_nrmse_against_torch_2_8": 0.00827235,
+    "layer_34_nrmse_against_torch_2_8": 0.0384125,
+    "layer_35_nrmse_against_torch_2_8": 0.04542,
+    "final_nrmse_against_pinned_torch_2_9_pipeline_fixture": 0.0361069,
+    "acceptance_limit": 0.04,
+    "passed": true
+  },
+  "reference_variation": {
+    "torch_2_8_vs_pinned_torch_2_9_final_nrmse": 0.03281885,
+    "interpretation": "The reference MPS backend itself moves the pre-final-RMSNorm representation by 3.28% between the two measured Torch versions. The native 4% gate is therefore local to this conditioning boundary and must be followed by a downstream denoiser/image gate before claiming prompt-equivalent generation."
+  },
+  "rejected_path": {
+    "description": "Keeping FP32 activations between language-model operations",
+    "final_nrmse": 0.0841984,
+    "reason": "Error accumulated from 0% at embedding to 9.21% at layer 35 against the Torch 2.8 boundary fixture. Explicit BF16 storage semantics reduced the pinned final error to 3.61%."
+  },
+  "limitations": [
+    "The native text-encoder output is not yet handed to the denoiser; the existing image command still reads committed prompt embeddings.",
+    "The four complete checkpoint shards remain mapped for this correctness path even though the vision tower and LM head are not touched.",
+    "Text-encoder quantization has not been calibrated, and the 17.5 GB mapping must be released before opening the 12.42 GB denoiser mapping.",
+    "Only a single unpadded prompt is executed natively; fixture metadata records exact left-padded batch IDs and masks for the later batching boundary."
+  ]
+}
