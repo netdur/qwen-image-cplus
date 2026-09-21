@@ -4147,6 +4147,7 @@ fn run_prompt_trajectory_256_to_host(
     final_latent: *f32,
     validate_reference: bool = false,
     fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+    requested_steps: str = "40",
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null() {
         io::eprintln("trajectory: native prompt handoff received a null buffer");
@@ -4154,7 +4155,7 @@ fn run_prompt_trajectory_256_to_host(
     }
     return run_trajectory_packed_impl(
         packed_path,
-        "40",
+        requested_steps,
         fixture_directory,
         final_latent,
         text_input,
@@ -4174,6 +4175,7 @@ fn run_prompt_trajectory_cache_dit_256_to_host(
     seed: u64,
     final_latent: *f32,
     threshold: f64 = 0.12f64,
+    requested_steps: str = "40",
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null()
         || !(threshold == 0.12f64 || threshold == 0.24f64) {
@@ -4182,7 +4184,7 @@ fn run_prompt_trajectory_cache_dit_256_to_host(
     }
     return run_trajectory_packed_impl(
         packed_path,
-        "40",
+        requested_steps,
         "tests/fixtures/trajectory_256_fp32",
         final_latent,
         text_input,
@@ -4201,6 +4203,7 @@ fn run_prompt_trajectory_1024_to_host(
     text_rows: usize,
     seed: u64,
     final_latent: *f32,
+    requested_steps: str = "40",
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null() {
         io::eprintln("trajectory: 1024px prompt handoff received a null buffer");
@@ -4208,7 +4211,7 @@ fn run_prompt_trajectory_1024_to_host(
     }
     return run_trajectory_packed_impl(
         packed_path,
-        "40",
+        requested_steps,
         "",
         final_latent,
         text_input,
@@ -4229,6 +4232,7 @@ fn run_prompt_trajectory_cache_dit_1024_to_host(
     seed: u64,
     final_latent: *f32,
     threshold: f64 = 0.12f64,
+    requested_steps: str = "40",
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null()
         || !(threshold == 0.12f64 || threshold == 0.24f64) {
@@ -4237,7 +4241,7 @@ fn run_prompt_trajectory_cache_dit_1024_to_host(
     }
     return run_trajectory_packed_impl(
         packed_path,
-        "40",
+        requested_steps,
         "",
         final_latent,
         text_input,
@@ -4274,10 +4278,12 @@ fn run_trajectory_packed_impl(
         step_limit = 1 as usize;
     } else if requested_steps == "2" {
         step_limit = 2 as usize;
+    } else if requested_steps == "25" {
+        step_limit = 25 as usize;
     } else if requested_steps == "40" {
         step_limit = 40 as usize;
     } else {
-        io::eprintln("trajectory: steps must be 1, 2, or 40");
+        io::eprintln("trajectory: steps must be 1, 2, 25, or 40");
         return 2;
     }
     let text_rows: usize = if native_inputs { native_text_rows } else { 22 as usize };
@@ -4294,6 +4300,10 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: reference checkpoints are available only at 256px");
         return 2;
     }
+    if validate_reference && step_limit != (40 as usize) {
+        io::eprintln("trajectory: reference checkpoints require the canonical 40-step schedule");
+        return 2;
+    }
     let latent_side: usize = pixels / (16 as usize);
     let target_rows: usize = latent_side *% latent_side;
     let rows: usize = text_rows +% target_rows;
@@ -4301,12 +4311,12 @@ fn run_trajectory_packed_impl(
     var sigmas: [f32; 41] = [0.0f32; 41];
     var timesteps: [f32; 40] = [0.0f32; 40];
     if !flow::fill_schedule(
-        40 as usize,
+        step_limit,
         target_rows,
         #addr_of(sigmas[0]),
         #addr_of(timesteps[0]),
     ) {
-        io::eprintln("trajectory: could not construct the 40-step FlowMatch schedule");
+        io::eprintln("trajectory: could not construct the ${step_limit}-step FlowMatch schedule");
         return 1;
     }
     let packed_load_start_ms: i64 = time::now_millis();

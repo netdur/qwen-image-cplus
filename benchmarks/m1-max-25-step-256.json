@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Explicit 25-step FlowMatch generation at 256x256",
+  "implementation": {
+    "schedule": "A complete 25-step FlowMatch schedule generated for 256 latent tokens; not a truncated 40-step schedule",
+    "cli": "The final optional generation argument accepts 25 or 40",
+    "default_steps": 40,
+    "supported_resolutions": [256, 1024],
+    "measured_resolutions": [256],
+    "reference_policy": "Official trajectory checkpoints remain restricted to the canonical 40-step schedule"
+  },
+  "native_prompt_to_png": {
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "seed": 42,
+    "steps": 25,
+    "cache_off": {
+      "text_wall_ms": 13330,
+      "transformer_loop_gpu_ms": 13898.7,
+      "transformer_loop_wall_ms": 14180,
+      "transformer_phase_wall_ms": 20536,
+      "vae_wall_ms": 1222,
+      "image_output_wall_ms": 20,
+      "end_to_end_wall_ms": 35109,
+      "adjacent_40_step_end_to_end_wall_ms": 44675,
+      "adjacent_40_step_transformer_loop_wall_ms": 23478,
+      "end_to_end_reduction_percent": 21.41,
+      "transformer_loop_wall_reduction_percent": 39.6
+    },
+    "cache_dit_0_24": {
+      "text_wall_ms": 12604,
+      "transformer_loop_gpu_ms": 5327.48,
+      "transformer_loop_wall_ms": 5463,
+      "transformer_phase_wall_ms": 11366,
+      "vae_wall_ms": 1232,
+      "image_output_wall_ms": 21,
+      "end_to_end_wall_ms": 25225,
+      "cached_steps": 16,
+      "adjacent_40_step_end_to_end_wall_ms": 27681,
+      "adjacent_40_step_transformer_loop_wall_ms": 7876,
+      "end_to_end_reduction_percent": 8.87,
+      "transformer_loop_wall_reduction_percent": 30.64
+    },
+    "measurement_note": "Fresh-process warm-filesystem measurements. Text paging and GPU frequency vary between runs; fixed text, startup, VAE, and PNG costs limit the end-to-end benefit relative to the denoising-loop reduction."
+  },
+  "quality": {
+    "cache_off_visual_comparison": "Extremely close to the 40-step image in composition and detail; minor highlight and texture differences only",
+    "cache_dit_0_24_visual_comparison": "Coherent and prompt-correct, but body, handle, lid geometry, and highlights diverge more visibly from 40-step cache-off",
+    "official_25_step_numeric_oracle": false,
+    "decision": "Accept 25 steps as an explicit option; preserve 40 as the compatibility and reproducibility default; keep 25-step Cache-DiT explicitly approximate"
+  },
+  "validation": {
+    "unit_tests": "334 passed, 0 failed",
+    "format_check": true,
+    "type_check": true,
+    "debug_build": true,
+    "manual_image_comparison": true,
+    "measured_1024": false
+  }
+}

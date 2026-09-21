@@ -65,15 +65,21 @@ cpc test
 ./target/debug/qwen-image-cplus test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
 ./target/debug/qwen-image-cplus test-native-inputs
 ./target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
-./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
-./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101
-./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
-./target/debug/qwen-image-cplus generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101
+./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
+./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
+./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
+./target/debug/qwen-image-cplus generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
 ./target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
 ./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
+
+The four production generation commands accept `25` or `40` as their final
+optional argument. Omitting it preserves the canonical 40-step behavior. A
+25-step run constructs a fresh 25-step FlowMatch schedule; it does not truncate
+the first 25 points of the 40-step schedule. The 25-step path is measured at
+256, while 1024 support currently has build and unit-test coverage only.
 
 Inspect a shard, optionally filtering tensor names:
 
@@ -806,6 +812,24 @@ Inspect a shard, optionally filtering tensor names:
   s text, 14.056 s transformer phase including a 7.876 s loop, 1.236 s VAE,
   and 19 ms PNG output. Exact isolated, oracle, and end-to-end measurements are
   in `benchmarks/m1-max-flash-attention-256.json`.
+- An explicit 25-step FlowMatch mode reduces the same 256 blue-teapot run to
+  **35.109 s end to end** without Cache-DiT: 13.330 s text, 20.536 s
+  transformer phase including a 14.180 s loop, 1.222 s VAE, and 20 ms PNG.
+  That is 21.4% lower end-to-end latency and 39.6% lower denoising-loop wall
+  time than the adjacent 40-step run. Manual side-by-side inspection found the
+  25-step image extremely close in composition and detail to the 40-step
+  image, with only minor highlight and texture differences. There is no
+  official 25-step numerical oracle, so 40 remains the default and the 25-step
+  result is an explicit speed/quality choice.
+- Combining 25 steps with Cache-DiT 0.24 reaches **25.225 s end to end**: 12.604
+  s text, 11.366 s transformer phase including a 5.463 s loop, 1.232 s VAE,
+  and 21 ms PNG; 16 of 25 steps were cached. This is only 8.9% below the
+  40-step Cache-DiT run because text, startup, and VAE costs do not scale with
+  the denoising count. The image remained coherent and prompt-correct, but its
+  body, handle, lid, and highlights diverged more visibly because step
+  reduction and residual caching are compounded approximations. It therefore
+  remains opt-in. Full measurements and the acceptance rationale are in
+  `benchmarks/m1-max-25-step-256.json`.
 
 ## Remaining optimization phases
 

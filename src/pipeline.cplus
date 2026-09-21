@@ -149,6 +149,7 @@ fn run_native_impl(
     validate_reference: bool,
     cache_dit: bool,
     cache_dit_threshold: f64,
+    steps: str = "40",
 ) -> i32 {
     let pipeline_wall_start_ms: i64 = time::now_millis();
     guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
@@ -165,6 +166,7 @@ fn run_native_impl(
         validate_reference,
         cache_dit,
         cache_dit_threshold,
+        steps,
         pipeline_wall_start_ms,
         pipeline_wall_start_ms,
     );
@@ -180,6 +182,7 @@ fn run_native_tokens_impl(
     validate_reference: bool,
     cache_dit: bool,
     cache_dit_threshold: f64,
+    steps: str,
     pipeline_wall_start_ms: i64,
     text_wall_start_ms: i64,
 ) -> i32 {
@@ -247,6 +250,7 @@ fn run_native_tokens_impl(
                 seed,
                 #slice_ptr(latent.as_slice()),
                 cache_dit_threshold,
+                steps,
             )
         } else {
             transformer::run_prompt_trajectory_1024_to_host(
@@ -255,6 +259,7 @@ fn run_native_tokens_impl(
                 text_rows,
                 seed,
                 #slice_ptr(latent.as_slice()),
+                steps,
             )
         }
     } else if cache_dit {
@@ -265,6 +270,7 @@ fn run_native_tokens_impl(
             seed,
             #slice_ptr(latent.as_slice()),
             cache_dit_threshold,
+            steps,
         )
     } else {
         transformer::run_prompt_trajectory_256_to_host(
@@ -274,6 +280,8 @@ fn run_native_tokens_impl(
             seed,
             #slice_ptr(latent.as_slice()),
             validate_reference,
+            "tests/fixtures/trajectory_256_fp32",
+            steps,
         )
     };
     if transformer_status != (0 as i32) {
@@ -392,6 +400,7 @@ fn benchmark_process_reuse_256(
             false,
             true,
             threshold,
+            "40",
             request_start_ms,
             request_start_ms,
         );
@@ -413,10 +422,11 @@ fn generate_256(
     output_path: str,
     prompt: str,
     seed: u64 = 1101 as u64,
+    steps: str = "40",
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 256 as usize,
-        false, false, 0.0f64,
+        false, false, 0.0f64, steps,
     );
 }
 
@@ -427,10 +437,11 @@ fn generate_256_cache_dit(
     prompt: str,
     seed: u64 = 1101 as u64,
     threshold: f64 = 0.12f64,
+    steps: str = "40",
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 256 as usize,
-        false, true, threshold,
+        false, true, threshold, steps,
     );
 }
 
@@ -440,10 +451,11 @@ fn generate_1024(
     output_path: str,
     prompt: str,
     seed: u64 = 1101 as u64,
+    steps: str = "40",
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
-        false, false, 0.0f64,
+        false, false, 0.0f64, steps,
     );
 }
 
@@ -454,10 +466,11 @@ fn generate_1024_cache_dit(
     prompt: str,
     seed: u64 = 1101 as u64,
     threshold: f64 = 0.12f64,
+    steps: str = "40",
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
-        false, true, threshold,
+        false, true, threshold, steps,
     );
 }
 
