@@ -25,6 +25,7 @@ const HEADS: usize = 32;
 const HEAD_DIMENSION: usize = 128;
 const MLP_WIDTH: usize = 12288;
 const TILE: usize = 16;
+const OUTPUT_TILE: usize = 32;
 const PACKED_SCHEME_BF16: u32 = 0;
 const PACKED_SCHEME_INT8_AFFINE: u32 = 3;
 const VM_PAGE_BYTES: usize = 16384;
@@ -216,10 +217,10 @@ fn dispatch_linear(
     encoder.set_buffer(weights, weights_offset, 1 as u64);
     encoder.set_buffer(output, 0 as u64, 2 as u64);
     encoder.set_bytes(#addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 3 as u64);
-    encoder.dispatch_threads(
+    encoder.dispatch_threadgroups(
         metal::Size {
-            width: round_up(output_columns, TILE) as u64,
-            height: round_up(rows, TILE) as u64,
+            width: (round_up(output_columns, OUTPUT_TILE) / OUTPUT_TILE) as u64,
+            height: (round_up(rows, OUTPUT_TILE) / OUTPUT_TILE) as u64,
             depth: 1 as u64,
         },
         metal::Size { width: TILE as u64, height: TILE as u64, depth: 1 as u64 },
@@ -270,10 +271,10 @@ fn dispatch_int8_linear(
     encoder.set_buffer(weight.storage, weight.zeros_offset, 3 as u64);
     encoder.set_buffer(output, 0 as u64, 4 as u64);
     encoder.set_bytes(#addr_of(params) as *u8, #size_of::[Int8LinearParams]() as u64, 5 as u64);
-    encoder.dispatch_threads(
+    encoder.dispatch_threadgroups(
         metal::Size {
-            width: round_up(output_columns, TILE) as u64,
-            height: round_up(rows, TILE) as u64,
+            width: (round_up(output_columns, OUTPUT_TILE) / OUTPUT_TILE) as u64,
+            height: (round_up(rows, OUTPUT_TILE) / OUTPUT_TILE) as u64,
             depth: 1 as u64,
         },
         metal::Size { width: TILE as u64, height: TILE as u64, depth: 1 as u64 },
@@ -1194,7 +1195,7 @@ fn run(model_directory: str, fixture_directory: str = "tests/fixtures/block0_fp3
         return 1;
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
-    guard let option::Option[OwnedObjc]::Some(linear_owner) = pipeline(device, library, "qi_block_linear_16x16") else {
+    guard let option::Option[OwnedObjc]::Some(linear_owner) = pipeline(device, library, "qi_block_linear_32x32") else {
         return 1;
     };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else {
@@ -1382,8 +1383,8 @@ fn run_packed(packed_path: str, fixture_directory: str = "tests/fixtures/block0_
         return 1;
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
-    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_16x16") else { return 1; };
-    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_16x16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_32x32") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_32x32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qi_block_attention") else { return 1; };
@@ -1476,9 +1477,9 @@ fn run_full_packed(
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
     guard let option::Option[OwnedObjc]::Some(dense_owner) =
-        pipeline(device, library, "qi_block_linear_16x16") else { return 1; };
+        pipeline(device, library, "qi_block_linear_32x32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(int8_owner) =
-        pipeline(device, library, "qi_block_int8_affine_linear_16x16") else { return 1; };
+        pipeline(device, library, "qi_block_int8_affine_linear_32x32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) =
         pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) =
@@ -1757,8 +1758,8 @@ fn run_complete_packed(
         return 1;
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
-    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_16x16") else { return 1; };
-    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_16x16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_32x32") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_32x32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qi_block_attention") else { return 1; };
@@ -2099,8 +2100,8 @@ fn run_scale_packed(
         return 1;
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
-    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_16x16") else { return 1; };
-    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_16x16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_32x32") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_32x32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qi_block_attention") else { return 1; };
@@ -2551,8 +2552,8 @@ fn run_trajectory_packed_impl(
         return 1;
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
-    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_16x16") else { return 1; };
-    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_16x16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(dense_owner) = pipeline(device, library, "qi_block_linear_32x32") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(int8_owner) = pipeline(device, library, "qi_block_int8_affine_linear_32x32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qi_block_attention") else { return 1; };
@@ -3023,6 +3024,8 @@ fn block_dimensions_match_pinned_model() {
 
 #[test]
 fn tile_rounding_covers_model_width() {
-    assert round_up(WIDTH, TILE) == WIDTH;
-    assert round_up(ROWS, TILE) == (16 as usize);
+    assert round_up(WIDTH, OUTPUT_TILE) == WIDTH;
+    assert round_up(ROWS, OUTPUT_TILE) == (32 as usize);
+    assert round_up((278 as usize), OUTPUT_TILE) == (288 as usize);
+    assert round_up((256 as usize), OUTPUT_TILE) == (256 as usize);
 }

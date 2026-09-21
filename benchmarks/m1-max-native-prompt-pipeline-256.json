@@ -24,10 +24,10 @@
     "packed_transformer": "/private/tmp/qwen-image-2.1-mixed.qipack"
   },
   "native": {
-    "text_encoder_gpu_kernel_ms": 756.699,
-    "transformer_gpu_kernel_ms": 148823.0,
-    "vae_gpu_kernel_ms": 2271.18,
-    "summed_gpu_kernel_ms": 151850.879,
+    "text_encoder_gpu_kernel_ms": 761.658,
+    "transformer_gpu_kernel_ms": 98843.8,
+    "vae_gpu_kernel_ms": 2373.47,
+    "summed_gpu_kernel_ms": 101978.928,
     "seeded_noise_nrmse": 0.0,
     "dynamic_rope_nrmse": 8.30726e-8,
     "latent_step_1_nrmse": 0.000896293,
@@ -64,17 +64,19 @@
     "vae_gpu_kernel_ms": 2284.94,
     "png_bytes": 262488,
     "finite_output": true,
-    "completed": true
+    "completed": true,
+    "timing_note": "Recorded before the transformer 32x32 output-tile optimization; retained as the variable-length functional smoke result."
   },
   "reasoning": {
     "separate_integrated_limits": "The fixture-fed trajectory retains its 1.1% final-latent and 1.3% decoded-FP32 gates. The native text encoder is independently bounded at 4% against the Torch 2.9 text fixture, whose result also differs by 3.28% from a Torch 2.8 MPS regeneration. Its small embedding drift measures 1.75609% after 40 denoising steps and 1.69086% after decode, so the integrated native-prompt boundaries use a measured 2% budget without weakening the fixture-fed tests.",
-    "final_image": "The canonical generated image remains within 0.957296% normalized RMS in RGBA byte space, with a 0.5574 mean absolute byte error. This is the downstream prompt-equivalence gate rather than an assertion that the text encoder is bit-identical across PyTorch backends."
+    "final_image": "The canonical generated image remains within 0.957296% normalized RMS in RGBA byte space, with a 0.5574 mean absolute byte error. This is the downstream prompt-equivalence gate rather than an assertion that the text encoder is bit-identical across PyTorch backends.",
+    "transformer_optimization": "A 16x16 threadgroup now computes a 32x32 output tile with four accumulators per thread while retaining a 16-wide K tile and the original inner accumulation order. Transformer GPU time fell from 148823 ms to 98843.8 ms (33.6%) with every numerical metric unchanged."
   },
   "limitations": [
     "Generation is currently fixed to 256x256, batch size one, text-to-image, and 40 denoising steps.",
     "Prompts are limited to 498 post-template tokens because the text encoder currently accepts at most 512 full-template tokens.",
     "Only the canonical prompt has a pinned end-to-end image oracle; arbitrary prompts are checked for finite execution but cannot be numerically compared without a matching reference fixture.",
-    "The correctness-first transformer takes roughly 149 seconds of summed GPU kernel time at 256px and is not interactive.",
-    "Text weights remain original BF16 and require a separate 17.5 GB residency phase; text quantization and kernel optimization remain future work."
+    "The optimized transformer still takes roughly 99 seconds of summed GPU kernel time at 256px and is not interactive.",
+    "Text weights remain original BF16 and require a separate 17.5 GB residency phase; text quantization, command-buffer batching, and further kernel optimization remain future work."
   ]
 }

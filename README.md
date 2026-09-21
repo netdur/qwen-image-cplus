@@ -242,8 +242,19 @@ Inspect a shard, optionally filtering tensor names:
   of 0.10%, 0.15%, and 1.10% preserve the observed accumulation curve rather
   than hiding early regressions behind one loose final limit.
 - The full native run dispatches 1,600 selected Q8 matrices, stays finite, and
-  totals 147,234 ms of summed GPU kernel time (145,779 ms on the preceding
-  corrected-oracle run). It is intentionally 256px so a
+  originally totaled 147,234 ms of summed GPU kernel time. The production
+  transformer linears now use a 32x32 output tile computed by each 16x16
+  threadgroup: every thread owns four accumulators, so input and weight tiles
+  are reused across twice as many rows and columns and four times as much
+  arithmetic occurs per barrier. The K tile and inner-loop order remain 16,
+  preserving the established accumulation order. The same 40-step gate now
+  totals 97,428.8 ms, a 33.8% reduction, with identical step-1, step-2, and
+  step-40 nRMSE. The four-row block fixture is slower because it underfills a
+  32-row tile; that deliberate test-only tradeoff avoids runtime shape
+  heuristics on the product path, where cached steps have exactly 256 target
+  rows. Before/after measurements are in
+  `benchmarks/m1-max-transformer-linear-32x32.json`. The trajectory is
+  intentionally 256px so a
   40-step regression remains practical; the independent scale gate already
   covers one complete noise prediction at 512px and 1024px. Fixture provenance,
   timings, acceptance limits, and limitations are recorded in
@@ -338,8 +349,11 @@ Inspect a shard, optionally filtering tensor names:
   1.6909%, and final RGBA error is 0.9573% with a 0.557 mean absolute byte
   error. The integrated text path has separate measured 2% latent/decoded
   budgets because of the already documented text-backend variation; the
-  stricter 1.1%/1.3% fixture-fed gates remain unchanged. Full measurements and
-  rationale are in `benchmarks/m1-max-native-prompt-pipeline-256.json`.
+  stricter 1.1%/1.3% fixture-fed gates remain unchanged. With the 32x32
+  transformer tile, this gate's denoiser time is 98,843.8 ms instead of
+  148,823 ms, while every recorded error metric remains identical. Full
+  measurements and rationale are in
+  `benchmarks/m1-max-native-prompt-pipeline-256.json`.
 
 ## Quantization decision log
 
@@ -397,7 +411,8 @@ noise, denoising, VAE decode, postprocessing, and PNG output now form one
 native `generate-256` command. The pinned fox case verifies the complete path;
 arbitrary prompts use the same path but naturally have no numeric oracle unless
 a matching reference fixture is generated. Production use still needs larger
-output sizes, text-encoder quantization, and substantial kernel optimization.
+output sizes, text-encoder quantization, and further kernel/command-submission
+optimization.
 The current VAE path intentionally implements the pinned one-frame first-chunk
 semantics; temporal continuation and tiled decode remain outside its verified
 scope.

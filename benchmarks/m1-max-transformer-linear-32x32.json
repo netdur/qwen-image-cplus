@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "change": {
+    "previous_kernel": "One 16x16 threadgroup computes one 16x16 output tile with one accumulator per thread",
+    "current_kernel": "One 16x16 threadgroup computes one 32x32 output tile with four accumulators per thread",
+    "dense_weights": "BF16 decoded to FP32 tiles with FP32 FMA accumulation",
+    "quantized_weights": "Affine U8/group-64 decoded to FP16 tiles with FP16 products and FP32 accumulation",
+    "k_tile": 16,
+    "output_tile": 32,
+    "threads_per_group": 256,
+    "reasoning": "The 256px production path has 278 rows on prefill and exactly 256 rows on cached steps, so both kernels reuse each loaded tile across twice as many rows and columns without adding row padding. Four outputs per thread perform four times as much arithmetic per barrier. Keeping K tiled by 16 and iterating it in the same order preserves numerical results."
+  },
+  "fixture_trajectory_256": {
+    "text_rows": 22,
+    "target_rows": 256,
+    "steps": 40,
+    "previous_summed_gpu_ms": 147234.0,
+    "current_summed_gpu_ms": 97428.8,
+    "speedup": 1.51120,
+    "time_reduction_percent": 33.8272,
+    "previous_step_1_gpu_ms": 4032.02,
+    "current_step_1_gpu_ms": 2670.66,
+    "previous_step_40_gpu_ms": 3718.55,
+    "current_step_40_gpu_ms": 2391.56,
+    "checkpoint_nrmse": {
+      "1": 0.000895723,
+      "2": 0.00129116,
+      "40": 0.0100476
+    },
+    "checkpoint_errors_unchanged": true,
+    "passed": true
+  },
+  "native_prompt_pipeline_256": {
+    "text_rows": 22,
+    "target_rows": 256,
+    "steps": 40,
+    "previous_transformer_gpu_ms": 148823.0,
+    "current_transformer_gpu_ms": 98843.8,
+    "speedup": 1.50564,
+    "time_reduction_percent": 33.583,
+    "latent_step_40_nrmse": 0.0175609,
+    "decoded_fp32_nrmse": 0.0169086,
+    "rgba_u8_nrmse": 0.00957296,
+    "all_errors_unchanged": true,
+    "passed": true
+  },
+  "tradeoffs": [
+    "The four-row block fixture underfills a 32-row tile and is slower; it remains a cheap correctness test, not the target workload.",
+    "Small two-row global projections also underfill the larger tile, but they contribute negligibly beside the 32 blocks of production-row matrix multiplication.",
+    "Each kernel still owns a separate command buffer and synchronous CPU wait; batching remains an independent optimization opportunity."
+  ]
+}
