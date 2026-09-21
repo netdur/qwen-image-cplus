@@ -506,6 +506,25 @@ Inspect a shard, optionally filtering tensor names:
   decoded-FP32, and 1.0031% RGBA nRMSE. Measurements and the difference
   between isolated and integrated projections are recorded in
   `benchmarks/m1-max-transformer-small-kernels.json`.
+- Scheduler conditioning is now computed for the whole requested trajectory
+  before the denoising loop. The two conditioning rows for each timestep are
+  stacked into one table, so time projection, the two timestep linears and
+  SiLUs, modulation, and final-scale projection require seven command buffers
+  total instead of seven per step (7 versus 280 for 40 steps). The four
+  linears deliberately retain the scalar FP32-operand kernel: automatically
+  selecting the >=64-row FP16 SIMD path would change model arithmetic. Batching
+  still cuts repeated reads of the roughly 192 MiB of conditioning weights
+  from 40 row tiles to three. Per-step slices are copied into the existing
+  small runtime buffers, keeping every downstream binding unchanged. All
+  checkpoint nRMSE values and the 27 Cache-DiT decisions are unchanged.
+  Cache-off summed GPU time fell from 28,979.7 to **28,794.4 ms**; its single
+  wall comparison moved from 29,908 to 29,983 ms, which is run-to-run noise
+  rather than a supported wall-speed claim. Cache-DiT 0.24 fell from 10,639.5
+  to **10,499.6 ms GPU** and from 11,181 to **11,057 ms wall**; its cheap
+  cached steps fell from about 27 to 24 ms GPU. The full native prompt and
+  decoded-image gate remains unchanged. Exact timings and the reason for not
+  using the faster FP16 kernel are in
+  `benchmarks/m1-max-conditioning-precompute.json`.
 - Cache-DiT is available as an explicit, off-by-default approximation. It
   follows the upstream
   [DBCache block flow](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_blocks/pattern_base.py)

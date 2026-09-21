@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "case": {
+    "pixels": 256,
+    "steps": 40,
+    "conditioning_rows_per_step": 2,
+    "batched_conditioning_rows": 80
+  },
+  "implementation": {
+    "operations": [
+      "time projection",
+      "timestep linear 1",
+      "SiLU 1",
+      "timestep linear 2",
+      "SiLU 2",
+      "modulation projection",
+      "final-scale projection"
+    ],
+    "command_buffers_before": 280,
+    "command_buffers_after": 7,
+    "conditioning_weight_bytes_streamed_per_step": 203423744,
+    "arithmetic": "The four linears are forced through the original scalar FP32-operand kernel. The normal >=64-row dispatcher would choose FP16 operands and change conditioning values.",
+    "binding_strategy": "The 80-row modulation and final-scale tables are computed once; each step copies its two rows into the existing small buffers, leaving all block and final-norm bindings unchanged."
+  },
+  "conditioning_precompute": {
+    "gpu_ms": 19.7242,
+    "steps": 40
+  },
+  "cache_off": {
+    "baseline_summed_gpu_ms": 28979.7,
+    "optimized_summed_gpu_ms": 28794.4,
+    "gpu_ms_saved": 185.3,
+    "baseline_loop_wall_ms": 29908,
+    "optimized_loop_wall_ms": 29983,
+    "wall_interpretation": "The 75 ms increase is within observed run-to-run variation; no cache-off wall improvement is claimed from this single pair.",
+    "checkpoint_nrmse": {
+      "1": 0.000906469,
+      "2": 0.00130081,
+      "40": 0.0103288
+    },
+    "checkpoint_values_unchanged": true,
+    "passed": true
+  },
+  "cache_dit_0_24": {
+    "cached_steps": 27,
+    "full_steps": 13,
+    "baseline_summed_gpu_ms": 10639.5,
+    "optimized_summed_gpu_ms": 10499.6,
+    "gpu_ms_saved": 139.9,
+    "baseline_loop_wall_ms": 11181,
+    "optimized_loop_wall_ms": 11057,
+    "wall_ms_saved": 124,
+    "step_40_latent_nrmse_vs_official": 0.10079,
+    "cached_decisions_unchanged": true
+  },
+  "native_prompt_pipeline": {
+    "conditioning_gpu_ms": 18.4203,
+    "transformer_summed_gpu_ms": 28781.5,
+    "transformer_loop_wall_ms": 29673,
+    "final_latent_nrmse": 0.017982,
+    "decoded_fp32_nrmse": 0.0177651,
+    "rgba_nrmse": 0.0100307,
+    "passed": true
+  },
+  "verification": {
+    "cpc_fmt_check": true,
+    "cpc_check": true,
+    "unit_tests_passed": 334,
+    "unit_tests_failed": 0,
+    "one_step_gate": true,
+    "two_step_gate": true,
+    "forty_step_gate": true,
+    "cache_dit_measurement": true,
+    "decoded_image_gate": true
+  }
+}

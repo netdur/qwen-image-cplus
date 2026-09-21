@@ -660,6 +660,33 @@ fn dispatch_weighted_linear(
     );
 }
 
+// Conditioning precomputation batches all scheduler rows while retaining the
+// scalar FP32-operand kernel used by the original two-row path. Selecting the
+// >=64-row SIMD-group kernel here would round activations and BF16 weights to
+// FP16 and would therefore change the conditioning values.
+fn dispatch_weighted_linear_scalar(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    input: metal::Buffer,
+    weight: LinearWeight,
+    output: metal::Buffer,
+    output_columns: usize,
+    input_columns: usize,
+    rows: usize,
+) -> option::Option[f64] {
+    if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
+        return dispatch_int8_linear(
+            queue, pipelines.int8_linear, input, weight, output,
+            output_columns, input_columns, rows,
+        );
+    }
+    return dispatch_linear(
+        queue, pipelines.dense_linear, input, weight.storage, output,
+        output_columns, input_columns, rows, weight.weights_offset,
+        if weight.scheme == PACKED_SCHEME_FP16 { 1 as u32 } else { 0 as u32 },
+    );
+}
+
 fn dispatch_1d(
     queue: metal::CommandQueue,
     pipeline: metal::ComputePipelineState,
@@ -3955,12 +3982,15 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(text_hidden) = new_buffer(device, text_bytes) else { return 1; }; let text_hidden_owner: OwnedObjc = OwnedObjc::new(text_hidden.raw());
     guard let option::Option[metal::Buffer]::Some(text_activated) = new_buffer(device, text_bytes) else { return 1; }; let text_activated_owner: OwnedObjc = OwnedObjc::new(text_activated.raw());
     guard let option::Option[metal::Buffer]::Some(text_projected) = new_buffer(device, text_bytes) else { return 1; }; let text_projected_owner: OwnedObjc = OwnedObjc::new(text_projected.raw());
-    guard let option::Option[metal::Buffer]::Some(timestep) = new_buffer(device, ((2 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let timestep_owner: OwnedObjc = OwnedObjc::new(timestep.raw());
-    guard let option::Option[metal::Buffer]::Some(time_projection) = new_buffer(device, ((2 as usize) *% (256 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let time_projection_owner: OwnedObjc = OwnedObjc::new(time_projection.raw());
-    guard let option::Option[metal::Buffer]::Some(time_hidden) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let time_hidden_owner: OwnedObjc = OwnedObjc::new(time_hidden.raw());
-    guard let option::Option[metal::Buffer]::Some(time_activated_hidden) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let time_activated_hidden_owner: OwnedObjc = OwnedObjc::new(time_activated_hidden.raw());
-    guard let option::Option[metal::Buffer]::Some(time_embedding) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let time_embedding_owner: OwnedObjc = OwnedObjc::new(time_embedding.raw());
-    guard let option::Option[metal::Buffer]::Some(activated_time) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let activated_time_owner: OwnedObjc = OwnedObjc::new(activated_time.raw());
+    let conditioning_rows: usize = (2 as usize) *% step_limit;
+    guard let option::Option[metal::Buffer]::Some(timestep) = new_buffer(device, (conditioning_rows *% #size_of::[f32]()) as u64) else { return 1; }; let timestep_owner: OwnedObjc = OwnedObjc::new(timestep.raw());
+    guard let option::Option[metal::Buffer]::Some(time_projection) = new_buffer(device, (conditioning_rows *% (256 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let time_projection_owner: OwnedObjc = OwnedObjc::new(time_projection.raw());
+    guard let option::Option[metal::Buffer]::Some(time_hidden) = new_buffer(device, (conditioning_rows *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let time_hidden_owner: OwnedObjc = OwnedObjc::new(time_hidden.raw());
+    guard let option::Option[metal::Buffer]::Some(time_activated_hidden) = new_buffer(device, (conditioning_rows *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let time_activated_hidden_owner: OwnedObjc = OwnedObjc::new(time_activated_hidden.raw());
+    guard let option::Option[metal::Buffer]::Some(time_embedding) = new_buffer(device, (conditioning_rows *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let time_embedding_owner: OwnedObjc = OwnedObjc::new(time_embedding.raw());
+    guard let option::Option[metal::Buffer]::Some(activated_time) = new_buffer(device, (conditioning_rows *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let activated_time_owner: OwnedObjc = OwnedObjc::new(activated_time.raw());
+    guard let option::Option[metal::Buffer]::Some(modulation_table) = new_buffer(device, (conditioning_rows *% (4 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let modulation_table_owner: OwnedObjc = OwnedObjc::new(modulation_table.raw());
+    guard let option::Option[metal::Buffer]::Some(final_scale_table) = new_buffer(device, (conditioning_rows *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_table_owner: OwnedObjc = OwnedObjc::new(final_scale_table.raw());
     guard let option::Option[metal::Buffer]::Some(modulation) = new_buffer(device, ((2 as usize) *% (4 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let modulation_owner: OwnedObjc = OwnedObjc::new(modulation.raw());
     guard let option::Option[metal::Buffer]::Some(first_hidden) = new_buffer(device, activation_bytes) else { return 1; }; let first_hidden_owner: OwnedObjc = OwnedObjc::new(first_hidden.raw());
     guard let option::Option[metal::Buffer]::Some(second_hidden) = new_buffer(device, activation_bytes) else { return 1; }; let second_hidden_owner: OwnedObjc = OwnedObjc::new(second_hidden.raw());
@@ -4041,21 +4071,80 @@ fn run_trajectory_packed_impl(
         "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms}",
     );
     let trajectory_wall_start_ms: i64 = time::now_millis();
+    let timestep_values: *f32 = timestep.contents() as *f32;
+    var conditioning_step: usize = 0 as usize;
+    while conditioning_step < step_limit {
+        timestep_values[conditioning_step *% (2 as usize)] = cpu::bf16_to_f32(
+            cpu::f32_to_bf16(timesteps[conditioning_step] / 1000.0f32),
+        );
+        timestep_values[conditioning_step *% (2 as usize) +% (1 as usize)] = 0.0f32;
+        conditioning_step = conditioning_step +% (1 as usize);
+    }
+    var conditioning_precompute_ms: f64 = 0.0f64;
+    params.rows = conditioning_rows as u32;
+    params.width = 256 as u32;
+    guard let option::Option[f64]::Some(time_projection_ms) = dispatch_1d(
+        queue, time_pipeline, timestep, dummy, time_projection, dummy, dummy, dummy,
+        #addr_of(params), conditioning_rows *% (256 as usize),
+    ) else { return 1; };
+    conditioning_precompute_ms = conditioning_precompute_ms + time_projection_ms;
+    guard let option::Option[f64]::Some(time_1_ms) = dispatch_weighted_linear_scalar(
+        queue, pipelines, time_projection, time_1_weight, time_hidden,
+        WIDTH, 256 as usize, conditioning_rows,
+    ) else { return 1; };
+    conditioning_precompute_ms = conditioning_precompute_ms + time_1_ms;
+    params.width = WIDTH as u32;
+    guard let option::Option[f64]::Some(time_silu_ms) = dispatch_1d(
+        queue, silu_pipeline, time_hidden, dummy, time_activated_hidden, dummy, dummy, dummy,
+        #addr_of(params), conditioning_rows *% WIDTH,
+    ) else { return 1; };
+    conditioning_precompute_ms = conditioning_precompute_ms + time_silu_ms;
+    guard let option::Option[f64]::Some(time_2_ms) = dispatch_weighted_linear_scalar(
+        queue, pipelines, time_activated_hidden, time_2_weight, time_embedding,
+        WIDTH, WIDTH, conditioning_rows,
+    ) else { return 1; };
+    conditioning_precompute_ms = conditioning_precompute_ms + time_2_ms;
+    guard let option::Option[f64]::Some(activated_time_ms) = dispatch_1d(
+        queue, silu_pipeline, time_embedding, dummy, activated_time, dummy, dummy, dummy,
+        #addr_of(params), conditioning_rows *% WIDTH,
+    ) else { return 1; };
+    conditioning_precompute_ms = conditioning_precompute_ms + activated_time_ms;
+    guard let option::Option[f64]::Some(modulation_ms) = dispatch_weighted_linear_scalar(
+        queue, pipelines, activated_time, modulation_weight, modulation_table,
+        (4 as usize) *% WIDTH, WIDTH, conditioning_rows,
+    ) else { return 1; };
+    conditioning_precompute_ms = conditioning_precompute_ms + modulation_ms;
+    guard let option::Option[f64]::Some(final_scale_ms) = dispatch_weighted_linear_scalar(
+        queue, pipelines, activated_time, final_scale_weight, final_scale_table,
+        WIDTH, WIDTH, conditioning_rows,
+    ) else { return 1; };
+    conditioning_precompute_ms = conditioning_precompute_ms + final_scale_ms;
+    total_ms = total_ms + conditioning_precompute_ms;
+    io::println(
+        "trajectory conditioning: rows=${conditioning_rows} gpu_ms=${conditioning_precompute_ms} batched_steps=${step_limit}",
+    );
     var step: usize = 0 as usize;
     while step < step_limit {
         let step_wall_start_ms: i64 = time::now_millis();
         var step_ms: f64 = 0.0f64;
-        let timestep_values: *f32 = timestep.contents() as *f32;
-        timestep_values[0] = cpu::bf16_to_f32(cpu::f32_to_bf16(timesteps[step] / 1000.0f32));
-        timestep_values[1] = 0.0f32;
-        params.rows = 2 as u32; params.width = 256 as u32;
-        guard let option::Option[f64]::Some(time_projection_ms) = dispatch_1d(queue, time_pipeline, timestep, dummy, time_projection, dummy, dummy, dummy, #addr_of(params), (2 as usize) *% (256 as usize)) else { return 1; }; step_ms = step_ms + time_projection_ms;
-        guard let option::Option[f64]::Some(time_1_ms) = dispatch_weighted_linear(queue, pipelines, time_projection, time_1_weight, time_hidden, WIDTH, 256, 2) else { return 1; }; step_ms = step_ms + time_1_ms;
-        params.width = WIDTH as u32;
-        guard let option::Option[f64]::Some(time_silu_ms) = dispatch_1d(queue, silu_pipeline, time_hidden, dummy, time_activated_hidden, dummy, dummy, dummy, #addr_of(params), (2 as usize) *% WIDTH) else { return 1; }; step_ms = step_ms + time_silu_ms;
-        guard let option::Option[f64]::Some(time_2_ms) = dispatch_weighted_linear(queue, pipelines, time_activated_hidden, time_2_weight, time_embedding, WIDTH, WIDTH, 2) else { return 1; }; step_ms = step_ms + time_2_ms;
-        guard let option::Option[f64]::Some(activated_time_ms) = dispatch_1d(queue, silu_pipeline, time_embedding, dummy, activated_time, dummy, dummy, dummy, #addr_of(params), (2 as usize) *% WIDTH) else { return 1; }; step_ms = step_ms + activated_time_ms;
-        guard let option::Option[f64]::Some(modulation_ms) = dispatch_weighted_linear(queue, pipelines, activated_time, modulation_weight, modulation, (4 as usize) *% WIDTH, WIDTH, 2) else { return 1; }; step_ms = step_ms + modulation_ms;
+        let modulation_values: *f32 = modulation.contents() as *f32;
+        let modulation_table_values: *f32 = modulation_table.contents() as *f32;
+        let modulation_step_offset: usize = step *% (2 as usize) *% (4 as usize) *% WIDTH;
+        var conditioning_index: usize = 0 as usize;
+        while conditioning_index < (2 as usize) *% (4 as usize) *% WIDTH {
+            modulation_values[conditioning_index] =
+                modulation_table_values[modulation_step_offset +% conditioning_index];
+            conditioning_index = conditioning_index +% (1 as usize);
+        }
+        let final_scale_values: *f32 = final_scale.contents() as *f32;
+        let final_scale_table_values: *f32 = final_scale_table.contents() as *f32;
+        let final_scale_step_offset: usize = step *% (2 as usize) *% WIDTH;
+        conditioning_index = 0 as usize;
+        while conditioning_index < (2 as usize) *% WIDTH {
+            final_scale_values[conditioning_index] =
+                final_scale_table_values[final_scale_step_offset +% conditioning_index];
+            conditioning_index = conditioning_index +% (1 as usize);
+        }
         guard let option::Option[f64]::Some(img_ms) = dispatch_weighted_linear(queue, pipelines, latents, img_in_weight, image_projected, WIDTH, IMAGE_CHANNELS, target_rows) else { return 1; }; step_ms = step_ms + img_ms;
 
         var active_rows: usize = target_rows;
@@ -4221,7 +4310,6 @@ fn run_trajectory_packed_impl(
             have_cache_residual = true;
         }
 
-        guard let option::Option[f64]::Some(final_scale_ms) = dispatch_weighted_linear(queue, pipelines, activated_time, final_scale_weight, final_scale, WIDTH, WIDTH, 2) else { return 1; }; step_ms = step_ms + final_scale_ms;
         params.rows = active_rows as u32; params.width = WIDTH as u32;
         guard let option::Option[f64]::Some(final_norm_ms) = dispatch_1d(queue, final_norm_pipeline, current, final_scale, final_normalized, active_workspace.target_mask, dummy, dummy, #addr_of(params), active_rows) else { return 1; }; step_ms = step_ms + final_norm_ms;
         guard let option::Option[f64]::Some(output_ms) = dispatch_weighted_linear(queue, pipelines, final_normalized, proj_out_weight, noise_output, IMAGE_CHANNELS, WIDTH, active_rows) else { return 1; }; step_ms = step_ms + output_ms;
