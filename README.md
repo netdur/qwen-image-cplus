@@ -468,6 +468,28 @@ Inspect a shard, optionally filtering tensor names:
   Metal compilation, and buffer setup; VAE setup and decode took 3,126 ms;
   and PNG output took 28 ms. A resident service is required to approach the
   loop time for repeated requests.
+- As an external Apple-Silicon baseline, the locally downloaded
+  `mlx-community/Qwen-Image-2.1-MLX-4bit` snapshot `4db4e8c` took
+  **36.48 seconds end to end on repeat** for the same blue-teapot prompt at
+  256x256, seed 42, 40 steps, and guidance 1.0. The first valid run was 39.23
+  seconds, so the measured fresh-process range is 36.48-39.23 seconds. The
+  repeat produced a byte-identical PNG. The timed scope was a fresh process
+  through model loading, tokenization/text encoding, denoising, VAE decode,
+  and completed PNG output; its progress-timed generation loop was 32.0
+  seconds. MLX reported 7.97 GB peak allocated memory, while macOS reported a
+  10.72 GB peak memory footprint. The output was visually coherent. This was
+  run with MLX 0.32.2 and the Qwen-Image-2.1 mflux reference branch at commit
+  `dc5af52025a323e9b6dd44b702f6fc941498f978`; because the checkpoint is a
+  generic MLX export and its model card supplies no inference command, a
+  temporary loader adapter preserved its packed affine tensors, accepted its
+  alternate Qwen3-VL key prefix, and avoided re-transposing already-MLX VAE
+  kernels. All 761 transformer tensors, all 904 text-only encoder tensors,
+  and all 226 still-image VAE tensors were mapped; only the unused vision,
+  LM-head, and video-only `time_conv` tensors were skipped. The filesystem
+  cache had been warmed by compatibility smoke tests, so this is cold model
+  initialization in a new process, not a post-reboot disk-cold measurement.
+  Exact measurements and the output checksum are in
+  `benchmarks/m1-max-mlx-community-qwen-image-2.1-4bit.json`.
 - QIPACK stores persistent packed weights and integrity/model metadata; it is
   not a serialized inference cache. Each generation must rebuild the
   prompt-dependent per-layer prefix K/V cache (about 18-23 MiB in the measured

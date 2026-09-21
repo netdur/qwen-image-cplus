@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "checkpoint": {
+    "repository": "mlx-community/Qwen-Image-2.1-MLX-4bit",
+    "snapshot": "4db4e8c0c0e7a1debf0320415bec8388e888494c",
+    "weight_bytes": 10481128868,
+    "quantization": {
+      "transformer_bits": 4,
+      "text_encoder_bits": 4,
+      "group_size": 64,
+      "mode": "affine",
+      "vae_dtype": "float32"
+    }
+  },
+  "runtime": {
+    "implementation": "mflux Qwen-Image-2.1 reference branch",
+    "commit": "dc5af52025a323e9b6dd44b702f6fc941498f978",
+    "mflux_version": "0.19.2",
+    "mlx_version": "0.32.2",
+    "python_version": "3.13.5",
+    "compatibility_adapter": {
+      "reason": "The checkpoint is a generic MLX export, not an mflux-saved checkpoint, and its model card provides no inference command.",
+      "changes": [
+        "preserve uint32 affine-packed weights instead of converting them to bf16",
+        "map weight, scales, and biases for quantized transformer and text-encoder modules",
+        "accept language_model.model as an alternative Qwen3-VL text-stack prefix",
+        "map the generic export's modulation.0 and time_text_embed.linear_* aliases",
+        "do not transpose VAE convolution kernels already stored in MLX layout"
+      ],
+      "mapped_tensors": {
+        "transformer": 761,
+        "text_encoder_text_stack": 904,
+        "vae_still_image": 226
+      },
+      "intentionally_skipped": "Qwen3-VL vision tower, lm_head, and twelve video-only VAE time_conv tensors"
+    }
+  },
+  "case": {
+    "mode": "text-to-image",
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "width": 256,
+    "height": 256,
+    "steps": 40,
+    "guidance": 1.0,
+    "seed": 42
+  },
+  "measurement": {
+    "end_to_end_wall_seconds": 36.48,
+    "generation_progress_seconds": 32.0,
+    "steady_step_rate_per_second": 1.30,
+    "peak_mlx_memory_gb": 7.97,
+    "maximum_resident_set_bytes": 5597806592,
+    "peak_memory_footprint_bytes": 10718910536,
+    "output_png_bytes": 70542,
+    "output_sha256": "724a404401485e0cea3a15e9878eb90e1b182a3e9c46acc5c143c82ed92ea388",
+    "finite_output": true,
+    "visually_coherent": true,
+    "scope": "Fresh process start through local model loading, tokenization and text encoding, 40-step denoising, VAE decode, and completed PNG output.",
+    "cache_state": "The process had no resident model or compiled graph, but prior compatibility smoke tests had warmed the macOS filesystem cache.",
+    "repeat_runs": [
+      {
+        "end_to_end_wall_seconds": 39.23,
+        "generation_progress_seconds": 34.9,
+        "output_sha256": "724a404401485e0cea3a15e9878eb90e1b182a3e9c46acc5c143c82ed92ea388"
+      },
+      {
+        "end_to_end_wall_seconds": 36.48,
+        "generation_progress_seconds": 32.0,
+        "output_sha256": "724a404401485e0cea3a15e9878eb90e1b182a3e9c46acc5c143c82ed92ea388"
+      }
+    ],
+    "fresh_process_range_seconds": [36.48, 39.23],
+    "repeat_output_byte_identical": true
+  },
+  "command": "/usr/bin/time -lp mflux-generate-qwen-2.1 --model <local-snapshot> --base-model qwen-image-2.1 --prompt 'A blue ceramic teapot on a windowsill.' --width 256 --height 256 --steps 40 --guidance 1 --seed 42 --no-metadata --output <output.png>",
+  "interpretation": "This is a real end-to-end process measurement for the downloaded MLX checkpoint, not only denoising GPU time. It is directly comparable in prompt, size, steps, guidance, and seed to the documented native arbitrary-prompt smoke run, but differs in quantization policy and runtime implementation."
+}
