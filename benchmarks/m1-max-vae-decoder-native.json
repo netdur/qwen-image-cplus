@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "date": "2026-09-20",
   "model": "Qwen/Qwen-Image-2.1",
   "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
@@ -81,11 +81,54 @@
     },
     "accepted": true
   },
+  "batched_submission_and_parity_upsample": {
+    "date": "2026-09-21",
+    "command_submission": {
+      "implementation": "The production 256px decoder encodes its complete dependency chain into one Metal command buffer and performs one commit/wait. The small diagnostic decoder retains synchronous dispatches because it reads and compares 35 intermediate boundaries on the CPU.",
+      "baseline_gpu_ms_runs": [741.014, 740.008, 745.628],
+      "batched_gpu_ms_runs": [736.641, 736.956, 743.391],
+      "baseline_warm_process_seconds_median": 0.98,
+      "batched_warm_process_seconds_median": 0.97,
+      "interpretation": "Removing 111 waits is correct but only a modest independent speedup because the cooperative convolution kernels dominate GPU time."
+    },
+    "parity_decomposed_nearest_upsample": {
+      "implementation": "Each nearest-neighbor 2x plus 3x3 convolution is split into four output parities. A GPU packing kernel collapses repeated samples into four 2x2 phase kernels, reducing the convolution inner dimension from 9*C to 4*C. One 84,934,656-byte scratch buffer is reused by all four upsample layers.",
+      "batched_baseline_gpu_ms_median": 736.956,
+      "optimized_gpu_ms_runs": [598.21, 600.717, 597.453],
+      "optimized_gpu_ms_median": 598.21,
+      "gpu_ms_saved": 138.746,
+      "gpu_reduction_percent": 18.827,
+      "original_synchronous_gpu_ms_median": 740.008,
+      "total_reduction_from_original_percent": 19.161,
+      "optimized_warm_process_seconds_runs": [0.85, 0.83, 0.82],
+      "optimized_warm_process_seconds_median": 0.83,
+      "scratch_bytes": 541458432,
+      "scratch_growth_bytes": 84934656,
+      "trajectory_256_output_nrmse": 0.000000664769,
+      "trajectory_256_output_limit": 0.000003,
+      "small_maximum_boundary_nrmse": 0.00000198209,
+      "small_output_nrmse": 0.000000772098,
+      "all_35_small_boundaries_passed": true
+    },
+    "native_prompt_integration": {
+      "vae_gpu_ms": 581.037,
+      "vae_phase_wall_ms": 1289,
+      "previous_qkv_phase_vae_wall_ms": 1398,
+      "latent_nrmse": 0.017982,
+      "decoded_fp32_nrmse": 0.0177651,
+      "rgba_nrmse": 0.0100307,
+      "all_gates_passed": true,
+      "whole_process_wall_ms": 58850,
+      "comparison_note": "The whole process is not a controlled speed comparison: text paging alone took 25,214 ms in this run. The VAE phase and its quality gates are the relevant measurements."
+    },
+    "tests_passed": 334,
+    "accepted": true
+  },
   "interpretation": "The model-scale output agrees closely enough to use arithmetic-error gates far tighter than the mixed-transformer runtime. The independently captured small boundaries make the unusual first-chunk shortcut semantics observable instead of relying only on final pixels.",
   "limitations": [
     "This validates the pinned still-image first-chunk path only; temporal continuation and tiled decode are not implemented.",
     "The command is a decoder validation boundary, not yet a user-facing generation pipeline or image writer.",
-    "Summed GPU time excludes Safetensors parsing, Metal source compilation, fixture I/O, and process startup; each kernel still uses a separate command buffer and synchronous wait.",
+    "Summed GPU time excludes Safetensors parsing, Metal source compilation, fixture I/O, and process startup. The production path now submits one command buffer; the boundary-diagnostic path remains synchronous by design.",
     "The 1.258 GiB FP32 VAE checkpoint is mapped without copying, but is not quantized.",
     "Native prompt encoding remains a separate later boundary."
   ]

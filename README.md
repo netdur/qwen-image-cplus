@@ -323,6 +323,27 @@ Inspect a shard, optionally filtering tensor names:
   was 35.528 s because text paging independently regressed from 12.674 to
   15.493 s. Exact measurements and the comparison caveat are in
   `benchmarks/m1-max-vae-decoder-native.json`.
+- The production 256px VAE now encodes its complete dependency chain into one
+  Metal command buffer and waits once; the small diagnostic path remains
+  synchronous because it reads 35 intermediate boundaries on the CPU. On its
+  own, removing 111 waits was deliberately a small win: median GPU time moved
+  from 740.008 to 736.956 ms and warm process time from about 0.98 to 0.97 s.
+  The larger accepted change decomposes nearest-neighbor 2x plus 3x3
+  convolution into four output parities. A GPU packing kernel collapses the
+  repeated samples into four 2x2 phase kernels, reducing the inner dimension
+  from `9*C` to `4*C`; one 84,934,656-byte buffer is reused for all four
+  upsample layers. Three runs measured 598.210, 600.717, and 597.453 ms GPU
+  (598.210 ms median) and 0.85, 0.83, and 0.82 s process wall. That is a 19.2%
+  GPU reduction from the synchronous 740.008 ms baseline, at 541,458,432
+  bytes total decoder scratch. Production output nRMSE improved slightly from
+  7.19e-7 to 6.65e-7; all small boundaries passed, and the native prompt's
+  latent, decoded-FP32, and RGBA gates were unchanged. Its VAE phase measured
+  581.037 ms GPU / 1,289 ms wall versus 1,398 ms wall in the preceding QKV
+  run. Whole-process time is excluded because text paging varied independently.
+  Pipelines and scratch already persist for the full decode; retaining them
+  across images requires a future multi-request API rather than more work in
+  the current single-image phase. Full measurements are in
+  `benchmarks/m1-max-vae-decoder-native.json`.
 - The first complete vertical slice now executes the committed prompt and
   initial-noise fixture through all 40 transformer/scheduler steps, hands the
   resulting `[16,16,64]` normalized latent to the VAE in caller-owned memory,
@@ -685,28 +706,23 @@ The original timing target is no longer a stopping condition. The remaining
 work is ordered by architectural leverage and evidence, not by whether a
 particular total has already been reached:
 
-1. **Remaining VAE work.** The dominant convolution is already a verified
-   FP32 SIMD-group kernel. Still open are fewer command-buffer waits, persistent
-   pipeline/scratch reuse where the phase lifetime permits it, and the
-   parity-decomposed nearest-upsample convolution experiment. The 3e-6 decoder
-   and RGBA byte gates remain stricter than the transformer gates.
-2. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
+1. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
    hundreds of synchronous dispatches without changing its BF16 store
    boundaries. Whole-shard readahead stays accepted; tensor-order selective
    advice and broad Q8 text policies stay rejected unless a materially new
    layout or calibration method is introduced.
-3. **Kernel-specific elementwise fusion.** Fuse attention residual with the
+2. **Kernel-specific elementwise fusion.** Fuse attention residual with the
    following LayerNorm and evaluate a cooperative final LayerNorm. A global
    256-thread elementwise launch was measured and rejected, so residual,
    SwiGLU, final norm, and small conditioning kernels must be tuned separately.
-4. **End-to-end remeasurement.** After the structural phases, repeat both
+3. **End-to-end remeasurement.** After the structural phases, repeat both
    cache-off and Cache-DiT native prompts with warm-filesystem and cold-page
    conditions reported separately. Transformer loop time, phase wall time,
    process wall time, memory footprint, and numerical/perceptual gates remain
    separate measurements.
 
-Completed transformer submission batching and fused QKV are no longer
-remaining phases. Other closed branches are not remaining phases: selective text readahead
+Completed transformer submission batching, fused QKV, and the remaining VAE
+work are no longer remaining phases. Other closed branches are not remaining phases: selective text readahead
 regressed wall time; the calibrated text-Q8 policies failed the downstream latent gate;
 process reuse without simultaneous model residency provided no warm-request
 gain; four-query attention and blanket 256-thread elementwise groups regressed

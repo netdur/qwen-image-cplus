@@ -123,6 +123,8 @@ struct ConvWeight {
 
 struct Pipelines {
     conv: metal::ComputePipelineState,
+    upsample_pack: metal::ComputePipelineState,
+    upsample_conv: metal::ComputePipelineState,
     norm: metal::ComputePipelineState,
     add: metal::ComputePipelineState,
     denormalize: metal::ComputePipelineState,
@@ -278,12 +280,28 @@ fn gamma_offset(
 fn finish_dispatch(
     command_buffer: metal::CommandBuffer,
     encoder: metal::ComputeCommandEncoder,
+    deferred: bool = false,
 ) -> f64 {
     let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
     command_encoder.end_encoding();
+    if deferred {
+        return 0.0f64;
+    }
     command_buffer.commit();
     command_buffer.wait_until_completed();
     return (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64;
+}
+
+fn dispatch_command_buffer(
+    queue: metal::CommandQueue,
+    deferred: *u8,
+) -> option::Option[metal::CommandBuffer] {
+    if !deferred.is_null() {
+        return option::Option[metal::CommandBuffer]::Some(
+            metal::CommandBuffer::from_raw(deferred),
+        );
+    }
+    return queue.command_buffer();
 }
 
 fn dispatch_conv(
@@ -300,11 +318,12 @@ fn dispatch_conv(
     kernel: usize,
     padding: usize,
     upsample: bool = false,
+    deferred: *u8 = 0 as *u8,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else {
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else {
         return option::Option[f64]::None;
     };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
@@ -335,7 +354,86 @@ fn dispatch_conv(
         },
         metal::Size { width: 512 as u64, height: 1 as u64, depth: 1 as u64 },
     );
-    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder));
+    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder, !deferred.is_null()));
+}
+
+fn dispatch_upsample_conv(
+    queue: metal::CommandQueue,
+    pack_pipeline: metal::ComputePipelineState,
+    conv_pipeline: metal::ComputePipelineState,
+    storage: metal::Buffer,
+    weight: ConvWeight,
+    packed_weight: metal::Buffer,
+    input: metal::Buffer,
+    output: metal::Buffer,
+    input_height: usize,
+    input_width: usize,
+    channels: usize,
+    deferred: *u8 = 0 as *u8,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        dispatch_command_buffer(queue, deferred) else {
+        return option::Option[f64]::None;
+    };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    var params: ConvParams = ConvParams {
+        input_height: input_height as u32,
+        input_width: input_width as u32,
+        input_channels: channels as u32,
+        output_height: (input_height *% (2 as usize)) as u32,
+        output_width: (input_width *% (2 as usize)) as u32,
+        output_channels: channels as u32,
+        kernel_size: 3 as u32,
+        padding: 1 as u32,
+        upsample: 1 as u32,
+    };
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(pack_encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let pack_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(pack_encoder.raw()));
+    pack_encoder.set_compute_pipeline_state(pack_pipeline);
+    pack_encoder.set_buffer(storage, weight.weight_offset, 0 as u64);
+    pack_encoder.set_buffer(packed_weight, 0 as u64, 1 as u64);
+    pack_encoder.set_bytes(#addr_of(params) as *u8, #size_of::[ConvParams]() as u64, 2 as u64);
+    let packed_values: usize = (16 as usize) *% channels *% channels;
+    pack_encoder.dispatch_threads(
+        metal::Size { width: packed_values as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size {
+            width: pack_pipeline.thread_execution_width(),
+            height: 1 as u64,
+            depth: 1 as u64,
+        },
+    );
+    let pack_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(pack_encoder.raw());
+    pack_command_encoder.end_encoding();
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(conv_encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let conv_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(conv_encoder.raw()));
+    conv_encoder.set_compute_pipeline_state(conv_pipeline);
+    conv_encoder.set_buffer(input, 0 as u64, 0 as u64);
+    conv_encoder.set_buffer(packed_weight, 0 as u64, 1 as u64);
+    conv_encoder.set_buffer(storage, weight.bias_offset, 2 as u64);
+    conv_encoder.set_buffer(output, 0 as u64, 3 as u64);
+    conv_encoder.set_bytes(#addr_of(params) as *u8, #size_of::[ConvParams]() as u64, 4 as u64);
+    conv_encoder.dispatch_threadgroups(
+        metal::Size {
+            width: round_up(channels, 64 as usize) as u64 / (64 as u64),
+            height: round_up(input_height *% input_width, 64 as usize) as u64 / (64 as u64),
+            depth: 4 as u64,
+        },
+        metal::Size { width: 512 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    return option::Option[f64]::Some(
+        finish_dispatch(command_buffer, conv_encoder, !deferred.is_null()),
+    );
 }
 
 fn dispatch_norm(
@@ -348,11 +446,12 @@ fn dispatch_norm(
     pixels: usize,
     channels: usize,
     silu: bool,
+    deferred: *u8 = 0 as *u8,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else { return option::Option[f64]::None; };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
     guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
     let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
@@ -366,7 +465,7 @@ fn dispatch_norm(
         metal::Size { width: pixels as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: REDUCTION_THREADS as u64, height: 1 as u64, depth: 1 as u64 },
     );
-    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder));
+    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder, !deferred.is_null()));
 }
 
 fn dispatch_element(
@@ -379,11 +478,12 @@ fn dispatch_element(
     elements: usize,
     channels: usize,
     mode: u32,
+    deferred: *u8 = 0 as *u8,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else { return option::Option[f64]::None; };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
     guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
     let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
@@ -404,7 +504,7 @@ fn dispatch_element(
         metal::Size { width: elements as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: threads, height: 1 as u64, depth: 1 as u64 },
     );
-    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder));
+    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder, !deferred.is_null()));
 }
 
 fn dispatch_clamp(
@@ -413,11 +513,12 @@ fn dispatch_clamp(
     input: metal::Buffer,
     output: metal::Buffer,
     elements: usize,
+    deferred: *u8 = 0 as *u8,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else { return option::Option[f64]::None; };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
     guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
     let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
@@ -431,7 +532,7 @@ fn dispatch_clamp(
         metal::Size { width: elements as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: threads, height: 1 as u64, depth: 1 as u64 },
     );
-    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder));
+    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder, !deferred.is_null()));
 }
 
 fn dispatch_dup(
@@ -444,11 +545,12 @@ fn dispatch_dup(
     input_channels: usize,
     output_channels: usize,
     factor_t: usize,
+    deferred: *u8 = 0 as *u8,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else { return option::Option[f64]::None; };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
     guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
     let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
@@ -469,7 +571,7 @@ fn dispatch_dup(
         metal::Size { width: elements as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: threads, height: 1 as u64, depth: 1 as u64 },
     );
-    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder));
+    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder, !deferred.is_null()));
 }
 
 fn dispatch_attention(
@@ -478,11 +580,12 @@ fn dispatch_attention(
     qkv: metal::Buffer,
     output: metal::Buffer,
     pixels: usize,
+    deferred: *u8 = 0 as *u8,
 ) -> option::Option[f64] {
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else { return option::Option[f64]::None; };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
     guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
     let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
@@ -495,7 +598,7 @@ fn dispatch_attention(
         metal::Size { width: pixels as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: REDUCTION_THREADS as u64, height: 1 as u64, depth: 1 as u64 },
     );
-    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder));
+    return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder, !deferred.is_null()));
 }
 
 fn execute_residual(
@@ -513,6 +616,7 @@ fn execute_residual(
     width: usize,
     input_channels: usize,
     output_channels: usize,
+    deferred: *u8 = 0 as *u8,
 ) -> option::Option[f64] {
     let norm1_name: text::Text = "${prefix}.norm1.gamma";
     let norm2_name: text::Text = "${prefix}.norm2.gamma";
@@ -527,15 +631,15 @@ fn execute_residual(
     if input_channels != output_channels {
         let shortcut_name: text::Text = "${prefix}.conv_shortcut";
         guard let option::Option[ConvWeight]::Some(shortcut_weight) = conv_weight(file, shortcut_name.view(), output_channels, input_channels, 1) else { return option::Option[f64]::None; };
-        guard let option::Option[f64]::Some(elapsed) = dispatch_conv(queue, pipelines.conv, storage, shortcut_weight, input, shortcut_buffer, height, width, input_channels, output_channels, 1, 0) else { return option::Option[f64]::None; };
+        guard let option::Option[f64]::Some(elapsed) = dispatch_conv(queue, pipelines.conv, storage, shortcut_weight, input, shortcut_buffer, height, width, input_channels, output_channels, 1, 0, false, deferred) else { return option::Option[f64]::None; };
         total = total + elapsed;
         shortcut = shortcut_buffer;
     }
-    guard let option::Option[f64]::Some(norm1_ms) = dispatch_norm(queue, pipelines.norm, storage, norm1, input, norm_buffer, height *% width, input_channels, true) else { return option::Option[f64]::None; };
-    guard let option::Option[f64]::Some(conv1_ms) = dispatch_conv(queue, pipelines.conv, storage, conv1, norm_buffer, conv_buffer, height, width, input_channels, output_channels, 3, 1) else { return option::Option[f64]::None; };
-    guard let option::Option[f64]::Some(norm2_ms) = dispatch_norm(queue, pipelines.norm, storage, norm2, conv_buffer, norm_buffer, height *% width, output_channels, true) else { return option::Option[f64]::None; };
-    guard let option::Option[f64]::Some(conv2_ms) = dispatch_conv(queue, pipelines.conv, storage, conv2, norm_buffer, output, height, width, output_channels, output_channels, 3, 1) else { return option::Option[f64]::None; };
-    guard let option::Option[f64]::Some(add_ms) = dispatch_element(queue, pipelines.add, output, shortcut, shortcut, output, height *% width *% output_channels, output_channels, 1 as u32) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(norm1_ms) = dispatch_norm(queue, pipelines.norm, storage, norm1, input, norm_buffer, height *% width, input_channels, true, deferred) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(conv1_ms) = dispatch_conv(queue, pipelines.conv, storage, conv1, norm_buffer, conv_buffer, height, width, input_channels, output_channels, 3, 1, false, deferred) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(norm2_ms) = dispatch_norm(queue, pipelines.norm, storage, norm2, conv_buffer, norm_buffer, height *% width, output_channels, true, deferred) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(conv2_ms) = dispatch_conv(queue, pipelines.conv, storage, conv2, norm_buffer, output, height, width, output_channels, output_channels, 3, 1, false, deferred) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(add_ms) = dispatch_element(queue, pipelines.add, output, shortcut, shortcut, output, height *% width *% output_channels, output_channels, 1 as u32, deferred) else { return option::Option[f64]::None; };
     return option::Option[f64]::Some(total + norm1_ms + conv1_ms + norm2_ms + conv2_ms + add_ms);
 }
 
@@ -711,6 +815,8 @@ fn run_impl(
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
     guard let option::Option[OwnedObjc]::Some(conv_owner) = pipeline(device, library, "vae_conv2d_f32_simdgroup_64x64") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(upsample_pack_owner) = pipeline(device, library, "vae_pack_nearest_upsample_3x3") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(upsample_conv_owner) = pipeline(device, library, "vae_nearest_upsample_conv2d_f32_simdgroup_64x64") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "vae_rms_norm") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(add_owner) = pipeline(device, library, "vae_add") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(denormalize_owner) = pipeline(device, library, "vae_denormalize") else { return 1; };
@@ -719,6 +825,8 @@ fn run_impl(
     guard let option::Option[OwnedObjc]::Some(clamp_owner) = pipeline(device, library, "vae_clamp") else { return 1; };
     let pipelines: Pipelines = Pipelines {
         conv: metal::ComputePipelineState::from_raw(conv_owner.raw()),
+        upsample_pack: metal::ComputePipelineState::from_raw(upsample_pack_owner.raw()),
+        upsample_conv: metal::ComputePipelineState::from_raw(upsample_conv_owner.raw()),
         norm: metal::ComputePipelineState::from_raw(norm_owner.raw()),
         add: metal::ComputePipelineState::from_raw(add_owner.raw()),
         denormalize: metal::ComputePipelineState::from_raw(denormalize_owner.raw()),
@@ -750,6 +858,8 @@ fn run_impl(
     let max_elements: usize = output_height *% output_width *% (288 as usize);
     let activation_bytes: u64 = (max_elements *% #size_of::[f32]()) as u64;
     let qkv_bytes: u64 = (input_height *% input_width *% (3456 as usize) *% #size_of::[f32]()) as u64;
+    let upsample_weight_bytes: u64 = ((16 as usize) *% (1152 as usize)
+        *% (1152 as usize) *% #size_of::[f32]()) as u64;
     guard let option::Option[metal::Buffer]::Some(buffer_a) = new_buffer(device, activation_bytes) else { return 1; }; let buffer_a_owner: OwnedObjc = OwnedObjc::new(buffer_a.raw());
     guard let option::Option[metal::Buffer]::Some(buffer_b) = new_buffer(device, activation_bytes) else { return 1; }; let buffer_b_owner: OwnedObjc = OwnedObjc::new(buffer_b.raw());
     guard let option::Option[metal::Buffer]::Some(buffer_c) = new_buffer(device, activation_bytes) else { return 1; }; let buffer_c_owner: OwnedObjc = OwnedObjc::new(buffer_c.raw());
@@ -757,39 +867,52 @@ fn run_impl(
     guard let option::Option[metal::Buffer]::Some(shortcut) = new_buffer(device, activation_bytes) else { return 1; }; let shortcut_owner: OwnedObjc = OwnedObjc::new(shortcut.raw());
     guard let option::Option[metal::Buffer]::Some(block_shortcut) = new_buffer(device, activation_bytes) else { return 1; }; let block_shortcut_owner: OwnedObjc = OwnedObjc::new(block_shortcut.raw());
     guard let option::Option[metal::Buffer]::Some(qkv) = new_buffer(device, qkv_bytes) else { return 1; }; let qkv_owner: OwnedObjc = OwnedObjc::new(qkv.raw());
+    guard let option::Option[metal::Buffer]::Some(packed_upsample_weight) = new_buffer(device, upsample_weight_bytes) else { return 1; }; let packed_upsample_weight_owner: OwnedObjc = OwnedObjc::new(packed_upsample_weight.raw());
+    guard let option::Option[metal::CommandBuffer]::Some(decode_command_buffer) =
+        queue.command_buffer() else { return 1; };
+    let decode_command_buffer_owner: OwnedObjc =
+        OwnedObjc::new(rt::retain(decode_command_buffer.raw()));
+    // The 256px path has no intermediate host reads, so encode its entire
+    // dependency chain before one commit/wait. The small diagnostic path keeps
+    // synchronous dispatches because every boundary is compared on the CPU.
+    let deferred: *u8 = if requested_case == "256" {
+        decode_command_buffer.raw()
+    } else {
+        0 as *u8
+    };
 
     var total_ms: f64 = 0.0f64;
-    guard let option::Option[f64]::Some(denormalize_ms) = dispatch_element(queue, pipelines.denormalize, normalized, mean, standard_deviation, buffer_a, input_elements, 64, 2 as u32) else { return 1; };
+    guard let option::Option[f64]::Some(denormalize_ms) = dispatch_element(queue, pipelines.denormalize, normalized, mean, standard_deviation, buffer_a, input_elements, 64, 2 as u32, deferred) else { return 1; };
     total_ms = total_ms + denormalize_ms;
     var all_ok: bool = true;
     if requested_case == "small" {
         all_ok = report_boundary("latent de-normalization", buffer_a, fixture_directory, "denormalized_latent", input_elements, 0.000001f64) && all_ok;
     }
     guard let option::Option[ConvWeight]::Some(post_quant_weight) = conv_weight(file, "post_quant_conv", 64, 64, 1) else { return 1; };
-    guard let option::Option[f64]::Some(post_quant_ms) = dispatch_conv(queue, pipelines.conv, storage, post_quant_weight, buffer_a, buffer_b, input_height, input_width, 64, 64, 1, 0) else { return 1; };
+    guard let option::Option[f64]::Some(post_quant_ms) = dispatch_conv(queue, pipelines.conv, storage, post_quant_weight, buffer_a, buffer_b, input_height, input_width, 64, 64, 1, 0, false, deferred) else { return 1; };
     total_ms = total_ms + post_quant_ms;
     if requested_case == "small" { all_ok = report_boundary("post-quant convolution", buffer_b, fixture_directory, "post_quant", input_height *% input_width *% (64 as usize), 0.000001f64) && all_ok; }
     guard let option::Option[ConvWeight]::Some(conv_in_weight) = conv_weight(file, "decoder.conv_in", 1152, 64, 3) else { return 1; };
-    guard let option::Option[f64]::Some(conv_in_ms) = dispatch_conv(queue, pipelines.conv, storage, conv_in_weight, buffer_b, buffer_a, input_height, input_width, 64, 1152, 3, 1) else { return 1; };
+    guard let option::Option[f64]::Some(conv_in_ms) = dispatch_conv(queue, pipelines.conv, storage, conv_in_weight, buffer_b, buffer_a, input_height, input_width, 64, 1152, 3, 1, false, deferred) else { return 1; };
     total_ms = total_ms + conv_in_ms;
     if requested_case == "small" { all_ok = report_boundary("decoder conv_in", buffer_a, fixture_directory, "conv_in", input_height *% input_width *% (1152 as usize), 0.000001f64) && all_ok; }
 
-    guard let option::Option[f64]::Some(mid_residual_0_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.0", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152) else { return 1; };
+    guard let option::Option[f64]::Some(mid_residual_0_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.0", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152, deferred) else { return 1; };
     total_ms = total_ms + mid_residual_0_ms;
     guard let option::Option[u64]::Some(attention_norm) = gamma_offset(file, "decoder.mid_block.attentions.0.norm.gamma", 1152) else { return 1; };
-    guard let option::Option[f64]::Some(attention_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, attention_norm, buffer_b, buffer_c, input_height *% input_width, 1152, false) else { return 1; };
+    guard let option::Option[f64]::Some(attention_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, attention_norm, buffer_b, buffer_c, input_height *% input_width, 1152, false, deferred) else { return 1; };
     total_ms = total_ms + attention_norm_ms;
     guard let option::Option[ConvWeight]::Some(qkv_weight) = conv_weight(file, "decoder.mid_block.attentions.0.to_qkv", 3456, 1152, 1) else { return 1; };
-    guard let option::Option[f64]::Some(qkv_ms) = dispatch_conv(queue, pipelines.conv, storage, qkv_weight, buffer_c, qkv, input_height, input_width, 1152, 3456, 1, 0) else { return 1; };
+    guard let option::Option[f64]::Some(qkv_ms) = dispatch_conv(queue, pipelines.conv, storage, qkv_weight, buffer_c, qkv, input_height, input_width, 1152, 3456, 1, 0, false, deferred) else { return 1; };
     total_ms = total_ms + qkv_ms;
-    guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(queue, pipelines.attention, qkv, buffer_d, input_height *% input_width) else { return 1; };
+    guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(queue, pipelines.attention, qkv, buffer_d, input_height *% input_width, deferred) else { return 1; };
     total_ms = total_ms + attention_ms;
     guard let option::Option[ConvWeight]::Some(attention_projection) = conv_weight(file, "decoder.mid_block.attentions.0.proj", 1152, 1152, 1) else { return 1; };
-    guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_conv(queue, pipelines.conv, storage, attention_projection, buffer_d, buffer_a, input_height, input_width, 1152, 1152, 1, 0) else { return 1; };
+    guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_conv(queue, pipelines.conv, storage, attention_projection, buffer_d, buffer_a, input_height, input_width, 1152, 1152, 1, 0, false, deferred) else { return 1; };
     total_ms = total_ms + attention_projection_ms;
-    guard let option::Option[f64]::Some(attention_add_ms) = dispatch_element(queue, pipelines.add, buffer_a, buffer_b, buffer_b, buffer_a, input_height *% input_width *% (1152 as usize), 1152, 1 as u32) else { return 1; };
+    guard let option::Option[f64]::Some(attention_add_ms) = dispatch_element(queue, pipelines.add, buffer_a, buffer_b, buffer_b, buffer_a, input_height *% input_width *% (1152 as usize), 1152, 1 as u32, deferred) else { return 1; };
     total_ms = total_ms + attention_add_ms;
-    guard let option::Option[f64]::Some(mid_residual_1_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.1", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152) else { return 1; };
+    guard let option::Option[f64]::Some(mid_residual_1_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.1", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152, deferred) else { return 1; };
     total_ms = total_ms + mid_residual_1_ms;
     if requested_case == "small" { all_ok = report_boundary("middle block", buffer_b, fixture_directory, "mid", input_height *% input_width *% (1152 as usize), 0.000001f64) && all_ok; }
 
@@ -809,24 +932,24 @@ fn run_impl(
         if block < (4 as usize) {
             // DupUp3D consumes the block input (x_copy), not the output of the
             // three residual layers. Materialize it before buffer_b is reused.
-            guard let option::Option[f64]::Some(elapsed) = dispatch_dup(queue, pipelines.dup, buffer_b, block_shortcut, height, width, input_channels, output_channels, temporal_factors[block]) else { return 1; };
+            guard let option::Option[f64]::Some(elapsed) = dispatch_dup(queue, pipelines.dup, buffer_b, block_shortcut, height, width, input_channels, output_channels, temporal_factors[block], deferred) else { return 1; };
             shortcut_ms = elapsed;
             if requested_case == "small" {
                 let shortcut_name: text::Text = "up_block_0${block}_shortcut";
                 all_ok = report_boundary("up block ${block} shortcut", block_shortcut, fixture_directory, shortcut_name.view(), height *% (2 as usize) *% width *% (2 as usize) *% output_channels, 0.000005f64) && all_ok;
             }
         }
-        guard let option::Option[f64]::Some(resnet_0_ms) = execute_residual(queue, pipelines, file, storage, resnet_0.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, input_channels, output_channels) else { return 1; };
+        guard let option::Option[f64]::Some(resnet_0_ms) = execute_residual(queue, pipelines, file, storage, resnet_0.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, input_channels, output_channels, deferred) else { return 1; };
         if requested_case == "small" {
             let name: text::Text = "up_block_0${block}_resnet_0";
             all_ok = report_boundary("up block ${block} residual 0", buffer_a, fixture_directory, name.view(), height *% width *% output_channels, 0.000005f64) && all_ok;
         }
-        guard let option::Option[f64]::Some(resnet_1_ms) = execute_residual(queue, pipelines, file, storage, resnet_1.view(), buffer_a, buffer_b, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels) else { return 1; };
+        guard let option::Option[f64]::Some(resnet_1_ms) = execute_residual(queue, pipelines, file, storage, resnet_1.view(), buffer_a, buffer_b, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels, deferred) else { return 1; };
         if requested_case == "small" {
             let name: text::Text = "up_block_0${block}_resnet_1";
             all_ok = report_boundary("up block ${block} residual 1", buffer_b, fixture_directory, name.view(), height *% width *% output_channels, 0.000005f64) && all_ok;
         }
-        guard let option::Option[f64]::Some(resnet_2_ms) = execute_residual(queue, pipelines, file, storage, resnet_2.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels) else { return 1; };
+        guard let option::Option[f64]::Some(resnet_2_ms) = execute_residual(queue, pipelines, file, storage, resnet_2.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels, deferred) else { return 1; };
         if requested_case == "small" {
             let name: text::Text = "up_block_0${block}_resnet_2";
             all_ok = report_boundary("up block ${block} residual 2", buffer_a, fixture_directory, name.view(), height *% width *% output_channels, 0.000005f64) && all_ok;
@@ -836,13 +959,17 @@ fn run_impl(
         if block < (4 as usize) {
             let upsample_name: text::Text = "decoder.up_blocks.${block}.upsampler.resample.1";
             guard let option::Option[ConvWeight]::Some(upsample_weight) = conv_weight(file, upsample_name.view(), output_channels, output_channels, 3) else { return 1; };
-            guard let option::Option[f64]::Some(upsample_ms) = dispatch_conv(queue, pipelines.conv, storage, upsample_weight, buffer_a, buffer_b, height, width, output_channels, output_channels, 3, 1, true) else { return 1; };
+            guard let option::Option[f64]::Some(upsample_ms) = dispatch_upsample_conv(
+                queue, pipelines.upsample_pack, pipelines.upsample_conv, storage,
+                upsample_weight, packed_upsample_weight, buffer_a, buffer_b, height,
+                width, output_channels, deferred,
+            ) else { return 1; };
             if requested_case == "small" {
                 let main_name: text::Text = "up_block_0${block}_main_upsample";
                 all_ok = report_boundary("up block ${block} main upsample", buffer_b, fixture_directory, main_name.view(), height *% (2 as usize) *% width *% (2 as usize) *% output_channels, 0.000005f64) && all_ok;
             }
             let upsample_elements: usize = height *% (2 as usize) *% width *% (2 as usize) *% output_channels;
-            guard let option::Option[f64]::Some(add_ms) = dispatch_element(queue, pipelines.add, buffer_b, block_shortcut, shortcut, buffer_b, upsample_elements, output_channels, 1 as u32) else { return 1; };
+            guard let option::Option[f64]::Some(add_ms) = dispatch_element(queue, pipelines.add, buffer_b, block_shortcut, shortcut, buffer_b, upsample_elements, output_channels, 1 as u32, deferred) else { return 1; };
             total_ms = total_ms + upsample_ms + add_ms;
             height = height *% (2 as usize);
             width = width *% (2 as usize);
@@ -857,18 +984,24 @@ fn run_impl(
 
     guard let option::Option[u64]::Some(final_norm_gamma) = gamma_offset(file, "decoder.norm_out.gamma", 144) else { return 1; };
     if requested_case == "small" {
-        guard let option::Option[f64]::Some(final_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_c, height *% width, 144, false) else { return 1; };
+        guard let option::Option[f64]::Some(final_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_c, height *% width, 144, false, deferred) else { return 1; };
         total_ms = total_ms + final_norm_ms;
         all_ok = report_boundary("final RMS norm", buffer_c, fixture_directory, "norm_out", height *% width *% (144 as usize), 0.000002f64) && all_ok;
     }
-    guard let option::Option[f64]::Some(final_norm_silu_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_d, height *% width, 144, true) else { return 1; };
+    guard let option::Option[f64]::Some(final_norm_silu_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_d, height *% width, 144, true, deferred) else { return 1; };
     total_ms = total_ms + final_norm_silu_ms;
     guard let option::Option[ConvWeight]::Some(conv_out_weight) = conv_weight(file, "decoder.conv_out", 4, 144, 3) else { return 1; };
-    guard let option::Option[f64]::Some(conv_out_ms) = dispatch_conv(queue, pipelines.conv, storage, conv_out_weight, buffer_d, buffer_b, height, width, 144, 4, 3, 1) else { return 1; };
+    guard let option::Option[f64]::Some(conv_out_ms) = dispatch_conv(queue, pipelines.conv, storage, conv_out_weight, buffer_d, buffer_b, height, width, 144, 4, 3, 1, false, deferred) else { return 1; };
     total_ms = total_ms + conv_out_ms;
     if requested_case == "small" { all_ok = report_boundary("decoder conv_out", buffer_b, fixture_directory, "conv_out", height *% width *% (4 as usize), 0.000002f64) && all_ok; }
-    guard let option::Option[f64]::Some(clamp_ms) = dispatch_clamp(queue, pipelines.clamp, buffer_b, buffer_a, height *% width *% (4 as usize)) else { return 1; };
+    guard let option::Option[f64]::Some(clamp_ms) = dispatch_clamp(queue, pipelines.clamp, buffer_b, buffer_a, height *% width *% (4 as usize), deferred) else { return 1; };
     total_ms = total_ms + clamp_ms;
+    if !deferred.is_null() {
+        decode_command_buffer.commit();
+        decode_command_buffer.wait_until_completed();
+        total_ms = (decode_command_buffer.g_p_u_end_time()
+            - decode_command_buffer.g_p_u_start_time()) * 1000.0f64;
+    }
     let output_count: usize = height *% width *% (4 as usize);
     var output_error: f64 = 0.0f64;
     var output_limit: f64 = 0.0f64;
@@ -899,9 +1032,9 @@ fn run_impl(
         }
     }
     if validate_reference {
-        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
     } else {
-        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes} gpu_ms=${total_ms}");
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms}");
     }
     if all_ok {
         if validate_reference {
