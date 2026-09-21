@@ -20,7 +20,7 @@
     "steps": 40,
     "scheduler": "Pinned FlowMatchEulerDiscreteScheduler with dynamic exponential shift and terminal sigma 0.02",
     "reference": "Pinned official Diffusers BF16 transformer on MPS; FP32 Euler update cast back to BF16 after every step",
-    "native": "FP32 activations, BF16 dense weights, affine-Q8/group-64 selected tail matrices, 32x32 output tiles with K tiled by 16, identical per-step BF16 latent rounding",
+    "native": "FP32 activations and accumulation, BF16 or affine-Q8/group-64 weights converted to FP16 SIMD-group operands, a bounds-safe 64x32 prefix kernel, a direct-store 64x64 cached kernel, 32-lane SIMD-group attention, and identical per-step BF16 latent rounding",
     "cache": "Step 1 extracts post-RoPE prefix K and raw V; steps 2-40 execute target rows only from the same 32-layer cache",
     "checkpoint_steps": [1, 2, 40]
   },
@@ -33,14 +33,15 @@
   "native": {
     "prefix_cache_bytes": 23068672,
     "q8_dispatch_matrices": 1600,
-    "summed_gpu_kernel_ms": 97428.8,
-    "step_1_gpu_ms": 2670.66,
-    "step_2_gpu_ms": 2436.34,
-    "step_40_gpu_ms": 2391.56,
+    "summed_gpu_kernel_ms": 46282.6,
+    "summed_loop_wall_ms": 47989,
+    "step_1_gpu_ms": 1549.27,
+    "step_2_gpu_ms": 1145.57,
+    "step_40_gpu_ms": 1144.45,
     "checkpoint_latent_nrmse": {
-      "1": 0.000895723,
-      "2": 0.00129116,
-      "40": 0.0100476
+      "1": 0.000903863,
+      "2": 0.00130082,
+      "40": 0.0100775
     },
     "finite_at_every_checked_boundary": true
   },
@@ -53,11 +54,11 @@
     "schedule_vectors_match_fixture": true,
     "passed": true
   },
-  "interpretation": "The final 1.00476% latent nRMSE is accumulated complete-runtime divergence from official BF16 execution, not a quantization-only number. The native path retains FP32 transformer activations but deliberately reproduces the scheduler's BF16 cast-back after each Euler update. The checkpoint-specific gates preserve the observed growth instead of masking early regressions behind one loose final tolerance. Moving from a 16x16 to a 32x32 output tile reduced summed GPU time from 147234 ms to 97428.8 ms (33.8%) without changing any checkpoint error because the K tile and accumulation order remain unchanged.",
+  "interpretation": "The final 1.00775% latent nRMSE is accumulated complete-runtime divergence from official BF16 execution, not a quantization-only number. The native path retains FP32 accumulation and transformer outputs but converts matrix operands to FP16 for Apple SIMD-group matrix operations; it also reproduces the scheduler's BF16 cast-back after each Euler update. The checkpoint-specific gates preserve the observed growth instead of masking early regressions behind one loose final tolerance. Production-shaped SIMD-group GEMM plus one-SIMD-group attention reduced summed GPU time from 97428.8 ms to 46282.6 ms (52.5%).",
   "limitations": [
     "The 1-step and 2-step commands validate prefixes of the official 40-step schedule; they are not separate one-step or two-step schedules.",
     "The trajectory is 256px so a 40-step regression remains practical. The earlier independent scale gate covers 512px and 1024px single-step execution.",
-    "Summed GPU time excludes packed-file validation, pipeline compilation, CPU scheduler work, and process startup; every kernel still uses a separate command buffer and synchronous wait.",
+    "Summed GPU time excludes packed-file validation, pipeline compilation, CPU scheduler work, and process startup; each transformer step is batched into one command buffer.",
     "Prompt embeddings and initial noise are precomputed fixtures. Native prompt encoding and RNG remain later boundaries.",
     "No VAE decode is included; this gate ends at the latent after scheduler step 40."
   ]

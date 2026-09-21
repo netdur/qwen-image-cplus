@@ -234,6 +234,823 @@ kernel void qi_block_linear_32x32(
     }
 }
 
+// Prototype cooperative-matrix path. Sixteen SIMD groups share coalesced
+// 32x32 input and transposed-weight tiles, and each SIMD group owns one 8x8
+// quadrant of the 32x32 result. The final shared-memory store permits masked
+// writes for the 278-row prefill without an out-of-bounds matrix store.
+kernel void qi_block_linear_simdgroup_32x32(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup float input_tile[32][32];
+    threadgroup float weight_tile[32][32];
+    threadgroup float output_tile[32][32];
+
+    const uint row_base = group_position.y * 32;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    simdgroup_float8x8 accumulator(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            const uint input_column = input_base + local_input;
+            input_tile[local_row][local_input] =
+                input_row < params.rows && input_column < params.input_columns
+                    ? input[input_row * params.input_columns + input_column]
+                    : 0.0f;
+
+            const uint output_column = output_base + local_row;
+            weight_tile[local_input][local_row] =
+                output_column < params.output_columns && input_column < params.input_columns
+                    ? qi_bf16(weights[output_column * params.input_columns + input_column])
+                    : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_float8x8 left;
+            simdgroup_float8x8 right;
+            simdgroup_load(
+                left, &input_tile[simd_row * 8][inner], 32
+            );
+            simdgroup_load(
+                right, &weight_tile[inner][simd_column * 8], 32
+            );
+            simdgroup_multiply_accumulate(accumulator, left, right, accumulator);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(
+        accumulator, &output_tile[simd_row * 8][simd_column * 8], 32
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 1024; linear += 512) {
+        const uint local_row = linear / 32;
+        const uint local_column = linear % 32;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_column;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_column];
+        }
+    }
+}
+
+kernel void qi_block_linear_simdgroup_half_32x32(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[32][32];
+    threadgroup half weight_tile[32][32];
+    threadgroup float output_tile[32][32];
+
+    const uint row_base = group_position.y * 32;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    simdgroup_float8x8 accumulator(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            const uint input_column = input_base + local_input;
+            input_tile[local_row][local_input] =
+                input_row < params.rows && input_column < params.input_columns
+                    ? half(input[input_row * params.input_columns + input_column])
+                    : half(0.0h);
+
+            const uint output_column = output_base + local_row;
+            weight_tile[local_input][local_row] =
+                output_column < params.output_columns && input_column < params.input_columns
+                    ? half(qi_bf16(weights[output_column * params.input_columns + input_column]))
+                    : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left;
+            simdgroup_half8x8 right;
+            simdgroup_load(left, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 32);
+            simdgroup_multiply_accumulate(accumulator, left, right, accumulator);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(
+        accumulator, &output_tile[simd_row * 8][simd_column * 8], 32
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 1024; linear += 512) {
+        const uint local_row = linear / 32;
+        const uint local_column = linear % 32;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_column;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_column];
+        }
+    }
+}
+
+kernel void qi_block_linear_simdgroup_half_64x32(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][32];
+    threadgroup float output_tile[64][32];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            const uint input_column = input_base + local_input;
+            input_tile[local_row][local_input] =
+                input_row < params.rows && input_column < params.input_columns
+                    ? half(input[input_row * params.input_columns + input_column])
+                    : half(0.0h);
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            const uint output_column = output_base + local_output;
+            const uint input_column = input_base + local_input;
+            weight_tile[local_input][local_output] =
+                output_column < params.output_columns && input_column < params.input_columns
+                    ? half(qi_bf16(weights[output_column * params.input_columns + input_column]))
+                    : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 32);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(
+        accumulator_0, &output_tile[simd_row * 8][simd_column * 8], 32
+    );
+    simdgroup_store(
+        accumulator_1, &output_tile[32 + simd_row * 8][simd_column * 8], 32
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 2048; linear += 512) {
+        const uint local_row = linear / 32;
+        const uint local_column = linear % 32;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_column;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_column];
+        }
+    }
+}
+
+kernel void qi_block_int8_simdgroup_half_64x32(
+    device const float *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device const uchar *zeros [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    constant Int8LinearParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][32];
+    threadgroup float output_tile[64][32];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    const uint groups_per_row = params.input_columns / params.group_size;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            const uint input_column = input_base + local_input;
+            input_tile[local_row][local_input] =
+                input_row < params.rows && input_column < params.input_columns
+                    ? half(input[input_row * params.input_columns + input_column])
+                    : half(0.0h);
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            const uint output_column = output_base + local_output;
+            const uint input_column = input_base + local_input;
+            if (output_column < params.output_columns && input_column < params.input_columns) {
+                const uint weight_index = output_column * params.input_columns + input_column;
+                const uint group_index =
+                    output_column * groups_per_row + input_column / params.group_size;
+                weight_tile[local_input][local_output] =
+                    half(int(weights[weight_index]) - int(zeros[group_index])) * scales[group_index];
+            } else {
+                weight_tile[local_input][local_output] = half(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 32);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(
+        accumulator_0, &output_tile[simd_row * 8][simd_column * 8], 32
+    );
+    simdgroup_store(
+        accumulator_1, &output_tile[32 + simd_row * 8][simd_column * 8], 32
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 2048; linear += 512) {
+        const uint local_row = linear / 32;
+        const uint local_column = linear % 32;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_column;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_column];
+        }
+    }
+}
+
+kernel void qi_block_linear_simdgroup_half_64x32_direct(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][32];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 256) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            input_tile[local_row][local_input] =
+                half(input[(row_base + local_row) * params.input_columns + input_base + local_input]);
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 256) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            weight_tile[local_input][local_output] = half(qi_bf16(
+                weights[(output_base + local_output) * params.input_columns
+                    + input_base + local_input]
+            ));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[16 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[48 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 32);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint output_column = output_base + simd_column * 8;
+    simdgroup_store(
+        accumulator_0, output + (row_base + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+    simdgroup_store(
+        accumulator_1, output + (row_base + 16 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+    simdgroup_store(
+        accumulator_2, output + (row_base + 32 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+    simdgroup_store(
+        accumulator_3, output + (row_base + 48 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+}
+
+kernel void qi_block_int8_simdgroup_half_64x32_direct(
+    device const float *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device const uchar *zeros [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    constant Int8LinearParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][32];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    const uint groups_per_row = params.input_columns / params.group_size;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 256) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            input_tile[local_row][local_input] =
+                half(input[(row_base + local_row) * params.input_columns + input_base + local_input]);
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 256) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            const uint output_column = output_base + local_output;
+            const uint input_column = input_base + local_input;
+            const uint weight_index = output_column * params.input_columns + input_column;
+            const uint group_index =
+                output_column * groups_per_row + input_column / params.group_size;
+            weight_tile[local_input][local_output] =
+                half(int(weights[weight_index]) - int(zeros[group_index])) * scales[group_index];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[16 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[48 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 32);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint output_column = output_base + simd_column * 8;
+    simdgroup_store(
+        accumulator_0, output + (row_base + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+    simdgroup_store(
+        accumulator_1, output + (row_base + 16 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+    simdgroup_store(
+        accumulator_2, output + (row_base + 32 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+    simdgroup_store(
+        accumulator_3, output + (row_base + 48 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns
+    );
+}
+
+kernel void qi_block_linear_simdgroup_half_64x64_direct(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][64];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 64;
+    const uint simd_row = simd_index / 8;
+    const uint simd_column = simd_index % 8;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            input_tile[local_row][local_input] =
+                half(input[(row_base + local_row) * params.input_columns + input_base + local_input]);
+        }
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            weight_tile[local_input][local_output] = half(qi_bf16(
+                weights[(output_base + local_output) * params.input_columns
+                    + input_base + local_input]
+            ));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[16 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[48 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 64);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint output_column = output_base + simd_column * 8;
+    simdgroup_store(accumulator_0,
+        output + (row_base + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_1,
+        output + (row_base + 16 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_2,
+        output + (row_base + 32 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_3,
+        output + (row_base + 48 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+}
+
+kernel void qi_block_int8_simdgroup_half_64x64_direct(
+    device const float *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device const uchar *zeros [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    constant Int8LinearParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][64];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 64;
+    const uint simd_row = simd_index / 8;
+    const uint simd_column = simd_index % 8;
+    const uint groups_per_row = params.input_columns / params.group_size;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            input_tile[local_row][local_input] =
+                half(input[(row_base + local_row) * params.input_columns + input_base + local_input]);
+        }
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            const uint output_column = output_base + local_output;
+            const uint input_column = input_base + local_input;
+            const uint weight_index = output_column * params.input_columns + input_column;
+            const uint group_index =
+                output_column * groups_per_row + input_column / params.group_size;
+            weight_tile[local_input][local_output] =
+                half(int(weights[weight_index]) - int(zeros[group_index])) * scales[group_index];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[16 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[48 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 64);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint output_column = output_base + simd_column * 8;
+    simdgroup_store(accumulator_0,
+        output + (row_base + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_1,
+        output + (row_base + 16 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_2,
+        output + (row_base + 32 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_3,
+        output + (row_base + 48 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+}
+
+kernel void qi_block_linear_simdgroup_half_128x32(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[128][32];
+    threadgroup half weight_tile[32][32];
+    threadgroup float output_tile[128][32];
+
+    const uint row_base = group_position.y * 128;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 4096; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            const uint input_column = input_base + local_input;
+            input_tile[local_row][local_input] =
+                input_row < params.rows && input_column < params.input_columns
+                    ? half(input[input_row * params.input_columns + input_column])
+                    : half(0.0h);
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            const uint output_column = output_base + local_output;
+            const uint input_column = input_base + local_input;
+            weight_tile[local_input][local_output] =
+                output_column < params.output_columns && input_column < params.input_columns
+                    ? half(qi_bf16(weights[output_column * params.input_columns + input_column]))
+                    : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[64 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[96 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 32);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(accumulator_0, &output_tile[simd_row * 8][simd_column * 8], 32);
+    simdgroup_store(accumulator_1, &output_tile[32 + simd_row * 8][simd_column * 8], 32);
+    simdgroup_store(accumulator_2, &output_tile[64 + simd_row * 8][simd_column * 8], 32);
+    simdgroup_store(accumulator_3, &output_tile[96 + simd_row * 8][simd_column * 8], 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 4096; linear += 512) {
+        const uint local_row = linear / 32;
+        const uint local_column = linear % 32;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_column;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_column];
+        }
+    }
+}
+
+kernel void qi_block_int8_simdgroup_half_128x32(
+    device const float *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device const uchar *zeros [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    constant Int8LinearParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[128][32];
+    threadgroup half weight_tile[32][32];
+    threadgroup float output_tile[128][32];
+
+    const uint row_base = group_position.y * 128;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    const uint groups_per_row = params.input_columns / params.group_size;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 4096; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            const uint input_column = input_base + local_input;
+            input_tile[local_row][local_input] =
+                input_row < params.rows && input_column < params.input_columns
+                    ? half(input[input_row * params.input_columns + input_column])
+                    : half(0.0h);
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_output = linear / 32;
+            const uint local_input = linear % 32;
+            const uint output_column = output_base + local_output;
+            const uint input_column = input_base + local_input;
+            if (output_column < params.output_columns && input_column < params.input_columns) {
+                const uint weight_index = output_column * params.input_columns + input_column;
+                const uint group_index =
+                    output_column * groups_per_row + input_column / params.group_size;
+                weight_tile[local_input][local_output] =
+                    half(int(weights[weight_index]) - int(zeros[group_index])) * scales[group_index];
+            } else {
+                weight_tile[local_input][local_output] = half(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[64 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[96 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 32);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(accumulator_0, &output_tile[simd_row * 8][simd_column * 8], 32);
+    simdgroup_store(accumulator_1, &output_tile[32 + simd_row * 8][simd_column * 8], 32);
+    simdgroup_store(accumulator_2, &output_tile[64 + simd_row * 8][simd_column * 8], 32);
+    simdgroup_store(accumulator_3, &output_tile[96 + simd_row * 8][simd_column * 8], 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 4096; linear += 512) {
+        const uint local_row = linear / 32;
+        const uint local_column = linear % 32;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_column;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_column];
+        }
+    }
+}
+
+kernel void qi_block_linear_simdgroup_bfloat_32x32(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat input_tile[32][32];
+    threadgroup float output_tile[32][32];
+    device const bfloat *bfloat_weights =
+        reinterpret_cast<device const bfloat *>(weights);
+
+    const uint row_base = group_position.y * 32;
+    const uint output_base = group_position.x * 32;
+    const uint simd_row = simd_index / 4;
+    const uint simd_column = simd_index % 4;
+    simdgroup_float8x8 accumulator(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            const uint input_column = input_base + local_input;
+            input_tile[local_row][local_input] =
+                input_row < params.rows && input_column < params.input_columns
+                    ? bfloat(input[input_row * params.input_columns + input_column])
+                    : bfloat(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_bfloat8x8 left;
+            simdgroup_bfloat8x8 right;
+            simdgroup_load(left, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(
+                right,
+                bfloat_weights
+                    + (output_base + simd_column * 8) * params.input_columns
+                    + input_base + inner,
+                params.input_columns,
+                ulong2(0),
+                true
+            );
+            simdgroup_multiply_accumulate(accumulator, left, right, accumulator);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(
+        accumulator, &output_tile[simd_row * 8][simd_column * 8], 32
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 1024; linear += 512) {
+        const uint local_row = linear / 32;
+        const uint local_column = linear % 32;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_column;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_column];
+        }
+    }
+}
+
 kernel void qi_block_int8_affine_linear_32x32(
     device const float *input [[buffer(0)]],
     device const uchar *weights [[buffer(1)]],
@@ -444,6 +1261,84 @@ kernel void qi_block_attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     output[query_start + lane] = accumulator / state[1];
+}
+
+// One 32-lane SIMD group owns one [query, head]. Each lane holds four head
+// channels, so the Q.K reduction uses a hardware SIMD reduction and the
+// online-softmax state stays in registers. This removes all threadgroup
+// barriers and shared memory from the production 128-channel attention path.
+kernel void qi_block_attention_simdgroup(
+    device const float *query [[buffer(0)]],
+    device const float *key [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const float *value [[buffer(3)]],
+    device const int *image_ids [[buffer(5)]],
+    device const uchar *key_valid [[buffer(6)]],
+    device const float *cache_key [[buffer(7)]],
+    device const float *cache_value [[buffer(8)]],
+    constant AttentionParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+    const uint query_row = group / params.heads;
+    const uint head = group % params.heads;
+    if (query_row >= params.query_rows) {
+        return;
+    }
+    const uint global_query_row = query_row + params.query_position_offset;
+    const uint query_start = (query_row * params.heads + head) * params.head_dimension;
+    const uint channel_0 = lane;
+    const uint channel_1 = lane + 32;
+    const uint channel_2 = lane + 64;
+    const uint channel_3 = lane + 96;
+    const float query_0 = query[query_start + channel_0];
+    const float query_1 = query[query_start + channel_1];
+    const float query_2 = query[query_start + channel_2];
+    const float query_3 = query[query_start + channel_3];
+    const float scale = rsqrt(float(params.head_dimension));
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    float accumulator_0 = 0.0f;
+    float accumulator_1 = 0.0f;
+    float accumulator_2 = 0.0f;
+    float accumulator_3 = 0.0f;
+
+    for (uint key_row = 0; key_row < params.key_rows; ++key_row) {
+        const bool same_image = image_ids[global_query_row] >= 0 &&
+            image_ids[global_query_row] == image_ids[key_row];
+        const bool allowed = key_valid[key_row] != 0 &&
+            (params.block_causal == 0 || global_query_row >= key_row || same_image);
+        if (!allowed) {
+            continue;
+        }
+        const bool from_cache = key_row < params.cached_prefix_rows;
+        const uint local_key_row = from_cache ? key_row : key_row - params.cached_prefix_rows;
+        const uint key_start = (local_key_row * params.heads + head) * params.head_dimension;
+        device const float *key_source = from_cache ? cache_key : key;
+        const float partial =
+            query_0 * key_source[key_start + channel_0] +
+            query_1 * key_source[key_start + channel_1] +
+            query_2 * key_source[key_start + channel_2] +
+            query_3 * key_source[key_start + channel_3];
+        const float score = simd_sum(partial) * scale;
+        const float next_maximum = max(maximum, score);
+        const float old_scale = isinf(maximum) ? 0.0f : exp(maximum - next_maximum);
+        const float new_weight = exp(score - next_maximum);
+        maximum = next_maximum;
+        denominator = denominator * old_scale + new_weight;
+        device const float *value_source = from_cache ? cache_value : value;
+        accumulator_0 = fma(accumulator_0, old_scale,
+            new_weight * value_source[key_start + channel_0]);
+        accumulator_1 = fma(accumulator_1, old_scale,
+            new_weight * value_source[key_start + channel_1]);
+        accumulator_2 = fma(accumulator_2, old_scale,
+            new_weight * value_source[key_start + channel_2]);
+        accumulator_3 = fma(accumulator_3, old_scale,
+            new_weight * value_source[key_start + channel_3]);
+    }
+    output[query_start + channel_0] = accumulator_0 / denominator;
+    output[query_start + channel_1] = accumulator_1 / denominator;
+    output[query_start + channel_2] = accumulator_2 / denominator;
+    output[query_start + channel_3] = accumulator_3 / denominator;
 }
 
 kernel void qi_block_residual(

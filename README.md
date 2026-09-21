@@ -383,6 +383,37 @@ Inspect a shard, optionally filtering tensor names:
   loop remained within normal run-to-run variation at 99,280 ms. Results,
   integrity boundaries, and caveats are recorded in
   `benchmarks/m1-max-packed-runtime-validation.json`.
+- Production-shape profiling, rather than square microbenchmarks, now drives
+  transformer kernel work. At the real cached shape (`M=256`), the former
+  scalar BF16 kernels sustained roughly 1.5-2.0 TFLOP/s and affine Q8 only
+  1.4-1.5 TFLOP/s; Q8 dequantization therefore saved storage but did not save
+  compute. The accepted Apple-family-7 SIMD-group kernels convert BF16 or Q8
+  operands to FP16 tiles while retaining FP32 accumulation. A bounds-safe
+  64x32 path handles the 278-row prefix step, while an exact-shape 64x64
+  direct-store path handles the 256-row cached steps. The latter measures
+  4.0-4.3 TFLOP/s on the three dominant matrix shapes. A 128x32 experiment
+  was rejected because register and threadgroup pressure reduced throughput to
+  2.0-2.9 TFLOP/s despite greater weight reuse.
+- Attention uses one 32-lane SIMD group per query/head. Each lane owns four of
+  the 128 head channels, `simd_sum` replaces the shared-memory dot-product
+  tree, and online-softmax state remains in registers. It is bit-identical to
+  the prior kernel on the production benchmark and reduces the projected
+  40-step, 32-block attention total from 14,986 ms to 4,233 ms (3.54-3.69x).
+  The corrected 32-thread launch is material: launching the same kernel with
+  the old 128-thread geometry duplicated the work across four SIMD groups and
+  hid almost all of the gain.
+- Together these kernels reduce the fixture-fed 40-step transformer from
+  97,429 ms to 46,283 ms of summed GPU time and 47,989 ms loop wall time.
+  The exact checkpoint nRMSE values are 0.09039%, 0.13008%, and 1.00775% at
+  steps 1, 2, and 40, all within their unchanged gates. Packed validation and
+  prefix preparation still add about 10.6 seconds before the loop, so this is
+  a verified ~58.6-second transformer checkpoint, not the 25-30-second goal.
+  A follow-up Apple MPS probe established the next credible path: FP16 inputs
+  with FP32 outputs are supported and sustain 6.3-7.2 TFLOP/s on the two MLP
+  shapes. Using that path requires an FP16 packed-weight scheme plus encoder
+  interop; native MPS BF16 matmul was tested and rejected by the framework on
+  this M1 Max. Detailed measurements are in
+  `benchmarks/m1-max-production-kernel-profile.json`.
 
 ## Quantization decision log
 

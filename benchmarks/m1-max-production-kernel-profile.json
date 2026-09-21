@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "shape": {
+    "prefix_rows": 278,
+    "cached_rows": 256,
+    "width": 4096,
+    "mlp_width": 12288,
+    "blocks": 32,
+    "steps": 40
+  },
+  "accepted_gemm": {
+    "prefix_kernel": "SIMD-group FP16 operands, FP32 accumulation, bounds-safe 64x32 output tile",
+    "cached_kernel": "SIMD-group FP16 operands, FP32 accumulation, direct-store 64x64 output tile",
+    "cached_bf16_tflops": {
+      "4096x4096": 4.299,
+      "12288x4096": 4.274,
+      "4096x12288": 4.019
+    },
+    "cached_q8_tflops": {
+      "4096x4096": 4.026,
+      "12288x4096": 4.050,
+      "4096x12288": 3.957
+    },
+    "isolated_bf16_nrmse": [
+      2.16898e-8,
+      2.00640e-8,
+      2.70442e-8
+    ],
+    "isolated_q8_nrmse": [
+      0.000206607,
+      0.000207084,
+      0.000209493
+    ]
+  },
+  "attention": {
+    "previous_prefill_gpu_ms": 11.4533,
+    "previous_cached_gpu_ms": 11.7146,
+    "simdgroup_prefill_gpu_ms": 3.10138,
+    "simdgroup_cached_gpu_ms": 3.31207,
+    "prefill_speedup": 3.69297,
+    "cached_speedup": 3.53695,
+    "nrmse": 0.0,
+    "previous_projected_40_step_32_block_gpu_ms": 14986.4,
+    "simdgroup_projected_40_step_32_block_gpu_ms": 4232.71
+  },
+  "trajectory": {
+    "summed_gpu_ms": 46282.6,
+    "loop_wall_ms": 47989,
+    "startup_wall_ms": 10654,
+    "step_1_gpu_ms": 1549.27,
+    "typical_cached_gpu_ms": 1145.0,
+    "checkpoint_nrmse": {
+      "1": 0.000903863,
+      "2": 0.00130082,
+      "40": 0.0100775
+    },
+    "passed": true
+  },
+  "rejected": [
+    "A 128x32 SIMD-group tile reduced occupancy and measured only 2.0-2.9 TFLOP/s.",
+    "A direct BF16 SIMD-matrix path was bit-identical but slower than FP16 operands.",
+    "Launching the 32-lane attention kernel with 128 threads duplicated work across four SIMD groups."
+  ],
+  "next_probe": {
+    "backend": "MPSMatrixMultiplication",
+    "input": "FP16",
+    "output": "FP32",
+    "cached_gpu_ms": {
+      "4096x4096": 1.8325,
+      "12288x4096": 3.5603,
+      "4096x12288": 4.0754
+    },
+    "tflops": {
+      "4096x4096": 4.687,
+      "12288x4096": 7.238,
+      "4096x12288": 6.323
+    },
+    "constraint": "MPSMatrixMultiplication on this machine rejects BFloat16 inputs, so using this path requires FP16-packed weights."
+  }
+}
