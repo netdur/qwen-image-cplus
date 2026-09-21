@@ -531,6 +531,19 @@ Inspect a shard, optionally filtering tensor names:
   the two-step integrated GPU total regressed from 2,103.8 to 2,139.4 ms.
   Kernel-specific launch sizes remain a possible later refinement, but 256 is
   not a safe global default.
+- The MPS MLP path now also handles the prompt-dependent first transformer
+  step. Its reusable half-activation scratch is sized for all joint
+  text+image rows (278 in the canonical case instead of 256), and the same
+  command buffer copies the post-RoPE text-prefix K plus raw V into the
+  per-layer cache before full joint attention. The later 256-row steps still
+  consume that cache through the existing path. This removes the special
+  custom-Metal MLP path without changing checkpoint values: step 1 fell from
+  1,415.1 to **893.7 ms GPU**, while its nRMSE stayed at 0.0906469%.
+  Cache-off fell from 28,794.4 to **28,440.4 ms GPU** and from 29,983 to
+  **29,282 ms loop wall**. Cache-DiT 0.24 fell from 10,499.6 to **10,062.5 ms
+  GPU** and from 11,057 to **10,543 ms wall**, with all 27 cache decisions
+  unchanged. The native prompt, VAE, and RGBA gates also remain unchanged.
+  Measurements are in `benchmarks/m1-max-first-step-mps.json`.
 - Cache-DiT is available as an explicit, off-by-default approximation. It
   follows the upstream
   [DBCache block flow](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_blocks/pattern_base.py)
@@ -637,13 +650,12 @@ The original timing target is no longer a stopping condition. The remaining
 work is ordered by architectural leverage and evidence, not by whether a
 particular total has already been reached:
 
-1. **First-step MPS MLP and transformer submission structure.** Extend the MPS
-   activation scratch from 256 to the prompt-dependent first-step row count,
-   support prefix extraction in that path, and measure it against the current
-   custom first-step MLP. Then test encoding a whole denoising step before its
-   single wait. Metadata lookup and steady-state MPS object construction have
-   already measured at 0-1 ms per sampled block, so prebuilding objects alone
-   is not assumed to provide the earlier projected host saving.
+1. **Transformer submission structure.** First-step MPS MLP and in-buffer
+   prefix extraction are complete and verified. Still open is encoding a whole
+   denoising step before its single wait. Metadata lookup and steady-state MPS
+   object construction have already measured at 0-1 ms per sampled block, so
+   prebuilding objects alone is not assumed to provide the earlier projected
+   host saving.
 2. **Fused QKV with FP16 attention storage.** Define a versioned QIPACK policy
    that stores dense attention matrices in the same FP16 operand form already
    consumed by the accepted custom kernels. Fuse Q, K, and V into a wider

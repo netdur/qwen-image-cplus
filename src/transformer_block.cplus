@@ -2049,6 +2049,8 @@ fn execute_mps_mlp_runtime_block(
     hidden: metal::Buffer,
     output: metal::Buffer,
     rows: usize,
+    cache_mode: u32,
+    cache_copy_pipeline: metal::ComputePipelineState,
     cache_key: metal::Buffer,
     cache_value: metal::Buffer,
     cache_offset: u64,
@@ -2153,11 +2155,21 @@ fn execute_mps_mlp_runtime_block(
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
     encode_buffer_barrier(attention_encoder);
+    if cache_mode == (1 as u32) {
+        encode_copy_prefix(
+            attention_encoder, cache_copy_pipeline, workspace.key_rope, workspace.value,
+            cache_key, cache_value, cache_offset, prefix_rows, workspace.dummy,
+        );
+        encode_buffer_barrier(attention_encoder);
+    }
+    let cached: bool = cache_mode == (2 as u32);
     encode_attention(
         attention_encoder, pipelines.attention, workspace.query_rope, workspace.key_rope,
         workspace.attended, workspace.value, workspace.image_ids, workspace.key_valid,
-        rows, prefix_rows +% rows, cache_key, cache_value, cache_offset, prefix_rows,
-        true, prefix_rows, pipelines.attention_threads,
+        rows, if cached { prefix_rows +% rows } else { rows },
+        cache_key, cache_value, cache_offset,
+        if cached { prefix_rows } else { 0 as usize }, true,
+        if cached { prefix_rows } else { 0 as usize }, pipelines.attention_threads,
     );
     encode_buffer_barrier(attention_encoder);
     encode_weighted_linear(
@@ -4048,7 +4060,7 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(cache_value_arena) = new_buffer(device, cache_arena_bytes) else { return 1; }; let cache_value_arena_owner: OwnedObjc = OwnedObjc::new(cache_value_arena.raw());
     let workspace: BlockWorkspace = BlockWorkspace { modulation: modulation, rope: rope, target_mask: target_mask, image_ids: image_ids, key_valid: key_valid, dummy: dummy, norm1: norm1, query: query, key: key, value: value, query_rope: query_rope, key_rope: key_rope, attended: attended, attention_projected: attention_projected, residual1: residual1, norm2: norm2, gate: gate, projected: projected, swiglu: swiglu, mlp_projected: mlp_projected };
     let cached_workspace: BlockWorkspace = BlockWorkspace { modulation: modulation, rope: cached_rope, target_mask: cached_target_mask, image_ids: image_ids, key_valid: key_valid, dummy: dummy, norm1: norm1, query: query, key: key, value: value, query_rope: query_rope, key_rope: key_rope, attended: attended, attention_projected: attention_projected, residual1: residual1, norm2: norm2, gate: gate, projected: projected, swiglu: swiglu, mlp_projected: mlp_projected };
-    guard let option::Option[metal::Buffer]::Some(mps_half_input) = new_buffer(device, (target_rows *% MLP_WIDTH *% (2 as usize)) as u64) else { return 1; }; let mps_half_input_owner: OwnedObjc = OwnedObjc::new(mps_half_input.raw());
+    guard let option::Option[metal::Buffer]::Some(mps_half_input) = new_buffer(device, (rows *% MLP_WIDTH *% (2 as usize)) as u64) else { return 1; }; let mps_half_input_owner: OwnedObjc = OwnedObjc::new(mps_half_input.raw());
     guard let option::Option[metal::Buffer]::Some(mps_half_weight) = new_buffer(device, (MLP_WIDTH *% WIDTH *% (2 as usize)) as u64) else { return 1; }; let mps_half_weight_owner: OwnedObjc = OwnedObjc::new(mps_half_weight.raw());
     let mps_workspace: MpsWorkspace = MpsWorkspace { device: device, input_pipeline: mps_input_pipeline, bf16_pipeline: mps_bf16_pipeline, q8_pipeline: mps_q8_pipeline, half_input: mps_half_input, half_weight: mps_half_weight };
     guard let option::Option[metal::Buffer]::Some(final_scale) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_owner: OwnedObjc = OwnedObjc::new(final_scale.raw());
@@ -4194,25 +4206,17 @@ fn run_trajectory_packed_impl(
             let cache_offset: u64 = block as u64 *% per_block_cache_bytes;
             let block_weights: BlockWeights = BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output };
             let block_metadata_wall_ms: i64 = time::now_millis() - block_metadata_start_ms;
-            let block_result: option::Option[f64] = if step == (0 as usize) {
-                execute_batched_runtime_block(
-                    queue, pipelines, block_weights, active_workspace, current, next, active_rows,
-                    cache_mode, cache_copy_pipeline, cache_key_arena, cache_value_arena,
-                    cache_offset, text_rows,
-                )
-            } else {
-                execute_mps_mlp_runtime_block(
-                    queue, pipelines, mps_workspace, block_weights, active_workspace,
-                    current, next, active_rows, cache_key_arena, cache_value_arena,
-                    cache_offset, text_rows,
-                    env::has_var("QI_PROFILE_CACHED_BLOCK")
-                        && step == (1 as usize)
-                        && (block == (0 as usize) || block == (1 as usize)
-                            || block == (31 as usize)),
-                    block_metadata_wall_ms,
-                    block,
-                )
-            };
+            let block_result: option::Option[f64] = execute_mps_mlp_runtime_block(
+                queue, pipelines, mps_workspace, block_weights, active_workspace,
+                current, next, active_rows, cache_mode, cache_copy_pipeline,
+                cache_key_arena, cache_value_arena, cache_offset, text_rows,
+                env::has_var("QI_PROFILE_CACHED_BLOCK")
+                    && step == (1 as usize)
+                    && (block == (0 as usize) || block == (1 as usize)
+                        || block == (31 as usize)),
+                block_metadata_wall_ms,
+                block,
+            );
             guard let option::Option[f64]::Some(block_ms) = block_result else { return 1; };
             step_ms = step_ms + block_ms;
             let swap: metal::Buffer = current; current = next; next = swap;

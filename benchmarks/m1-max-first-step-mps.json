@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "case": {
+    "pixels": 256,
+    "text_rows": 22,
+    "target_rows": 256,
+    "joint_rows": 278,
+    "steps": 40
+  },
+  "implementation": {
+    "before": "Step 1 used the batched custom-Metal MLP path; steps 2-40 used FP16 MPSMatrixMultiplication for all three MLP matrices.",
+    "after": "All steps use the MPS MLP path. Step 1 encodes post-RoPE prefix K and raw V extraction before full joint attention in the same command buffer.",
+    "half_activation_scratch_bytes_before": 6291456,
+    "half_activation_scratch_bytes_after": 6832128,
+    "scratch_growth_bytes": 540672,
+    "q8_weight_scratch_bytes_unchanged": 100663296,
+    "numerical_reason": "Both paths consume FP16 MLP operands and produce FP32 outputs; the trajectory checkpoints determine whether backend accumulation differences are acceptable."
+  },
+  "step_1": {
+    "baseline_gpu_ms": 1415.12,
+    "mps_gpu_ms": 893.674,
+    "gpu_ms_saved": 521.446,
+    "baseline_nrmse": 0.000906469,
+    "mps_nrmse": 0.000906469,
+    "limit": 0.001,
+    "passed": true
+  },
+  "cache_off_trajectory": {
+    "baseline_summed_gpu_ms": 28794.4,
+    "mps_summed_gpu_ms": 28440.4,
+    "gpu_ms_saved": 354.0,
+    "baseline_loop_wall_ms": 29983,
+    "mps_loop_wall_ms": 29282,
+    "wall_ms_saved": 701,
+    "checkpoint_nrmse": {
+      "1": 0.000906469,
+      "2": 0.00130081,
+      "40": 0.0103288
+    },
+    "checkpoint_values_unchanged": true,
+    "passed": true
+  },
+  "cache_dit_0_24": {
+    "cached_steps": 27,
+    "full_steps": 13,
+    "baseline_summed_gpu_ms": 10499.6,
+    "mps_summed_gpu_ms": 10062.5,
+    "gpu_ms_saved": 437.1,
+    "baseline_loop_wall_ms": 11057,
+    "mps_loop_wall_ms": 10543,
+    "wall_ms_saved": 514,
+    "step_40_latent_nrmse_vs_official": 0.10079,
+    "cached_decisions_unchanged": true
+  },
+  "native_prompt_pipeline": {
+    "transformer_summed_gpu_ms": 28453.3,
+    "transformer_loop_wall_ms": 29582,
+    "final_latent_nrmse": 0.017982,
+    "decoded_fp32_nrmse": 0.0177651,
+    "rgba_nrmse": 0.0100307,
+    "passed": true
+  },
+  "verification": {
+    "cpc_fmt_check": true,
+    "cpc_check": true,
+    "unit_tests_passed": 334,
+    "unit_tests_failed": 0,
+    "one_step_gate": true,
+    "two_step_prefix_cache_gate": true,
+    "forty_step_gate": true,
+    "cache_dit_measurement": true,
+    "decoded_image_gate": true
+  }
+}
