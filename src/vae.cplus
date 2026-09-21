@@ -10,7 +10,6 @@ import "stdlib/text" as text;
 
 extern fn MTLCreateSystemDefaultDevice() -> *u8;
 
-const TILE: usize = 16;
 const REDUCTION_THREADS: usize = 128;
 const VM_PAGE_BYTES: usize = 16384;
 
@@ -330,11 +329,11 @@ fn dispatch_conv(
     encoder.set_bytes(#addr_of(params) as *u8, #size_of::[ConvParams]() as u64, 4 as u64);
     encoder.dispatch_threadgroups(
         metal::Size {
-            width: round_up(output_channels, TILE) as u64 / TILE as u64,
-            height: round_up(output_height *% output_width, TILE) as u64 / TILE as u64,
+            width: round_up(output_channels, 64 as usize) as u64 / (64 as u64),
+            height: round_up(output_height *% output_width, 64 as usize) as u64 / (64 as u64),
             depth: 1 as u64,
         },
-        metal::Size { width: TILE as u64, height: TILE as u64, depth: 1 as u64 },
+        metal::Size { width: 512 as u64, height: 1 as u64, depth: 1 as u64 },
     );
     return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder));
 }
@@ -711,7 +710,7 @@ fn run_impl(
         return 1;
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
-    guard let option::Option[OwnedObjc]::Some(conv_owner) = pipeline(device, library, "vae_conv2d_f32_16x16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(conv_owner) = pipeline(device, library, "vae_conv2d_f32_simdgroup_64x64") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "vae_rms_norm") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(add_owner) = pipeline(device, library, "vae_add") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(denormalize_owner) = pipeline(device, library, "vae_denormalize") else { return 1; };
@@ -857,9 +856,11 @@ fn run_impl(
     }
 
     guard let option::Option[u64]::Some(final_norm_gamma) = gamma_offset(file, "decoder.norm_out.gamma", 144) else { return 1; };
-    guard let option::Option[f64]::Some(final_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_c, height *% width, 144, false) else { return 1; };
-    total_ms = total_ms + final_norm_ms;
-    if requested_case == "small" { all_ok = report_boundary("final RMS norm", buffer_c, fixture_directory, "norm_out", height *% width *% (144 as usize), 0.000002f64) && all_ok; }
+    if requested_case == "small" {
+        guard let option::Option[f64]::Some(final_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_c, height *% width, 144, false) else { return 1; };
+        total_ms = total_ms + final_norm_ms;
+        all_ok = report_boundary("final RMS norm", buffer_c, fixture_directory, "norm_out", height *% width *% (144 as usize), 0.000002f64) && all_ok;
+    }
     guard let option::Option[f64]::Some(final_norm_silu_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_d, height *% width, 144, true) else { return 1; };
     total_ms = total_ms + final_norm_silu_ms;
     guard let option::Option[ConvWeight]::Some(conv_out_weight) = conv_weight(file, "decoder.conv_out", 4, 144, 3) else { return 1; };

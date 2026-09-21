@@ -282,8 +282,8 @@ Inspect a shard, optionally filtering tensor names:
   It applies the exact 64-channel latent mean/std handoff, post-quant and input
   convolutions, the 1,152-channel residual/one-head-attention middle block,
   five residual up blocks, final RMSNorm/SiLU, output convolution, and clamp.
-  Activations use HWC order so the shared 16x16 tiled OIHW convolution can read
-  checkpoint weights without transposing or repacking them.
+  Activations use HWC order so the implicit-GEMM convolution can read OIHW
+  checkpoint weights without a persistent transpose or repack.
 - The official class is named a causal 3D VAE, but its image specialization is
   materially different from a generic Conv3D decoder. Its checkpoint
   convolution weights are four-dimensional Conv2d tensors. On the first
@@ -304,6 +304,23 @@ Inspect a shard, optionally filtering tensor names:
   under a 3e-6 gate. The measured M1 Max run used 456,523,776 bytes of explicit
   scratch storage plus the no-copy weights and took 2,297.53 ms of summed GPU
   kernel time. Results, scope, and limitations are recorded in
+  `benchmarks/m1-max-vae-decoder-native.json`.
+- A dispatch-level VAE profile showed that convolution owned about 2.23 s of
+  the 2.25 s GPU total, so command submission was not the first-order problem.
+  The scalar 16x16 convolution is now an implicit 64x64 FP32 cooperative-matrix
+  tile: sixteen SIMD groups share a gathered 64x32 input tile and transposed
+  32x64 weight tile, while preserving FP32 operands and accumulation. It does
+  not materialize the largest 680 MiB im2col matrix, adds no global scratch,
+  and the production path no longer computes a no-SiLU final norm used only by
+  the small fixture report. Three 256px repeats measured 795.151, 728.080, and
+  728.438 ms GPU (728.438 ms median), a 3.15x speedup over the recorded
+  2,297.53 ms baseline. Direct decoder wall time was 1.09, 1.01, and 0.99 s.
+  All 35 small boundaries still pass; production output nRMSE is 7.19e-7 under
+  the unchanged 3e-6 limit. The changed FP32 summation order moves only five
+  of 262,144 final teapot RGBA bytes, each by one. In the full pipeline the VAE
+  phase fell from 2,971 to 1,396 ms, saving 1.575 s; that run's end-to-end time
+  was 35.528 s because text paging independently regressed from 12.674 to
+  15.493 s. Exact measurements and the comparison caveat are in
   `benchmarks/m1-max-vae-decoder-native.json`.
 - The first complete vertical slice now executes the committed prompt and
   initial-noise fixture through all 40 transformer/scheduler steps, hands the

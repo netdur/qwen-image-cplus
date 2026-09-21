@@ -41,11 +41,51 @@
     "trajectory_256_output_passed": true,
     "passed": true
   },
+  "simdgroup_64x64_optimization": {
+    "date": "2026-09-21",
+    "reason": "A dispatch-level profile attributed about 2.23 seconds of the 2.25-second decoder GPU total to convolution; batching the 112 command buffers could only address the much smaller wall-minus-GPU remainder.",
+    "implementation": "Implicit NHWC convolution as a 64x64 FP32 cooperative-matrix tile. Sixteen SIMD groups reuse a gathered 64x32 input tile and a transposed 32x64 weight tile without materializing im2col; operands, accumulation, and output remain FP32. The production-only unused no-SiLU final norm was also removed.",
+    "global_im2col_bytes_avoided": 713031680,
+    "profiled_scalar_conv_gpu_ms": 2230,
+    "trajectory_256": {
+      "baseline_summed_gpu_kernel_ms": 2297.53,
+      "optimized_gpu_kernel_ms_runs": [795.151, 728.08, 728.438],
+      "optimized_gpu_kernel_ms_median": 728.438,
+      "gpu_speedup": 3.154,
+      "gpu_reduction_percent": 68.30,
+      "direct_process_wall_seconds_runs": [1.09, 1.01, 0.99],
+      "direct_process_wall_seconds_median": 1.01,
+      "output_nrmse": 0.000000719484,
+      "output_limit": 0.000003,
+      "scratch_bytes": 456523776
+    },
+    "small_case": {
+      "maximum_reported_boundary_nrmse": 0.00000248248,
+      "output_nrmse": 0.000000765185,
+      "output_limit": 0.000002,
+      "all_35_boundaries_passed": true
+    },
+    "integrated_blue_teapot": {
+      "baseline_vae_phase_wall_ms": 2971,
+      "optimized_vae_gpu_ms": 714.149,
+      "optimized_vae_phase_wall_ms": 1396,
+      "vae_wall_ms_saved": 1575,
+      "optimized_end_to_end_wall_ms": 35528,
+      "end_to_end_comparison_note": "The text phase varied from the 12674 ms baseline to 15493 ms in this run, so the 35528 ms total is not a controlled whole-process speed comparison; the transformer loop remained normal at 12516 ms.",
+      "rgba_vs_previous_runtime": {
+        "mismatched_bytes": 5,
+        "mean_absolute_byte_error": 0.000019073,
+        "maximum_absolute_byte_error": 1,
+        "nrmse": 0.0000247176
+      }
+    },
+    "accepted": true
+  },
   "interpretation": "The model-scale output agrees closely enough to use arithmetic-error gates far tighter than the mixed-transformer runtime. The independently captured small boundaries make the unusual first-chunk shortcut semantics observable instead of relying only on final pixels.",
   "limitations": [
     "This validates the pinned still-image first-chunk path only; temporal continuation and tiled decode are not implemented.",
     "The command is a decoder validation boundary, not yet a user-facing generation pipeline or image writer.",
-    "Summed GPU time excludes Safetensors parsing, Metal source compilation, fixture I/O, and process startup; each kernel currently uses a separate command buffer and synchronous wait.",
+    "Summed GPU time excludes Safetensors parsing, Metal source compilation, fixture I/O, and process startup; each kernel still uses a separate command buffer and synchronous wait.",
     "The 1.258 GiB FP32 VAE checkpoint is mapped without copying, but is not quantized.",
     "Native prompt encoding remains a separate later boundary."
   ]

@@ -1,7 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint VAE_TILE = 16;
 constant uint VAE_REDUCTION_THREADS = 128;
 constant uint VAE_ATTENTION_CHANNELS = 1152;
 constant uint VAE_ATTENTION_LANES = 9;
@@ -38,65 +37,114 @@ struct ElementParams {
     uint channels;
 };
 
-kernel void vae_conv2d_f32_16x16(
+// Treat NHWC convolution as an implicit [pixels, K] x [K, output_channels]
+// matrix product. The input tile is gathered directly from the image, so the
+// decoder does not need to materialize an im2col buffer (680 MiB at its largest
+// 256x256 layer). Sixteen SIMD groups reuse each input tile across a 64x64
+// output tile with FP32 cooperative matrices and FP32 accumulation.
+kernel void vae_conv2d_f32_simdgroup_64x64(
     device const float *input [[buffer(0)]],
     device const float *weights [[buffer(1)]],
     device const float *bias [[buffer(2)]],
     device float *output [[buffer(3)]],
     constant ConvParams &params [[buffer(4)]],
-    ushort2 thread_position [[thread_position_in_threadgroup]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
     uint2 group_position [[threadgroup_position_in_grid]]) {
-    threadgroup float input_tile[VAE_TILE][VAE_TILE];
-    threadgroup float weight_tile[VAE_TILE][VAE_TILE];
+    threadgroup float input_tile[64][32];
+    threadgroup float weight_tile[32][64];
+    threadgroup float output_tile[64][64];
 
-    const uint pixel = group_position.y * VAE_TILE + thread_position.y;
-    const uint output_channel = group_position.x * VAE_TILE + thread_position.x;
+    const uint pixel_base = group_position.y * 64;
+    const uint output_base = group_position.x * 64;
+    const uint simd_row = simd_index / 8;
+    const uint simd_column = simd_index % 8;
     const uint output_pixels = params.output_height * params.output_width;
     const uint kernel_area = params.kernel_size * params.kernel_size;
     const uint inner_count = params.input_channels * kernel_area;
-    float sum = output_channel < params.output_channels ? bias[output_channel] : 0.0f;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
 
-    for (uint inner_base = 0; inner_base < inner_count; inner_base += VAE_TILE) {
-        const uint input_inner = inner_base + thread_position.x;
-        float input_value = 0.0f;
-        if (pixel < output_pixels && input_inner < inner_count) {
-            const uint output_y = pixel / params.output_width;
-            const uint output_x = pixel % params.output_width;
-            const uint input_channel = input_inner / kernel_area;
-            const uint kernel_position = input_inner % kernel_area;
-            const int kernel_y = int(kernel_position / params.kernel_size);
-            const int kernel_x = int(kernel_position % params.kernel_size);
-            int sample_y = int(output_y) + kernel_y - int(params.padding);
-            int sample_x = int(output_x) + kernel_x - int(params.padding);
-            if (params.upsample != 0) {
-                const int expanded_height = int(params.input_height * 2);
-                const int expanded_width = int(params.input_width * 2);
-                if (sample_y >= 0 && sample_y < expanded_height && sample_x >= 0 && sample_x < expanded_width) {
-                    const uint source_y = uint(sample_y) / 2;
-                    const uint source_x = uint(sample_x) / 2;
-                    input_value = input[(source_y * params.input_width + source_x) * params.input_channels + input_channel];
+    for (uint inner_base = 0; inner_base < inner_count; inner_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_pixel = linear / 32;
+            const uint local_inner = linear % 32;
+            const uint pixel = pixel_base + local_pixel;
+            const uint input_inner = inner_base + local_inner;
+            float input_value = 0.0f;
+            if (pixel < output_pixels && input_inner < inner_count) {
+                const uint output_y = pixel / params.output_width;
+                const uint output_x = pixel % params.output_width;
+                const uint input_channel = input_inner / kernel_area;
+                const uint kernel_position = input_inner % kernel_area;
+                const int kernel_y = int(kernel_position / params.kernel_size);
+                const int kernel_x = int(kernel_position % params.kernel_size);
+                const int sample_y = int(output_y) + kernel_y - int(params.padding);
+                const int sample_x = int(output_x) + kernel_x - int(params.padding);
+                if (params.upsample != 0) {
+                    const int expanded_height = int(params.input_height * 2);
+                    const int expanded_width = int(params.input_width * 2);
+                    if (sample_y >= 0 && sample_y < expanded_height
+                        && sample_x >= 0 && sample_x < expanded_width) {
+                        const uint source_y = uint(sample_y) / 2;
+                        const uint source_x = uint(sample_x) / 2;
+                        input_value = input[(source_y * params.input_width + source_x)
+                                            * params.input_channels + input_channel];
+                    }
+                } else if (sample_y >= 0 && sample_y < int(params.input_height)
+                           && sample_x >= 0 && sample_x < int(params.input_width)) {
+                    input_value = input[(uint(sample_y) * params.input_width + uint(sample_x))
+                                        * params.input_channels + input_channel];
                 }
-            } else if (sample_y >= 0 && sample_y < int(params.input_height)
-                       && sample_x >= 0 && sample_x < int(params.input_width)) {
-                input_value = input[(uint(sample_y) * params.input_width + uint(sample_x))
-                                    * params.input_channels + input_channel];
             }
+            input_tile[local_pixel][local_inner] = input_value;
         }
-        input_tile[thread_position.y][thread_position.x] = input_value;
-
-        const uint weight_inner = inner_base + thread_position.y;
-        weight_tile[thread_position.y][thread_position.x] =
-            output_channel < params.output_channels && weight_inner < inner_count
-                ? weights[output_channel * inner_count + weight_inner]
-                : 0.0f;
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_channel = linear / 32;
+            const uint local_inner = linear % 32;
+            const uint input_inner = inner_base + local_inner;
+            const uint output_channel = output_base + local_channel;
+            weight_tile[local_inner][local_channel] =
+                output_channel < params.output_channels && input_inner < inner_count
+                    ? weights[output_channel * inner_count + input_inner]
+                    : 0.0f;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint inner = 0; inner < VAE_TILE; ++inner) {
-            sum = fma(input_tile[thread_position.y][inner], weight_tile[inner][thread_position.x], sum);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_float8x8 left_0;
+            simdgroup_float8x8 left_1;
+            simdgroup_float8x8 left_2;
+            simdgroup_float8x8 left_3;
+            simdgroup_float8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[16 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[48 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 64);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (pixel < output_pixels && output_channel < params.output_channels) {
-        output[pixel * params.output_channels + output_channel] = sum;
+
+    simdgroup_store(accumulator_0, &output_tile[simd_row * 8][simd_column * 8], 64);
+    simdgroup_store(accumulator_1, &output_tile[16 + simd_row * 8][simd_column * 8], 64);
+    simdgroup_store(accumulator_2, &output_tile[32 + simd_row * 8][simd_column * 8], 64);
+    simdgroup_store(accumulator_3, &output_tile[48 + simd_row * 8][simd_column * 8], 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 4096; linear += 512) {
+        const uint local_pixel = linear / 64;
+        const uint local_channel = linear % 64;
+        const uint pixel = pixel_base + local_pixel;
+        const uint output_channel = output_base + local_channel;
+        if (pixel < output_pixels && output_channel < params.output_channels) {
+            output[pixel * params.output_channels + output_channel] =
+                output_tile[local_pixel][local_channel] + bias[output_channel];
+        }
     }
 }
 
