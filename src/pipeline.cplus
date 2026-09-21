@@ -148,15 +148,40 @@ fn run_native_256_impl(
     cache_dit_threshold: f64,
 ) -> i32 {
     let pipeline_wall_start_ms: i64 = time::now_millis();
-    let vae_fixture: str = "tests/fixtures/vae_decoder_fp32/trajectory_256";
-    if validate_reference && !image_output::validate_reference_postprocess(vae_fixture) {
-        return 1;
-    }
-    let text_wall_start_ms: i64 = time::now_millis();
     guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
         tokenizer::tokenize_full_prompt(model_root, prompt) else {
         return 1;
     };
+    return run_native_256_tokens_impl(
+        packed_path,
+        model_root,
+        output_path,
+        full_tokens,
+        seed,
+        validate_reference,
+        cache_dit,
+        cache_dit_threshold,
+        pipeline_wall_start_ms,
+        pipeline_wall_start_ms,
+    );
+}
+
+fn run_native_256_tokens_impl(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    full_tokens: vec::Vec[u32],
+    seed: u64,
+    validate_reference: bool,
+    cache_dit: bool,
+    cache_dit_threshold: f64,
+    pipeline_wall_start_ms: i64,
+    text_wall_start_ms: i64,
+) -> i32 {
+    let vae_fixture: str = "tests/fixtures/vae_decoder_fp32/trajectory_256";
+    if validate_reference && !image_output::validate_reference_postprocess(vae_fixture) {
+        return 1;
+    }
     if full_tokens.count() <= SYSTEM_PREFIX_TOKENS || full_tokens.count() > (512 as usize) {
         io::eprintln("pipeline: unsupported full prompt token count ${full_tokens.count()}");
         return 2;
@@ -253,6 +278,71 @@ fn run_native_256_impl(
     } else {
         io::println("Qwen-Image-2.1 native prompt 256px generation: complete");
     }
+    return 0;
+}
+
+// Establish the warm-request baseline before retaining multi-gigabyte model
+// runtimes. This keeps one process and one parsed tokenizer alive across all
+// requests, while the text, transformer, and VAE mappings retain their normal
+// phase-scoped lifetimes. That distinction is intentional: the measurement
+// tells us how much process/tokenizer reuse earns before increasing the 32 GB
+// machine's simultaneous mapped working set.
+fn benchmark_process_reuse_256(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    request_count: usize = 2 as usize,
+    seed: u64 = 42 as u64,
+    threshold: f64 = 0.24f64,
+) -> i32 {
+    if request_count < (2 as usize) || request_count > (16 as usize) {
+        io::eprintln("resident benchmark: request count must be 2..16");
+        return 2;
+    }
+    if !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("resident benchmark: threshold must be 0.12 or 0.24");
+        return 2;
+    }
+    let session_start_ms: i64 = time::now_millis();
+    guard let tokenizer::LoadResult::Ok(resident_tokenizer) =
+        tokenizer::load(model_root) else tokenizer::LoadResult::Err {
+        return 1;
+    };
+    let tokenizer_init_ms: i64 = time::now_millis() - session_start_ms;
+    io::println(
+        "resident session: tokenizer_init_ms=${tokenizer_init_ms} requests=${request_count}",
+    );
+
+    var request: usize = 0 as usize;
+    while request < request_count {
+        let request_start_ms: i64 = time::now_millis();
+        guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
+            tokenizer::tokenize_full_prompt_with(resident_tokenizer, prompt) else {
+            return 1;
+        };
+        io::println("resident session: request=${request +% (1 as usize)} begin");
+        let status: i32 = run_native_256_tokens_impl(
+            packed_path,
+            model_root,
+            output_path,
+            full_tokens,
+            seed,
+            false,
+            true,
+            threshold,
+            request_start_ms,
+            request_start_ms,
+        );
+        if status != (0 as i32) { return status; }
+        io::println(
+            "resident session: request=${request +% (1 as usize)} wall_ms=${time::now_millis() - request_start_ms}",
+        );
+        request = request +% (1 as usize);
+    }
+    io::println(
+        "resident session: total_wall_ms=${time::now_millis() - session_start_ms} complete",
+    );
     return 0;
 }
 

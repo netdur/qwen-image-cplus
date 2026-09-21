@@ -62,6 +62,7 @@ cpc test
 ./target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
 ./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101
+./target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
 ./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
@@ -473,8 +474,30 @@ Inspect a shard, optionally filtering tensor names:
   21 ms for PNG output. All A/B and repeat PNGs are byte-identical. Readahead
   raised maximum resident set size from 13.35 GB to 17.60 GB in the controlled
   runs, a deliberate speed-for-memory tradeoff on the 32 GB test machine. A
-  resident service is still required to approach the loop time for repeated
-  requests.
+  resident service would still be required to approach the loop time for
+  repeated requests, but residency alone is constrained by the combined model
+  working set as measured below.
+- A two-request same-process baseline disproved the assumption that process and
+  tokenizer reuse alone would materially improve warm latency. The tokenizer
+  initialized once in 138 ms, then request 1 took 35,675 ms and request 2 took
+  35,688 ms. The output remained byte-identical and maximum RSS stayed at
+  17.56 GB. Model resources deliberately remained phase-scoped: keeping
+  the 17.5 GB text weights, 12.42 GiB denoiser, and VAE live together would
+  exceed the safe working set. Cycling through them also displaces the useful
+  pages, so a persistent process cannot remove the dominant weight-I/O cost
+  without first reducing model storage. The reproducible command and exact
+  phase timings are in `benchmarks/m1-max-process-reuse-native.json`.
+- Affine Q8/group-64 text-weight calibration found no acceptable broad policy.
+  Uniform Q8 added 5.72% text-output nRMSE under the custom-kernel FP32
+  emulation; quantizing complete early layers reached 3.33% after only one
+  layer while saving just 1.32% of linear storage. The best large isolated
+  role was all 36 MLP `up_proj` matrices: it saved 1.608 GiB (12.43% of linear
+  storage) but added 3.32-3.66% text nRMSE across three prompts. When its
+  canonical embedding was passed into the native transformer, step-1 latent
+  nRMSE rose from 0.08963% to 0.10334%, exceeding the 0.10% gate. Building a
+  packed text runtime for that marginal policy is rejected. Exact calibration,
+  limitations, and the downstream decision are in
+  `benchmarks/m1-max-text-q8-calibration.json`.
 - As an external Apple-Silicon baseline, the locally downloaded
   `mlx-community/Qwen-Image-2.1-MLX-4bit` snapshot `4db4e8c` took
   **36.48 seconds end to end on repeat** for the same blue-teapot prompt at
@@ -507,12 +530,14 @@ Inspect a shard, optionally filtering tensor names:
   not a serialized inference cache. Each generation must rebuild the
   prompt-dependent per-layer prefix K/V cache (about 18-23 MiB in the measured
   256px cases) and roughly 16 MiB of Cache-DiT first-block and middle-residual
-  state. A resident process can retain the validated memory mapping, compiled
-  pipelines, and reusable workspaces between requests, but it must refresh
-  both caches for every new prompt and denoising trajectory. New processes
-  still benefit from macOS's filesystem page cache and always repeat structural
-  QIPACK validation and runtime setup, but payload checksum scans are now
-  explicit verification work rather than a cost paid by every generation.
+  state. A resident process could retain validated mappings, compiled
+  pipelines, and reusable workspaces, but it must refresh both caches for every
+  new prompt and denoising trajectory. The measured same-process baseline
+  showed no warm-request gain while mappings remain phase-scoped, and retaining
+  all three weight sets concurrently is outside the 32 GB memory budget. New
+  processes still benefit from macOS's filesystem page cache and always repeat
+  structural QIPACK validation and runtime setup, but payload checksum scans
+  are explicit verification work rather than a cost paid by every generation.
 
 ## Quantization decision log
 
@@ -570,7 +595,8 @@ noise, denoising, VAE decode, postprocessing, and PNG output now form one
 native `generate-256` command. The pinned fox case verifies the complete path;
 arbitrary prompts use the same path but naturally have no numeric oracle unless
 a matching reference fixture is generated. Production use still needs larger
-output sizes, text-encoder quantization, and further kernel optimization.
+output sizes, a text-weight storage strategy that passes the downstream gates,
+and further kernel optimization; the measured affine-Q8 candidates do not.
 The current VAE path intentionally implements the pinned one-frame first-chunk
 semantics; temporal continuation and tiled decode remain outside its verified
 scope.

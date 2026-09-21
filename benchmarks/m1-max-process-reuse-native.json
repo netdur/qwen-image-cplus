@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "case": {
+    "pixels": 256,
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "latent_seed": 42,
+    "steps": 40,
+    "cache_dit_threshold": 0.24,
+    "request_count": 2
+  },
+  "method": {
+    "process": "Both requests execute sequentially in one native process.",
+    "reused": "Parsed tokenizer vocabulary, BPE merge ranks, and Unicode regular expression.",
+    "phase_scoped": "Text encoder, packed transformer, and VAE mappings and Metal resources are released at their existing phase boundaries.",
+    "reason": "Establish the benefit of safe process/tokenizer reuse before attempting to overlap weight mappings whose combined working set exceeds 32 GB."
+  },
+  "session": {
+    "tokenizer_initialization_wall_ms": 138,
+    "total_internal_wall_ms": 71501,
+    "process_wall_seconds": 71.52,
+    "maximum_resident_set_bytes": 17556570112
+  },
+  "requests": [
+    {
+      "index": 1,
+      "text_wall_ms": 13297,
+      "transformer_startup_wall_ms": 6514,
+      "transformer_loop_gpu_ms": 12061.9,
+      "transformer_loop_wall_ms": 12707,
+      "transformer_phase_wall_ms": 19345,
+      "vae_wall_ms": 3006,
+      "image_output_wall_ms": 26,
+      "end_to_end_wall_ms": 35675
+    },
+    {
+      "index": 2,
+      "text_wall_ms": 12945,
+      "transformer_startup_wall_ms": 7355,
+      "transformer_loop_gpu_ms": 11804.5,
+      "transformer_loop_wall_ms": 12306,
+      "transformer_phase_wall_ms": 19761,
+      "vae_wall_ms": 2962,
+      "image_output_wall_ms": 19,
+      "end_to_end_wall_ms": 35688
+    }
+  ],
+  "warm_request_speedup_percent": -0.0364,
+  "png_sha256": "4ba4db4de203a5a0a27160454695e93c5c75062406e7d53a4dab74c4abd49a99",
+  "output_byte_identical_to_prior_native_run": true,
+  "interpretation": "Process and tokenizer reuse alone provide no measurable warm-request speedup. The sequential 17.5 GB text, 12.42 GiB transformer, and 1.35 GB VAE phases churn the 32 GB unified-memory page cache; meaningful resident-mode gains require a much smaller text checkpoint or a different memory policy."
+}

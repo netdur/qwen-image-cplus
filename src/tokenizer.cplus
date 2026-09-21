@@ -381,6 +381,17 @@ fn tokenize_full_prompt(model_root: str, prompt: str) -> option::Option[vec::Vec
     return encode_full_prompt(tokenizer, prompt);
 }
 
+// Resident callers load the 151,643-entry vocabulary and 151,387 BPE merge
+// table once, then use this entry point for each request. The tokenizer is
+// immutable after construction, so sharing it across sequential requests does
+// not change tokenization semantics.
+fn tokenize_full_prompt_with(
+    tokenizer: Tokenizer,
+    prompt: str,
+) -> option::Option[vec::Vec[u32]] {
+    return encode_full_prompt(tokenizer, prompt);
+}
+
 fn validate_case(tokenizer: Tokenizer, fixture_directory: str, name: str, prompt: str) -> bool {
     guard let option::Option[vec::Vec[u32]]::Some(actual) = encode_prompt(tokenizer, prompt) else {
         io::eprintln("tokenizer: failed to encode ${name}");

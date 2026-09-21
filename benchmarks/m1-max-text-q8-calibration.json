@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "environment": {
+    "torch": "2.8.0",
+    "transformers": "5.17.0",
+    "device": "mps"
+  },
+  "policy": {
+    "scheme": "affine_int8",
+    "group_axis": "input/K",
+    "group_size": 64,
+    "scale": "FP16 per output-row group",
+    "zero": "U8 per output-row group",
+    "quantized": "cumulative early decoder layers selected by --scan",
+    "roles": [
+      "up"
+    ],
+    "retained_bf16": "token embeddings and all norm vectors",
+    "execution_emulation": "packed values dequantized by output-row chunks with FP32 inputs and accumulation, cast back to the surrounding BF16 dtype"
+  },
+  "timing_seconds": {
+    "load": 12.561184667050838,
+    "reference": 6.32519791694358,
+    "quantized": 1.9369937919545919
+  },
+  "candidates": [
+    {
+      "first_quantized_layer_count": 36,
+      "quantized_matrix_count": 36,
+      "quantized_parameter_count": 1811939328,
+      "retained_bf16_parameter_count": 5133828096,
+      "projected_linear_bytes": 12164530176,
+      "linear_storage_reduction_percent": 12.432065217391308,
+      "cumulative_quantization_seconds": 3.2899709579069167,
+      "inference_seconds": 1.9369937919545919,
+      "cases": [
+        {
+          "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+          "tokens": 22,
+          "max_abs": 27.0,
+          "mean_abs": 0.250315859913826,
+          "rms": 0.40140777901973,
+          "reference_rms": 12.0836822387815,
+          "normalized_rms": 0.03321899492949654,
+          "passes_text_gate": true,
+          "passes_one_percent_calibration_target": false
+        },
+        {
+          "prompt": "A blue ceramic teapot on a windowsill.",
+          "tokens": 18,
+          "max_abs": 34.0,
+          "mean_abs": 0.26333986388312447,
+          "rms": 0.45526768928376293,
+          "reference_rms": 12.436415705556504,
+          "normalized_rms": 0.03660762876238951,
+          "passes_text_gate": true,
+          "passes_one_percent_calibration_target": false
+        },
+        {
+          "prompt": "An isometric orbital greenhouse with citrus trees, gardeners, and a blue maintenance robot.",
+          "tokens": 26,
+          "max_abs": 60.0,
+          "mean_abs": 0.23589706019713327,
+          "rms": 0.4302355995776038,
+          "reference_rms": 11.814272466762157,
+          "normalized_rms": 0.03641659702601349,
+          "passes_text_gate": true,
+          "passes_one_percent_calibration_target": false
+        }
+      ],
+      "all_pass_text_gate": true,
+      "all_pass_one_percent_calibration_target": false
+    }
+  ],
+  "downstream_native_validation": {
+    "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+    "scope": "The calibrated up_proj-Q8 embedding replaces text_input.f32 in the pinned native one-step transformer fixture.",
+    "baseline_step_1_latent_nrmse": 0.000896293,
+    "candidate_step_1_latent_nrmse": 0.00103339,
+    "step_1_limit": 0.001,
+    "passed": false
+  },
+  "decision": "Reject the measured text-Q8 policies. Uniform and complete-layer policies fail the text boundary. The least damaging large role policy leaves too little text-error margin and fails the stricter downstream step-1 latent gate while saving only 1.608 GiB.",
+  "limitations": [
+    "PyTorch MPS FP32 matmul is not bit-exact with the future native packed Metal kernel.",
+    "The downstream 256px latent and decoded-image gates must pass before this becomes a runtime policy."
+  ]
+}
