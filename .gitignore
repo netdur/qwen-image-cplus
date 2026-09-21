@@ -5,3 +5,4 @@ __pycache__/
 target/
 tests/fixtures/small/
 vendor
+/plan.md
