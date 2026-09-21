@@ -8,6 +8,7 @@ import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
+import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 
 extern fn MTLCreateSystemDefaultDevice() -> *u8;
@@ -363,6 +364,8 @@ fn run_impl(
         return 2;
     }
 
+    let run_wall_start_ms: i64 = time::now_millis();
+    let mapping_start_ms: i64 = time::now_millis();
     let directory: text::Text = "${model_root}/text_encoder";
     let shard_0_path: text::Text = "${directory}/model-00001-of-00004.safetensors";
     let shard_1_path: text::Text = "${directory}/model-00002-of-00004.safetensors";
@@ -372,21 +375,27 @@ fn run_impl(
     guard let safetensors::LoadResult::Ok(file_1) = safetensors::load(shard_1_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 2: ${error.name()}"); return 1; };
     guard let safetensors::LoadResult::Ok(file_2) = safetensors::load(shard_2_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 3: ${error.name()}"); return 1; };
     guard let safetensors::LoadResult::Ok(file_3) = safetensors::load(shard_3_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 4: ${error.name()}"); return 1; };
+    let mapping_wall_ms: i64 = time::now_millis() - mapping_start_ms;
     // These four shards are 17.5 GB of BF16 weights and the phase is disk
     // bound, not GPU bound. Start the reads now so they proceed while the
     // Metal device, library, and pipelines are built below.
+    let advise_start_ms: i64 = time::now_millis();
     let _advised_0: bool = mapped::advise_range_willneed(file_0.mapping_pointer(), file_0.mapping_length());
     let _advised_1: bool = mapped::advise_range_willneed(file_1.mapping_pointer(), file_1.mapping_length());
     let _advised_2: bool = mapped::advise_range_willneed(file_2.mapping_pointer(), file_2.mapping_length());
     let _advised_3: bool = mapped::advise_range_willneed(file_3.mapping_pointer(), file_3.mapping_length());
+    let advise_wall_ms: i64 = time::now_millis() - advise_start_ms;
 
+    let device_queue_start_ms: i64 = time::now_millis();
     let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
     if device_pointer.is_null() { io::eprintln("text encoder: no Metal device"); return 1; }
     let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
     let device: metal::Device = metal::Device::from_raw(device_owner.raw());
     guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else { return 1; };
     let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let device_queue_wall_ms: i64 = time::now_millis() - device_queue_start_ms;
 
+    let storage_start_ms: i64 = time::now_millis();
     guard let option::Option[metal::Buffer]::Some(storage_0) = mapped_storage_buffer(device, file_0) else { return 1; };
     let storage_0_owner: OwnedObjc = OwnedObjc::new(storage_0.raw());
     guard let option::Option[metal::Buffer]::Some(storage_1) = mapped_storage_buffer(device, file_1) else { return 1; };
@@ -395,7 +404,9 @@ fn run_impl(
     let storage_2_owner: OwnedObjc = OwnedObjc::new(storage_2.raw());
     guard let option::Option[metal::Buffer]::Some(storage_3) = mapped_storage_buffer(device, file_3) else { return 1; };
     let storage_3_owner: OwnedObjc = OwnedObjc::new(storage_3.raw());
+    let storage_wall_ms: i64 = time::now_millis() - storage_start_ms;
 
+    let compile_start_ms: i64 = time::now_millis();
     let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
     if options_pointer.is_null() { return 1; }
     let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
@@ -430,7 +441,9 @@ fn run_impl(
         add: metal::ComputePipelineState::from_raw(add_owner.raw()),
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
+    let compile_wall_ms: i64 = time::now_millis() - compile_start_ms;
 
+    let scratch_start_ms: i64 = time::now_millis();
     let hidden_bytes: u64 = (rows *% WIDTH *% #size_of::[f32]()) as u64;
     let kv_bytes: u64 = (rows *% KV_WIDTH *% #size_of::[f32]()) as u64;
     let intermediate_bytes: u64 = (rows *% INTERMEDIATE_WIDTH *% #size_of::[f32]()) as u64;
@@ -449,7 +462,9 @@ fn run_impl(
     guard let option::Option[metal::Buffer]::Some(gate) = new_buffer(device, intermediate_bytes) else { return 1; }; let gate_owner: OwnedObjc = OwnedObjc::new(gate.raw());
     guard let option::Option[metal::Buffer]::Some(up) = new_buffer(device, intermediate_bytes) else { return 1; }; let up_owner: OwnedObjc = OwnedObjc::new(up.raw());
     guard let option::Option[metal::Buffer]::Some(activated) = new_buffer(device, intermediate_bytes) else { return 1; }; let activated_owner: OwnedObjc = OwnedObjc::new(activated.raw());
+    let scratch_wall_ms: i64 = time::now_millis() - scratch_start_ms;
 
+    let execution_start_ms: i64 = time::now_millis();
     var params: TextParams = TextParams {
         rows: rows as u32,
         width: WIDTH as u32,
@@ -472,6 +487,7 @@ fn run_impl(
 
     var layer: usize = 0 as usize;
     while layer < LAYERS {
+        let layer_wall_start_ms: i64 = time::now_millis();
         let prefix: text::Text = "model.language_model.layers.${layer}.";
         guard let option::Option[Weight]::Some(input_norm) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}input_layernorm.weight", WIDTH as u64) else { return 1; };
         guard let option::Option[Weight]::Some(q_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}self_attn.q_proj.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
@@ -503,7 +519,7 @@ fn run_impl(
         guard let option::Option[f64]::Some(swiglu_ms) = dispatch_element(queue, pipelines.swiglu, gate, up, activated, #addr_of(params), rows *% INTERMEDIATE_WIDTH) else { return 1; }; total_ms = total_ms + swiglu_ms;
         guard let option::Option[f64]::Some(down_ms) = dispatch_linear(queue, pipelines.linear, activated, down_weight, branch, rows, WIDTH, INTERMEDIATE_WIDTH) else { return 1; }; total_ms = total_ms + down_ms;
         guard let option::Option[f64]::Some(add_mlp_ms) = dispatch_element(queue, pipelines.add, hidden_b, branch, hidden_a, #addr_of(params), rows *% WIDTH) else { return 1; }; total_ms = total_ms + add_mlp_ms;
-        io::println("text encoder: layer=${layer} cumulative_gpu_ms=${total_ms}");
+        io::println("text encoder: layer=${layer} cumulative_gpu_ms=${total_ms} wall_ms=${time::now_millis() - layer_wall_start_ms} cumulative_wall_ms=${time::now_millis() - execution_start_ms}");
         if validate_reference && (
             layer == (0 as usize) || layer == (17 as usize) || layer == (23 as usize)
                 || layer >= (31 as usize)
@@ -536,6 +552,10 @@ fn run_impl(
 
     let finite_ok: bool = finite(hidden_a, rows *% WIDTH);
     if !finite_ok { return 1; }
+    let execution_wall_ms: i64 = time::now_millis() - execution_start_ms;
+    io::println(
+        "text encoder timing: mapping_ms=${mapping_wall_ms} advise_ms=${advise_wall_ms} device_queue_ms=${device_queue_wall_ms} storage_buffers_ms=${storage_wall_ms} metal_compile_pipeline_ms=${compile_wall_ms} scratch_buffers_ms=${scratch_wall_ms} execution_ms=${execution_wall_ms} total_wall_ms=${time::now_millis() - run_wall_start_ms}",
+    );
     if !output.is_null() {
         let values: *f32 = hidden_a.contents() as *f32;
         let source_offset: usize = SYSTEM_PREFIX_TOKENS *% WIDTH;

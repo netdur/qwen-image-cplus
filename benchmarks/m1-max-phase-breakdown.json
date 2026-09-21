@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "purpose": "Measure the paging and host-work assumptions in plan-3-speedup.md before selecting the next optimization.",
+  "text_encoder": {
+    "command": "test-text-encoder MODEL_DIR",
+    "full_tokens": 36,
+    "output_tokens": 22,
+    "timing_ms": {
+      "safetensors_mapping": 6,
+      "whole_shard_madvise_willneed": 7622,
+      "device_and_queue": 99,
+      "no_copy_storage_buffers": 1,
+      "metal_compile_and_pipelines": 5,
+      "scratch_buffers": 0,
+      "execution": 7865,
+      "total": 15598,
+      "summed_gpu": 761.357
+    },
+    "execution_page_fault_boundaries": [
+      {"boundary": "embedding_to_layer_0", "cumulative_wall_ms": 2372},
+      {"layer": 6, "wall_ms": 1600},
+      {"layer": 19, "wall_ms": 1908},
+      {"layer": 32, "wall_ms": 1187}
+    ],
+    "output_nrmse": 0.0361069,
+    "output_limit": 0.04,
+    "interpretation": "Whole-file WILLNEED is not a cheap asynchronous hint on this run: the four calls consumed 7.622 seconds, yet first use still stalled at the embedding and shard transitions. Selective decoder-layer ranges are worth an A/B; merely moving no-copy buffer creation after compilation cannot matter because buffer creation was 1 ms and compilation was 5 ms."
+  },
+  "cached_transformer_block": {
+    "command": "QI_PROFILE_CACHED_BLOCK=1 test-transformer-trajectory PACKED 2",
+    "trajectory_startup_ms": {
+      "packed_validation": 20,
+      "metal_pipeline": 71,
+      "storage_and_weights": 1,
+      "buffers_and_prefix_first_touch": 6186
+    },
+    "step_2": {
+      "gpu_ms": 812.808,
+      "wall_ms": 884,
+      "latent_nrmse": 0.00130082,
+      "limit": 0.0015
+    },
+    "sampled_blocks": [
+      {"block": 0, "metadata_wall_ms": 0, "mps_setup_wall_ms": 4, "execute_wall_ms": 70, "gpu_ms": 24.9234},
+      {"block": 1, "metadata_wall_ms": 0, "mps_setup_wall_ms": 0, "execute_wall_ms": 25, "gpu_ms": 24.8619},
+      {"block": 31, "metadata_wall_ms": 1, "mps_setup_wall_ms": 0, "execute_wall_ms": 27, "gpu_ms": 26.7922}
+    ],
+    "interpretation": "The first MPS block pays a one-time cold-start penalty. Steady blocks are GPU-bound: metadata lookup is 0-1 ms, MPS object construction rounds to 0 ms, and block wall time is within 0-1 ms of GPU time. Prebuilding descriptors remains sensible cleanup but is bounded by the existing whole-loop wall-minus-GPU gap (about 0.5 s with Cache-DiT), not the multi-second estimate."
+  },
+  "profiling_controls": {
+    "text_timing": "Always emitted with the existing per-layer progress lines.",
+    "cached_block_timing": "Set QI_PROFILE_CACHED_BLOCK=1; only blocks 0, 1, and 31 of step 2 are printed."
+  }
+}

@@ -357,6 +357,24 @@ Inspect a shard, optionally filtering tensor names:
   does not carry an incomplete home-grown Unicode database; byte mapping and
   BPE execution remain C+ code and the fixture gate checks their combined
   behavior.
+- Text execution now reports wall time separately for Safetensors mapping,
+  `WILLNEED`, device/queue creation, no-copy storage buffers, Metal pipelines,
+  scratch allocation, and each layer. On the measured 36-token run, mapping
+  took 6 ms but whole-shard `WILLNEED` took 7,622 ms; execution then took
+  another 7,865 ms despite only 761.357 ms of summed GPU work. The remaining
+  stalls were concentrated before layer 0 and at layers 6, 19, and 32, which
+  are the decoder-weight shard transitions. This falsifies the assumption that
+  the current full-file advice cheaply overlaps setup: no-copy buffer creation
+  was 1 ms and Metal compile/pipeline creation was 5 ms. Selective layer-range
+  advice is therefore the next I/O A/B.
+- `QI_PROFILE_CACHED_BLOCK=1` samples blocks 0, 1, and 31 of trajectory step 2
+  without changing the default log. The steady samples measured 24.86 ms GPU
+  / 25 ms wall and 26.79 ms GPU / 27 ms wall; tensor metadata took 0–1 ms and
+  MPS object setup rounded to 0 ms. Block 0 paid a one-time MPS cold start
+  (24.92 ms GPU / 70 ms wall). Prebuilding descriptors can only recover part
+  of the measured whole-loop wall-minus-GPU gap (about 0.5 s under Cache-DiT),
+  not the multi-second saving initially projected. Raw timing and interpretation
+  are recorded in `benchmarks/m1-max-phase-breakdown.json`.
 - The complete text-only Qwen3-VL language path also runs natively from the
   original four no-copy BF16 Safetensors mappings: 36 decoder layers at width
   4096, 32 query heads, 8 KV heads, 128-wide RoPE, and 12,288-wide SwiGLU. It

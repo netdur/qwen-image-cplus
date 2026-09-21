@@ -9,6 +9,7 @@ import "./safetensors" as safetensors;
 import "metal/metal" as metal;
 import "objc/bridge" as bridge;
 import "objc/runtime" as rt;
+import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
@@ -1946,7 +1947,11 @@ fn execute_mps_mlp_runtime_block(
     cache_value: metal::Buffer,
     cache_offset: u64,
     prefix_rows: usize,
+    profile: bool = false,
+    metadata_wall_ms: i64 = 0,
+    block_index: usize = 0,
 ) -> option::Option[f64] {
+    let block_wall_start_ms: i64 = time::now_millis();
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
@@ -2002,6 +2007,7 @@ fn execute_mps_mlp_runtime_block(
         output_weight_buffer, output_weight_offset, workspace.mlp_projected, 0 as u64,
         rows, WIDTH, MLP_WIDTH,
     ) else { return option::Option[f64]::None; };
+    let mps_setup_wall_ms: i64 = time::now_millis() - block_wall_start_ms;
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(attention_encoder) =
         command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
@@ -2132,9 +2138,14 @@ fn execute_mps_mlp_runtime_block(
 
     command_buffer.commit();
     command_buffer.wait_until_completed();
-    return option::Option[f64]::Some(
-        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
-    );
+    let gpu_ms: f64 =
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64;
+    if profile {
+        io::println(
+            "trajectory cached block profile: block=${block_index} rows=${rows} metadata_wall_ms=${metadata_wall_ms} mps_setup_wall_ms=${mps_setup_wall_ms} execute_wall_ms=${time::now_millis() - block_wall_start_ms} gpu_ms=${gpu_ms}",
+        );
+    }
+    return option::Option[f64]::Some(gpu_ms);
 }
 
 fn captured_block_name(block: usize) -> str {
@@ -3989,6 +4000,7 @@ fn run_trajectory_packed_impl(
         var step_quantized_matrices: usize = 0 as usize;
         var block: usize = 0 as usize;
         while block < (32 as usize) {
+            let block_metadata_start_ms: i64 = time::now_millis();
             let prefix: text::Text = "transformer_blocks.${block}.";
             let norm_q_name: text::Text = "${prefix}attn.norm_q.weight";
             let norm_k_name: text::Text = "${prefix}attn.norm_k.weight";
@@ -4013,6 +4025,7 @@ fn run_trajectory_packed_impl(
                 (if mlp_output.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize });
             let cache_offset: u64 = block as u64 *% per_block_cache_bytes;
             let block_weights: BlockWeights = BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output };
+            let block_metadata_wall_ms: i64 = time::now_millis() - block_metadata_start_ms;
             let block_result: option::Option[f64] = if step == (0 as usize) {
                 execute_batched_runtime_block(
                     queue, pipelines, block_weights, active_workspace, current, next, active_rows,
@@ -4024,6 +4037,12 @@ fn run_trajectory_packed_impl(
                     queue, pipelines, mps_workspace, block_weights, active_workspace,
                     current, next, active_rows, cache_key_arena, cache_value_arena,
                     cache_offset, text_rows,
+                    env::has_var("QI_PROFILE_CACHED_BLOCK")
+                        && step == (1 as usize)
+                        && (block == (0 as usize) || block == (1 as usize)
+                            || block == (31 as usize)),
+                    block_metadata_wall_ms,
+                    block,
                 )
             };
             guard let option::Option[f64]::Some(block_ms) = block_result else { return 1; };
