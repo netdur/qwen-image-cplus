@@ -631,6 +631,51 @@ Inspect a shard, optionally filtering tensor names:
   structural QIPACK validation and runtime setup, but payload checksum scans
   are explicit verification work rather than a cost paid by every generation.
 
+## Remaining optimization phases
+
+The original timing target is no longer a stopping condition. The remaining
+work is ordered by architectural leverage and evidence, not by whether a
+particular total has already been reached:
+
+1. **First-step MPS MLP and transformer submission structure.** Extend the MPS
+   activation scratch from 256 to the prompt-dependent first-step row count,
+   support prefix extraction in that path, and measure it against the current
+   custom first-step MLP. Then test encoding a whole denoising step before its
+   single wait. Metadata lookup and steady-state MPS object construction have
+   already measured at 0-1 ms per sampled block, so prebuilding objects alone
+   is not assumed to provide the earlier projected host saving.
+2. **Fused QKV with FP16 attention storage.** Define a versioned QIPACK policy
+   that stores dense attention matrices in the same FP16 operand form already
+   consumed by the accepted custom kernels. Fuse Q, K, and V into a wider
+   projection and add row-stride/offset support to Q/K norm, attention, and V
+   consumers. Keep the existing Q8 policy for its calibrated late-block
+   matrices. This requires regenerating and validating the packed artifact.
+3. **Remaining VAE work.** The dominant convolution is already a verified
+   FP32 SIMD-group kernel. Still open are fewer command-buffer waits, persistent
+   pipeline/scratch reuse where the phase lifetime permits it, and the
+   parity-decomposed nearest-upsample convolution experiment. The 3e-6 decoder
+   and RGBA byte gates remain stricter than the transformer gates.
+4. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
+   hundreds of synchronous dispatches without changing its BF16 store
+   boundaries. Whole-shard readahead stays accepted; tensor-order selective
+   advice and broad Q8 text policies stay rejected unless a materially new
+   layout or calibration method is introduced.
+5. **Kernel-specific elementwise fusion.** Fuse attention residual with the
+   following LayerNorm and evaluate a cooperative final LayerNorm. A global
+   256-thread elementwise launch was measured and rejected, so residual,
+   SwiGLU, final norm, and small conditioning kernels must be tuned separately.
+6. **End-to-end remeasurement.** After the structural phases, repeat both
+   cache-off and Cache-DiT native prompts with warm-filesystem and cold-page
+   conditions reported separately. Transformer loop time, phase wall time,
+   process wall time, memory footprint, and numerical/perceptual gates remain
+   separate measurements.
+
+Closed branches are not remaining phases: selective text readahead regressed
+wall time; the calibrated text-Q8 policies failed the downstream latent gate;
+process reuse without simultaneous model residency provided no warm-request
+gain; four-query attention and blanket 256-thread elementwise groups regressed
+throughput.
+
 ## Quantization decision log
 
 The quantization policy is measurement-driven and deliberately conservative:
