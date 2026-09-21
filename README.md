@@ -460,12 +460,14 @@ Inspect a shard, optionally filtering tensor names:
   reason for retaining both thresholds are in
   `benchmarks/m1-max-cache-dit-native.json`.
 - The 12.74-second figure is the 40-step transformer/scheduler loop, not a
-  cold end-to-end request. In the arbitrary-prompt teapot run, the complete
-  transformer phase took 24,236 ms because it also loaded and validated the
-  packed file, compiled Metal pipelines, and allocated buffers; native text
-  encoding took 17,440 ms, VAE setup and decode took 3,126 ms, and total
-  process wall time was 44,831 ms including PNG output. A resident service is
-  required to approach the loop time for repeated requests.
+  cold end-to-end request. The measured arbitrary-prompt teapot run took
+  **44.831 seconds end to end**, from process start through tokenization, text
+  encoding, transformer, VAE decode, and completed PNG output. Its native text
+  phase took 17,440 ms; the complete transformer phase took 24,236 ms,
+  including 12,554 ms in the denoising loop plus packed-file validation,
+  Metal compilation, and buffer setup; VAE setup and decode took 3,126 ms;
+  and PNG output took 28 ms. A resident service is required to approach the
+  loop time for repeated requests.
 - QIPACK stores persistent packed weights and integrity/model metadata; it is
   not a serialized inference cache. Each generation must rebuild the
   prompt-dependent per-layer prefix K/V cache (about 18-23 MiB in the measured

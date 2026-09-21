@@ -74,6 +74,12 @@
     "cached_steps": 27,
     "transformer_gpu_kernel_ms": 12004.2,
     "transformer_loop_wall_ms": 12554,
+    "text_phase_wall_ms": 17440,
+    "transformer_phase_wall_ms": 24236,
+    "vae_phase_wall_ms": 3126,
+    "image_output_wall_ms": 28,
+    "end_to_end_wall_ms": 44831,
+    "end_to_end_scope": "Process start through tokenization, text encoding, transformer loading and denoising, VAE setup and decode, and completed PNG output",
     "png_bytes": 262488,
     "finite_output": true,
     "visually_coherent": true
