@@ -2040,8 +2040,8 @@ fn execute_batched_runtime_block(
     );
 }
 
-fn execute_mps_mlp_runtime_block(
-    queue: metal::CommandQueue,
+fn encode_mps_mlp_runtime_block(
+    command_buffer: metal::CommandBuffer,
     pipelines: Pipelines,
     mps_workspace: MpsWorkspace,
     weights: BlockWeights,
@@ -2055,17 +2055,7 @@ fn execute_mps_mlp_runtime_block(
     cache_value: metal::Buffer,
     cache_offset: u64,
     prefix_rows: usize,
-    profile: bool = false,
-    metadata_wall_ms: i64 = 0,
-    block_index: usize = 0,
-) -> option::Option[f64] {
-    let block_wall_start_ms: i64 = time::now_millis();
-    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
-    if pool_pointer.is_null() { return option::Option[f64]::None; }
-    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
-        queue.command_buffer() else { return option::Option[f64]::None; };
-    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+) -> bool {
     let gate_weight_buffer: metal::Buffer = if weights.gate.scheme == PACKED_SCHEME_FP16 {
         weights.gate.storage
     } else {
@@ -2104,21 +2094,20 @@ fn execute_mps_mlp_runtime_block(
         mps_workspace.device, mps_workspace.half_input, 0 as u64,
         gate_weight_buffer, gate_weight_offset, workspace.gate, 0 as u64,
         rows, MLP_WIDTH, WIDTH,
-    ) else { return option::Option[f64]::None; };
+    ) else { return false; };
     guard let option::Option[mps::Multiplication]::Some(projected_operation) = mps::create(
         mps_workspace.device, mps_workspace.half_input, 0 as u64,
         projected_weight_buffer, projected_weight_offset, workspace.projected, 0 as u64,
         rows, MLP_WIDTH, WIDTH,
-    ) else { return option::Option[f64]::None; };
+    ) else { return false; };
     guard let option::Option[mps::Multiplication]::Some(output_operation) = mps::create(
         mps_workspace.device, mps_workspace.half_input, 0 as u64,
         output_weight_buffer, output_weight_offset, workspace.mlp_projected, 0 as u64,
         rows, WIDTH, MLP_WIDTH,
-    ) else { return option::Option[f64]::None; };
-    let mps_setup_wall_ms: i64 = time::now_millis() - block_wall_start_ms;
+    ) else { return false; };
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(attention_encoder) =
-        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+        command_buffer.compute_command_encoder() else { return false; };
     let attention_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(attention_encoder.raw()));
     var params: BlockParams = BlockParams {
         rows: rows as u32,
@@ -2195,7 +2184,7 @@ fn execute_mps_mlp_runtime_block(
     attention_command_encoder.end_encoding();
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(gate_conversion_encoder) =
-        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+        command_buffer.compute_command_encoder() else { return false; };
     let gate_conversion_owner: OwnedObjc = OwnedObjc::new(rt::retain(gate_conversion_encoder.raw()));
     encode_mps_input_conversion(
         gate_conversion_encoder, mps_workspace.input_pipeline, workspace.norm2,
@@ -2210,7 +2199,7 @@ fn execute_mps_mlp_runtime_block(
     gate_operation.encode(command_buffer);
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(projected_conversion_encoder) =
-        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+        command_buffer.compute_command_encoder() else { return false; };
     let projected_conversion_owner: OwnedObjc = OwnedObjc::new(rt::retain(projected_conversion_encoder.raw()));
     encode_mps_weight_conversion(
         projected_conversion_encoder, mps_workspace, weights.projected, MLP_WIDTH, WIDTH,
@@ -2221,7 +2210,7 @@ fn execute_mps_mlp_runtime_block(
     projected_operation.encode(command_buffer);
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(swiglu_encoder) =
-        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+        command_buffer.compute_command_encoder() else { return false; };
     let swiglu_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(swiglu_encoder.raw()));
     encode_1d(
         swiglu_encoder, pipelines.swiglu, workspace.gate, workspace.projected,
@@ -2242,7 +2231,7 @@ fn execute_mps_mlp_runtime_block(
     output_operation.encode(command_buffer);
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(residual_encoder) =
-        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+        command_buffer.compute_command_encoder() else { return false; };
     let residual_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(residual_encoder.raw()));
     params.slot = 3 as u32;
     encode_1d(
@@ -2254,13 +2243,47 @@ fn execute_mps_mlp_runtime_block(
         metal::CommandEncoder::from_raw(residual_encoder.raw());
     residual_command_encoder.end_encoding();
 
+    return true;
+}
+
+fn execute_mps_mlp_runtime_block(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    mps_workspace: MpsWorkspace,
+    weights: BlockWeights,
+    workspace: BlockWorkspace,
+    hidden: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+    cache_mode: u32,
+    cache_copy_pipeline: metal::ComputePipelineState,
+    cache_key: metal::Buffer,
+    cache_value: metal::Buffer,
+    cache_offset: u64,
+    prefix_rows: usize,
+    profile: bool = false,
+    metadata_wall_ms: i64 = 0,
+    block_index: usize = 0,
+) -> option::Option[f64] {
+    let block_wall_start_ms: i64 = time::now_millis();
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    if !encode_mps_mlp_runtime_block(
+        command_buffer, pipelines, mps_workspace, weights, workspace, hidden, output, rows,
+        cache_mode, cache_copy_pipeline, cache_key, cache_value, cache_offset, prefix_rows,
+    ) { return option::Option[f64]::None; }
+    let encode_wall_ms: i64 = time::now_millis() - block_wall_start_ms;
     command_buffer.commit();
     command_buffer.wait_until_completed();
     let gpu_ms: f64 =
         (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64;
     if profile {
         io::println(
-            "trajectory cached block profile: block=${block_index} rows=${rows} metadata_wall_ms=${metadata_wall_ms} mps_setup_wall_ms=${mps_setup_wall_ms} execute_wall_ms=${time::now_millis() - block_wall_start_ms} gpu_ms=${gpu_ms}",
+            "trajectory cached block profile: block=${block_index} rows=${rows} metadata_wall_ms=${metadata_wall_ms} encode_wall_ms=${encode_wall_ms} execute_wall_ms=${time::now_millis() - block_wall_start_ms} gpu_ms=${gpu_ms}",
         );
     }
     return option::Option[f64]::Some(gpu_ms);
@@ -4137,6 +4160,9 @@ fn run_trajectory_packed_impl(
     );
     var step: usize = 0 as usize;
     while step < step_limit {
+        let step_pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+        if step_pool_pointer.is_null() { return 1; }
+        let step_pool: OwnedObjc = OwnedObjc::new(step_pool_pointer);
         let step_wall_start_ms: i64 = time::now_millis();
         var step_ms: f64 = 0.0f64;
         let modulation_values: *f32 = modulation.contents() as *f32;
@@ -4177,6 +4203,13 @@ fn run_trajectory_packed_impl(
         var cache_dit_cached_step: bool = false;
         var cache_dit_diff: f64 = 0.0f64 - 1.0f64;
 
+        let profile_cached_block: bool = env::has_var("QI_PROFILE_CACHED_BLOCK");
+        let batch_transformer_step: bool = !cache_dit_enabled && !profile_cached_block;
+        guard let option::Option[metal::CommandBuffer]::Some(transformer_command_buffer) =
+            queue.command_buffer() else { return 1; };
+        let transformer_command_buffer_owner: OwnedObjc =
+            OwnedObjc::new(rt::retain(transformer_command_buffer.raw()));
+
         var step_quantized_matrices: usize = 0 as usize;
         var block: usize = 0 as usize;
         while block < (32 as usize) {
@@ -4206,19 +4239,30 @@ fn run_trajectory_packed_impl(
             let cache_offset: u64 = block as u64 *% per_block_cache_bytes;
             let block_weights: BlockWeights = BlockWeights { norm_q: norm_q, norm_k: norm_k, q: q, k: k, v: v, attention_output: attention_output, gate: gate_weight, projected: projected_weight, mlp_output: mlp_output };
             let block_metadata_wall_ms: i64 = time::now_millis() - block_metadata_start_ms;
-            let block_result: option::Option[f64] = execute_mps_mlp_runtime_block(
-                queue, pipelines, mps_workspace, block_weights, active_workspace,
-                current, next, active_rows, cache_mode, cache_copy_pipeline,
-                cache_key_arena, cache_value_arena, cache_offset, text_rows,
-                env::has_var("QI_PROFILE_CACHED_BLOCK")
-                    && step == (1 as usize)
-                    && (block == (0 as usize) || block == (1 as usize)
-                        || block == (31 as usize)),
-                block_metadata_wall_ms,
-                block,
-            );
-            guard let option::Option[f64]::Some(block_ms) = block_result else { return 1; };
-            step_ms = step_ms + block_ms;
+            let batch_transformer_block: bool = batch_transformer_step
+                || (cache_dit_enabled && !profile_cached_block && block > (0 as usize));
+            if batch_transformer_block {
+                if !encode_mps_mlp_runtime_block(
+                    transformer_command_buffer, pipelines, mps_workspace, block_weights,
+                    active_workspace, current, next, active_rows, cache_mode,
+                    cache_copy_pipeline, cache_key_arena, cache_value_arena, cache_offset,
+                    text_rows,
+                ) { return 1; }
+            } else {
+                let block_result: option::Option[f64] = execute_mps_mlp_runtime_block(
+                    queue, pipelines, mps_workspace, block_weights, active_workspace,
+                    current, next, active_rows, cache_mode, cache_copy_pipeline,
+                    cache_key_arena, cache_value_arena, cache_offset, text_rows,
+                    profile_cached_block
+                        && step == (1 as usize)
+                        && (block == (0 as usize) || block == (1 as usize)
+                            || block == (31 as usize)),
+                    block_metadata_wall_ms,
+                    block,
+                );
+                guard let option::Option[f64]::Some(block_ms) = block_result else { return 1; };
+                step_ms = step_ms + block_ms;
+            }
             let swap: metal::Buffer = current; current = next; next = swap;
             if cache_dit_enabled && block == (0 as usize) {
                 params.rows = target_rows as u32;
@@ -4282,6 +4326,16 @@ fn run_trajectory_packed_impl(
                 continuous_cached_steps = 0 as usize;
             }
             block = block +% (1 as usize);
+        }
+        let batch_cache_dit_tail: bool = cache_dit_enabled
+            && !profile_cached_block
+            && !cache_dit_cached_step;
+        if batch_transformer_step || batch_cache_dit_tail {
+            transformer_command_buffer.commit();
+            transformer_command_buffer.wait_until_completed();
+            step_ms = step_ms +
+                (transformer_command_buffer.g_p_u_end_time()
+                    - transformer_command_buffer.g_p_u_start_time()) * 1000.0f64;
         }
         let expected_step_quantized: usize = if cache_dit_cached_step {
             0 as usize

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "case": {
+    "pixels": 256,
+    "text_rows": 22,
+    "target_rows": 256,
+    "steps": 40
+  },
+  "implementation": {
+    "before": "Every transformer block owned, committed, and waited for its own command buffer.",
+    "cache_off_after": "All 32 transformer blocks encode into one caller-owned command buffer and the host waits once per denoising step.",
+    "cache_dit_after": "Block 0 remains a separate command buffer because its residual must be read by the host cache decision. On full steps, blocks 1-31 encode into one tail command buffer; cached steps still stop after block 0.",
+    "profiling_fallback": "QI_PROFILE_CACHED_BLOCK retains the per-block wrapper and timing path.",
+    "arithmetic_changed": false,
+    "kernel_changed": false
+  },
+  "cache_off_trajectory": {
+    "baseline_summed_gpu_ms": 28440.4,
+    "whole_step_summed_gpu_ms": 28413.6,
+    "baseline_loop_wall_ms": 29282,
+    "whole_step_loop_wall_ms": 28824,
+    "wall_ms_saved": 458,
+    "wall_reduction_percent": 1.5641,
+    "checkpoint_nrmse": {
+      "1": 0.000906469,
+      "2": 0.00130081,
+      "40": 0.0103288
+    },
+    "checkpoint_values_unchanged": true,
+    "passed": true
+  },
+  "cache_dit_0_24": {
+    "baseline_summed_gpu_ms": 10062.5,
+    "segmented_summed_gpu_ms": 10075.7,
+    "baseline_loop_wall_ms": 10543,
+    "segmented_loop_wall_ms": 10452,
+    "wall_ms_saved": 91,
+    "wall_reduction_percent": 0.8631,
+    "cached_steps": 27,
+    "full_steps": 13,
+    "step_40_latent_nrmse_vs_official": 0.10079,
+    "cached_decisions_unchanged": true,
+    "passed": true
+  },
+  "native_prompt_pipeline": {
+    "transformer_summed_gpu_ms": 28338.6,
+    "transformer_loop_wall_ms": 28704,
+    "transformer_phase_wall_ms": 35696,
+    "end_to_end_wall_ms": 50552,
+    "final_latent_nrmse": 0.017982,
+    "decoded_fp32_nrmse": 0.0177651,
+    "rgba_nrmse": 0.0100307,
+    "passed": true
+  },
+  "interpretation": "The optimization removes repeated host waits and command-buffer submission gaps, but does not reduce transformer arithmetic. Cache-off loop wall time improves by 458 ms while summed GPU time is effectively unchanged. Cache-DiT benefits less because cached steps already execute only block 0 and every full step still requires a block-0 readback before its batched tail.",
+  "verification": {
+    "cpc_fmt_check": true,
+    "cpc_check": true,
+    "unit_tests_passed": 334,
+    "unit_tests_failed": 0,
+    "one_step_gate": true,
+    "two_step_prefix_cache_gate": true,
+    "forty_step_gate": true,
+    "cache_dit_measurement": true,
+    "native_prompt_pipeline_gate": true
+  }
+}

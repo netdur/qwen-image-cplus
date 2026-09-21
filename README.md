@@ -544,6 +544,22 @@ Inspect a shard, optionally filtering tensor names:
   GPU** and from 11,057 to **10,543 ms wall**, with all 27 cache decisions
   unchanged. The native prompt, VAE, and RGBA gates also remain unchanged.
   Measurements are in `benchmarks/m1-max-first-step-mps.json`.
+- Transformer submission now spans a full denoising step instead of stopping
+  and waiting after each of its 32 blocks. The block executor can encode into
+  a caller-owned command buffer; cache-off commits once after block 31.
+  Cache-DiT must still complete block 0 so the CPU can inspect its residual,
+  but each non-cached step then commits blocks 1-31 as one tail. The explicit
+  block-profiling mode retains the old per-block wrapper. No kernels or
+  arithmetic changed: the canonical step-1, step-2, and step-40 nRMSE values
+  are identical. Cache-off loop wall time fell from 29,282 to **28,824 ms**
+  while summed GPU time stayed effectively flat at 28,413.6 ms, confirming
+  that this was a host synchronization optimization rather than a compute
+  optimization. Cache-DiT 0.24 retained all 27 decisions and fell from 10,543
+  to **10,452 ms wall**; its summed GPU time varied from 10,062.5 to 10,075.7
+  ms. The native prompt pipeline also passed unchanged at 28,704 ms transformer
+  loop wall, 1.7982% latent nRMSE, 1.77651% decoded-FP32 nRMSE, and 1.00307%
+  RGBA nRMSE. Full measurements and rationale are in
+  `benchmarks/m1-max-transformer-step-submission.json`.
 - Cache-DiT is available as an explicit, off-by-default approximation. It
   follows the upstream
   [DBCache block flow](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_blocks/pattern_base.py)
@@ -650,40 +666,35 @@ The original timing target is no longer a stopping condition. The remaining
 work is ordered by architectural leverage and evidence, not by whether a
 particular total has already been reached:
 
-1. **Transformer submission structure.** First-step MPS MLP and in-buffer
-   prefix extraction are complete and verified. Still open is encoding a whole
-   denoising step before its single wait. Metadata lookup and steady-state MPS
-   object construction have already measured at 0-1 ms per sampled block, so
-   prebuilding objects alone is not assumed to provide the earlier projected
-   host saving.
-2. **Fused QKV with FP16 attention storage.** Define a versioned QIPACK policy
+1. **Fused QKV with FP16 attention storage.** Define a versioned QIPACK policy
    that stores dense attention matrices in the same FP16 operand form already
    consumed by the accepted custom kernels. Fuse Q, K, and V into a wider
    projection and add row-stride/offset support to Q/K norm, attention, and V
    consumers. Keep the existing Q8 policy for its calibrated late-block
    matrices. This requires regenerating and validating the packed artifact.
-3. **Remaining VAE work.** The dominant convolution is already a verified
+2. **Remaining VAE work.** The dominant convolution is already a verified
    FP32 SIMD-group kernel. Still open are fewer command-buffer waits, persistent
    pipeline/scratch reuse where the phase lifetime permits it, and the
    parity-decomposed nearest-upsample convolution experiment. The 3e-6 decoder
    and RGBA byte gates remain stricter than the transformer gates.
-4. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
+3. **Text-encoder GPU efficiency.** Replace the low-row scalar linear path and
    hundreds of synchronous dispatches without changing its BF16 store
    boundaries. Whole-shard readahead stays accepted; tensor-order selective
    advice and broad Q8 text policies stay rejected unless a materially new
    layout or calibration method is introduced.
-5. **Kernel-specific elementwise fusion.** Fuse attention residual with the
+4. **Kernel-specific elementwise fusion.** Fuse attention residual with the
    following LayerNorm and evaluate a cooperative final LayerNorm. A global
    256-thread elementwise launch was measured and rejected, so residual,
    SwiGLU, final norm, and small conditioning kernels must be tuned separately.
-6. **End-to-end remeasurement.** After the structural phases, repeat both
+5. **End-to-end remeasurement.** After the structural phases, repeat both
    cache-off and Cache-DiT native prompts with warm-filesystem and cold-page
    conditions reported separately. Transformer loop time, phase wall time,
    process wall time, memory footprint, and numerical/perceptual gates remain
    separate measurements.
 
-Closed branches are not remaining phases: selective text readahead regressed
-wall time; the calibrated text-Q8 policies failed the downstream latent gate;
+Completed transformer submission batching is also no longer a remaining
+phase. Other closed branches are not remaining phases: selective text readahead
+regressed wall time; the calibrated text-Q8 policies failed the downstream latent gate;
 process reuse without simultaneous model residency provided no warm-request
 gain; four-query attention and blanket 256-thread elementwise groups regressed
 throughput.
