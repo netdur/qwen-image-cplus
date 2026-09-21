@@ -1,0 +1,128 @@
+import "stdlib/math" as _;
+
+const MT_N: usize = 624;
+const MT_M: usize = 397;
+const MATRIX_A: u32 = 0x9908B0DF;
+const UPPER_MASK: u32 = 0x80000000;
+const LOWER_MASK: u32 = 0x7FFFFFFF;
+const TWO_PI: f64 = 6.283185307179586476925286766559;
+
+// PyTorch's CPU generator is its own MT19937 implementation. Keeping the
+// state and transformations explicit makes a generation seed independent of
+// libc and lets the initial latent be checked against torch.randn fixtures.
+struct TorchMt19937 {
+    state: [u32; 624],
+    left: usize,
+    next: usize,
+}
+
+fn torch_mt19937(seed: u64) -> TorchMt19937 {
+    var generator: TorchMt19937 = TorchMt19937 {
+        state: [0 as u32; 624],
+        left: 1 as usize,
+        next: 0 as usize,
+    };
+    generator.state[0] = seed as u32;
+    var index: usize = 1 as usize;
+    while index < MT_N {
+        let previous: u32 = generator.state[index -% (1 as usize)];
+        generator.state[index] = (1812433253 as u32) *% (previous ^ (previous >> (30 as u32)))
+            +% index as u32;
+        index = index +% (1 as usize);
+    }
+    return generator;
+}
+
+fn twist(ref generator: TorchMt19937) {
+    var index: usize = 0 as usize;
+    while index < MT_N -% MT_M {
+        let mixed: u32 = (generator.state[index] & UPPER_MASK)
+            | (generator.state[index +% (1 as usize)] & LOWER_MASK);
+        let odd_term: u32 = if (mixed & (1 as u32)) != (0 as u32) {
+            MATRIX_A
+        } else {
+            0 as u32
+        };
+        generator.state[index] = generator.state[index +% MT_M]
+            ^ (mixed >> (1 as u32)) ^ odd_term;
+        index = index +% (1 as usize);
+    }
+    while index < MT_N -% (1 as usize) {
+        let mixed: u32 = (generator.state[index] & UPPER_MASK)
+            | (generator.state[index +% (1 as usize)] & LOWER_MASK);
+        let odd_term: u32 = if (mixed & (1 as u32)) != (0 as u32) {
+            MATRIX_A
+        } else {
+            0 as u32
+        };
+        generator.state[index] = generator.state[index +% MT_M -% MT_N]
+            ^ (mixed >> (1 as u32)) ^ odd_term;
+        index = index +% (1 as usize);
+    }
+    let final_mixed: u32 = (generator.state[MT_N -% (1 as usize)] & UPPER_MASK)
+        | (generator.state[0] & LOWER_MASK);
+    let final_odd_term: u32 = if (final_mixed & (1 as u32)) != (0 as u32) {
+        MATRIX_A
+    } else {
+        0 as u32
+    };
+    generator.state[MT_N -% (1 as usize)] = generator.state[MT_M -% (1 as usize)]
+        ^ (final_mixed >> (1 as u32)) ^ final_odd_term;
+    generator.left = MT_N;
+    generator.next = 0 as usize;
+}
+
+fn next_u32(ref generator: TorchMt19937) -> u32 {
+    generator.left = generator.left -% (1 as usize);
+    if generator.left == (0 as usize) { twist(generator); }
+    var value: u32 = generator.state[generator.next];
+    generator.next = generator.next +% (1 as usize);
+    value = value ^ (value >> (11 as u32));
+    value = value ^ ((value << (7 as u32)) & (0x9D2C5680 as u32));
+    value = value ^ ((value << (15 as u32)) & (0xEFC60000 as u32));
+    value = value ^ (value >> (18 as u32));
+    return value;
+}
+
+fn uniform_f32(ref generator: TorchMt19937) -> f32 {
+    let mantissa: u32 = next_u32(generator) & (0x00FFFFFF as u32);
+    return mantissa as f32 * (1.0f32 / 16777216.0f32);
+}
+
+// Reproduce the contiguous float32 normal_fill path in PyTorch 2.9. The
+// tensor sizes used by Qwen-Image are divisible by 16, so no tail redraw is
+// necessary. Callers round the result to BF16 exactly where the pipeline does.
+fn torch_randn_f32(destination: *f32, count: usize, seed: u64) -> bool {
+    if destination.is_null() || count < (16 as usize) || count % (16 as usize) != (0 as usize) {
+        return false;
+    }
+    var generator: TorchMt19937 = torch_mt19937(seed);
+    var index: usize = 0 as usize;
+    while index < count {
+        destination[index] = uniform_f32(generator);
+        index = index +% (1 as usize);
+    }
+    var block: usize = 0 as usize;
+    while block < count {
+        var pair: usize = 0 as usize;
+        while pair < (8 as usize) {
+            let u1: f32 = 1.0f32 - destination[block +% pair];
+            let u2: f32 = destination[block +% pair +% (8 as usize)];
+            let radius: f32 = (0.0f32 - 2.0f32 * u1.ln()).sqrt();
+            let theta: f32 = (TWO_PI * u2 as f64) as f32;
+            destination[block +% pair] = radius * theta.cos();
+            destination[block +% pair +% (8 as usize)] = radius * theta.sin();
+            pair = pair +% (1 as usize);
+        }
+        block = block +% (16 as usize);
+    }
+    return true;
+}
+
+#[test]
+fn torch_mt19937_matches_known_seed_vector() {
+    var generator: TorchMt19937 = torch_mt19937(5489 as u64);
+    assert next_u32(generator) == (3499211612 as u32);
+    assert next_u32(generator) == (581869302 as u32);
+    assert next_u32(generator) == (3890346734 as u32);
+}

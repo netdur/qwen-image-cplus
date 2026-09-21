@@ -2,6 +2,7 @@ import "./cpu_ops" as cpu;
 import "./metal_primitives" as metrics;
 import "./mmap_macos" as mapped;
 import "./packed_model" as packed;
+import "./random" as random;
 import "./scheduler" as flow;
 import "./safetensors" as safetensors;
 import "metal/metal" as metal;
@@ -2294,6 +2295,118 @@ fn run_scale_packed(
     return 1;
 }
 
+fn fill_target_rope_256(destination: *f32, text_rows: usize) -> bool {
+    if destination.is_null() { return false; }
+    let side: usize = 16 as usize;
+    let target_rows: usize = side *% side;
+    let rows: usize = text_rows +% target_rows;
+    let theta_log: f32 = (10000.0f32).ln();
+    var row: usize = 0 as usize;
+    while row < rows {
+        let is_image: bool = row >= text_rows;
+        let image_row: usize = if is_image { row -% text_rows } else { 0 as usize };
+        let frame_position: i32 = if is_image { text_rows as i32 } else { row as i32 };
+        let height_position: i32 = if is_image {
+            (image_row / side) as i32 - (8 as i32)
+        } else {
+            row as i32
+        };
+        let width_position: i32 = if is_image {
+            (image_row % side) as i32 - (8 as i32)
+        } else {
+            row as i32
+        };
+        let positions: [i32; 3] = [frame_position, height_position, width_position];
+        let dimensions: [usize; 3] = [16 as usize, 56 as usize, 56 as usize];
+        var complex_offset: usize = 0 as usize;
+        var axis: usize = 0 as usize;
+        while axis < (3 as usize) {
+            let dimension: usize = dimensions[axis];
+            let complex_count: usize = dimension / (2 as usize);
+            var pair: usize = 0 as usize;
+            while pair < complex_count {
+                let exponent: f32 = (0.0f32 - theta_log) * ((2 as usize) *% pair) as f32
+                    / dimension as f32;
+                let angle: f32 = positions[axis] as f32 * exponent.exp();
+                let output_index: usize = row *% HEAD_DIMENSION +% complex_offset +% pair;
+                destination[output_index] = angle.cos();
+                destination[output_index +% (HEAD_DIMENSION / (2 as usize))] = angle.sin();
+                pair = pair +% (1 as usize);
+            }
+            complex_offset = complex_offset +% complex_count;
+            axis = axis +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    return true;
+}
+
+fn fill_seeded_latent(destination: *f32, count: usize, seed: u64) -> bool {
+    if !random::torch_randn_f32(destination, count, seed) { return false; }
+    var index: usize = 0 as usize;
+    while index < count {
+        destination[index] = cpu::bf16_to_f32(cpu::f32_to_bf16(destination[index]));
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn host_normalized_rms(actual: *f32, expected: *f32, count: usize) -> f64 {
+    var squared_error: f64 = 0.0f64;
+    var squared_reference: f64 = 0.0f64;
+    var index: usize = 0 as usize;
+    while index < count {
+        let difference: f64 = actual[index] as f64 - expected[index] as f64;
+        squared_error = squared_error + difference * difference;
+        squared_reference = squared_reference + expected[index] as f64 * expected[index] as f64;
+        index = index +% (1 as usize);
+    }
+    return (squared_error / squared_reference.max(0.000000000001f64)).sqrt();
+}
+
+fn test_native_inputs_256(
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+) -> i32 {
+    let text_rows: usize = 22 as usize;
+    let target_rows: usize = 256 as usize;
+    let latent_count: usize = target_rows *% IMAGE_CHANNELS;
+    let rope_count: usize = (text_rows +% target_rows) *% HEAD_DIMENSION;
+    var noise: [f32; 16384] = [0.0f32; 16384];
+    var rope: [f32; 35584] = [0.0f32; 35584];
+    if !fill_seeded_latent(#addr_of(noise[0]), latent_count, 1101 as u64)
+        || !fill_target_rope_256(#addr_of(rope[0]), text_rows) {
+        return 1;
+    }
+    let noise_path: text::Text = "${fixture_directory}/image_input.f32";
+    let rope_path: text::Text = "${fixture_directory}/rope.f32";
+    guard let mapped::MapResult::Ok(expected_noise) = mapped::map_readonly(noise_path.view()) else {
+        return 1;
+    };
+    guard let mapped::MapResult::Ok(expected_rope) = mapped::map_readonly(rope_path.view()) else {
+        return 1;
+    };
+    if expected_noise.length() != latent_count *% #size_of::[f32]()
+        || expected_rope.length() != rope_count *% #size_of::[f32]() {
+        return 1;
+    }
+    let noise_error: f64 = host_normalized_rms(
+        #addr_of(noise[0]),
+        expected_noise.pointer() as *f32,
+        latent_count,
+    );
+    let rope_error: f64 = host_normalized_rms(
+        #addr_of(rope[0]),
+        expected_rope.pointer() as *f32,
+        rope_count,
+    );
+    io::println("native inputs: seed=1101 noise_nRMSE=${noise_error} rope_nRMSE=${rope_error}");
+    if noise_error <= (0.000001f64) && rope_error <= (0.000001f64) {
+        io::println("PyTorch-compatible noise and dynamic Qwen-Image RoPE: verified");
+        return 0;
+    }
+    return 1;
+}
+
 fn run_trajectory_packed(
     packed_path: str,
     requested_steps: str,
@@ -2304,6 +2417,11 @@ fn run_trajectory_packed(
         requested_steps,
         fixture_directory,
         0 as *f32,
+        0 as *f32,
+        0 as usize,
+        0 as u64,
+        false,
+        true,
     );
 }
 
@@ -2320,7 +2438,46 @@ fn run_trajectory_256_to_host(
         io::eprintln("trajectory: final latent destination is null");
         return 2;
     }
-    return run_trajectory_packed_impl(packed_path, "40", fixture_directory, final_latent);
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        fixture_directory,
+        final_latent,
+        0 as *f32,
+        0 as usize,
+        0 as u64,
+        false,
+        true,
+    );
+}
+
+// Runs a native-prompt 256px trajectory. The text encoder and transformer are
+// deliberately separate calls so their 17.5 GB and 12.4 GB mappings never
+// overlap on a 32 GB machine.
+fn run_prompt_trajectory_256_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+    validate_reference: bool = false,
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+) -> i32 {
+    if text_input.is_null() || final_latent.is_null() {
+        io::eprintln("trajectory: native prompt handoff received a null buffer");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        fixture_directory,
+        final_latent,
+        text_input,
+        text_rows,
+        seed,
+        true,
+        validate_reference,
+    );
 }
 
 fn run_trajectory_packed_impl(
@@ -2328,6 +2485,11 @@ fn run_trajectory_packed_impl(
     requested_steps: str,
     fixture_directory: str,
     final_latent: *f32,
+    native_text_input: *f32,
+    native_text_rows: usize,
+    latent_seed: u64,
+    native_inputs: bool,
+    validate_reference: bool,
 ) -> i32 {
     var step_limit: usize = 0 as usize;
     if requested_steps == "1" {
@@ -2340,7 +2502,11 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: steps must be 1, 2, or 40");
         return 2;
     }
-    let text_rows: usize = 22 as usize;
+    let text_rows: usize = if native_inputs { native_text_rows } else { 22 as usize };
+    if text_rows == (0 as usize) || text_rows > (512 as usize) {
+        io::eprintln("trajectory: text row count must be 1..512, got ${text_rows}");
+        return 2;
+    }
     let target_rows: usize = 256 as usize;
     let rows: usize = text_rows +% target_rows;
     let latent_count: usize = target_rows *% IMAGE_CHANNELS;
@@ -2438,25 +2604,67 @@ fn run_trajectory_packed_impl(
     let cache_arena_bytes: u64 = (32 as u64) *% per_block_cache_bytes;
 
     guard let option::Option[metal::Buffer]::Some(dummy) = new_buffer(device, 4 as u64) else { return 1; }; let dummy_owner: OwnedObjc = OwnedObjc::new(dummy.raw());
-    guard let option::Option[metal::Buffer]::Some(latents) = fixture_buffer(device, fixture_directory, "image_input", image_input_bytes) else { return 1; }; let latents_owner: OwnedObjc = OwnedObjc::new(latents.raw());
-    guard let option::Option[metal::Buffer]::Some(text_input) = fixture_buffer(device, fixture_directory, "text_input", text_bytes) else { return 1; }; let text_input_owner: OwnedObjc = OwnedObjc::new(text_input.raw());
-    guard let option::Option[metal::Buffer]::Some(rope) = fixture_buffer(device, fixture_directory, "rope", (rows *% HEAD_DIMENSION *% #size_of::[f32]()) as u64) else { return 1; }; let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
-    guard let option::Option[metal::Buffer]::Some(expected_sigmas) = fixture_buffer(device, fixture_directory, "sigmas", ((41 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let expected_sigmas_owner: OwnedObjc = OwnedObjc::new(expected_sigmas.raw());
-    guard let option::Option[metal::Buffer]::Some(expected_timesteps) = fixture_buffer(device, fixture_directory, "timesteps", ((40 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let expected_timesteps_owner: OwnedObjc = OwnedObjc::new(expected_timesteps.raw());
-    let sigma_reference: *f32 = expected_sigmas.contents() as *f32;
-    let timestep_reference: *f32 = expected_timesteps.contents() as *f32;
-    var schedule_index: usize = 0 as usize;
-    while schedule_index < (40 as usize) {
-        if (sigmas[schedule_index] - sigma_reference[schedule_index]).abs() > 0.000002f32
-            || (timesteps[schedule_index] - timestep_reference[schedule_index]).abs() > 0.002f32 {
-            io::eprintln("trajectory: scheduler mismatch at step ${schedule_index}");
+    guard let option::Option[metal::Buffer]::Some(latents) = if native_inputs {
+        new_buffer(device, image_input_bytes)
+    } else {
+        fixture_buffer(device, fixture_directory, "image_input", image_input_bytes)
+    } else { return 1; };
+    let latents_owner: OwnedObjc = OwnedObjc::new(latents.raw());
+    if native_inputs && !fill_seeded_latent(latents.contents() as *f32, latent_count, latent_seed) {
+        io::eprintln("trajectory: could not generate the seeded latent");
+        return 1;
+    }
+    guard let option::Option[metal::Buffer]::Some(text_input) = if native_inputs {
+        device.new_buffer_with_bytes(
+            native_text_input as *u8,
+            text_bytes,
+            metal::resource_options_m_t_l_resource_storage_mode_shared,
+        )
+    } else {
+        fixture_buffer(device, fixture_directory, "text_input", text_bytes)
+    } else { return 1; };
+    let text_input_owner: OwnedObjc = OwnedObjc::new(text_input.raw());
+    let rope_bytes: u64 = (rows *% HEAD_DIMENSION *% #size_of::[f32]()) as u64;
+    guard let option::Option[metal::Buffer]::Some(rope) = if native_inputs {
+        new_buffer(device, rope_bytes)
+    } else {
+        fixture_buffer(device, fixture_directory, "rope", rope_bytes)
+    } else { return 1; };
+    let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
+    if native_inputs && !fill_target_rope_256(rope.contents() as *f32, text_rows) {
+        io::eprintln("trajectory: could not construct dynamic RoPE");
+        return 1;
+    }
+    if validate_reference {
+        guard let option::Option[metal::Buffer]::Some(expected_sigmas) = fixture_buffer(device, fixture_directory, "sigmas", ((41 as usize) *% #size_of::[f32]()) as u64) else { return 1; };
+        let expected_sigmas_owner: OwnedObjc = OwnedObjc::new(expected_sigmas.raw());
+        guard let option::Option[metal::Buffer]::Some(expected_timesteps) = fixture_buffer(device, fixture_directory, "timesteps", ((40 as usize) *% #size_of::[f32]()) as u64) else { return 1; };
+        let expected_timesteps_owner: OwnedObjc = OwnedObjc::new(expected_timesteps.raw());
+        let sigma_reference: *f32 = expected_sigmas.contents() as *f32;
+        let timestep_reference: *f32 = expected_timesteps.contents() as *f32;
+        var schedule_index: usize = 0 as usize;
+        while schedule_index < (40 as usize) {
+            if (sigmas[schedule_index] - sigma_reference[schedule_index]).abs() > 0.000002f32
+                || (timesteps[schedule_index] - timestep_reference[schedule_index]).abs() > 0.002f32 {
+                io::eprintln("trajectory: scheduler mismatch at step ${schedule_index}");
+                return 1;
+            }
+            schedule_index = schedule_index +% (1 as usize);
+        }
+        if sigmas[40] != sigma_reference[40] {
+            io::eprintln("trajectory: scheduler endpoint mismatch");
             return 1;
         }
-        schedule_index = schedule_index +% (1 as usize);
-    }
-    if sigmas[40] != sigma_reference[40] {
-        io::eprintln("trajectory: scheduler endpoint mismatch");
-        return 1;
+        if native_inputs {
+            guard let option::Option[metal::Buffer]::Some(expected_noise) = fixture_buffer(device, fixture_directory, "image_input", image_input_bytes) else { return 1; };
+            let expected_noise_owner: OwnedObjc = OwnedObjc::new(expected_noise.raw());
+            let noise_error: f64 = normalized_rms_buffers(latents, 0 as usize, expected_noise, 0 as usize, latent_count);
+            guard let option::Option[metal::Buffer]::Some(expected_rope) = fixture_buffer(device, fixture_directory, "rope", rope_bytes) else { return 1; };
+            let expected_rope_owner: OwnedObjc = OwnedObjc::new(expected_rope.raw());
+            let rope_error: f64 = normalized_rms_buffers(rope, 0 as usize, expected_rope, 0 as usize, rows *% HEAD_DIMENSION);
+            io::println("trajectory native inputs: seed=${latent_seed} noise_nRMSE=${noise_error} rope_nRMSE=${rope_error}");
+            if noise_error > (0.000001f64) || rope_error > (0.000001f64) { return 1; }
+        }
     }
 
     guard let option::Option[metal::Buffer]::Some(image_projected) = new_buffer(device, image_projected_bytes) else { return 1; }; let image_projected_owner: OwnedObjc = OwnedObjc::new(image_projected.raw());
@@ -2621,7 +2829,10 @@ fn run_trajectory_packed_impl(
         );
         total_ms = total_ms + step_ms;
         let completed_step: usize = step +% (1 as usize);
-        if completed_step == (1 as usize) || completed_step == (2 as usize) || completed_step == (40 as usize) {
+        if validate_reference && (
+            completed_step == (1 as usize) || completed_step == (2 as usize)
+                || completed_step == (40 as usize)
+        ) {
             let checkpoint_name: text::Text = if completed_step < (10 as usize) { "latent_step_0${completed_step}" } else { "latent_step_${completed_step}" };
             guard let option::Option[f64]::Some(error) = normalized_rms_fixture(latents, fixture_directory, checkpoint_name.view(), latent_count) else { return 1; };
             let cache_mode_name: str = if step == (0 as usize) { "extract" } else { "cached" };
@@ -2629,13 +2840,22 @@ fn run_trajectory_packed_impl(
                 0.001f64
             } else if completed_step == (2 as usize) {
                 0.0015f64
+            } else if native_inputs {
+                // The native Qwen3-VL path is independently bounded at 4%
+                // against the Torch text fixture. Its small prompt-embedding
+                // drift accumulates through 40 denoising steps, so preserve
+                // the stricter 1.1% fixture-fed gate and give this integrated
+                // boundary its own measured 2% budget.
+                0.02f64
             } else {
                 0.011f64
             };
             io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} latent_nRMSE=${error} limit=${error_limit}");
             all_ok = error <= error_limit && finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         } else {
-            io::println("trajectory step ${completed_step}: mode=cached timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms}");
+            let cache_mode_name: str = if step == (0 as usize) { "extract" } else { "cached" };
+            io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms}");
+            all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         }
         step = step +% (1 as usize);
     }
@@ -2648,7 +2868,14 @@ fn run_trajectory_packed_impl(
         }
     }
     io::println("trajectory: pixels=256 steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} cache_bytes=${(2 as u64) *% cache_arena_bytes} total_gpu_ms=${total_ms}");
-    if all_ok { io::println("Qwen-Image-2.1 latent trajectory prefix: verified"); return 0; }
+    if all_ok {
+        if validate_reference {
+            io::println("Qwen-Image-2.1 latent trajectory prefix: verified");
+        } else {
+            io::println("Qwen-Image-2.1 native-prompt latent trajectory: complete");
+        }
+        return 0;
+    }
     return 1;
 }
 

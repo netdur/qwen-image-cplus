@@ -19,10 +19,62 @@ import "stdlib/io" as io;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
 
+fn parse_u64_decimal(value: str) -> option::Option[u64] {
+    if value.count() == (0 as usize) { return option::Option[u64]::None; }
+    var result: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < value.count() {
+        guard let option::Option[u8]::Some(byte) = value.byte_at(index) else {
+            return option::Option[u64]::None;
+        };
+        if byte < (48 as u8) || byte > (57 as u8) {
+            return option::Option[u64]::None;
+        }
+        let digit: u64 = (byte -% (48 as u8)) as u64;
+        if result > ((18446744073709551615 as u64) -% digit) / (10 as u64) {
+            return option::Option[u64]::None;
+        }
+        result = result *% (10 as u64) +% digit;
+        index = index +% (1 as usize);
+    }
+    return option::Option[u64]::Some(result);
+}
+
+#[test]
+fn decimal_seed_parser_checks_syntax_and_overflow() {
+    guard let option::Option[u64]::Some(zero) = parse_u64_decimal("0") else {
+        assert false;
+        return;
+    };
+    guard let option::Option[u64]::Some(seed) = parse_u64_decimal("1101") else {
+        assert false;
+        return;
+    };
+    guard let option::Option[u64]::Some(maximum) = parse_u64_decimal("18446744073709551615") else {
+        assert false;
+        return;
+    };
+    assert zero == (0 as u64);
+    assert seed == (1101 as u64);
+    assert maximum == (18446744073709551615 as u64);
+    match parse_u64_decimal("") {
+        option::Option[u64]::None => {}
+        option::Option[u64]::Some(_) => { assert false; }
+    }
+    match parse_u64_decimal("-1") {
+        option::Option[u64]::None => {}
+        option::Option[u64]::Some(_) => { assert false; }
+    }
+    match parse_u64_decimal("18446744073709551616") {
+        option::Option[u64]::None => {}
+        option::Option[u64]::Some(_) => { assert false; }
+    }
+}
+
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -65,6 +117,16 @@ fn main() -> i32 {
     }
     if command == "benchmark-attention" {
         return transformer_block::benchmark_attention();
+    }
+    if command == "test-native-inputs" {
+        match env::arg(2 as usize) {
+            option::Option[text::Text]::Some(fixtures) => {
+                return transformer_block::test_native_inputs_256(fixtures.view());
+            }
+            option::Option[text::Text]::None => {
+                return transformer_block::test_native_inputs_256();
+            }
+        }
     }
     if command == "test-transformer-block" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
@@ -190,6 +252,61 @@ fn main() -> i32 {
             return 2;
         };
         return pipeline::run_fixture_256(
+            packed_path.view(),
+            model_path.view(),
+            output_path.view(),
+        );
+    }
+    if command == "generate-256" {
+        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
+            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
+            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
+            return 2;
+        };
+        var seed: u64 = 1101 as u64;
+        match env::arg(6 as usize) {
+            option::Option[text::Text]::Some(seed_text) => {
+                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
+                    io::eprintln("generate-256: seed must be an unsigned decimal integer");
+                    return 2;
+                };
+                seed = parsed;
+            }
+            option::Option[text::Text]::None => {}
+        }
+        return pipeline::generate_256(
+            packed_path.view(),
+            model_path.view(),
+            output_path.view(),
+            prompt.view(),
+            seed,
+        );
+    }
+    if command == "test-native-pipeline-256" {
+        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-native-pipeline-256 PACKED MODEL_DIR OUTPUT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-native-pipeline-256 PACKED MODEL_DIR OUTPUT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-native-pipeline-256 PACKED MODEL_DIR OUTPUT");
+            return 2;
+        };
+        return pipeline::test_native_256(
             packed_path.view(),
             model_path.view(),
             output_path.view(),

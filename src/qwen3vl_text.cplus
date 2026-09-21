@@ -333,10 +333,14 @@ fn finite(buffer: metal::Buffer, count: usize) -> bool {
     return true;
 }
 
-fn run(
+fn run_impl(
     model_root: str,
-    prompt: str = "A red fox asleep beside a mossy stone in soft morning light.",
-    fixture_path: str = "tests/fixtures/trajectory_256_fp32/text_input.f32",
+    prompt: str,
+    fixture_path: str,
+    output: *f32,
+    output_capacity: usize,
+    output_row_count: *usize,
+    validate_reference: bool,
 ) -> i32 {
     guard let option::Option[vec::Vec[u32]]::Some(token_ids) = tokenizer::tokenize_full_prompt(model_root, prompt) else {
         return 1;
@@ -345,6 +349,12 @@ fn run(
     if rows <= SYSTEM_PREFIX_TOKENS || rows > (512 as usize) {
         io::eprintln("text encoder: unsupported full token count ${rows}");
         return 1;
+    }
+    let output_rows: usize = rows -% SYSTEM_PREFIX_TOKENS;
+    let output_values: usize = output_rows *% WIDTH;
+    if !output.is_null() && output_capacity < output_values {
+        io::eprintln("text encoder: output capacity ${output_capacity} is smaller than ${output_values}");
+        return 2;
     }
 
     let directory: text::Text = "${model_root}/text_encoder";
@@ -440,9 +450,11 @@ fn run(
     guard let option::Option[Weight]::Some(embedding_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "model.language_model.embed_tokens.weight", VOCABULARY as u64, WIDTH as u64) else { return 1; };
     guard let option::Option[f64]::Some(embedding_ms) = dispatch_element(queue, pipelines.embedding, ids, embedding_weight.storage, hidden_a, #addr_of(params), rows *% WIDTH, 0 as u64, embedding_weight.offset) else { return 1; };
     var total_ms: f64 = embedding_ms;
-    match normalized_rms_output(hidden_a, SYSTEM_PREFIX_TOKENS, rows -% SYSTEM_PREFIX_TOKENS, "tests/fixtures/text_encoder_fp32/embedding.f32") {
-        option::Option[f64]::Some(error) => { io::println("text encoder embedding: nRMSE=${error}"); }
-        option::Option[f64]::None => {}
+    if validate_reference {
+        match normalized_rms_output(hidden_a, SYSTEM_PREFIX_TOKENS, output_rows, "tests/fixtures/text_encoder_fp32/embedding.f32") {
+            option::Option[f64]::Some(error) => { io::println("text encoder embedding: nRMSE=${error}"); }
+            option::Option[f64]::None => {}
+        }
     }
 
     var layer: usize = 0 as usize;
@@ -479,8 +491,10 @@ fn run(
         guard let option::Option[f64]::Some(down_ms) = dispatch_linear(queue, pipelines.linear, activated, down_weight, branch, rows, WIDTH, INTERMEDIATE_WIDTH) else { return 1; }; total_ms = total_ms + down_ms;
         guard let option::Option[f64]::Some(add_mlp_ms) = dispatch_element(queue, pipelines.add, hidden_b, branch, hidden_a, #addr_of(params), rows *% WIDTH) else { return 1; }; total_ms = total_ms + add_mlp_ms;
         io::println("text encoder: layer=${layer} cumulative_gpu_ms=${total_ms}");
-        if layer == (0 as usize) || layer == (17 as usize) || layer == (23 as usize)
-            || layer >= (31 as usize) {
+        if validate_reference && (
+            layer == (0 as usize) || layer == (17 as usize) || layer == (23 as usize)
+                || layer >= (31 as usize)
+        ) {
             let fixture_name: str = if layer == (0 as usize) {
                 "layer_00"
             } else if layer == (17 as usize) {
@@ -507,13 +521,55 @@ fn run(
         layer = layer +% (1 as usize);
     }
 
-    let output_rows: usize = rows -% SYSTEM_PREFIX_TOKENS;
-    guard let option::Option[f64]::Some(error) = normalized_rms_output(hidden_a, SYSTEM_PREFIX_TOKENS, output_rows, fixture_path) else { return 1; };
     let finite_ok: bool = finite(hidden_a, rows *% WIDTH);
-    io::println("Qwen3-VL text encoder: full_tokens=${rows} output_tokens=${output_rows} gpu_ms=${total_ms} output_nRMSE=${error} finite=${finite_ok}");
-    if finite_ok && error <= (0.04f64) {
-        io::println("Qwen3-VL native text conditioning: verified");
-        return 0;
+    if !finite_ok { return 1; }
+    if !output.is_null() {
+        let values: *f32 = hidden_a.contents() as *f32;
+        let source_offset: usize = SYSTEM_PREFIX_TOKENS *% WIDTH;
+        var output_index: usize = 0 as usize;
+        while output_index < output_values {
+            output[output_index] = values[source_offset +% output_index];
+            output_index = output_index +% (1 as usize);
+        }
     }
-    return 1;
+    if !output_row_count.is_null() { *output_row_count = output_rows; }
+    if validate_reference {
+        guard let option::Option[f64]::Some(error) = normalized_rms_output(hidden_a, SYSTEM_PREFIX_TOKENS, output_rows, fixture_path) else { return 1; };
+        io::println("Qwen3-VL text encoder: full_tokens=${rows} output_tokens=${output_rows} gpu_ms=${total_ms} output_nRMSE=${error} finite=${finite_ok}");
+        if error > (0.04f64) { return 1; }
+        io::println("Qwen3-VL native text conditioning: verified");
+    } else {
+        io::println("Qwen3-VL text encoder: full_tokens=${rows} output_tokens=${output_rows} gpu_ms=${total_ms} finite=${finite_ok}");
+    }
+    return 0;
+}
+
+fn encode_prompt_to_host(
+    model_root: str,
+    prompt: str,
+    output: *f32,
+    output_capacity: usize,
+    output_row_count: *usize,
+) -> i32 {
+    if output.is_null() || output_row_count.is_null() {
+        io::eprintln("text encoder: integrated output pointers must not be null");
+        return 2;
+    }
+    return run_impl(model_root, prompt, "", output, output_capacity, output_row_count, false);
+}
+
+fn run(
+    model_root: str,
+    prompt: str = "A red fox asleep beside a mossy stone in soft morning light.",
+    fixture_path: str = "tests/fixtures/trajectory_256_fp32/text_input.f32",
+) -> i32 {
+    return run_impl(
+        model_root,
+        prompt,
+        fixture_path,
+        0 as *f32,
+        0 as usize,
+        0 as *usize,
+        true,
+    );
 }

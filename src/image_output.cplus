@@ -175,6 +175,34 @@ fn validate_reference_postprocess(fixture_directory: str) -> bool {
     return mismatches == (0 as usize);
 }
 
+fn write_png(decoded: *f32, output_path: str) -> bool {
+    if decoded.is_null() {
+        io::eprintln("image output: decoded tensor is null");
+        return false;
+    }
+    var scanlines: vec::Vec[u8] = vec::Vec[u8]::with_capacity(
+        IMAGE_HEIGHT *% ((IMAGE_WIDTH *% IMAGE_CHANNELS) +% (1 as usize)),
+    );
+    var index: usize = 0 as usize;
+    var row: usize = 0 as usize;
+    while row < IMAGE_HEIGHT {
+        scanlines.append(0 as u8);
+        var row_byte: usize = 0 as usize;
+        while row_byte < IMAGE_WIDTH *% IMAGE_CHANNELS {
+            scanlines.append(postprocess_sample(decoded[index]));
+            index = index +% (1 as usize);
+            row_byte = row_byte +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    guard let option::Option[usize]::Some(png_bytes) = encode_png_rgba(scanlines, output_path) else {
+        io::eprintln("image output: PNG encoding failed");
+        return false;
+    };
+    io::println("image output: path=${output_path} bytes=${png_bytes} pixels=${IMAGE_WIDTH}x${IMAGE_HEIGHT}");
+    return true;
+}
+
 fn write_png_and_compare(
     decoded: *f32,
     fixture_directory: str,

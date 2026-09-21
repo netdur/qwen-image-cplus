@@ -609,6 +609,8 @@ fn run(
         fixture_root,
         0 as *f32,
         0 as *f32,
+        true,
+        false,
     );
 }
 
@@ -626,7 +628,32 @@ fn decode_trajectory_256_from_host(
         io::eprintln("VAE: integrated decode received a null host buffer");
         return 2;
     }
-    return run_impl(model_root, "256", fixture_root, normalized_latent, decoded_output);
+    return run_impl(model_root, "256", fixture_root, normalized_latent, decoded_output, true, false);
+}
+
+fn decode_native_prompt_256_from_host(
+    model_root: str,
+    normalized_latent: *f32,
+    decoded_output: *f32,
+    fixture_root: str = "tests/fixtures/vae_decoder_fp32",
+) -> i32 {
+    if normalized_latent.is_null() || decoded_output.is_null() {
+        io::eprintln("VAE: native-prompt validation received a null host buffer");
+        return 2;
+    }
+    return run_impl(model_root, "256", fixture_root, normalized_latent, decoded_output, true, true);
+}
+
+fn decode_256_from_host(
+    model_root: str,
+    normalized_latent: *f32,
+    decoded_output: *f32,
+) -> i32 {
+    if normalized_latent.is_null() || decoded_output.is_null() {
+        io::eprintln("VAE: native generation received a null host buffer");
+        return 2;
+    }
+    return run_impl(model_root, "256", "", normalized_latent, decoded_output, false, false);
 }
 
 fn run_impl(
@@ -635,6 +662,8 @@ fn run_impl(
     fixture_root: str,
     normalized_source: *f32,
     decoded_destination: *f32,
+    validate_reference: bool,
+    native_prompt_source: bool,
 ) -> i32 {
     var input_height: usize = 0 as usize;
     var case_directory: str = "";
@@ -839,15 +868,26 @@ fn run_impl(
     if requested_case == "small" { all_ok = report_boundary("decoder conv_out", buffer_b, fixture_directory, "conv_out", height *% width *% (4 as usize), 0.000002f64) && all_ok; }
     guard let option::Option[f64]::Some(clamp_ms) = dispatch_clamp(queue, pipelines.clamp, buffer_b, buffer_a, height *% width *% (4 as usize)) else { return 1; };
     total_ms = total_ms + clamp_ms;
-    guard let option::Option[f64]::Some(output_error) = normalized_rms_fixture(buffer_a, fixture_directory, "output", height *% width *% (4 as usize)) else { return 1; };
-    let output_limit: f64 = if requested_case == "small" {
-        0.000002f64
-    } else if normalized_source.is_null() {
-        0.000003f64
-    } else {
-        0.013f64
-    };
-    all_ok = output_error <= output_limit && finite(buffer_a, height *% width *% (4 as usize)) && all_ok;
+    let output_count: usize = height *% width *% (4 as usize);
+    var output_error: f64 = 0.0f64;
+    var output_limit: f64 = 0.0f64;
+    if validate_reference {
+        guard let option::Option[f64]::Some(error) = normalized_rms_fixture(buffer_a, fixture_directory, "output", output_count) else { return 1; };
+        output_error = error;
+        output_limit = if native_prompt_source {
+            // The native text/trajectory integration has its own measured
+            // 2% latent boundary; do not weaken the 1.3% fixture-fed gate.
+            0.02f64
+        } else if requested_case == "small" {
+            0.000002f64
+        } else if normalized_source.is_null() {
+            0.000003f64
+        } else {
+            0.013f64
+        };
+        all_ok = output_error <= output_limit && all_ok;
+    }
+    all_ok = finite(buffer_a, output_count) && all_ok;
     if !decoded_destination.is_null() {
         let decoded_values: *f32 = buffer_a.contents() as *f32;
         let decoded_count: usize = height *% width *% (4 as usize);
@@ -857,8 +897,19 @@ fn run_impl(
             decoded_index = decoded_index +% (1 as usize);
         }
     }
-    io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
-    if all_ok { io::println("Qwen-Image-2.1 still-image VAE decoder: verified"); return 0; }
+    if validate_reference {
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
+    } else {
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(6 as u64) *% activation_bytes + qkv_bytes} gpu_ms=${total_ms}");
+    }
+    if all_ok {
+        if validate_reference {
+            io::println("Qwen-Image-2.1 still-image VAE decoder: verified");
+        } else {
+            io::println("Qwen-Image-2.1 still-image VAE decoder: complete");
+        }
+        return 0;
+    }
     return 1;
 }
 

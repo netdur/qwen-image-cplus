@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "transformers_version": "5.17.0",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "case": {
+    "pixels": 256,
+    "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+    "latent_seed": 1101,
+    "full_prompt_tokens": 36,
+    "removed_system_prefix_tokens": 14,
+    "text_rows": 22,
+    "target_rows": 256,
+    "steps": 40
+  },
+  "method": {
+    "execution": "One C+ command performs native tokenization, the text-only Qwen3-VL encoder, dynamic prompt-sized metadata and RoPE, PyTorch-compatible seeded noise, the cached 40-step transformer trajectory, VAE decode, RGBA conversion, and PNG output.",
+    "memory_phases": "The 17.5 GB text checkpoint mappings are released before the 12.42 GiB packed transformer is opened; transformer resources are released before the 1.35 GB VAE is opened.",
+    "noise": "PyTorch 2.9 CPU MT19937 and scalar 16-value Box-Muller path, followed by ties-to-even BF16 conversion.",
+    "rope": "Exact QwenImage21Rope three-axis position construction for a prompt prefix followed by a centered 16x16 target grid.",
+    "packed_transformer": "/private/tmp/qwen-image-2.1-mixed.qipack"
+  },
+  "native": {
+    "text_encoder_gpu_kernel_ms": 756.699,
+    "transformer_gpu_kernel_ms": 148823.0,
+    "vae_gpu_kernel_ms": 2271.18,
+    "summed_gpu_kernel_ms": 151850.879,
+    "seeded_noise_nrmse": 0.0,
+    "dynamic_rope_nrmse": 8.30726e-8,
+    "latent_step_1_nrmse": 0.000896293,
+    "latent_step_2_nrmse": 0.00128607,
+    "latent_step_40_nrmse": 0.0175609,
+    "decoded_fp32_nrmse": 0.0169086,
+    "rgba_u8_nrmse": 0.00957296,
+    "rgba_mean_absolute_error": 0.5574,
+    "rgba_maximum_absolute_error": 31,
+    "rgba_mismatched_bytes": 84137,
+    "rgba_bytes": 262144,
+    "png_bytes": 262488,
+    "finite_output": true
+  },
+  "acceptance": {
+    "official_postprocess_mismatched_bytes": 0,
+    "seeded_noise_limit": 1e-6,
+    "dynamic_rope_limit": 1e-6,
+    "latent_step_1_limit": 0.001,
+    "latent_step_2_limit": 0.0015,
+    "native_prompt_latent_step_40_limit": 0.02,
+    "native_prompt_decoded_fp32_limit": 0.02,
+    "rgba_u8_limit": 0.013,
+    "passed": true
+  },
+  "arbitrary_prompt_smoke": {
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "latent_seed": 42,
+    "full_prompt_tokens": 32,
+    "text_rows": 18,
+    "cache_bytes": 18874368,
+    "text_encoder_gpu_kernel_ms": 587.323,
+    "transformer_gpu_kernel_ms": 148513.0,
+    "vae_gpu_kernel_ms": 2284.94,
+    "png_bytes": 262488,
+    "finite_output": true,
+    "completed": true
+  },
+  "reasoning": {
+    "separate_integrated_limits": "The fixture-fed trajectory retains its 1.1% final-latent and 1.3% decoded-FP32 gates. The native text encoder is independently bounded at 4% against the Torch 2.9 text fixture, whose result also differs by 3.28% from a Torch 2.8 MPS regeneration. Its small embedding drift measures 1.75609% after 40 denoising steps and 1.69086% after decode, so the integrated native-prompt boundaries use a measured 2% budget without weakening the fixture-fed tests.",
+    "final_image": "The canonical generated image remains within 0.957296% normalized RMS in RGBA byte space, with a 0.5574 mean absolute byte error. This is the downstream prompt-equivalence gate rather than an assertion that the text encoder is bit-identical across PyTorch backends."
+  },
+  "limitations": [
+    "Generation is currently fixed to 256x256, batch size one, text-to-image, and 40 denoising steps.",
+    "Prompts are limited to 498 post-template tokens because the text encoder currently accepts at most 512 full-template tokens.",
+    "Only the canonical prompt has a pinned end-to-end image oracle; arbitrary prompts are checked for finite execution but cannot be numerically compared without a matching reference fixture.",
+    "The correctness-first transformer takes roughly 149 seconds of summed GPU kernel time at 256px and is not interactive.",
+    "Text weights remain original BF16 and require a separate 17.5 GB residency phase; text quantization and kernel optimization remain future work."
+  ]
+}

@@ -56,6 +56,9 @@ cpc test
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus test-image-output reference.png
 ./target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./target/debug/qwen-image-cplus test-native-inputs
+./target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
 ./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
@@ -320,6 +323,23 @@ Inspect a shard, optionally filtering tensor names:
   fixture by 3.28% itself; consequently the local 4% gate is not treated as an
   end-to-end prompt-equivalence claim. Boundaries and limitations are recorded
   in `benchmarks/m1-max-text-conditioning-native.json`.
+- The prompt path is now connected to the complete 256px image pipeline.
+  `generate-256` accepts an arbitrary prompt and unsigned 64-bit seed, releases
+  the 17.5 GB text mappings before opening the 12.42 GiB packed denoiser, and
+  releases the denoiser before opening the VAE. Joint sequence buffers, masks,
+  cache sizing, and three-axis RoPE are derived from the actual prompt length.
+  Native noise reproduces PyTorch 2.9's CPU MT19937 plus scalar Box-Muller path
+  exactly before BF16 rounding: the seed-1101 fixture has zero nRMSE, while
+  generated RoPE measures `8.31e-8` nRMSE. A separate seed-42 blue-teapot
+  smoke run completed with 18 text rows, proving that the handoff and KV-cache
+  sizing are not accidentally fixed to the 22-row canonical prompt.
+- The canonical end-to-end native-prompt gate measures 0.0896%, 0.1286%, and
+  1.7561% latent nRMSE after denoising steps 1, 2, and 40; decoded FP32 error is
+  1.6909%, and final RGBA error is 0.9573% with a 0.557 mean absolute byte
+  error. The integrated text path has separate measured 2% latent/decoded
+  budgets because of the already documented text-backend variation; the
+  stricter 1.1%/1.3% fixture-fed gates remain unchanged. Full measurements and
+  rationale are in `benchmarks/m1-max-native-prompt-pipeline-256.json`.
 
 ## Quantization decision log
 
@@ -372,12 +392,12 @@ claim. The packed mapping is exposed to Metal without copying 12.42 GiB of
 weights; only activations, cache arenas, and 128-element Q/K norm vectors are
 copied.
 
-The denoising trajectory, VAE decode, postprocessing, and PNG output form one
-verified process, while tokenizer and text-only Qwen3-VL encoding are now a
-second verified native process. The image command remains fixture-driven until
-the new prompt embedding is handed into dynamically sized transformer token
-metadata/RoPE; native seeded noise and downstream prompt-equivalence validation
-also remain. Production use additionally needs text-encoder quantization and
-substantial kernel optimization. The current VAE path intentionally implements
-the pinned one-frame first-chunk semantics; temporal continuation and tiled
-decode remain outside its verified scope.
+Tokenization, text encoding, prompt-sized transformer metadata/RoPE, seeded
+noise, denoising, VAE decode, postprocessing, and PNG output now form one
+native `generate-256` command. The pinned fox case verifies the complete path;
+arbitrary prompts use the same path but naturally have no numeric oracle unless
+a matching reference fixture is generated. Production use still needs larger
+output sizes, text-encoder quantization, and substantial kernel optimization.
+The current VAE path intentionally implements the pinned one-frame first-chunk
+semantics; temporal continuation and tiled decode remain outside its verified
+scope.
