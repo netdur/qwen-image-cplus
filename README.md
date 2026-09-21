@@ -486,6 +486,26 @@ Inspect a shard, optionally filtering tensor names:
   Measurements are
   in `benchmarks/m1-max-transformer-trajectory-native.json`; custom-kernel
   baselines remain in `benchmarks/m1-max-production-kernel-profile.json`.
+- The next production-shape profile found that the remaining normalization
+  kernels were serial in the wrong dimension: one Metal thread reduced an
+  entire 4,096-value LayerNorm row, and one thread reduced all 128 channels of
+  each Q/K head. One 32-lane SIMD group now owns each row or head. Lanes visit
+  every 32nd value, `simd_sum` combines their partial sums, and the same lanes
+  write the normalized/modulated or RoPE-rotated result. The scalar kernels
+  remain in the benchmark as numerical references. At 256 rows, LayerNorm
+  fell from 2.241 to 0.149 ms (15.1x, 0.000161% nRMSE) and Q/K norm+RoPE from
+  0.178 to 0.034 ms (5.19x, zero measured nRMSE). The isolated projection
+  overestimated the benefit because production batches these dispatches with
+  GEMM and MPS work; the authoritative cache-off trajectory nevertheless fell
+  from 32,712.5 to **28,979.7 ms GPU** and from 33,733 to **29,908 ms loop
+  wall**. Step-40 nRMSE is 1.03288%, below the unchanged 1.1% limit. This is
+  the first exact cache-off loop measurement below the 30-second target.
+  Cache-DiT 0.24 retains the same 27 cached decisions and falls from 11,942 to
+  **10,639.5 ms GPU**, and from 12,530 to **11,181 ms loop wall**. The full
+  native prompt regression also passes at 1.7982% final-latent, 1.7765%
+  decoded-FP32, and 1.0031% RGBA nRMSE. Measurements and the difference
+  between isolated and integrated projections are recorded in
+  `benchmarks/m1-max-transformer-small-kernels.json`.
 - Cache-DiT is available as an explicit, off-by-default approximation. It
   follows the upstream
   [DBCache block flow](https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_blocks/pattern_base.py)

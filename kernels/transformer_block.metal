@@ -1215,7 +1215,7 @@ kernel void qi_block_int8_affine_linear_32x32(
 }
 
 // modulation is [real/zero, scale1/gate1/scale2/gate2, width].
-kernel void qi_block_layernorm_modulate(
+kernel void qi_block_layernorm_modulate_scalar(
     device const float *input [[buffer(0)]],
     device const float *modulation [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -1245,8 +1245,42 @@ kernel void qi_block_layernorm_modulate(
     }
 }
 
+// One SIMD group owns one row. Each lane visits every 32nd column, then the
+// SIMD reduction combines the 32 partial sums without threadgroup memory.
+kernel void qi_block_layernorm_modulate(
+    device const float *input [[buffer(0)]],
+    device const float *modulation [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const uchar *target_mask [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+    if (row >= params.rows) {
+        return;
+    }
+    const uint start = row * params.width;
+    float partial_mean = 0.0f;
+    for (uint column = lane; column < params.width; column += 32) {
+        partial_mean += input[start + column];
+    }
+    const float mean = simd_sum(partial_mean) / float(params.width);
+    float partial_variance = 0.0f;
+    for (uint column = lane; column < params.width; column += 32) {
+        const float centered = input[start + column] - mean;
+        partial_variance = fma(centered, centered, partial_variance);
+    }
+    const float inverse_std =
+        rsqrt(simd_sum(partial_variance) / float(params.width) + params.epsilon);
+    const uint modulation_row = target_mask[row] != 0 ? 0 : 1;
+    const uint modulation_start = (modulation_row * 4 + params.slot) * params.width;
+    for (uint column = lane; column < params.width; column += 32) {
+        output[start + column] = (input[start + column] - mean) * inverse_std *
+            (1.0f + modulation[modulation_start + column]);
+    }
+}
+
 // One thread owns one [token, head]. The learned RMSNorm scale is shared by heads.
-kernel void qi_block_qk_norm_rope(
+kernel void qi_block_qk_norm_rope_scalar(
     device const float *input [[buffer(0)]],
     device const ushort *norm_weight [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -1274,6 +1308,46 @@ kernel void qi_block_qk_norm_rope(
         const float real = input[start + real_column] * inverse_rms * qi_bf16(norm_weight[real_column]);
         const float imaginary =
             input[start + imaginary_column] * inverse_rms * qi_bf16(norm_weight[imaginary_column]);
+        const float cosine = rope[rope_start + pair];
+        const float sine = rope[rope_start + complex_count + pair];
+        output[start + real_column] = real * cosine - imaginary * sine;
+        output[start + imaginary_column] = real * sine + imaginary * cosine;
+    }
+}
+
+// One SIMD group owns one [token, head]. With a 128-wide head each lane reads
+// four channels and writes two complex RoPE pairs.
+kernel void qi_block_qk_norm_rope(
+    device const float *input [[buffer(0)]],
+    device const ushort *norm_weight [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const float *rope [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint index [[threadgroup_position_in_grid]]) {
+    const uint count = params.rows * params.heads;
+    if (index >= count) {
+        return;
+    }
+    const uint row = index / params.heads;
+    const uint head = index % params.heads;
+    const uint start = index * params.head_dimension;
+    float partial_square = 0.0f;
+    for (uint column = lane; column < params.head_dimension; column += 32) {
+        const float value = input[start + column];
+        partial_square = fma(value, value, partial_square);
+    }
+    const float inverse_rms =
+        rsqrt(simd_sum(partial_square) / float(params.head_dimension) + params.epsilon);
+    const uint complex_count = params.head_dimension / 2;
+    const uint rope_start = row * complex_count * 2;
+    for (uint pair = lane; pair < complex_count; pair += 32) {
+        const uint real_column = pair * 2;
+        const uint imaginary_column = real_column + 1;
+        const float real = input[start + real_column] * inverse_rms *
+            qi_bf16(norm_weight[real_column]);
+        const float imaginary = input[start + imaginary_column] * inverse_rms *
+            qi_bf16(norm_weight[imaginary_column]);
         const float cosine = rope[rope_start + pair];
         const float sine = rope[rope_start + complex_count + pair];
         output[start + real_column] = real * cosine - imaginary * sine;

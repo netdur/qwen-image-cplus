@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "shape": {
+    "rows": 256,
+    "width": 4096,
+    "heads": 32,
+    "head_dimension": 128,
+    "blocks": 32,
+    "steps": 40
+  },
+  "reasoning": {
+    "problem": "LayerNorm assigned one 4096-value row to one GPU thread, while Q/K RMSNorm plus RoPE assigned all 128 channels of one head to one thread.",
+    "implementation": "Assign one 32-lane SIMD group to each LayerNorm row or Q/K head. Each lane traverses every 32nd value, simd_sum combines partial reductions, and lanes write disjoint output columns or complex pairs.",
+    "accuracy_note": "The reduction association changes for LayerNorm, so scalar implementations remain compiled as benchmark references and the complete denoising and decoded-image gates remain mandatory."
+  },
+  "isolated_production_shape": {
+    "iterations": 10,
+    "layernorm": {
+      "scalar_gpu_ms": 2.24051,
+      "simdgroup_gpu_ms": 0.148808,
+      "speedup": 15.0563,
+      "nrmse_vs_scalar": 1.61365e-6
+    },
+    "qk_norm_rope": {
+      "scalar_gpu_ms": 0.178167,
+      "simdgroup_gpu_ms": 0.0343333,
+      "speedup": 5.18932,
+      "nrmse_vs_scalar": 0.0
+    },
+    "unchanged_kernels": {
+      "residual_gpu_ms": 0.0494583,
+      "swiglu_gpu_ms": 0.148721
+    },
+    "projected_40_step_32_block_gpu_ms": {
+      "scalar": 6508.78,
+      "candidate": 785.819,
+      "savings": 5722.97
+    },
+    "projection_limit": "Standalone dispatch timings include command-buffer overhead that is amortized in the fused production block, so the full trajectory is authoritative."
+  },
+  "cache_off_trajectory": {
+    "baseline_after_two_query_attention": {
+      "summed_gpu_ms": 32712.5,
+      "loop_wall_ms": 33733
+    },
+    "simdgroup_norms": {
+      "summed_gpu_ms": 28979.7,
+      "loop_wall_ms": 29908,
+      "gpu_ms_saved": 3732.8,
+      "wall_ms_saved": 3825,
+      "gpu_reduction_percent": 11.41,
+      "wall_reduction_percent": 11.34
+    },
+    "checkpoint_nrmse": {
+      "1": 0.000906469,
+      "2": 0.00130081,
+      "40": 0.0103288
+    },
+    "checkpoint_limits": {
+      "1": 0.001,
+      "2": 0.0015,
+      "40": 0.011
+    },
+    "passed": true
+  },
+  "cache_dit_0_24": {
+    "cached_steps": 27,
+    "full_steps": 13,
+    "baseline_summed_gpu_ms": 11942.0,
+    "simdgroup_norms_summed_gpu_ms": 10639.5,
+    "gpu_ms_saved": 1302.5,
+    "baseline_loop_wall_ms": 12530,
+    "simdgroup_norms_loop_wall_ms": 11181,
+    "wall_ms_saved": 1349,
+    "step_40_latent_nrmse_vs_official": 0.10079,
+    "cached_decisions_unchanged": true
+  },
+  "native_prompt_pipeline": {
+    "prompt_tokens": 22,
+    "transformer_summed_gpu_ms": 29244.6,
+    "transformer_loop_wall_ms": 30314,
+    "final_latent_nrmse": 0.017982,
+    "final_latent_limit": 0.02,
+    "vae_gpu_ms": 720.673,
+    "decoded_fp32_nrmse": 0.0177651,
+    "decoded_fp32_limit": 0.02,
+    "rgba_nrmse": 0.0100307,
+    "rgba_limit": 0.013,
+    "passed": true,
+    "timing_note": "The 62.577-second request was an oracle regression with substantial text and transformer page-in stalls; it is not a controlled end-to-end comparison run."
+  },
+  "verification": {
+    "cpc_fmt_check": true,
+    "cpc_check": true,
+    "unit_tests_passed": 334,
+    "unit_tests_failed": 0,
+    "four_row_block_fixture": true,
+    "four_row_block_final_nrmse": 2.6884e-6,
+    "one_step_gate": true,
+    "two_step_gate": true,
+    "forty_step_gate": true,
+    "cache_dit_measurement": true,
+    "decoded_image_gate": true
+  }
+}

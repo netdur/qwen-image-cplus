@@ -708,6 +708,50 @@ fn dispatch_1d(
     );
 }
 
+fn dispatch_simdgroup_1d(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    buffer_0: metal::Buffer,
+    buffer_1: metal::Buffer,
+    buffer_2: metal::Buffer,
+    buffer_3: metal::Buffer,
+    buffer_5: metal::Buffer,
+    buffer_6: metal::Buffer,
+    parameters: *BlockParams,
+    group_count: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(buffer_0, 0 as u64, 0 as u64);
+    encoder.set_buffer(buffer_1, 0 as u64, 1 as u64);
+    encoder.set_buffer(buffer_2, 0 as u64, 2 as u64);
+    encoder.set_buffer(buffer_3, 0 as u64, 3 as u64);
+    encoder.set_bytes(parameters as *u8, #size_of::[BlockParams]() as u64, 4 as u64);
+    encoder.set_buffer(buffer_5, 0 as u64, 5 as u64);
+    encoder.set_buffer(buffer_6, 0 as u64, 6 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size { width: group_count as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: 32 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
 fn dispatch_attention(
     queue: metal::CommandQueue,
     pipeline: metal::ComputePipelineState,
@@ -1059,6 +1103,32 @@ fn encode_1d(
     encoder.dispatch_threads(
         metal::Size { width: thread_count as u64, height: 1 as u64, depth: 1 as u64 },
         metal::Size { width: width, height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+fn encode_simdgroup_1d(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline: metal::ComputePipelineState,
+    buffer_0: metal::Buffer,
+    buffer_1: metal::Buffer,
+    buffer_2: metal::Buffer,
+    buffer_3: metal::Buffer,
+    buffer_5: metal::Buffer,
+    buffer_6: metal::Buffer,
+    parameters: *BlockParams,
+    group_count: usize,
+) {
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(buffer_0, 0 as u64, 0 as u64);
+    encoder.set_buffer(buffer_1, 0 as u64, 1 as u64);
+    encoder.set_buffer(buffer_2, 0 as u64, 2 as u64);
+    encoder.set_buffer(buffer_3, 0 as u64, 3 as u64);
+    encoder.set_bytes(parameters as *u8, #size_of::[BlockParams]() as u64, 4 as u64);
+    encoder.set_buffer(buffer_5, 0 as u64, 5 as u64);
+    encoder.set_buffer(buffer_6, 0 as u64, 6 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size { width: group_count as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: 32 as u64, height: 1 as u64, depth: 1 as u64 },
     );
 }
 
@@ -1535,7 +1605,7 @@ fn execute_block(
     var params: BlockParams = BlockParams { rows: ROWS as u32, width: WIDTH as u32, heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32 };
     var all_ok: bool = true;
     var total_ms: f64 = 0.0f64;
-    guard let option::Option[f64]::Some(elapsed) = dispatch_1d(queue, pipelines.norm, hidden, modulation, norm1, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; };
+    guard let option::Option[f64]::Some(elapsed) = dispatch_simdgroup_1d(queue, pipelines.norm, hidden, modulation, norm1, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; };
     total_ms = total_ms + elapsed;
     all_ok = compare_fixture("block0 norm1 + scale1", norm1, fixture_directory, "norm1", ROWS *% WIDTH, 0.00005f64, 0.00005f64) && all_ok;
 
@@ -1546,8 +1616,8 @@ fn execute_block(
     all_ok = compare_fixture("block0 K projection", key, fixture_directory, "key", ROWS *% WIDTH, if quantized { 0.2f64 } else { 0.0002f64 }, 0.0f64) && all_ok;
     all_ok = compare_fixture("block0 V projection", value, fixture_directory, "value", ROWS *% WIDTH, if quantized { 0.1f64 } else { 0.0002f64 }, 0.0f64) && all_ok;
 
-    guard let option::Option[f64]::Some(qk_q_ms) = dispatch_1d(queue, pipelines.qk, query, weights.norm_q, query_rope, rope, dummy, dummy, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + qk_q_ms;
-    guard let option::Option[f64]::Some(qk_k_ms) = dispatch_1d(queue, pipelines.qk, key, weights.norm_k, key_rope, rope, dummy, dummy, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + qk_k_ms;
+    guard let option::Option[f64]::Some(qk_q_ms) = dispatch_simdgroup_1d(queue, pipelines.qk, query, weights.norm_q, query_rope, rope, dummy, dummy, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + qk_q_ms;
+    guard let option::Option[f64]::Some(qk_k_ms) = dispatch_simdgroup_1d(queue, pipelines.qk, key, weights.norm_k, key_rope, rope, dummy, dummy, #addr_of(params), ROWS *% HEADS) else { return 1; }; total_ms = total_ms + qk_k_ms;
     all_ok = compare_fixture("block0 Q RMSNorm + RoPE", query_rope, fixture_directory, "query_rope", ROWS *% WIDTH, if quantized { 0.2f64 } else { 0.0003f64 }, 0.0f64) && all_ok;
     all_ok = compare_fixture("block0 K RMSNorm + RoPE", key_rope, fixture_directory, "key_rope", ROWS *% WIDTH, if quantized { 0.2f64 } else { 0.0003f64 }, 0.0f64) && all_ok;
 
@@ -1566,7 +1636,7 @@ fn execute_block(
     all_ok = compare_fixture("block0 attention gated residual", residual1, fixture_directory, "residual1", ROWS *% WIDTH, if quantized { 0.1f64 } else { 0.0005f64 }, 0.0f64) && all_ok;
 
     params.slot = 2 as u32;
-    guard let option::Option[f64]::Some(norm2_ms) = dispatch_1d(queue, pipelines.norm, residual1, modulation, norm2, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; }; total_ms = total_ms + norm2_ms;
+    guard let option::Option[f64]::Some(norm2_ms) = dispatch_simdgroup_1d(queue, pipelines.norm, residual1, modulation, norm2, target_mask, dummy, dummy, #addr_of(params), ROWS) else { return 1; }; total_ms = total_ms + norm2_ms;
     all_ok = compare_fixture("block0 norm2 + scale2", norm2, fixture_directory, "norm2", ROWS *% WIDTH, if quantized { 0.2f64 } else { 0.0005f64 }, 0.0f64) && all_ok;
 
     guard let option::Option[f64]::Some(gate_ms) = dispatch_weighted_linear(queue, pipelines, norm2, weights.gate, gate, MLP_WIDTH, WIDTH, ROWS) else { return 1; }; total_ms = total_ms + gate_ms;
@@ -1622,7 +1692,7 @@ fn execute_runtime_block(
         slot: 0 as u32,
     };
     var total_ms: f64 = 0.0f64;
-    guard let option::Option[f64]::Some(norm1_ms) = dispatch_1d(
+    guard let option::Option[f64]::Some(norm1_ms) = dispatch_simdgroup_1d(
         queue,
         pipelines.norm,
         hidden,
@@ -1645,7 +1715,7 @@ fn execute_runtime_block(
         queue, pipelines, workspace.norm1, weights.v, workspace.value, WIDTH, WIDTH, rows,
     ) else { return option::Option[f64]::None; };
     total_ms = total_ms + q_ms + k_ms + v_ms;
-    guard let option::Option[f64]::Some(q_norm_ms) = dispatch_1d(
+    guard let option::Option[f64]::Some(q_norm_ms) = dispatch_simdgroup_1d(
         queue,
         pipelines.qk,
         workspace.query,
@@ -1657,7 +1727,7 @@ fn execute_runtime_block(
         #addr_of(params),
         rows *% HEADS,
     ) else { return option::Option[f64]::None; };
-    guard let option::Option[f64]::Some(k_norm_ms) = dispatch_1d(
+    guard let option::Option[f64]::Some(k_norm_ms) = dispatch_simdgroup_1d(
         queue,
         pipelines.qk,
         workspace.key,
@@ -1731,7 +1801,7 @@ fn execute_runtime_block(
     ) else { return option::Option[f64]::None; };
     total_ms = total_ms + residual1_ms;
     params.slot = 2 as u32;
-    guard let option::Option[f64]::Some(norm2_ms) = dispatch_1d(
+    guard let option::Option[f64]::Some(norm2_ms) = dispatch_simdgroup_1d(
         queue,
         pipelines.norm,
         workspace.residual1,
@@ -1838,7 +1908,7 @@ fn execute_batched_runtime_block(
         slot: 0 as u32,
     };
 
-    encode_1d(
+    encode_simdgroup_1d(
         encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
         workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
     );
@@ -1853,11 +1923,11 @@ fn execute_batched_runtime_block(
         encoder, pipelines, workspace.norm1, weights.v, workspace.value, WIDTH, WIDTH, rows,
     );
     encode_buffer_barrier(encoder);
-    encode_1d(
+    encode_simdgroup_1d(
         encoder, pipelines.qk, workspace.query, weights.norm_q, workspace.query_rope,
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
-    encode_1d(
+    encode_simdgroup_1d(
         encoder, pipelines.qk, workspace.key, weights.norm_k, workspace.key_rope,
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
@@ -1903,7 +1973,7 @@ fn execute_batched_runtime_block(
     );
     encode_buffer_barrier(encoder);
     params.slot = 2 as u32;
-    encode_1d(
+    encode_simdgroup_1d(
         encoder, pipelines.norm, workspace.residual1, workspace.modulation, workspace.norm2,
         workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
     );
@@ -2029,7 +2099,7 @@ fn execute_mps_mlp_runtime_block(
         epsilon: 0.000001f32,
         slot: 0 as u32,
     };
-    encode_1d(
+    encode_simdgroup_1d(
         attention_encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
         workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
     );
@@ -2047,11 +2117,11 @@ fn execute_mps_mlp_runtime_block(
         WIDTH, WIDTH, rows,
     );
     encode_buffer_barrier(attention_encoder);
-    encode_1d(
+    encode_simdgroup_1d(
         attention_encoder, pipelines.qk, workspace.query, weights.norm_q, workspace.query_rope,
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
-    encode_1d(
+    encode_simdgroup_1d(
         attention_encoder, pipelines.qk, workspace.key, weights.norm_k, workspace.key_rope,
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
@@ -2076,7 +2146,7 @@ fn execute_mps_mlp_runtime_block(
     );
     encode_buffer_barrier(attention_encoder);
     params.slot = 2 as u32;
-    encode_1d(
+    encode_simdgroup_1d(
         attention_encoder, pipelines.norm, workspace.residual1, workspace.modulation,
         workspace.norm2, workspace.target_mask, workspace.dummy, workspace.dummy,
         #addr_of(params), rows,
@@ -2215,10 +2285,10 @@ fn run(model_directory: str, fixture_directory: str = "tests/fixtures/block0_fp3
     guard let option::Option[OwnedObjc]::Some(linear_owner) = pipeline(device, library, "qi_block_linear_32x32") else {
         return 1;
     };
-    guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else {
+    guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate_scalar") else {
         return 1;
     };
-    guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else {
+    guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope_scalar") else {
         return 1;
     };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qi_block_attention") else {
@@ -5110,6 +5180,153 @@ fn benchmark_mps_gemm(packed_path: str) -> i32 {
         WIDTH, MLP_WIDTH, PACKED_SCHEME_INT8_AFFINE,
     ) && all_ok;
     return if all_ok { 0 } else { 1 };
+}
+
+fn benchmark_transformer_small_kernels() -> i32 {
+    let rows: usize = 256 as usize;
+    let activation_elements: usize = rows *% WIDTH;
+    let mlp_elements: usize = rows *% MLP_WIDTH;
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return 1; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() { return 1; }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else {
+        return 1;
+    };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() { return 1; }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        #include_str("../kernels/transformer_block.metal"), options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 = rt::msg_id(
+                compile_error, rt::sel(#str_ptr("localizedDescription\0")),
+            );
+            io::eprintln("small-kernel Metal compile: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[OwnedObjc]::Some(norm_owner) =
+        pipeline(device, library, "qi_block_layernorm_modulate_scalar") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(norm_simd_owner) =
+        pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(qk_owner) =
+        pipeline(device, library, "qi_block_qk_norm_rope_scalar") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(qk_simd_owner) =
+        pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(residual_owner) =
+        pipeline(device, library, "qi_block_residual") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(swiglu_owner) =
+        pipeline(device, library, "qi_block_swiglu") else { return 1; };
+    let norm_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(norm_owner.raw());
+    let norm_simd_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(norm_simd_owner.raw());
+    let qk_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(qk_owner.raw());
+    let qk_simd_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(qk_simd_owner.raw());
+    let residual_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(residual_owner.raw());
+    let swiglu_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(swiglu_owner.raw());
+
+    let activation_bytes: u64 = (activation_elements *% #size_of::[f32]()) as u64;
+    let mlp_bytes: u64 = (mlp_elements *% #size_of::[f32]()) as u64;
+    guard let option::Option[metal::Buffer]::Some(input) = new_buffer(device, activation_bytes) else { return 1; }; let input_owner: OwnedObjc = OwnedObjc::new(input.raw());
+    guard let option::Option[metal::Buffer]::Some(reference) = new_buffer(device, activation_bytes) else { return 1; }; let reference_owner: OwnedObjc = OwnedObjc::new(reference.raw());
+    guard let option::Option[metal::Buffer]::Some(candidate) = new_buffer(device, activation_bytes) else { return 1; }; let candidate_owner: OwnedObjc = OwnedObjc::new(candidate.raw());
+    guard let option::Option[metal::Buffer]::Some(modulation) = new_buffer(device, ((8 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let modulation_owner: OwnedObjc = OwnedObjc::new(modulation.raw());
+    guard let option::Option[metal::Buffer]::Some(rope) = new_buffer(device, (rows *% HEAD_DIMENSION *% #size_of::[f32]()) as u64) else { return 1; }; let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
+    guard let option::Option[metal::Buffer]::Some(norm_weight) = new_buffer(device, (HEAD_DIMENSION *% #size_of::[u16]()) as u64) else { return 1; }; let norm_weight_owner: OwnedObjc = OwnedObjc::new(norm_weight.raw());
+    guard let option::Option[metal::Buffer]::Some(target_mask) = new_buffer(device, rows as u64) else { return 1; }; let target_mask_owner: OwnedObjc = OwnedObjc::new(target_mask.raw());
+    guard let option::Option[metal::Buffer]::Some(mlp_gate) = new_buffer(device, mlp_bytes) else { return 1; }; let mlp_gate_owner: OwnedObjc = OwnedObjc::new(mlp_gate.raw());
+    guard let option::Option[metal::Buffer]::Some(mlp_projected) = new_buffer(device, mlp_bytes) else { return 1; }; let mlp_projected_owner: OwnedObjc = OwnedObjc::new(mlp_projected.raw());
+    guard let option::Option[metal::Buffer]::Some(mlp_output) = new_buffer(device, mlp_bytes) else { return 1; }; let mlp_output_owner: OwnedObjc = OwnedObjc::new(mlp_output.raw());
+    guard let option::Option[metal::Buffer]::Some(dummy) = new_buffer(device, 4 as u64) else { return 1; }; let dummy_owner: OwnedObjc = OwnedObjc::new(dummy.raw());
+
+    var index: usize = 0 as usize;
+    while index < activation_elements {
+        (input.contents() as *f32)[index] = ((index % (251 as usize)) as f32 - 125.0f32) / 128.0f32;
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < (8 as usize) *% WIDTH {
+        (modulation.contents() as *f32)[index] = ((index % (67 as usize)) as f32 - 33.0f32) / 1024.0f32;
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < rows *% HEAD_DIMENSION {
+        (rope.contents() as *f32)[index] = if index % (2 as usize) == (0 as usize) { 1.0f32 } else { 0.0f32 };
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < HEAD_DIMENSION {
+        (norm_weight.contents() as *u16)[index] = cpu::f32_to_bf16(1.0f32);
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < rows {
+        target_mask.contents()[index] = 1 as u8;
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < mlp_elements {
+        (mlp_gate.contents() as *f32)[index] = ((index % (127 as usize)) as f32 - 63.0f32) / 64.0f32;
+        (mlp_projected.contents() as *f32)[index] = ((index % (113 as usize)) as f32 - 56.0f32) / 64.0f32;
+        index = index +% (1 as usize);
+    }
+    var params: BlockParams = BlockParams {
+        rows: rows as u32, width: WIDTH as u32, heads: HEADS as u32,
+        head_dimension: HEAD_DIMENSION as u32, epsilon: 0.000001f32, slot: 0 as u32,
+    };
+    guard let option::Option[f64]::Some(_norm_warmup) = dispatch_1d(queue, norm_pipeline, input, modulation, reference, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; };
+    guard let option::Option[f64]::Some(_norm_simd_warmup) = dispatch_simdgroup_1d(queue, norm_simd_pipeline, input, modulation, candidate, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; };
+    guard let option::Option[f64]::Some(_qk_warmup) = dispatch_1d(queue, qk_pipeline, input, norm_weight, reference, rope, dummy, dummy, #addr_of(params), rows *% HEADS) else { return 1; };
+    guard let option::Option[f64]::Some(_qk_simd_warmup) = dispatch_simdgroup_1d(queue, qk_simd_pipeline, input, norm_weight, candidate, rope, dummy, dummy, #addr_of(params), rows *% HEADS) else { return 1; };
+
+    let iterations: usize = 10 as usize;
+    var norm_ms: f64 = 0.0f64; var norm_simd_ms: f64 = 0.0f64;
+    var qk_ms: f64 = 0.0f64; var qk_simd_ms: f64 = 0.0f64;
+    var residual_ms: f64 = 0.0f64; var swiglu_ms: f64 = 0.0f64;
+    index = 0 as usize;
+    while index < iterations {
+        guard let option::Option[f64]::Some(norm_value) = dispatch_1d(queue, norm_pipeline, input, modulation, reference, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; }; norm_ms = norm_ms + norm_value;
+        guard let option::Option[f64]::Some(norm_simd_value) = dispatch_simdgroup_1d(queue, norm_simd_pipeline, input, modulation, candidate, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; }; norm_simd_ms = norm_simd_ms + norm_simd_value;
+        guard let option::Option[f64]::Some(qk_value) = dispatch_1d(queue, qk_pipeline, input, norm_weight, reference, rope, dummy, dummy, #addr_of(params), rows *% HEADS) else { return 1; }; qk_ms = qk_ms + qk_value;
+        guard let option::Option[f64]::Some(qk_simd_value) = dispatch_simdgroup_1d(queue, qk_simd_pipeline, input, norm_weight, candidate, rope, dummy, dummy, #addr_of(params), rows *% HEADS) else { return 1; }; qk_simd_ms = qk_simd_ms + qk_simd_value;
+        params.slot = 1 as u32;
+        guard let option::Option[f64]::Some(residual_value) = dispatch_1d(queue, residual_pipeline, input, modulation, candidate, reference, target_mask, dummy, #addr_of(params), activation_elements) else { return 1; }; residual_ms = residual_ms + residual_value;
+        params.width = WIDTH as u32;
+        guard let option::Option[f64]::Some(swiglu_value) = dispatch_1d(queue, swiglu_pipeline, mlp_gate, mlp_projected, mlp_output, dummy, dummy, dummy, #addr_of(params), mlp_elements) else { return 1; }; swiglu_ms = swiglu_ms + swiglu_value;
+        params.slot = 0 as u32;
+        index = index +% (1 as usize);
+    }
+    norm_ms = norm_ms / iterations as f64; norm_simd_ms = norm_simd_ms / iterations as f64;
+    qk_ms = qk_ms / iterations as f64; qk_simd_ms = qk_simd_ms / iterations as f64;
+    residual_ms = residual_ms / iterations as f64; swiglu_ms = swiglu_ms / iterations as f64;
+    guard let option::Option[f64]::Some(_norm_reference) = dispatch_1d(queue, norm_pipeline, input, modulation, reference, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; };
+    guard let option::Option[f64]::Some(_norm_candidate) = dispatch_simdgroup_1d(queue, norm_simd_pipeline, input, modulation, candidate, target_mask, dummy, dummy, #addr_of(params), rows) else { return 1; };
+    let norm_error: f64 = normalized_rms_buffers(candidate, 0 as usize, reference, 0 as usize, activation_elements);
+    guard let option::Option[f64]::Some(_qk_reference) = dispatch_1d(queue, qk_pipeline, input, norm_weight, reference, rope, dummy, dummy, #addr_of(params), rows *% HEADS) else { return 1; };
+    guard let option::Option[f64]::Some(_qk_candidate) = dispatch_simdgroup_1d(queue, qk_simd_pipeline, input, norm_weight, candidate, rope, dummy, dummy, #addr_of(params), rows *% HEADS) else { return 1; };
+    let qk_error: f64 = normalized_rms_buffers(candidate, 0 as usize, reference, 0 as usize, activation_elements);
+    let scalar_projected_ms: f64 = (2.0f64 * norm_ms + 2.0f64 * qk_ms + 2.0f64 * residual_ms + swiglu_ms) * 32.0f64 * 40.0f64;
+    let candidate_projected_ms: f64 = (2.0f64 * norm_simd_ms + 2.0f64 * qk_simd_ms + 2.0f64 * residual_ms + swiglu_ms) * 32.0f64 * 40.0f64;
+    io::println("small-kernel benchmark: rows=${rows} iterations=${iterations} layernorm_gpu_ms=${norm_ms} layernorm_simd_gpu_ms=${norm_simd_ms} layernorm_speedup=${norm_ms / norm_simd_ms} layernorm_nRMSE=${norm_error}");
+    io::println("small-kernel benchmark: qk_norm_rope_gpu_ms=${qk_ms} qk_simd_gpu_ms=${qk_simd_ms} qk_speedup=${qk_ms / qk_simd_ms} qk_nRMSE=${qk_error} residual_gpu_ms=${residual_ms} swiglu_gpu_ms=${swiglu_ms}");
+    io::println("small-kernel benchmark: projected_40_step_32_block_gpu_ms=${scalar_projected_ms} candidate_projected_gpu_ms=${candidate_projected_ms} projected_savings_ms=${scalar_projected_ms - candidate_projected_ms}");
+    return if norm_error <= 0.00001f64 && qk_error <= 0.00001f64 { 0 } else { 1 };
 }
 
 fn benchmark_production_attention() -> i32 {
