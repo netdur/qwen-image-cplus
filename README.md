@@ -366,7 +366,13 @@ Inspect a shard, optionally filtering tensor names:
   are the decoder-weight shard transitions. This falsifies the assumption that
   the current full-file advice cheaply overlaps setup: no-copy buffer creation
   was 1 ms and Metal compile/pipeline creation was 5 ms. Selective layer-range
-  advice is therefore the next I/O A/B.
+  advice was therefore tested next. Advising the 13.892 GB of used embedding
+  rows and decoder tensors reduced advice to 5,569 ms, but doing so in
+  layer/tensor order destroyed sequential file access: execution rose to
+  13,018 ms and total text time regressed by 3,048 ms to 18,646 ms. That
+  implementation was rejected. Any retry must coalesce and sort ranges by file
+  offset or use a decoder-only pack; the accepted runtime retains whole-shard
+  advice.
 - `QI_PROFILE_CACHED_BLOCK=1` samples blocks 0, 1, and 31 of trajectory step 2
   without changing the default log. The steady samples measured 24.86 ms GPU
   / 25 ms wall and 26.79 ms GPU / 27 ms wall; tensor metadata took 0–1 ms and

@@ -30,6 +30,19 @@
     "output_limit": 0.04,
     "interpretation": "Whole-file WILLNEED is not a cheap asynchronous hint on this run: the four calls consumed 7.622 seconds, yet first use still stalled at the embedding and shard transitions. Selective decoder-layer ranges are worth an A/B; merely moving no-copy buffer creation after compilation cannot matter because buffer creation was 1 ms and compilation was 5 ms."
   },
+  "selective_tensor_readahead_rejected": {
+    "method": "Advise only prompt embedding rows and the 11 consumed tensors of each decoder layer, in layer/use order.",
+    "advised_payload_bytes": 13892438016,
+    "timing_ms": {
+      "advice": 5569,
+      "execution": 13018,
+      "total": 18646,
+      "summed_gpu": 771.763
+    },
+    "comparison_to_whole_shards_ms": 3048,
+    "output_nrmse": 0.0361069,
+    "rejection_reason": "Although advice itself was 2053 ms shorter, hundreds of tensor-order ranges lost sequential file access and execution page stalls grew by 5153 ms. A future selective attempt must coalesce and sort contiguous ranges by file offset, or build a decoder-only pack; this implementation was reverted."
+  },
   "cached_transformer_block": {
     "command": "QI_PROFILE_CACHED_BLOCK=1 test-transformer-trajectory PACKED 2",
     "trajectory_startup_ms": {
@@ -52,7 +65,7 @@
     "interpretation": "The first MPS block pays a one-time cold-start penalty. Steady blocks are GPU-bound: metadata lookup is 0-1 ms, MPS object construction rounds to 0 ms, and block wall time is within 0-1 ms of GPU time. Prebuilding descriptors remains sensible cleanup but is bounded by the existing whole-loop wall-minus-GPU gap (about 0.5 s with Cache-DiT), not the multi-second estimate."
   },
   "profiling_controls": {
-    "text_timing": "Always emitted with the existing per-layer progress lines.",
+    "text_timing": "Always emitted with the existing per-layer progress lines; the accepted runtime retains whole-shard advice after the selective-tensor rejection.",
     "cached_block_timing": "Set QI_PROFILE_CACHED_BLOCK=1; only blocks 0, 1, and 31 of step 2 are printed."
   }
 }

@@ -377,8 +377,8 @@ fn run_impl(
     guard let safetensors::LoadResult::Ok(file_3) = safetensors::load(shard_3_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 4: ${error.name()}"); return 1; };
     let mapping_wall_ms: i64 = time::now_millis() - mapping_start_ms;
     // These four shards are 17.5 GB of BF16 weights and the phase is disk
-    // bound, not GPU bound. Start the reads now so they proceed while the
-    // Metal device, library, and pipelines are built below.
+    // bound, not GPU bound. Start the reads before Metal setup. The timing
+    // below makes the cost of this advisory operation explicit.
     let advise_start_ms: i64 = time::now_millis();
     let _advised_0: bool = mapped::advise_range_willneed(file_0.mapping_pointer(), file_0.mapping_length());
     let _advised_1: bool = mapped::advise_range_willneed(file_1.mapping_pointer(), file_1.mapping_length());

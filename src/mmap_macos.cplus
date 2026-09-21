@@ -58,11 +58,10 @@ enum MapResult {
     Err(MapError),
 }
 
-// Ask the kernel to start faulting this mapping into the page cache. The call
-// returns immediately and the pages arrive asynchronously, so multi-gigabyte
-// weight I/O overlaps Metal pipeline construction instead of being paid for
-// serially at the first dispatch that touches the buffer. It is only a hint:
-// a failure changes performance, never correctness, so the result is advisory.
+// Ask the kernel to start faulting this mapping into the page cache. This is
+// only a hint: a failure changes performance, never correctness. On macOS a
+// multi-gigabyte WILLNEED call can itself take seconds, so callers should time
+// it and avoid advising tensors they will not consume.
 fn advise_range_willneed(pointer: *u8, length: usize) -> bool {
     if pointer.is_null() || length == (0 as usize) {
         return false;
