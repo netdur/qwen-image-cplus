@@ -195,6 +195,42 @@ kernel void qi_cache_apply_residual(
     }
 }
 
+// First-order TaylorSeer models the residual produced by blocks 1..31 as a
+// value and a per-denoising-step derivative. A full step updates both in
+// place; a cached step evaluates the model at `epsilon` steps after that full
+// step. Keeping the ordinary Cache-DiT kernels separate makes the approximation
+// an explicit opt-in rather than silently changing the established path.
+kernel void qi_taylor_store_residual(
+    device const float *final_output [[buffer(0)]],
+    device const float *first_output [[buffer(1)]],
+    device float *residual [[buffer(2)]],
+    device float *derivative [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        const uint source_index = params.slot * params.width + index;
+        const float next_residual = final_output[source_index] - first_output[index];
+        derivative[index] = (next_residual - residual[index]) * params.epsilon;
+        residual[index] = next_residual;
+    }
+}
+
+kernel void qi_taylor_apply_residual(
+    device const float *first_output [[buffer(0)]],
+    device const float *residual [[buffer(1)]],
+    device const float *derivative [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index < count) {
+        output[index] = first_output[index]
+            + residual[index]
+            + params.epsilon * derivative[index];
+    }
+}
+
 // Two-pass relative-L1 reduction for Cache-DiT. The product trajectory must
 // synchronize after block 0 to make its cache decision, but only these two
 // totals need to cross to the CPU rather than the entire residual tensor.

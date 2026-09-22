@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Plan-5 F8 first-order TaylorSeer calibration",
+  "algorithm": {
+    "enabled_by_default": false,
+    "base_policy": "Cache-DiT DBCache after transformer block 0",
+    "warmup_steps": 4,
+    "derivative_order": 1,
+    "full_step_update": "dY = (Y_current - Y_previous) / full_step_distance",
+    "cached_step_prediction": "Y_current + elapsed_steps * dY",
+    "ordinary_cache_dit_continuous_cap": 3,
+    "taylorseer_continuous_cap": 4,
+    "additional_1024_buffer_bytes": 67108864,
+    "note": "The derivative buffer is allocated at full size only when TaylorSeer is selected. Ordinary Cache-DiT retains its original kernels and cap."
+  },
+  "calibration_256": {
+    "case": {
+      "steps": 40,
+      "threshold": 0.24,
+      "packed_transformer": "/private/tmp/qwen-image-2.1-all-fp16-v4.qipack",
+      "oracle": "tests/fixtures/trajectory_256_fp32/latent_step_40.f32"
+    },
+    "ordinary_cache_dit": {
+      "continuous_cap": 3,
+      "cached_steps": 27,
+      "full_steps": 13,
+      "trajectory_gpu_ms": 7255.3,
+      "trajectory_wall_ms": 7577,
+      "step_40_latent_nrmse": 0.100293
+    },
+    "taylor_same_cap_control": {
+      "continuous_cap": 3,
+      "cached_steps": 27,
+      "full_steps": 13,
+      "trajectory_gpu_ms": 7159.53,
+      "trajectory_wall_ms": 7379,
+      "step_40_latent_nrmse": 0.0681592,
+      "interpretation": "At equal cache decisions, first-order prediction reduces trajectory error substantially; the predictor itself is useful."
+    },
+    "taylor_selected_cap": {
+      "continuous_cap": 4,
+      "cached_steps": 29,
+      "full_steps": 11,
+      "trajectory_gpu_ms": 6235.59,
+      "trajectory_wall_ms": 6474,
+      "step_40_latent_nrmse": 0.106648,
+      "wall_reduction_vs_ordinary_percent": 14.56,
+      "interpretation": "This meets the predeclared numerical gate: two fewer full passes at a final latent error close to ordinary Cache-DiT."
+    },
+    "lower_threshold_control": {
+      "threshold": 0.12,
+      "continuous_cap": 4,
+      "cached_steps": 25,
+      "full_steps": 15,
+      "trajectory_gpu_ms": 8042.22,
+      "trajectory_wall_ms": 8252,
+      "step_40_latent_nrmse": 0.0668167,
+      "interpretation": "The lower threshold improves error but does not create a speed advantage over the existing 0.24 policy."
+    },
+    "rejected_cap": {
+      "continuous_cap": 5,
+      "cached_steps": 30,
+      "full_steps": 10,
+      "trajectory_gpu_ms": 5767.47,
+      "trajectory_wall_ms": 5996,
+      "step_40_latent_nrmse": 0.145265,
+      "reason": "The extra skipped pass caused a clear numerical regression."
+    }
+  },
+  "controlled_1024_visual": {
+    "case": {
+      "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+      "seed": 1301,
+      "steps": 40,
+      "threshold": 0.24,
+      "packed_transformer": "/private/tmp/qwen-image-2.1-all-fp16-v4.qipack"
+    },
+    "ordinary_cache_dit": {
+      "cached_steps": 27,
+      "full_steps": 13,
+      "text_wall_ms": 3205,
+      "transformer_startup_ms": 6852,
+      "trajectory_wall_ms": 153880,
+      "transformer_phase_wall_ms": 160812,
+      "vae_wall_ms": 10993,
+      "png_wall_ms": 303,
+      "end_to_end_wall_ms": 175339,
+      "png_sha256": "32c095c0499d8503cc4e4e6b489f846c4c58d014872cdd8d36c17db06145a62c",
+      "visual": "Coherent poster; CASABLANCA, MEET ME AT, and SUNSET are legible."
+    },
+    "taylorseer": {
+      "cached_steps": 29,
+      "full_steps": 11,
+      "text_wall_ms": 3381,
+      "transformer_startup_ms": 8053,
+      "trajectory_wall_ms": 107037,
+      "transformer_phase_wall_ms": 115174,
+      "vae_wall_ms": 9714,
+      "png_wall_ms": 298,
+      "end_to_end_wall_ms": 128592,
+      "end_to_end_reduction_percent": 26.66,
+      "png_sha256": "3a3c964d34dff3a4cbc2673f5d282977e6504277380e3d3619e345a33d741ef1",
+      "visual": "Coherent poster, but CASABLANCA becomes CASABLANCCA while the remaining requested text stays legible."
+    },
+    "timing_caveat": "The two runs were sequential, and full steps in the later ordinary run were slower. The measured 46.747-second end-to-end gap therefore cannot be attributed entirely to the two avoided full passes; cache count is the reproducible structural result.",
+    "quality_decision": "The cap-4 policy fails this exact-text visual A/B. Keep TaylorSeer explicit and off by default; do not replace ordinary Cache-DiT."
+  },
+  "validation": {
+    "project_tests_passed": 333,
+    "environment_sensitive_tcp_tests_failed": 2,
+    "cache_off_path_changed": false,
+    "ordinary_cache_dit_policy_changed": false,
+    "taylorseer_is_equivalence_gated": false
+  },
+  "phase_status": "F8 implementation and calibration complete; experimental capability retained, production policy rejected for now"
+}

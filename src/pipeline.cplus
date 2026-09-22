@@ -148,6 +148,7 @@ fn run_native_impl(
     pixels: usize,
     validate_reference: bool,
     cache_dit: bool,
+    taylorseer: bool,
     cache_dit_threshold: f64,
     steps: str = "40",
 ) -> i32 {
@@ -165,6 +166,7 @@ fn run_native_impl(
         pixels,
         validate_reference,
         cache_dit,
+        taylorseer,
         cache_dit_threshold,
         steps,
         pipeline_wall_start_ms,
@@ -181,6 +183,7 @@ fn run_native_tokens_impl(
     pixels: usize,
     validate_reference: bool,
     cache_dit: bool,
+    taylorseer: bool,
     cache_dit_threshold: f64,
     steps: str,
     pipeline_wall_start_ms: i64,
@@ -242,7 +245,17 @@ fn run_native_tokens_impl(
     io::println("pipeline: phase=transformer-scheduler pixels=${pixels} text_rows=${text_rows} seed=${seed}");
     let transformer_wall_start_ms: i64 = time::now_millis();
     let transformer_status: i32 = if pixels == (1024 as usize) {
-        if cache_dit {
+        if taylorseer {
+            transformer::run_prompt_trajectory_taylorseer_1024_to_host(
+                packed_path,
+                #slice_ptr(text_embeddings.as_slice()),
+                text_rows,
+                seed,
+                #slice_ptr(latent.as_slice()),
+                cache_dit_threshold,
+                steps,
+            )
+        } else if cache_dit {
             transformer::run_prompt_trajectory_cache_dit_1024_to_host(
                 packed_path,
                 #slice_ptr(text_embeddings.as_slice()),
@@ -399,6 +412,7 @@ fn benchmark_process_reuse_256(
             256 as usize,
             false,
             true,
+            false,
             threshold,
             "40",
             request_start_ms,
@@ -426,7 +440,7 @@ fn generate_256(
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 256 as usize,
-        false, false, 0.0f64, steps,
+        false, false, false, 0.0f64, steps,
     );
 }
 
@@ -441,7 +455,7 @@ fn generate_256_cache_dit(
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 256 as usize,
-        false, true, threshold, steps,
+        false, true, false, threshold, steps,
     );
 }
 
@@ -455,7 +469,7 @@ fn generate_1024(
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
-        false, false, 0.0f64, steps,
+        false, false, false, 0.0f64, steps,
     );
 }
 
@@ -470,7 +484,22 @@ fn generate_1024_cache_dit(
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
-        false, true, threshold, steps,
+        false, true, false, threshold, steps,
+    );
+}
+
+fn generate_1024_taylorseer(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    threshold: f64 = 0.24f64,
+    steps: str = "40",
+) -> i32 {
+    return run_native_impl(
+        packed_path, model_root, output_path, prompt, seed, 1024 as usize,
+        false, true, true, threshold, steps,
     );
 }
 
@@ -487,6 +516,7 @@ fn test_native_256(
         1101 as u64,
         256 as usize,
         true,
+        false,
         false,
         0.0f64,
     );

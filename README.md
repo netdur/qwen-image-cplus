@@ -57,6 +57,7 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 2
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
 ./target/debug/qwen-image-cplus test-transformer-cache-dit transformer.qipack 0.12
+./target/debug/qwen-image-cplus test-transformer-taylorseer transformer.qipack 0.24
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024
@@ -70,13 +71,14 @@ cpc test
 ./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
 ./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
 ./target/debug/qwen-image-cplus generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
+./target/debug/qwen-image-cplus generate-1024-taylorseer transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 1101 40
 ./target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
 ./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
 
-The four production generation commands accept `25` or `40` as their final
+The five production generation commands accept `25` or `40` as their final
 optional argument. Omitting it preserves the canonical 40-step behavior. A
 25-step run constructs a fresh 25-step FlowMatch schedule; it does not truncate
 the first 25 points of the 40-step schedule. Both 256 and 1024 paths have
@@ -797,6 +799,27 @@ Inspect a shard, optionally filtering tensor names:
   convolution or demonstrate an equally accurate FP32 framework path; FP16
   operands remain outside the numerical gate. Raw per-residual and per-block
   measurements are in `benchmarks/m1-max-vae-1024-profile.json`.
+- Plan-5 F8 first-order TaylorSeer is implemented as a separate, explicit
+  Cache-DiT mode. Full steps update the blocks-1-through-31 residual and its
+  per-step finite difference; cached steps evaluate `Y + elapsed * dY` in one
+  Metal kernel. Ordinary Cache-DiT is unchanged: it retains its original
+  residual kernels and three-consecutive-step cap. Taylor allocates one extra
+  residual-sized buffer only when selected (64 MiB at 1024) and raises its own
+  cap to four.
+- The 256 oracle explains why this is retained experimentally but not promoted.
+  At the same 27 cached steps, Taylor reduced step-40 latent nRMSE from
+  **0.100293 to 0.0681592**, proving the predictor is better than repeating the
+  last residual. Its cap-four setting cached **29/40** steps and reduced the
+  measured trajectory wall time from 7,577 to 6,474 ms, while nRMSE rose only
+  to 0.106648. Cap five was rejected at 0.145265. The qualified 1024 A/B then
+  measured 128.592 s end to end for Taylor versus 175.339 s for ordinary
+  Cache-DiT, but sequential-run thermal variation makes the full timing gap
+  non-causal; the durable gain is two avoided full passes. More importantly,
+  the controlled poster image changed the correctly rendered `CASABLANCA` to
+  `CASABLANCCA`. Taylor therefore stays off by default and does not replace
+  ordinary Cache-DiT. The implementation, all calibration points, checksums,
+  timing caveat, and visual decision are recorded in
+  `benchmarks/m1-max-taylorseer.json`.
 - Short 1024 transformer runs now make optimization practical without decoding
   an image: `benchmark-transformer-trajectory-1024 ... 1|2` uses the committed
   31-row text fixture, seed 1301, and the first one or two steps of the normal
@@ -962,7 +985,10 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    assess Cache-DiT image quality because the existing thresholds were
    calibrated only at 256.
 2. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
-   FP16 normalization/SwiGLU output have completed Plan-5 F1, F2, and F4. The
+   FP16 normalization/SwiGLU output have completed Plan-5 F1, F2, and F4.
+   First-order TaylorSeer F8 is also complete: its predictor passed the 256
+   numerical calibration, but the faster cap-four policy failed the controlled
+   1024 exact-text visual A/B, so it remains experimental. The
    remaining conversion candidate is direct FP16 K/V preparation, but F4's
    measured 0.1-1.1% 1024 gain shows that bandwidth-only estimates must be
    profiled before more code is added. Scalar attention variants, further Q8,

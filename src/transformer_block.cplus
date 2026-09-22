@@ -4080,10 +4080,32 @@ fn cache_dit_should_cache(
     difference: f64,
     threshold: f64,
 ) -> bool {
+    return cache_dit_should_cache_with_cap(
+        step, have_residual, continuous_cached_steps, difference, threshold,
+        3 as usize,
+    );
+}
+
+fn cache_dit_should_cache_with_cap(
+    step: usize,
+    have_residual: bool,
+    continuous_cached_steps: usize,
+    difference: f64,
+    threshold: f64,
+    continuous_cap: usize,
+) -> bool {
     return step >= (4 as usize)
         && have_residual
-        && continuous_cached_steps < (3 as usize)
+        && continuous_cached_steps < continuous_cap
         && difference < threshold;
+}
+
+fn taylor_first_derivative(previous: f32, current: f32, window: usize) -> f32 {
+    return (current - previous) / window as f32;
+}
+
+fn taylor_first_predict(value: f32, derivative: f32, elapsed: usize) -> f32 {
+    return value + elapsed as f32 * derivative;
 }
 
 #[test]
@@ -4103,6 +4125,20 @@ fn cache_dit_decision_preserves_warmup_and_continuous_cap() {
     assert cache_dit_should_cache(4 as usize, true, 0 as usize, 0.11f64, 0.12f64);
     assert !cache_dit_should_cache(4 as usize, true, 0 as usize, 0.12f64, 0.12f64);
     assert !cache_dit_should_cache(4 as usize, true, 3 as usize, 0.01f64, 0.12f64);
+}
+
+#[test]
+fn taylorseer_first_order_uses_full_step_distance() {
+    let derivative: f32 = taylor_first_derivative(4.0f32, 10.0f32, 3 as usize);
+    assert (derivative - 2.0f32).abs() < 0.000001f32;
+    assert (taylor_first_predict(10.0f32, derivative, 2 as usize) - 14.0f32).abs()
+        < 0.000001f32;
+    assert cache_dit_should_cache_with_cap(
+        7 as usize, true, 4 as usize, 0.01f64, 0.12f64, 5 as usize,
+    );
+    assert !cache_dit_should_cache_with_cap(
+        8 as usize, true, 5 as usize, 0.01f64, 0.12f64, 5 as usize,
+    );
 }
 
 fn test_native_inputs_256(
@@ -4236,6 +4272,32 @@ fn run_trajectory_cache_dit_packed(
         true,
         true,
         threshold,
+    );
+}
+
+fn run_trajectory_taylorseer_packed(
+    packed_path: str,
+    threshold_text: str,
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+) -> i32 {
+    guard let option::Option[f64]::Some(threshold) = cache_dit_threshold(threshold_text) else {
+        io::eprintln("trajectory TaylorSeer: threshold must be 0.12 or 0.24");
+        return 2;
+    };
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        fixture_directory,
+        0 as *f32,
+        0 as *f32,
+        0 as usize,
+        0 as u64,
+        false,
+        true,
+        true,
+        threshold,
+        256 as usize,
+        true,
     );
 }
 
@@ -4411,6 +4473,37 @@ fn run_prompt_trajectory_cache_dit_1024_to_host(
     );
 }
 
+fn run_prompt_trajectory_taylorseer_1024_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+    threshold: f64 = 0.24f64,
+    requested_steps: str = "40",
+) -> i32 {
+    if text_input.is_null() || final_latent.is_null()
+        || !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("trajectory: invalid 1024px TaylorSeer prompt handoff");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        requested_steps,
+        "",
+        final_latent,
+        text_input,
+        text_rows,
+        seed,
+        true,
+        false,
+        true,
+        threshold,
+        1024 as usize,
+        true,
+    );
+}
+
 fn run_trajectory_packed_impl(
     packed_path: str,
     requested_steps: str,
@@ -4424,7 +4517,12 @@ fn run_trajectory_packed_impl(
     cache_dit_enabled: bool,
     cache_dit_threshold_value: f64,
     pixels: usize = 256 as usize,
+    taylorseer_enabled: bool = false,
 ) -> i32 {
+    if taylorseer_enabled && !cache_dit_enabled {
+        io::eprintln("trajectory: TaylorSeer requires Cache-DiT");
+        return 2;
+    }
     if !mps::load_framework() {
         io::eprintln("trajectory: could not load MetalPerformanceShaders");
         return 1;
@@ -4545,6 +4643,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(cache_first_residual_owner) = pipeline(device, library, "qi_cache_first_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_store_residual_owner) = pipeline(device, library, "qi_cache_store_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_apply_residual_owner) = pipeline(device, library, "qi_cache_apply_residual") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(taylor_store_residual_owner) = pipeline(device, library, "qi_taylor_store_residual") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(taylor_apply_residual_owner) = pipeline(device, library, "qi_taylor_apply_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_relative_l1_partials_owner) = pipeline(device, library, "qi_cache_relative_l1_partials") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_relative_l1_finish_owner) = pipeline(device, library, "qi_cache_relative_l1_finish") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_bf16_owner) = pipeline(device, library, "qi_mps_bf16_weight_to_half") else { return 1; };
@@ -4591,6 +4691,8 @@ fn run_trajectory_packed_impl(
     let cache_first_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_first_residual_owner.raw());
     let cache_store_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_store_residual_owner.raw());
     let cache_apply_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_apply_residual_owner.raw());
+    let taylor_store_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(taylor_store_residual_owner.raw());
+    let taylor_apply_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(taylor_apply_residual_owner.raw());
     let cache_relative_l1_partials_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_relative_l1_partials_owner.raw());
     let cache_relative_l1_finish_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_relative_l1_finish_owner.raw());
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
@@ -4824,6 +4926,12 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(cache_fn_a) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_fn_a_owner: OwnedObjc = OwnedObjc::new(cache_fn_a.raw());
     guard let option::Option[metal::Buffer]::Some(cache_fn_b) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_fn_b_owner: OwnedObjc = OwnedObjc::new(cache_fn_b.raw());
     guard let option::Option[metal::Buffer]::Some(cache_middle_residual) = new_buffer(device, image_projected_bytes) else { return 1; }; let cache_middle_residual_owner: OwnedObjc = OwnedObjc::new(cache_middle_residual.raw());
+    let taylor_derivative_bytes: u64 = if taylorseer_enabled {
+        image_projected_bytes
+    } else {
+        #size_of::[f32]() as u64
+    };
+    guard let option::Option[metal::Buffer]::Some(cache_middle_derivative) = new_buffer(device, taylor_derivative_bytes) else { return 1; }; let cache_middle_derivative_owner: OwnedObjc = OwnedObjc::new(cache_middle_derivative.raw());
     guard let option::Option[metal::Buffer]::Some(cache_diff_partials) = new_buffer(device, ((256 as usize) *% (2 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let cache_diff_partials_owner: OwnedObjc = OwnedObjc::new(cache_diff_partials.raw());
     guard let option::Option[metal::Buffer]::Some(cache_diff_result) = new_buffer(device, ((2 as usize) *% #size_of::[f32]()) as u64) else { return 1; }; let cache_diff_result_owner: OwnedObjc = OwnedObjc::new(cache_diff_result.raw());
 
@@ -4834,6 +4942,8 @@ fn run_trajectory_packed_impl(
     var have_cache_residual: bool = false;
     var continuous_cached_steps: usize = 0 as usize;
     var total_cached_steps: usize = 0 as usize;
+    var have_taylor_derivative: bool = false;
+    var last_full_step: usize = 0 as usize;
     let buffers_and_prefix_wall_ms: i64 = time::now_millis() - buffers_and_prefix_start_ms;
     io::println(
         "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms} direct_fp16_activations=${direct_half_activations} fp32_activation_scratch_bytes=${(2 as u64) *% fp32_norm_scratch_bytes +% fp32_swiglu_scratch_bytes}",
@@ -5037,9 +5147,14 @@ fn run_trajectory_packed_impl(
                 ) else { return 1; };
                 step_ms = step_ms + first_residual_ms;
 
+                let continuous_cache_cap: usize = if taylorseer_enabled {
+                    4 as usize
+                } else {
+                    3 as usize
+                };
                 let forced_full: bool = step < (4 as usize)
                     || !have_cache_residual
-                    || continuous_cached_steps >= (3 as usize);
+                    || continuous_cached_steps >= continuous_cache_cap;
                 if !forced_full {
                     guard let option::Option[CacheDiffResult]::Some(diff_result) = gpu_relative_l1(
                         queue,
@@ -5062,27 +5177,47 @@ fn run_trajectory_packed_impl(
                         io::println("trajectory cache diff validation: gpu=${cache_dit_diff} host=${host_difference} absolute_error=${(cache_dit_diff - host_difference).abs()}");
                     }
                 }
-                cache_dit_cached_step = cache_dit_should_cache(
+                cache_dit_cached_step = cache_dit_should_cache_with_cap(
                     step,
                     have_cache_residual,
                     continuous_cached_steps,
                     cache_dit_diff,
                     cache_dit_threshold_value,
+                    continuous_cache_cap,
                 );
                 if cache_dit_cached_step {
                     params.slot = 0 as u32;
-                    guard let option::Option[f64]::Some(apply_ms) = dispatch_1d(
-                        queue,
-                        cache_apply_residual_pipeline,
-                        current,
-                        cache_middle_residual,
-                        next,
-                        dummy,
-                        dummy,
-                        dummy,
-                        #addr_of(params),
-                        target_rows *% WIDTH,
-                    ) else { return 1; };
+                    var apply_ms: f64 = 0.0f64;
+                    if taylorseer_enabled && have_taylor_derivative {
+                        params.epsilon = (step -% last_full_step) as f32;
+                        guard let option::Option[f64]::Some(taylor_apply_ms) = dispatch_1d(
+                            queue,
+                            taylor_apply_residual_pipeline,
+                            current,
+                            cache_middle_residual,
+                            cache_middle_derivative,
+                            next,
+                            dummy,
+                            dummy,
+                            #addr_of(params),
+                            target_rows *% WIDTH,
+                        ) else { return 1; };
+                        apply_ms = taylor_apply_ms;
+                    } else {
+                        guard let option::Option[f64]::Some(cache_apply_ms) = dispatch_1d(
+                            queue,
+                            cache_apply_residual_pipeline,
+                            current,
+                            cache_middle_residual,
+                            next,
+                            dummy,
+                            dummy,
+                            dummy,
+                            #addr_of(params),
+                            target_rows *% WIDTH,
+                        ) else { return 1; };
+                        apply_ms = cache_apply_ms;
+                    }
                     step_ms = step_ms + apply_ms;
                     current = next;
                     continuous_cached_steps = continuous_cached_steps +% (1 as usize);
@@ -5122,22 +5257,45 @@ fn run_trajectory_packed_impl(
             params.rows = target_rows as u32;
             params.width = WIDTH as u32;
             params.slot = if step == (0 as usize) { text_rows as u32 } else { 0 as u32 };
-            guard let option::Option[f64]::Some(store_ms) = dispatch_1d(
-                queue,
-                cache_store_residual_pipeline,
-                current,
-                cache_first_output,
-                cache_middle_residual,
-                dummy,
-                dummy,
-                dummy,
-                #addr_of(params),
-                target_rows *% WIDTH,
-            ) else { return 1; };
+            var store_ms: f64 = 0.0f64;
+            if taylorseer_enabled && have_cache_residual {
+                let full_step_window: usize = step -% last_full_step;
+                params.epsilon = 1.0f32 / full_step_window as f32;
+                guard let option::Option[f64]::Some(taylor_store_ms) = dispatch_1d(
+                    queue,
+                    taylor_store_residual_pipeline,
+                    current,
+                    cache_first_output,
+                    cache_middle_residual,
+                    cache_middle_derivative,
+                    dummy,
+                    dummy,
+                    #addr_of(params),
+                    target_rows *% WIDTH,
+                ) else { return 1; };
+                store_ms = taylor_store_ms;
+                have_taylor_derivative = true;
+            } else {
+                guard let option::Option[f64]::Some(cache_store_ms) = dispatch_1d(
+                    queue,
+                    cache_store_residual_pipeline,
+                    current,
+                    cache_first_output,
+                    cache_middle_residual,
+                    dummy,
+                    dummy,
+                    dummy,
+                    #addr_of(params),
+                    target_rows *% WIDTH,
+                ) else { return 1; };
+                store_ms = cache_store_ms;
+            }
             step_ms = step_ms + store_ms;
             have_cache_residual = true;
+            last_full_step = step;
         }
 
+        params.epsilon = 0.000001f32;
         params.rows = active_rows as u32; params.width = WIDTH as u32;
         guard let option::Option[f64]::Some(final_norm_ms) = dispatch_1d(queue, final_norm_pipeline, current, final_scale, final_normalized, active_workspace.target_mask, dummy, dummy, #addr_of(params), active_rows) else { return 1; }; step_ms = step_ms + final_norm_ms;
         guard let option::Option[f64]::Some(output_ms) = dispatch_weighted_linear(queue, pipelines, final_normalized, proj_out_weight, noise_output, IMAGE_CHANNELS, WIDTH, active_rows) else { return 1; }; step_ms = step_ms + output_ms;
@@ -5155,7 +5313,11 @@ fn run_trajectory_packed_impl(
         let step_wall_ms: i64 = time::now_millis() - step_wall_start_ms;
         let completed_step: usize = step +% (1 as usize);
         let cache_mode_name: str = if cache_dit_cached_step {
-            "dbcache"
+            if taylorseer_enabled && have_taylor_derivative {
+                "taylor"
+            } else {
+                "dbcache"
+            }
         } else if step == (0 as usize) {
             "extract"
         } else if cache_dit_enabled {
@@ -5209,9 +5371,11 @@ fn run_trajectory_packed_impl(
         }
     }
     let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
-    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
+    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} taylorseer=${taylorseer_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
-        if cache_dit_enabled {
+        if taylorseer_enabled {
+            io::println("Qwen-Image-2.1 TaylorSeer trajectory: complete; quality requires measured acceptance");
+        } else if cache_dit_enabled {
             io::println("Qwen-Image-2.1 Cache-DiT trajectory: complete; quality requires measured acceptance");
         } else if validate_reference {
             io::println("Qwen-Image-2.1 latent trajectory prefix: verified");
