@@ -145,22 +145,22 @@ Inspect a shard, optionally filtering tensor names:
   and output in blocks 28-31. Its repeated worst-case error is 0.985%, and its
   block-matrix storage is 12.166 GiB instead of 13 GiB. The repeat is recorded
   in `benchmarks/m1-max-mixed-quantization.json`.
-- A full-transformer QIPACK1 writer/reader for that mixed policy. It generates
-  the complete 297-tensor inventory from nine global tensor definitions and a
-  nine-role block schema. QIPACK policy v3 stores the 88 non-Q8 MLP matrices
-  and 72 dense Q/K/V matrices as the FP16 operands consumed by MPS, orders Q,
-  K, and V adjacently per block, and retains the measured 40 Q8 matrices.
-  Vectors, global matrices, and other dense attention matrices remain BF16.
-  The reader remains compatible with the v2 MLP-FP16 and original v1 policies. The
-  writer refuses a source other than the exact 7,115,124,736-
-  parameter, two-shard inventory; installs atomically only after structure,
-  payload, per-tensor, and exact source round-trip checks; and produced a
-  verified 13,334,843,392-byte artifact from the pinned snapshot. The layout
-  and scope compatibility rules are documented in `docs/packed-format-v1.md`.
+- A full-transformer QIPACK1 writer/reader for the complete 297-tensor
+  inventory. Current policy v4 stores all 224 block matrices as the FP16
+  operands consumed by MPS, orders Q, K, and V adjacently per block, and has
+  no Q8 records; vectors and the nine global tensors remain BF16. The reader
+  remains compatible with the mixed v3, MLP-FP16 v2, and original v1
+  policies. The writer refuses a source other than the exact
+  7,115,124,736-parameter, two-shard inventory; installs atomically only after
+  structure, payload, per-tensor, and exact source round-trip checks; and
+  produced a verified 14,230,327,296-byte artifact from the pinned snapshot.
+  The layout and scope compatibility rules are documented in
+  `docs/packed-format-v1.md`.
 - Native execution of all 32 blocks directly from one read-only, page-aligned
   no-copy QIPACK1 Metal buffer. Kernel selection comes from each tensor record,
-  not a second hard-coded policy: blocks 0-23 discover zero Q8 matrices,
-  blocks 24-27 discover four, and blocks 28-31 discover six. A compact
+  not a second hard-coded policy. Current v4 artifacts discover zero Q8
+  matrices; legacy v3 artifacts still discover zero in blocks 0-23, four in
+  blocks 24-27, and six in blocks 28-31. A compact
   four-token FP32 oracle checks blocks 0, 23, 24, 27, 28, and 31 around both
   precision transitions. The final native mixed output measured 0.1300%
   nRMSE, with 581.5 ms summed GPU kernel time on the M1 Max; repeated results
@@ -450,11 +450,12 @@ Inspect a shard, optionally filtering tensor names:
   `benchmarks/m1-max-native-prompt-pipeline-256.json`.
 - Runtime transformer loading maps QIPACK1 once and always validates its exact
   model identity, tensor inventory, ordering, dimensions, quantization schemes,
-  and byte ranges. It no longer rescans the complete 13.33 GB payload on every
-  generation. Set `QI_VERIFY_PACKED_CHECKSUMS=1` when loading an artifact whose
-  provenance is uncertain; that adds all per-tensor checksum checks. The
-  explicit `verify-packed` audit remains exhaustive, checking both the whole
-  payload and every tensor, and passes the full 13,334,843,392-byte artifact.
+  policy-specific file length, and byte ranges. It no longer rescans the
+  complete 13.33 GB v3 or 14.23 GB v4 payload on every generation. Set
+  `QI_VERIFY_PACKED_CHECKSUMS=1` when loading an artifact whose provenance is
+  uncertain; that adds all per-tensor checksum checks. The explicit
+  `verify-packed` audit remains exhaustive, checking both the whole payload
+  and every tensor.
   Pack creation already performs an exact source round-trip and installs the
   completed artifact atomically, so normal inference trusts an artifact that
   was verified when it was built while retaining deliberate audit paths.
@@ -501,13 +502,16 @@ Inspect a shard, optionally filtering tensor names:
   2.83 ms). That result still governs non-fused and Q8 projections; QIPACK v3
   later makes one adjacent FP16 4096-to-12288 QKV operation profitable.
   Isolated MPS output nRMSE is at most 0.02095%.
-- Cached MLPs convert FP32 activations and only Q8 packed weights to FP16
-  scratch storage, bind v2/v3 FP16 weights directly from the read-only QIPACK
-  mapping, and invoke `MPSMatrixMultiplication` with FP32 output.
+- Cached MLPs convert FP32 activations to FP16, bind v2/v3/v4 FP16 weights
+  directly from the read-only QIPACK mapping, and invoke
+  `MPSMatrixMultiplication` with FP32 output. Legacy Q8 packed weights are
+  converted into reusable FP16 scratch storage.
   Conversion, MPS GEMM, SwiGLU, and residual work remain ordered in one command
   buffer per transformer block; there is no CPU inference fallback or host
-  synchronization between operations. One reusable 96 MiB weight buffer still
-  handles Q8 matrices, while a 6 MiB activation buffer feeds every MPS GEMM.
+  synchronization between operations. Legacy packs allocate one reusable
+  96 MiB weight-conversion buffer, while v4 reduces that placeholder to two
+  bytes because every block matrix is already FP16. A 6 MiB activation buffer
+  feeds every MPS GEMM at 256.
   Both the 278-row first step and 256-row steady-state steps use MPS for all
   three MLP matrices; the first step also extracts prefix K/V in-buffer.
 - Direct FP16 storage removes 88 repeated BF16 conversion dispatches per step
@@ -805,6 +809,31 @@ Inspect a shard, optionally filtering tensor names:
   the custom flash control. At 256 the isolated gain was only 1.8-3.8%, so the
   lower-overhead custom kernel remains selected. Full evidence is in
   `benchmarks/m1-max-mpsgraph-attention-1024.json`.
+- Plan-5 F2 replaces the mixed v3 policy with the all-block-matrix FP16 v4
+  policy. All 224 block matrices now bind directly from the 14,230,327,296-byte
+  pack, Q8 dispatches fall from 40 to zero per full step, and v4 avoids the
+  reusable 96 MiB legacy weight-conversion buffer. Two reversed adjacent 1024
+  two-step A/B pairs reduced loop wall from 21.262-21.283 s with v3 to
+  **18.985-19.002 s with v4**, a 10.6-10.8% saving. The FP16 prefill step was
+  9.967-9.976 s and the cached step 9.003-9.014 s; the cached improvement was
+  about 13.9%. MPS handles fused QKV and all three MLP matrices. It also handles
+  the attention-output projection for the exact 4,096-row cached shape, but a
+  measured M1 Max `MPSMatrixMultiplication` failure produced partial non-finite
+  output at the 4,096-plus-prompt prefill shape, so prefill keeps the finite
+  custom FP16-weight/FP32-input projection. Smaller resolutions retain that
+  custom projection for their better numerical behavior.
+
+  The official 256 1-, 2-, and 40-step trajectory gates pass at 0.08727%,
+  0.12607%, and **1.07623%** nRMSE, respectively, under their unchanged limits;
+  the 40-step loop measured 20.934 s wall. Cache-DiT 0.24 retained 27 cached
+  steps and measured 7.494 s wall with 10.0293% approximation nRMSE. The full
+  native prompt-to-PNG regression also passes with zero Q8 dispatches at
+  1.90087% final-latent and 1.03176% RGBA nRMSE. A 1024 25-step retry completed
+  in 307.868 s end to end, but step time drifted from about 8.64 s to 13.67 s
+  while macOS reported `AC Power` and a discharging battery, so it is recorded
+  as a thermally/power-confounded observation rather than a speed comparison.
+  The adjacent two-step A/B is the F2 throughput result. Details are in
+  `benchmarks/m1-max-all-fp16-v4-1024.json`.
 - Smaller scalar variations were closed before adopting flash: FP16 K/V alone
   saved only 3-3.5% and introduced the same numerical loss; eight queries in
   one scalar SIMD group regressed 33-38% from register pressure; and a
@@ -869,12 +898,14 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    data outside Git. Cache-off remains the reproducible path; independently
    assess Cache-DiT image quality because the existing thresholds were
    calibrated only at 256.
-2. **1024 transformer throughput.** Flash Attention has removed the former
-   roughly 24-second attention wall, and MPSGraph SDPA has reduced a complete
-   measured step to about 10.6-10.8 s wall. The next plausible work is direct
-   FP16 K/V production (removing the preparation pass), then the remaining QKV,
-   output, and MLP GEMMs; scalar attention variants are closed. Accept changes
-   only with full-shape timing and numerical gates.
+2. **1024 transformer elementwise traffic (plan-5 F4).** MPSGraph SDPA and the
+   all-FP16 v4 pack have reduced clean measured steps to about 9.0 s cached and
+   10.0 s prefill. All block GEMMs are now FP16-backed and Q8 is absent. The
+   next measured opportunity is writing FP16 directly from normalization and
+   SwiGLU into MPS inputs, plus direct FP16 K/V production, to remove conversion
+   dispatches and large intermediate traffic. Scalar attention variants and
+   further Q8 work are closed for this phase. Accept changes only with
+   full-shape timing and numerical gates.
 3. **1024 working memory.** Right-size and safely alias VAE activation arenas;
    the initial decoder path deliberately favors simple ownership and currently
    reserves several maximum-size buffers. Measure peak footprint after every

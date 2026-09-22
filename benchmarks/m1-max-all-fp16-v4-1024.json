@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Plan-5 F2: replace the mixed Q8/FP16 v3 transformer pack with an all-block-matrix FP16 v4 pack",
+  "artifacts": {
+    "control_policy": "transformer:qkv-f16-q8-g64-v3",
+    "control_bytes": 13334843392,
+    "control_q8_block_matrices": 40,
+    "candidate_policy": "transformer:all-matrix-f16-v4",
+    "candidate_bytes": 14230327296,
+    "candidate_fp16_block_matrices": 224,
+    "candidate_q8_block_matrices": 0,
+    "candidate_growth_bytes": 895483904,
+    "candidate_path_not_committed": "/private/tmp/qwen-image-2.1-all-fp16-v4.qipack",
+    "validation": "structure, whole-payload checksum, per-tensor checksums, and exact BF16-source-to-FP16 round trip passed before atomic installation"
+  },
+  "runtime_policy": {
+    "mps": [
+      "fused QKV",
+      "MLP gate",
+      "MLP projection",
+      "MLP output",
+      "attention output at the exact 4096-row cached 1024 shape"
+    ],
+    "custom_attention_output": [
+      "1024 prefill with prompt rows",
+      "smaller resolutions"
+    ],
+    "reason": "MPSMatrixMultiplication produced partial non-finite attention-output projection values at the 4096-plus-prompt prefill shape on this M1 Max. Per-block finite validation localized the failure to block 0; disabling only that MPS projection made the same trajectory finite.",
+    "legacy_weight_conversion_scratch_bytes": 100663296,
+    "v4_weight_conversion_placeholder_bytes": 2
+  },
+  "adjacent_1024_two_step_ab": [
+    {
+      "order": "v4 then v3",
+      "v4": {
+        "startup_buffers_ms": 6900,
+        "prefill_step_wall_ms": 9967,
+        "cached_step_wall_ms": 9003,
+        "loop_wall_ms": 18985,
+        "q8_dispatch_matrices": 0
+      },
+      "v3": {
+        "startup_buffers_ms": 6177,
+        "prefill_step_wall_ms": 10814,
+        "cached_step_wall_ms": 10454,
+        "loop_wall_ms": 21283,
+        "q8_dispatch_matrices": 80
+      },
+      "loop_wall_saving_ms": 2298,
+      "loop_wall_saving_percent": 10.8
+    },
+    {
+      "order": "v3 then v4",
+      "v3": {
+        "prefill_step_wall_ms": 10774,
+        "cached_step_wall_ms": 10474,
+        "loop_wall_ms": 21262,
+        "q8_dispatch_matrices": 80
+      },
+      "v4": {
+        "prefill_step_wall_ms": 9976,
+        "cached_step_wall_ms": 9014,
+        "loop_wall_ms": 19002,
+        "q8_dispatch_matrices": 0
+      },
+      "loop_wall_saving_ms": 2260,
+      "loop_wall_saving_percent": 10.6
+    }
+  ],
+  "timing_interpretation": "MPSGraph fragments command-buffer GPU timestamps, so wall time is authoritative. Reversing A/B order reduces thermal and ordering bias.",
+  "mps_gemm_256_rows": [
+    {
+      "tensor": "block 0 Q",
+      "shape": "4096x4096",
+      "mps_ms": 3.07463,
+      "nrmse": 0
+    },
+    {
+      "tensor": "block 0 MLP gate",
+      "shape": "12288x4096",
+      "mps_ms": 3.249,
+      "nrmse": 0
+    },
+    {
+      "tensor": "block 0 MLP output",
+      "shape": "4096x12288",
+      "mps_ms": 3.28949,
+      "nrmse": 0
+    },
+    {
+      "tensor": "block 28 Q",
+      "shape": "4096x4096",
+      "mps_ms": 1.16115,
+      "nrmse": 0
+    },
+    {
+      "tensor": "block 28 MLP projection",
+      "shape": "12288x4096",
+      "mps_ms": 3.16701,
+      "nrmse": 0
+    },
+    {
+      "tensor": "block 28 MLP output",
+      "shape": "4096x12288",
+      "mps_ms": 3.26819,
+      "nrmse": 0
+    }
+  ],
+  "quality_and_regression_gates": {
+    "trajectory_256": {
+      "step_1_nrmse": 0.000872739,
+      "step_2_nrmse": 0.00126067,
+      "step_40_nrmse": 0.0107623,
+      "step_40_limit": 0.011,
+      "loop_gpu_ms": 20594,
+      "loop_wall_ms": 20934,
+      "q8_dispatch_matrices": 0,
+      "result": "pass"
+    },
+    "cache_dit_256_0_24": {
+      "cached_steps": 27,
+      "loop_gpu_ms": 7292.49,
+      "loop_wall_ms": 7494,
+      "final_nrmse": 0.100293,
+      "interpretation": "measured approximation quality, not an equivalence gate"
+    },
+    "native_prompt_pipeline_256": {
+      "prompt_tokens": 22,
+      "q8_dispatch_matrices": 0,
+      "trajectory_loop_gpu_ms": 20589.7,
+      "trajectory_loop_wall_ms": 21085,
+      "final_latent_nrmse": 0.0190087,
+      "final_latent_limit": 0.02,
+      "vae_output_nrmse": 0.0182946,
+      "vae_output_limit": 0.02,
+      "rgba_nrmse": 0.0103176,
+      "rgba_limit": 0.013,
+      "end_to_end_wall_ms": 42391,
+      "result": "pass"
+    }
+  },
+  "end_to_end_1024_25_step_observations": [
+    {
+      "output_path_not_committed": "/private/tmp/qwen-image-cplus-1024-25-blue-teapot-fp16-v4.png",
+      "end_to_end_wall_ms": 483681,
+      "denoising_loop_wall_ms": 453042,
+      "invalid_for_speed_comparison": true,
+      "reason": "step 21 alone stalled for 234658 ms while neighboring steps were approximately 8.9 to 10.2 seconds"
+    },
+    {
+      "output_path_not_committed": "/private/tmp/qwen-image-cplus-1024-25-blue-teapot-fp16-v4-retry.png",
+      "width": 1024,
+      "height": 1024,
+      "text_wall_ms": 13284,
+      "transformer_phase_wall_ms": 283217,
+      "transformer_startup_and_conditioning_ms": 6631,
+      "denoising_loop_wall_ms": 276586,
+      "vae_wall_ms": 11042,
+      "png_output_wall_ms": 300,
+      "end_to_end_wall_ms": 307868,
+      "invalid_for_speed_comparison": true,
+      "reason": "uninterrupted, but cached steps drifted from approximately 8.64 seconds early to 13.67 seconds near step 22, indicating strong thermal/power throttling",
+      "power_before": "Now drawing from AC Power; battery 72%; discharging; 1:33 remaining",
+      "power_after": "immediate reading unavailable; a later reading after additional testing still reported AC Power with battery discharging"
+    }
+  ],
+  "decision": "accept F2; use the reversed adjacent two-step A/B pairs as the throughput evidence and do not claim the thermally confounded 25-step runs as an end-to-end speedup"
+}

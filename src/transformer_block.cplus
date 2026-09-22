@@ -2244,6 +2244,30 @@ fn execute_batched_runtime_block(
     );
 }
 
+fn encode_post_attention_epilogue(
+    encoder: metal::ComputeCommandEncoder,
+    pipelines: Pipelines,
+    workspace: BlockWorkspace,
+    hidden: metal::Buffer,
+    rows: usize,
+    params: *BlockParams,
+) {
+    encode_buffer_barrier(encoder);
+    (*params).slot = 1 as u32;
+    encode_1d(
+        encoder, pipelines.residual, hidden, workspace.modulation, workspace.residual1,
+        workspace.attention_projected, workspace.target_mask, workspace.dummy,
+        params, rows *% WIDTH,
+    );
+    encode_buffer_barrier(encoder);
+    (*params).slot = 2 as u32;
+    encode_simdgroup_1d(
+        encoder, pipelines.norm, workspace.residual1, workspace.modulation,
+        workspace.norm2, workspace.target_mask, workspace.dummy, workspace.dummy,
+        params, rows,
+    );
+}
+
 fn encode_post_attention(
     encoder: metal::ComputeCommandEncoder,
     pipelines: Pipelines,
@@ -2258,19 +2282,8 @@ fn encode_post_attention(
         encoder, pipelines, workspace.attended, weights.attention_output,
         workspace.attention_projected, WIDTH, WIDTH, rows,
     );
-    encode_buffer_barrier(encoder);
-    (*params).slot = 1 as u32;
-    encode_1d(
-        encoder, pipelines.residual, hidden, workspace.modulation, workspace.residual1,
-        workspace.attention_projected, workspace.target_mask, workspace.dummy,
-        params, rows *% WIDTH,
-    );
-    encode_buffer_barrier(encoder);
-    (*params).slot = 2 as u32;
-    encode_simdgroup_1d(
-        encoder, pipelines.norm, workspace.residual1, workspace.modulation,
-        workspace.norm2, workspace.target_mask, workspace.dummy, workspace.dummy,
-        params, rows,
+    encode_post_attention_epilogue(
+        encoder, pipelines, workspace, hidden, rows, params,
     );
 }
 
@@ -2355,6 +2368,12 @@ fn encode_mps_mlp_runtime_block(
         input_offset: 0 as u32,
     };
     let matrix_bytes: u64 = (WIDTH *% WIDTH *% (2 as usize)) as u64;
+    // MPSMatrix produces partial non-finite output for the 4096-plus-prompt
+    // prefill shape on M1 Max. Select it only for the measured 4096-row cached
+    // shape; smaller resolutions keep the more accurate custom FP32-input GEMM.
+    let mps_attention_output: bool = weights.attention_output.scheme == PACKED_SCHEME_FP16
+        && rows == (4096 as usize)
+        && !env::has_var("QI_DISABLE_MPS_ATTENTION_OUTPUT");
     let mps_qkv: bool = weights.q.scheme == PACKED_SCHEME_FP16
         && weights.k.scheme == PACKED_SCHEME_FP16
         && weights.v.scheme == PACKED_SCHEME_FP16
@@ -2477,7 +2496,7 @@ fn encode_mps_mlp_runtime_block(
             pipelines.attention_queries_per_group,
         );
     }
-    if !use_graph_attention {
+    if !use_graph_attention && !mps_attention_output {
         encode_post_attention(
             attention_encoder, pipelines, weights, workspace, hidden, rows,
             #addr_of(params),
@@ -2502,7 +2521,36 @@ fn encode_mps_mlp_runtime_block(
         if !graph_ok { return false; }
     }
 
-    if use_graph_attention {
+    if mps_attention_output {
+        guard let option::Option[mps::Multiplication]::Some(attention_output_operation) =
+            mps::create(
+                mps_workspace.device, mps_workspace.half_input, 0 as u64,
+            weights.attention_output.storage, weights.attention_output.weights_offset,
+            workspace.attention_projected, 0 as u64, rows, WIDTH, WIDTH,
+        ) else { return false; };
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(conversion_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let conversion_encoder_owner: OwnedObjc =
+            OwnedObjc::new(rt::retain(conversion_encoder.raw()));
+        encode_mps_input_conversion(
+            conversion_encoder, mps_workspace.input_pipeline, workspace.attended,
+            mps_workspace.half_input, rows, WIDTH,
+        );
+        let conversion_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(conversion_encoder.raw());
+        conversion_command_encoder.end_encoding();
+        attention_output_operation.encode(command_buffer);
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(epilogue_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let epilogue_encoder_owner: OwnedObjc =
+            OwnedObjc::new(rt::retain(epilogue_encoder.raw()));
+        encode_post_attention_epilogue(
+            epilogue_encoder, pipelines, workspace, hidden, rows, #addr_of(params),
+        );
+        let epilogue_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(epilogue_encoder.raw());
+        epilogue_command_encoder.end_encoding();
+    } else if use_graph_attention {
         guard let option::Option[metal::ComputeCommandEncoder]::Some(post_attention_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
         let post_attention_encoder_owner: OwnedObjc =
@@ -2531,15 +2579,19 @@ fn encode_mps_mlp_runtime_block(
     gate_conversion_command_encoder.end_encoding();
     gate_operation.encode(command_buffer);
 
-    guard let option::Option[metal::ComputeCommandEncoder]::Some(projected_conversion_encoder) =
-        command_buffer.compute_command_encoder() else { return false; };
-    let projected_conversion_owner: OwnedObjc = OwnedObjc::new(rt::retain(projected_conversion_encoder.raw()));
-    encode_mps_weight_conversion(
-        projected_conversion_encoder, mps_workspace, weights.projected, MLP_WIDTH, WIDTH,
-    );
-    let projected_conversion_command_encoder: metal::CommandEncoder =
-        metal::CommandEncoder::from_raw(projected_conversion_encoder.raw());
-    projected_conversion_command_encoder.end_encoding();
+    if weights.projected.scheme != PACKED_SCHEME_FP16 {
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(
+            projected_conversion_encoder,
+        ) = command_buffer.compute_command_encoder() else { return false; };
+        let projected_conversion_owner: OwnedObjc =
+            OwnedObjc::new(rt::retain(projected_conversion_encoder.raw()));
+        encode_mps_weight_conversion(
+            projected_conversion_encoder, mps_workspace, weights.projected, MLP_WIDTH, WIDTH,
+        );
+        let projected_conversion_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(projected_conversion_encoder.raw());
+        projected_conversion_command_encoder.end_encoding();
+    }
     projected_operation.encode(command_buffer);
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(swiglu_encoder) =
@@ -3218,8 +3270,9 @@ fn run_full_packed(
         next = swap;
         block = block +% (1 as usize);
     }
-    if quantized_matrices != (40 as usize) {
-        io::eprintln("transformer runtime: expected 40 Q8 matrices, found ${quantized_matrices}");
+    let expected_quantized_matrices: usize = weight_file.quantized_matrix_count();
+    if quantized_matrices != expected_quantized_matrices {
+        io::eprintln("transformer runtime: expected ${expected_quantized_matrices} Q8 matrices, found ${quantized_matrices}");
         return 1;
     }
     io::println(
@@ -3543,7 +3596,8 @@ fn run_complete_packed(
     guard let option::Option[f64]::Some(final_error) = normalized_rms_fixture(output, fixture_directory, "output", COMPLETE_ROWS *% IMAGE_CHANNELS) else { return 1; };
     guard let option::Option[f64]::Some(target_error) = normalized_rms_fixture_slice(output, fixture_directory, "output", (7 as usize) *% IMAGE_CHANNELS, (8 as usize) *% IMAGE_CHANNELS) else { return 1; };
     all_ok = finite("complete transformer output", output, COMPLETE_ROWS *% IMAGE_CHANNELS) && finite("cached target output", cached_output, target_rows *% IMAGE_CHANNELS) && target_error <= 0.012f64 && cached_output_error <= 0.00001f64 && all_ok;
-    if quantized_matrices != (40 as usize) { io::eprintln("complete transformer: expected 40 Q8 matrices, found ${quantized_matrices}"); return 1; }
+    let expected_quantized_matrices: usize = weight_file.quantized_matrix_count();
+    if quantized_matrices != expected_quantized_matrices { io::eprintln("complete transformer: expected ${expected_quantized_matrices} Q8 matrices, found ${quantized_matrices}"); return 1; }
     io::println("complete transformer: rows=${COMPLETE_ROWS} q8=${quantized_matrices} total_gpu_ms=${total_ms} final_norm_nRMSE=${final_norm_error} all_output_nRMSE=${final_error} target_output_nRMSE=${target_error}");
     io::println("complete transformer cache: prefix_rows=${prefix_rows} target_rows=${target_rows} cache_bytes=${(2 as u64) *% cache_arena_bytes} cached_gpu_ms=${cached_total_ms} cached_output_nRMSE=${cached_output_error}");
     if all_ok { io::println("Qwen-Image-2.1 complete transformer boundary: verified"); return 0; }
@@ -3809,7 +3863,8 @@ fn run_scale_packed(
         output, text_rows *% IMAGE_CHANNELS, fixture_directory, "output", target_rows *% IMAGE_CHANNELS,
     ) else { return 1; };
     all_ok = output_error <= 0.015f64 && finite("scale transformer output", output, rows *% IMAGE_CHANNELS) && all_ok;
-    if quantized_matrices != (40 as usize) { io::eprintln("scale transformer: expected 40 Q8 matrices, found ${quantized_matrices}"); return 1; }
+    let expected_quantized_matrices: usize = weight_file.quantized_matrix_count();
+    if quantized_matrices != expected_quantized_matrices { io::eprintln("scale transformer: expected ${expected_quantized_matrices} Q8 matrices, found ${quantized_matrices}"); return 1; }
     io::println("scale transformer: pixels=${pixels} text_rows=${text_rows} target_rows=${target_rows} joint_rows=${rows} q8=${quantized_matrices} working_bytes=${working_bytes} cache_bytes=${(2 as u64) *% cache_arena_bytes} total_gpu_ms=${total_ms} target_output_nRMSE=${output_error}");
     if all_ok { io::println("Qwen-Image-2.1 ${pixels}px full noise prediction: verified"); return 0; }
     return 1;
@@ -4698,7 +4753,10 @@ fn run_trajectory_packed_impl(
     let workspace: BlockWorkspace = BlockWorkspace { modulation: modulation, rope: rope, target_mask: target_mask, image_ids: image_ids, key_valid: key_valid, dummy: dummy, norm1: norm1, query: query, key: key, value: value, query_rope: query_rope, key_rope: key_rope, attended: attended, attention_projected: attention_projected, residual1: residual1, norm2: norm2, gate: gate, projected: projected, swiglu: swiglu, mlp_projected: mlp_projected };
     let cached_workspace: BlockWorkspace = BlockWorkspace { modulation: modulation, rope: cached_rope, target_mask: cached_target_mask, image_ids: image_ids, key_valid: key_valid, dummy: dummy, norm1: norm1, query: query, key: key, value: value, query_rope: query_rope, key_rope: key_rope, attended: attended, attention_projected: attention_projected, residual1: residual1, norm2: norm2, gate: gate, projected: projected, swiglu: swiglu, mlp_projected: mlp_projected };
     guard let option::Option[metal::Buffer]::Some(mps_half_input) = new_buffer(device, (rows *% MLP_WIDTH *% (2 as usize)) as u64) else { return 1; }; let mps_half_input_owner: OwnedObjc = OwnedObjc::new(mps_half_input.raw());
-    guard let option::Option[metal::Buffer]::Some(mps_half_weight) = new_buffer(device, (MLP_WIDTH *% WIDTH *% (2 as usize)) as u64) else { return 1; }; let mps_half_weight_owner: OwnedObjc = OwnedObjc::new(mps_half_weight.raw());
+    let mps_half_weight_bytes: u64 = if weight_file.all_block_matrices_fp16() {
+        2 as u64
+    } else { (MLP_WIDTH *% WIDTH *% (2 as usize)) as u64 };
+    guard let option::Option[metal::Buffer]::Some(mps_half_weight) = new_buffer(device, mps_half_weight_bytes) else { return 1; }; let mps_half_weight_owner: OwnedObjc = OwnedObjc::new(mps_half_weight.raw());
     let mps_workspace: MpsWorkspace = MpsWorkspace { device: device, input_pipeline: mps_input_pipeline, bf16_pipeline: mps_bf16_pipeline, q8_pipeline: mps_q8_pipeline, half_input: mps_half_input, half_weight: mps_half_weight };
     guard let option::Option[metal::Buffer]::Some(final_scale) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_owner: OwnedObjc = OwnedObjc::new(final_scale.raw());
     guard let option::Option[metal::Buffer]::Some(final_normalized) = new_buffer(device, activation_bytes) else { return 1; }; let final_normalized_owner: OwnedObjc = OwnedObjc::new(final_normalized.raw());
@@ -4820,7 +4878,10 @@ fn run_trajectory_packed_impl(
         var cache_dit_diff: f64 = 0.0f64 - 1.0f64;
 
         let profile_cached_block: bool = env::has_var("QI_PROFILE_CACHED_BLOCK");
-        let batch_transformer_step: bool = !cache_dit_enabled && !profile_cached_block;
+        let validate_trajectory_blocks: bool = env::has_var("QI_VALIDATE_TRAJECTORY_BLOCKS");
+        let batch_transformer_step: bool = !cache_dit_enabled
+            && !profile_cached_block
+            && !validate_trajectory_blocks;
         guard let option::Option[metal::CommandBuffer]::Some(base_transformer_command_buffer) =
             queue.command_buffer() else { return 1; };
         let transformer_command_buffer_owner: OwnedObjc =
@@ -4889,6 +4950,14 @@ fn run_trajectory_packed_impl(
                 );
                 guard let option::Option[f64]::Some(block_ms) = block_result else { return 1; };
                 step_ms = step_ms + block_ms;
+                if validate_trajectory_blocks
+                    && !finite(
+                        "trajectory step ${step +% (1 as usize)} block ${block}",
+                    next,
+                    active_rows *% WIDTH,
+                ) {
+                    return 1;
+                }
             }
             let swap: metal::Buffer = current; current = next; next = swap;
             if cache_dit_enabled && block == (0 as usize) {
@@ -4982,7 +5051,7 @@ fn run_trajectory_packed_impl(
         let expected_step_quantized: usize = if cache_dit_cached_step {
             0 as usize
         } else {
-            40 as usize
+            weight_file.quantized_matrix_count()
         };
         if step_quantized_matrices != expected_step_quantized {
             io::eprintln("trajectory: expected ${expected_step_quantized} Q8 matrices at step ${step +% (1 as usize)}, found ${step_quantized_matrices}");
@@ -5754,13 +5823,11 @@ fn benchmark_mps_gemm_case(
     tensor_name: str,
     output_columns: usize,
     input_columns: usize,
-    expected_scheme: u32,
 ) -> bool {
     let rows: usize = 256 as usize;
     guard let option::Option[LinearWeight]::Some(weight) = packed_linear_weight(
         file, storage, tensor_name, output_columns as u64, input_columns as u64,
     ) else { return false; };
-    if weight.scheme != expected_scheme { return false; }
     let reference_result: option::Option[f64] =
         if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
         dispatch_int8_linear(
@@ -5930,42 +5997,42 @@ fn benchmark_mps_gemm(packed_path: str) -> i32 {
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
-        "transformer_blocks.0.attn.to_q.weight", WIDTH, WIDTH, PACKED_SCHEME_BF16,
+        "transformer_blocks.0.attn.to_q.weight", WIDTH, WIDTH,
     ) && all_ok;
     all_ok = benchmark_mps_gemm_case(
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
         "transformer_blocks.0.img_mlp.gate_layer.weight",
-        MLP_WIDTH, WIDTH, PACKED_SCHEME_FP16,
+        MLP_WIDTH, WIDTH,
     ) && all_ok;
     all_ok = benchmark_mps_gemm_case(
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
         "transformer_blocks.0.img_mlp.out.weight",
-        WIDTH, MLP_WIDTH, PACKED_SCHEME_FP16,
+        WIDTH, MLP_WIDTH,
     ) && all_ok;
     all_ok = benchmark_mps_gemm_case(
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
         "transformer_blocks.28.attn.to_q.weight",
-        WIDTH, WIDTH, PACKED_SCHEME_INT8_AFFINE,
+        WIDTH, WIDTH,
     ) && all_ok;
     all_ok = benchmark_mps_gemm_case(
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
         "transformer_blocks.28.img_mlp.proj.weight",
-        MLP_WIDTH, WIDTH, PACKED_SCHEME_INT8_AFFINE,
+        MLP_WIDTH, WIDTH,
     ) && all_ok;
     all_ok = benchmark_mps_gemm_case(
         device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
         bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
         input, half_input, half_weight, output, reference,
         "transformer_blocks.28.img_mlp.out.weight",
-        WIDTH, MLP_WIDTH, PACKED_SCHEME_INT8_AFFINE,
+        WIDTH, MLP_WIDTH,
     ) && all_ok;
     return if all_ok { 0 } else { 1 };
 }

@@ -57,9 +57,11 @@ const SNAPSHOT: str = "b3179ad355be050328e483a9dfdd9e60cd62adfa";
 const DIFFUSERS_COMMIT: str = "80c7ed262aeffbeb43ef13ae04baeb9b84515a69";
 const LEGACY_FULL_POLICY: str = "transformer:mixed-q8-g64-v1";
 const FP16_MLP_POLICY: str = "transformer:q8-g64-f16-v2";
-const FULL_POLICY: str = "transformer:qkv-f16-q8-g64-v3";
+const QKV_FP16_Q8_POLICY: str = "transformer:qkv-f16-q8-g64-v3";
+const FULL_POLICY: str = "transformer:all-matrix-f16-v4";
 const FULL_PARAMETER_COUNT: u64 = 7115124736;
-const FULL_FILE_BYTES: u64 = 13334843392;
+const LEGACY_FULL_FILE_BYTES: u64 = 13334843392;
+const FULL_FILE_BYTES: u64 = 14230327296;
 
 #[repr(C)]
 struct PackedHeader {
@@ -191,6 +193,29 @@ impl File {
             index = index +% (1 as usize);
         }
         return option::Option[TensorData]::None;
+    }
+
+    fn quantized_matrix_count(this) -> usize {
+        let header: *PackedHeader = this._mapping.pointer() as *PackedHeader;
+        let records: *PackedRecord =
+            (this._mapping.pointer() + (*header).directory_offset as usize) as *PackedRecord;
+        var count: usize = 0 as usize;
+        var index: usize = 0 as usize;
+        while index < (*header).tensor_count as usize {
+            let record: *PackedRecord = records + index;
+            if (*record).scheme == SCHEME_INT8_AFFINE {
+                count = count +% (1 as usize);
+            }
+            index = index +% (1 as usize);
+        }
+        return count;
+    }
+
+    fn all_block_matrices_fp16(this) -> bool {
+        let header: *PackedHeader = this._mapping.pointer() as *PackedHeader;
+        return fixed_matches(
+            #addr_of((*header).policy[0]), 32 as usize, FULL_POLICY,
+        );
     }
 }
 
@@ -445,21 +470,34 @@ fn full_tensor_spec(index: usize) -> FullTensorSpec {
     };
 }
 
-// MPS accepts FP16 but not BF16 matrices on Apple family 7. Only MLP matrices
-// use FP16 storage: cached attention projections remain on the faster custom
-// BF16 kernels, while Q8 tensors retain their calibrated representation.
-fn full_tensor_uses_fp16(index: usize, qkv_policy: bool = false) -> bool {
+// MPS accepts FP16 but not BF16 matrices on Apple family 7. The v4 policy
+// stores every block matrix in FP16; older policies retain their measured
+// mixtures so existing artifacts remain readable.
+fn full_tensor_uses_fp16(
+    index: usize,
+    qkv_policy: bool = false,
+    all_matrix_policy: bool = false,
+) -> bool {
     if index < GLOBAL_TENSOR_COUNT { return false; }
+    let spec: FullTensorSpec = full_tensor_spec(index);
+    if all_matrix_policy { return spec.input != (0 as u64); }
     let role_index: usize = (index -% GLOBAL_TENSOR_COUNT) % BLOCK_TENSOR_COUNT;
     let dense_qkv: bool = qkv_policy
         && role_index >= (2 as usize) && role_index <= (4 as usize);
-    return (dense_qkv || role_index >= (6 as usize)) && !full_tensor_spec(index).quantized;
+    return (dense_qkv || role_index >= (6 as usize)) && !spec.quantized;
 }
 
-fn full_expected_scheme(index: usize, fp16_policy: bool, qkv_policy: bool = false) -> u32 {
+fn full_expected_scheme(
+    index: usize,
+    fp16_policy: bool,
+    qkv_policy: bool = false,
+    all_matrix_policy: bool = false,
+) -> u32 {
     let spec: FullTensorSpec = full_tensor_spec(index);
+    if fp16_policy && full_tensor_uses_fp16(index, qkv_policy, all_matrix_policy) {
+        return SCHEME_FP16;
+    }
     if spec.quantized { return SCHEME_INT8_AFFINE; }
-    if fp16_policy && full_tensor_uses_fp16(index, qkv_policy) { return SCHEME_FP16; }
     return SCHEME_BF16;
 }
 
@@ -470,18 +508,20 @@ fn make_full_record(
     ref cursor: u64,
 ) -> PackedRecord {
     let elements: u64 = if spec.input == (0 as u64) { spec.output } else { spec.output *% spec.input };
-    let groups: u64 = if spec.quantized { spec.output *% (spec.input / (64 as u64)) } else { 0 as u64 };
+    let scheme: u32 = full_expected_scheme(index, true, true, true);
+    let quantized: bool = scheme == SCHEME_INT8_AFFINE;
+    let groups: u64 = if quantized { spec.output *% (spec.input / (64 as u64)) } else { 0 as u64 };
     var record: PackedRecord = PackedRecord {
         name: [0 as u8; 128],
-        scheme: full_expected_scheme(index, true, true),
+        scheme: scheme,
         rank: if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 },
         dimensions: [spec.output, spec.input, 0 as u64, 0 as u64],
-        group_axis: if spec.quantized { 1 as u32 } else { (0xFFFFFFFF as u32) },
-        group_size: if spec.quantized { 64 as u32 } else { 0 as u32 },
-        scale_type: if spec.quantized { TYPE_F16 } else { TYPE_NONE },
-        zero_type: if spec.quantized { TYPE_U8 } else { TYPE_NONE },
+        group_axis: if quantized { 1 as u32 } else { (0xFFFFFFFF as u32) },
+        group_size: if quantized { 64 as u32 } else { 0 as u32 },
+        scale_type: if quantized { TYPE_F16 } else { TYPE_NONE },
+        zero_type: if quantized { TYPE_U8 } else { TYPE_NONE },
         weights_offset: 0 as u64,
-        weights_length: if spec.quantized { elements } else { elements *% (2 as u64) },
+        weights_length: if quantized { elements } else { elements *% (2 as u64) },
         scales_offset: 0 as u64,
         scales_length: groups *% (2 as u64),
         zeros_offset: 0 as u64,
@@ -494,7 +534,7 @@ fn make_full_record(
     cursor = align_up(cursor, TENSOR_ALIGNMENT);
     record.weights_offset = cursor;
     cursor = cursor +% record.weights_length;
-    if spec.quantized {
+    if quantized {
         cursor = align_up(cursor, TENSOR_ALIGNMENT);
         record.scales_offset = cursor;
         cursor = cursor +% record.scales_length;
@@ -616,9 +656,13 @@ fn convert_tensor_to_fp16(tensor: safetensors::TensorData) -> option::Option[Own
 
 fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
     let header: *PackedHeader = file.pointer() as *PackedHeader;
-    let qkv_policy: bool = fixed_matches(
+    let all_matrix_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FULL_POLICY,
     );
+    let qkv_fp16_q8_policy: bool = fixed_matches(
+        #addr_of((*header).policy[0]), 32 as usize, QKV_FP16_Q8_POLICY,
+    );
+    let qkv_policy: bool = all_matrix_policy || qkv_fp16_q8_policy;
     let fp16_mlp_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FP16_MLP_POLICY,
     );
@@ -636,11 +680,13 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
         || (*header).scope != SCOPE_TRANSFORMER
         || (*header).directory_offset != HEADER_BYTES
         || (*header).data_offset != expected_data_offset
-        || (*header).file_bytes != FULL_FILE_BYTES
-        || (*header).file_bytes != file.length() as u64
+        || (*header).file_bytes != if all_matrix_policy {
+        FULL_FILE_BYTES
+    } else { LEGACY_FULL_FILE_BYTES }
+    || (*header).file_bytes != file.length() as u64
         || !fixed_matches(#addr_of((*header).model_snapshot[0]), 40 as usize, SNAPSHOT)
         || !fixed_matches(#addr_of((*header).diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT)
-        || !(qkv_policy || fp16_mlp_policy || legacy_policy) {
+        || !(all_matrix_policy || qkv_fp16_q8_policy || fp16_mlp_policy || legacy_policy) {
         if !quiet { io::eprintln("packed transformer: invalid header or model identity"); }
         return 1;
     }
@@ -664,7 +710,9 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
         let record: *PackedRecord = records + index;
         let name: text::Text = full_tensor_name(index, qkv_policy);
         let spec: FullTensorSpec = full_tensor_spec(index);
-        let expected_scheme: u32 = full_expected_scheme(index, fp16_policy, qkv_policy);
+        let expected_scheme: u32 = full_expected_scheme(
+            index, fp16_policy, qkv_policy, all_matrix_policy,
+        );
         let expected_rank: u32 = if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 };
         let expected_elements: u64 = if spec.input == (0 as u64) {
             spec.output
@@ -672,14 +720,17 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
             spec.output *% spec.input
         };
         parameter_count = parameter_count +% expected_elements;
-        if spec.quantized { quantized_count = quantized_count +% (1 as usize); }
+        if expected_scheme == SCHEME_INT8_AFFINE {
+            quantized_count = quantized_count +% (1 as usize);
+        }
         if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, name.view())
             || (*record).rank != expected_rank
             || (*record).dimensions[0] != spec.output
             || (expected_rank == (2 as u32) && (*record).dimensions[1] != spec.input)
             || (*record).elements != expected_elements
             || (*record).scheme != expected_scheme
-            || (spec.quantized && (*record).weights_length != expected_elements)
+            || (expected_scheme == SCHEME_INT8_AFFINE
+                && (*record).weights_length != expected_elements)
             || (*record).weights_offset % TENSOR_ALIGNMENT != (0 as u64)
             || (*record).weights_offset < cursor
             || (*record).weights_offset > (*header).file_bytes
@@ -740,7 +791,10 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
         }
         index = index +% (1 as usize);
     }
-    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != (40 as usize)
+    let expected_quantized_count: usize = if all_matrix_policy {
+        0 as usize
+    } else { 40 as usize };
+    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != expected_quantized_count
         || align_up(cursor, TENSOR_ALIGNMENT) != (*header).file_bytes {
         if !quiet { io::eprintln("packed transformer: inventory or trailing data mismatch"); }
         return 1;
@@ -760,9 +814,13 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
 // the whole-payload and per-tensor checksum layers.
 fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
     let header: *PackedHeader = file.pointer() as *PackedHeader;
-    let qkv_policy: bool = fixed_matches(
+    let all_matrix_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FULL_POLICY,
     );
+    let qkv_fp16_q8_policy: bool = fixed_matches(
+        #addr_of((*header).policy[0]), 32 as usize, QKV_FP16_Q8_POLICY,
+    );
+    let qkv_policy: bool = all_matrix_policy || qkv_fp16_q8_policy;
     let fp16_mlp_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FP16_MLP_POLICY,
     );
@@ -780,11 +838,13 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
         || (*header).scope != SCOPE_TRANSFORMER
         || (*header).directory_offset != HEADER_BYTES
         || (*header).data_offset != expected_data_offset
-        || (*header).file_bytes != FULL_FILE_BYTES
-        || (*header).file_bytes != file.length() as u64
+        || (*header).file_bytes != if all_matrix_policy {
+        FULL_FILE_BYTES
+    } else { LEGACY_FULL_FILE_BYTES }
+    || (*header).file_bytes != file.length() as u64
         || !fixed_matches(#addr_of((*header).model_snapshot[0]), 40 as usize, SNAPSHOT)
         || !fixed_matches(#addr_of((*header).diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT)
-        || !(qkv_policy || fp16_mlp_policy || legacy_policy) {
+        || !(all_matrix_policy || qkv_fp16_q8_policy || fp16_mlp_policy || legacy_policy) {
         if !quiet { io::eprintln("packed transformer: invalid runtime header or model identity"); }
         return 1;
     }
@@ -799,7 +859,9 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
         let record: *PackedRecord = records + index;
         let name: text::Text = full_tensor_name(index, qkv_policy);
         let spec: FullTensorSpec = full_tensor_spec(index);
-        let expected_scheme: u32 = full_expected_scheme(index, fp16_policy, qkv_policy);
+        let expected_scheme: u32 = full_expected_scheme(
+            index, fp16_policy, qkv_policy, all_matrix_policy,
+        );
         let expected_rank: u32 = if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 };
         let expected_elements: u64 = if spec.input == (0 as u64) {
             spec.output
@@ -807,14 +869,17 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
             spec.output *% spec.input
         };
         parameter_count = parameter_count +% expected_elements;
-        if spec.quantized { quantized_count = quantized_count +% (1 as usize); }
+        if expected_scheme == SCHEME_INT8_AFFINE {
+            quantized_count = quantized_count +% (1 as usize);
+        }
         if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, name.view())
             || (*record).rank != expected_rank
             || (*record).dimensions[0] != spec.output
             || (expected_rank == (2 as u32) && (*record).dimensions[1] != spec.input)
             || (*record).elements != expected_elements
             || (*record).scheme != expected_scheme
-            || (spec.quantized && (*record).weights_length != expected_elements)
+            || (expected_scheme == SCHEME_INT8_AFFINE
+                && (*record).weights_length != expected_elements)
             || (*record).weights_offset % TENSOR_ALIGNMENT != (0 as u64)
             || (*record).weights_offset < cursor
             || (*record).weights_offset > (*header).file_bytes
@@ -856,7 +921,10 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
         }
         index = index +% (1 as usize);
     }
-    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != (40 as usize)
+    let expected_quantized_count: usize = if all_matrix_policy {
+        0 as usize
+    } else { 40 as usize };
+    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != expected_quantized_count
         || align_up(cursor, TENSOR_ALIGNMENT) != (*header).file_bytes {
         if !quiet { io::eprintln("packed transformer: runtime inventory or trailing data mismatch"); }
         return 1;
@@ -1235,6 +1303,8 @@ fn verify_full_against_source(
     let header: *PackedHeader = packed.pointer() as *PackedHeader;
     let qkv_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FULL_POLICY,
+    ) || fixed_matches(
+        #addr_of((*header).policy[0]), 32 as usize, QKV_FP16_Q8_POLICY,
     );
     if !magic_matches(header) || (*header).scope != SCOPE_TRANSFORMER
         || (*header).tensor_count != FULL_TENSOR_COUNT as u32 {
@@ -1784,14 +1854,16 @@ fn full_transformer_layout_matches_inventory_and_policy() {
         let spec: FullTensorSpec = full_tensor_spec(index);
         let record: PackedRecord = make_full_record(index, name.view(), spec, cursor);
         parameters = parameters +% record.elements;
-        if spec.quantized { quantized = quantized +% (1 as usize); }
+        if record.scheme == SCHEME_INT8_AFFINE {
+            quantized = quantized +% (1 as usize);
+        }
         if record.scheme == SCHEME_FP16 { fp16 = fp16 +% (1 as usize); }
         index = index +% (1 as usize);
     }
     assert data_offset == (77824 as u64);
     assert parameters == FULL_PARAMETER_COUNT;
-    assert quantized == (40 as usize);
-    assert fp16 == (160 as usize);
+    assert quantized == (0 as usize);
+    assert fp16 == (224 as usize);
     assert align_up(cursor, TENSOR_ALIGNMENT) == FULL_FILE_BYTES;
 }
 
@@ -1818,7 +1890,10 @@ fn full_transformer_policy_boundaries_match_calibration() {
         == "transformer_blocks.0.attn.to_k.weight";
     assert full_tensor_name(block0 +% (4 as usize), true)
         == "transformer_blocks.0.attn.to_v.weight";
-    assert full_expected_scheme(block0 +% (2 as usize), true, true) == SCHEME_FP16;
+    assert full_expected_scheme(block0 +% (2 as usize), true, true, true)
+        == SCHEME_FP16;
+    assert full_expected_scheme(block24 +% (2 as usize), true, true, true)
+        == SCHEME_FP16;
     assert full_expected_scheme(block24 +% (2 as usize), true, true)
         == SCHEME_INT8_AFFINE;
 }
