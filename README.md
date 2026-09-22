@@ -738,6 +738,24 @@ Inspect a shard, optionally filtering tensor names:
   packed text runtime for that marginal policy is rejected. Exact calibration,
   limitations, and the downstream decision are in
   `benchmarks/m1-max-text-q8-calibration.json`.
+- As an external full-precision baseline, the patched stable-diffusion.cpp
+  build at commit `6dcb5bb` completed one cache-off 1024x1024, 40-step run in
+  **1006.36 seconds process wall** (16:46.36) on AC power. Its internal
+  `generate_image` timer was 1005.29 seconds: 63.24 seconds for text
+  conditioning, 922.90 seconds for sampling, and 19.00 seconds for VAE decode.
+  Progress timings averaged 23.07 seconds over all 40 iterations; iteration 1
+  was 66.12 seconds because it included lazy transformer loading, Metal
+  staging, and compilation, while iterations 2-40 averaged 21.97 seconds and
+  ranged from 17.57 to 25.93 seconds under sustained load. The run used the
+  original BF16/F32 checkpoint, ggml diffusion flash attention,
+  `--offload-to-cpu`, CFG 1.0, Euler, no cache mode, and a warm filesystem
+  cache. It reported 16.93 GB maximum RSS, 43.77 GB macOS peak memory
+  footprint, and zero swaps. Its automatically selected Flux shift was 1.150
+  rather than the pinned Diffusers/native oracle's 0.693548; that changes the
+  trajectory but not the tensor shapes or amount of 40-step transformer work,
+  so the result is retained strictly as a speed baseline. Exact command,
+  binary identity, timings, and host conditions are in
+  `benchmarks/m1-max-stable-diffusion-cpp-1024-40.json`.
 - As an external Apple-Silicon baseline, the locally downloaded
   `mlx-community/Qwen-Image-2.1-MLX-4bit` snapshot `4db4e8c` took
   **36.48 seconds end to end on repeat** for the same blue-teapot prompt at
