@@ -6,6 +6,7 @@ import "./transformer_block" as transformer;
 import "./vae" as vae;
 import "stdlib/io" as io;
 import "stdlib/option" as option;
+import "stdlib/text" as text;
 import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 
@@ -136,6 +137,136 @@ fn run_fixture_cache_dit_256(
         return 1;
     }
     io::println("Qwen-Image-2.1 fixture-driven Cache-DiT pipeline: complete; quality requires visual acceptance");
+    return 0;
+}
+
+// Executes the native 1024px/40-step transformer from the official fixture's
+// exact text embedding and seed, then decodes the resulting latent. This is a
+// measured diagnostic: it reports both latent and decoded-output drift and
+// always retains the native PNG for visual review instead of hiding a useful
+// artifact behind an arbitrary image-similarity threshold.
+fn run_fixture_1024(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    trajectory_fixture: str,
+    vae_fixture_root: str,
+) -> i32 {
+    return run_fixture_1024_impl(
+        packed_path, model_root, output_path, trajectory_fixture,
+        vae_fixture_root, false, 0.0f64,
+    );
+}
+
+fn run_fixture_cache_dit_1024(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    threshold: f64,
+    trajectory_fixture: str,
+    vae_fixture_root: str,
+) -> i32 {
+    if !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("pipeline 1024 oracle Cache-DiT: threshold must be 0.12 or 0.24");
+        return 2;
+    }
+    return run_fixture_1024_impl(
+        packed_path, model_root, output_path, trajectory_fixture,
+        vae_fixture_root, true, threshold,
+    );
+}
+
+fn run_fixture_1024_impl(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    trajectory_fixture: str,
+    vae_fixture_root: str,
+    cache_dit: bool,
+    cache_dit_threshold: f64,
+) -> i32 {
+    let text_path: text::Text = "${trajectory_fixture}/text_input.f32";
+    guard let mapped::MapResult::Ok(text_mapping) = mapped::map_readonly(text_path.view()) else {
+        io::eprintln("pipeline 1024 oracle: could not map ${text_path}");
+        return 1;
+    };
+    let text_row_bytes: usize = TEXT_WIDTH *% #size_of::[f32]();
+    if text_mapping.length() == (0 as usize)
+        || text_mapping.length() % text_row_bytes != (0 as usize) {
+        io::eprintln("pipeline 1024 oracle: invalid text fixture byte count");
+        return 1;
+    }
+    let text_rows: usize = text_mapping.length() / text_row_bytes;
+    if text_rows != (31 as usize) {
+        io::eprintln("pipeline 1024 oracle: expected the pinned 31-row CASABLANCA fixture, got ${text_rows}");
+        return 1;
+    }
+    var latent: vec::Vec[f32] = vec::Vec[f32]::with_capacity(LATENT_VALUES_1024);
+    var index: usize = 0 as usize;
+    while index < LATENT_VALUES_1024 {
+        latent.append(0.0f32);
+        index = index +% (1 as usize);
+    }
+
+    let total_start_ms: i64 = time::now_millis();
+    let transformer_start_ms: i64 = time::now_millis();
+    let transformer_status: i32 = if cache_dit {
+        transformer::run_prompt_trajectory_cache_dit_1024_to_host(
+            packed_path,
+            text_mapping.pointer() as *f32,
+            text_rows,
+            1301 as u64,
+            #slice_ptr(latent.as_slice()),
+            cache_dit_threshold,
+            "40",
+        )
+    } else {
+        transformer::run_prompt_trajectory_1024_to_host(
+            packed_path,
+            text_mapping.pointer() as *f32,
+            text_rows,
+            1301 as u64,
+            #slice_ptr(latent.as_slice()),
+            "40",
+        )
+    };
+    if transformer_status != (0 as i32) {
+        return 1;
+    }
+    let transformer_wall_ms: i64 = time::now_millis() - transformer_start_ms;
+    let expected_latent_path: text::Text = "${trajectory_fixture}/latent_step_40.f32";
+    guard let option::Option[f64]::Some(latent_error) = normalized_rms_fixture(
+        #slice_ptr(latent.as_slice()), expected_latent_path.view(), LATENT_VALUES_1024,
+    ) else { return 1; };
+
+    var decoded: vec::Vec[f32] = vec::Vec[f32]::with_capacity(DECODED_VALUES_1024);
+    index = 0 as usize;
+    while index < DECODED_VALUES_1024 {
+        decoded.append(0.0f32);
+        index = index +% (1 as usize);
+    }
+    let vae_start_ms: i64 = time::now_millis();
+    if vae::decode_1024_from_host(
+        model_root,
+        #slice_ptr(latent.as_slice()),
+        #slice_ptr(decoded.as_slice()),
+    ) != (0 as i32) {
+        return 1;
+    }
+    let vae_wall_ms: i64 = time::now_millis() - vae_start_ms;
+    let decoded_path: text::Text = "${vae_fixture_root}/trajectory_1024/output.f32";
+    guard let option::Option[f64]::Some(decoded_error) = normalized_rms_fixture(
+        #slice_ptr(decoded.as_slice()), decoded_path.view(), DECODED_VALUES_1024,
+    ) else { return 1; };
+    let image_start_ms: i64 = time::now_millis();
+    if !image_output::write_png_sized(
+        #slice_ptr(decoded.as_slice()), output_path, 1024 as usize, 1024 as usize,
+    ) {
+        return 1;
+    }
+    io::println(
+        "pipeline 1024 oracle: cache_dit=${cache_dit} threshold=${cache_dit_threshold} latent_nRMSE=${latent_error} decoded_nRMSE=${decoded_error} transformer_wall_ms=${transformer_wall_ms} vae_wall_ms=${vae_wall_ms} image_output_wall_ms=${time::now_millis() - image_start_ms} total_wall_ms=${time::now_millis() - total_start_ms} validation=measured-only",
+    );
     return 0;
 }
 

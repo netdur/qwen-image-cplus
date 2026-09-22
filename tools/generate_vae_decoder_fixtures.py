@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Generate pinned Qwen-Image-2.1 still-image VAE decoder fixtures.
 
-The small 1x1-latent case retains every major decoder boundary.  The 16x16
-case decodes the committed 40-step trajectory latent to a complete 256x256
-four-channel sample, proving the real pipeline handoff without committing
-large intermediate feature maps.  Files use NHWC order for direct native
-Metal consumption even though the official module executes NCTHW tensors.
+The small 1x1-latent case retains every major decoder boundary. A trajectory
+case infers its square latent side and decodes the supplied 40-step latent to
+a complete four-channel sample. Files use NHWC order for direct native Metal
+consumption even though the official module executes NCTHW tensors.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import time
 from pathlib import Path
 
@@ -191,6 +191,11 @@ def main() -> int:
         default=Path("tests/fixtures/trajectory_256_fp32/latent_step_40.f32"),
     )
     parser.add_argument("--output", type=Path, default=Path("tests/fixtures/vae_decoder_fp32"))
+    parser.add_argument(
+        "--trajectory-only",
+        action="store_true",
+        help="skip the small diagnostic fixture when generating a large oracle",
+    )
     args = parser.parse_args()
     model_root = args.model.resolve()
     validate_model_root(model_root)
@@ -207,17 +212,29 @@ def main() -> int:
     ).to(device).eval()
     print(f"loaded pinned VAE in {time.perf_counter() - started:.2f}s", flush=True)
 
-    generator = torch.Generator(device="cpu").manual_seed(2101)
-    small = torch.randn((1, 64, 1, 1, 1), generator=generator, dtype=torch.float32)
-    small = small.to(torch.bfloat16).float().to(device)
-    run_case(model, "small_1x1", small, args.output, retain_boundaries=True)
+    if not args.trajectory_only:
+        generator = torch.Generator(device="cpu").manual_seed(2101)
+        small = torch.randn((1, 64, 1, 1, 1), generator=generator, dtype=torch.float32)
+        small = small.to(torch.bfloat16).float().to(device)
+        run_case(model, "small_1x1", small, args.output, retain_boundaries=True)
 
     flat = np.fromfile(args.trajectory_fixture, dtype="<f4")
-    if flat.size != 256 * 64:
-        raise ValueError(f"trajectory fixture has {flat.size} values, expected {256 * 64}")
-    trajectory_hwc = torch.from_numpy(flat.copy().reshape(16, 16, 64))
+    latent_pixels = flat.size // 64
+    latent_side = math.isqrt(latent_pixels)
+    if flat.size % 64 or latent_side * latent_side != latent_pixels:
+        raise ValueError(
+            f"trajectory fixture has {flat.size} values; expected square HWC with 64 channels"
+        )
+    output_pixels = latent_side * 16
+    trajectory_hwc = torch.from_numpy(flat.copy().reshape(latent_side, latent_side, 64))
     trajectory = trajectory_hwc.permute(2, 0, 1).unsqueeze(0).unsqueeze(2).to(device)
-    run_case(model, "trajectory_256", trajectory, args.output, retain_boundaries=False)
+    run_case(
+        model,
+        f"trajectory_{output_pixels}",
+        trajectory,
+        args.output,
+        retain_boundaries=False,
+    )
     return 0
 
 

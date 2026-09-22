@@ -74,7 +74,7 @@ fn decimal_seed_parser_checks_syntax_and_overflow() {
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -269,6 +269,23 @@ fn main() -> i32 {
             }
         }
     }
+    if command == "test-transformer-trajectory-1024" {
+        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(steps) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(fixtures) = env::arg(4 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR");
+            return 2;
+        };
+        return transformer_block::run_trajectory_1024_packed(
+            path.view(), steps.view(), fixtures.view(),
+        );
+    }
     if command == "test-transformer-cache-dit" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
             io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR]");
@@ -290,6 +307,23 @@ fn main() -> i32 {
                 );
             }
         }
+    }
+    if command == "test-transformer-cache-dit-1024" {
+        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(threshold) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(fixtures) = env::arg(4 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR");
+            return 2;
+        };
+        return transformer_block::run_trajectory_cache_dit_1024_packed(
+            path.view(), threshold.view(), fixtures.view(),
+        );
     }
     if command == "test-transformer-taylorseer" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
@@ -331,11 +365,11 @@ fn main() -> i32 {
     }
     if command == "test-vae-decoder" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256|1024|1024-profile [FIXTURE_ROOT]");
+            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT]");
             return 2;
         };
         guard let option::Option[text::Text]::Some(test_case) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256|1024|1024-profile [FIXTURE_ROOT]");
+            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT]");
             return 2;
         };
         match env::arg(4 as usize) {
@@ -364,6 +398,70 @@ fn main() -> i32 {
             packed_path.view(),
             model_path.view(),
             output_path.view(),
+        );
+    }
+    if command == "test-pipeline-1024-oracle" {
+        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(model_root) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(trajectory_fixture) = env::arg(5 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(vae_fixture_root) = env::arg(6 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        return pipeline::run_fixture_1024(
+            packed_path.view(), model_root.view(), output_path.view(),
+            trajectory_fixture.view(), vae_fixture_root.view(),
+        );
+    }
+    if command == "test-pipeline-cache-dit-1024-oracle" {
+        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(model_root) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(threshold_text) = env::arg(5 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        let threshold: f64 = if threshold_text.view() == "0.12" {
+            0.12f64
+        } else if threshold_text.view() == "0.24" {
+            0.24f64
+        } else {
+            io::eprintln("pipeline 1024 oracle Cache-DiT: threshold must be 0.12 or 0.24");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(trajectory_fixture) = env::arg(6 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(vae_fixture_root) = env::arg(7 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
+            return 2;
+        };
+        return pipeline::run_fixture_cache_dit_1024(
+            packed_path.view(), model_root.view(), output_path.view(), threshold,
+            trajectory_fixture.view(), vae_fixture_root.view(),
         );
     }
     if command == "test-pipeline-cache-dit-256" {

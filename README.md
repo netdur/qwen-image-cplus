@@ -73,15 +73,20 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 1
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 2
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
+./target/debug/qwen-image-cplus test-transformer-trajectory-1024 transformer.qipack 40 /path/to/trajectory_1024
 ./target/debug/qwen-image-cplus test-transformer-cache-dit transformer.qipack 0.12
+./target/debug/qwen-image-cplus test-transformer-cache-dit-1024 transformer.qipack 0.12 /path/to/trajectory_1024
 ./target/debug/qwen-image-cplus test-transformer-taylorseer transformer.qipack 0.24
 ./target/debug/qwen-image-cplus test-transformer-bottleneck transformer.qipack
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024-profile
+./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot trajectory-1024 /path/to/vae_oracle_1024
 ./target/debug/qwen-image-cplus test-image-output reference.png
 ./target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./target/debug/qwen-image-cplus test-pipeline-1024-oracle transformer.qipack /path/to/model/snapshot output.png /path/to/trajectory_1024 /path/to/vae_oracle_1024
+./target/debug/qwen-image-cplus test-pipeline-cache-dit-1024-oracle transformer.qipack /path/to/model/snapshot cache.png 0.12 /path/to/trajectory_1024 /path/to/vae_oracle_1024
 ./target/debug/qwen-image-cplus test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
 ./target/debug/qwen-image-cplus test-native-inputs
 ./target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
@@ -103,8 +108,9 @@ optional argument. Omitting it preserves the canonical 40-step behavior. A
 25-step run constructs a fresh 25-step FlowMatch schedule; it does not truncate
 the first 25 points of the 40-step schedule. It reproduces a community ComfyUI
 template choice rather than Qwen's official recommendation. Both 256 and 1024
-paths have end-to-end measurements; their numerical gates and remaining 1024
-oracle limitations are recorded below.
+paths have end-to-end measurements. The 1024/40 path now also has external
+official transformer and VAE oracles; their numerical and visual findings are
+recorded below.
 
 The two `bottleneck` commands are research diagnostics, not production
 recommendations. They use the fixed 4+13+8 stage experiment described below;
@@ -799,8 +805,47 @@ Inspect a shard, optionally filtering tensor names:
   1024px result in **687.920 s end to end**: 13.316 s text, 662.176 s for the
   transformer phase (651.573 s GPU / 654.686 s wall in the denoising loop),
   12.095 s VAE, and 0.308 s PNG output. This is a functional and perceptual
-  smoke result, not an equivalence claim: the Cache-DiT thresholds were
-  measured at 256 and no official 40-step 1024 image oracle exists yet.
+  smoke result, not an equivalence claim. It predates the official 1024
+  trajectory and image oracle described below and is superseded for quality
+  decisions.
+- The official 1024x1024, 40-step oracle gate now replays the pinned
+  Diffusers transformer with the same 31-row `CASABLANCA` poster prompt,
+  seed 1301, scheduler, and per-layer prefix K/V cache. Large tensors remain
+  outside Git. Native input construction is exact: seeded-noise nRMSE is zero
+  and dynamic-RoPE nRMSE is 2.46e-7. Native all-FP16-v4 latents pass the early
+  checkpoints at **0.09597%** (step 1) and **0.14312%** (step 2), but diverge
+  to **13.211%** at step 40 against the official BF16 trajectory. This is a
+  newly exposed long-horizon precision limitation; the old 256-only gate did
+  not justify calling the 1024 path numerically equivalent.
+
+  The pixel-space result is substantially better than the latent number alone
+  suggests. The native 1024 VAE independently matches Diffusers at
+  **6.47e-7 output nRMSE** when fed the same official latent. Decoding the
+  native final latent gives 22.9042% FP32-output nRMSE, 6.42 mean U8 absolute
+  error, 20.55 dB PSNR, and 80.06% of pixels within eight U8 levels on every
+  channel. Visual inspection finds only small high-contrast letter-edge and
+  texture shifts; `CASABLANCA / MEET ME AT / SUNSET` remains exact and the
+  composition matches. Cache-off is therefore the reproducible native policy,
+  but it is visually close rather than numerically equivalent to BF16.
+
+  A confirmed-AC fixture-to-PNG run measured 387.707 s for the transformer
+  loop, 394.789 s for transformer setup plus loop, 10.277 s for VAE setup and
+  decode, and **405.434 s total**. It intentionally bypasses text encoding by
+  consuming the oracle embedding. A preceding full run took 479.823 s as
+  cached-step time drifted from about 10.5 to 14.6 seconds, demonstrating why
+  power and thermal state must accompany long-run timings.
+- The same oracle qualifies ordinary Cache-DiT at 1024/40. Threshold 0.12
+  caches **25/40** steps, measures 17.4586% final-latent and 30.2985%
+  decoded-output nRMSE, and preserves all poster text and overall structure.
+  Its observed loop was 137.934 s and fixture-to-PNG total was 157.122 s;
+  cached steps cost about 0.28 s while full steps cost about 8.58 s in that
+  run. Threshold 0.24 caches only two additional steps (**27/40**) but rises
+  to 26.8949% latent and 42.4777% decoded-output nRMSE and visibly corrupts
+  `CASABLANCA`. It is rejected for 1024/40. Ordinary **0.12 is the recommended
+  1024 Cache-DiT threshold**, still explicit and off by default. Because the
+  0.24 run started hotter, its slower absolute wall time is not used to compare
+  thresholds. Full provenance and measurements are in
+  `benchmarks/m1-max-1024-40-oracle.json`.
 - The 1024 VAE initially reserved every activation arena for the largest
   `[1024,1024,288]` boundary. Shape-specific maxima reduce its explicit scratch
   from 7,389,315,072 to **5,577,375,744 bytes**, saving exactly 1.6875 GiB.
@@ -1042,11 +1087,14 @@ evidence:
    not start a full 40-step image until both phases fit safely on the 32 GB M1
    Max. If they pass, the first resolution-scheduling candidate is
    2048→1024→2048 rather than 1024→512→1024.
-2. **1024 correctness and reproducibility gates.** Add official 40-step
-   trajectory and VAE oracles at 1024, while keeping their large generated
-   data outside Git. Cache-off remains the reproducible path; independently
-   assess Cache-DiT image quality because the existing thresholds were
-   calibrated only at 256.
+2. **1024 precision follow-up.** The official 40-step transformer and VAE
+   oracles are complete. Cache-off is visually close but reaches 13.211%
+   final-latent nRMSE against official BF16; determine whether a bounded
+   higher-precision accumulation or operand path can reduce that long-horizon
+   drift without losing the all-FP16 v4 throughput. Do not loosen a numerical
+   gate merely because this poster remains readable. Cache-DiT calibration is
+   also complete: use 0.12 when explicitly requested and reject 0.24 at
+   1024/40.
 3. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
    FP16 normalization/SwiGLU output have completed Plan-5 F1, F2, and F4.
    First-order TaylorSeer F8 is also complete: its predictor passed the 256
@@ -1080,8 +1128,10 @@ evidence:
    readahead is superseded; tensor-order `madvise`, broad text Q8, four-query
    attention at 256, and blanket 256-thread elementwise groups stay rejected
    unless new evidence changes their tradeoffs.
-6. **End-to-end remeasurement.** Repeat cache-off and Cache-DiT 1024 prompts
-   with warm-filesystem and cold-page conditions reported separately.
+6. **Production end-to-end remeasurement.** The fixture-driven cache-off and
+   Cache-DiT 0.12 oracle-to-PNG paths are measured. Repeat arbitrary native
+   prompts including text encoding with warm-filesystem and cold-page
+   conditions reported separately.
    Transformer loop, phase wall time, process wall time, memory footprint, and
    numerical/perceptual gates remain separate measurements.
 

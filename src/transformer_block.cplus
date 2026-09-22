@@ -4339,6 +4339,92 @@ fn run_trajectory_packed(
     );
 }
 
+// Replays the pinned official 1024px/40-step CASABLANCA oracle. The fixture
+// supplies the exact Diffusers text embedding while the native runtime
+// independently regenerates the seed-1301 latent and dynamic RoPE, so the
+// comparison covers both input construction and the complete trajectory.
+fn run_trajectory_1024_packed(
+    packed_path: str,
+    requested_steps: str,
+    fixture_directory: str,
+) -> i32 {
+    if !(requested_steps == "1" || requested_steps == "2" || requested_steps == "40") {
+        io::eprintln("1024 trajectory: steps must be 1, 2, or 40");
+        return 2;
+    }
+    let text_path: text::Text = "${fixture_directory}/text_input.f32";
+    guard let mapped::MapResult::Ok(text_mapping) = mapped::map_readonly(text_path.view()) else {
+        io::eprintln("1024 trajectory: could not map ${text_path}");
+        return 1;
+    };
+    let row_bytes: usize = WIDTH *% #size_of::[f32]();
+    if text_mapping.length() == (0 as usize)
+        || text_mapping.length() % row_bytes != (0 as usize) {
+        io::eprintln("1024 trajectory: invalid text fixture byte count ${text_mapping.length()}");
+        return 1;
+    }
+    let text_rows: usize = text_mapping.length() / row_bytes;
+    if text_rows != (31 as usize) {
+        io::eprintln("1024 trajectory: expected the pinned 31-row CASABLANCA fixture, got ${text_rows}");
+        return 1;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        requested_steps,
+        fixture_directory,
+        0 as *f32,
+        text_mapping.pointer() as *f32,
+        text_rows,
+        1301 as u64,
+        true,
+        true,
+        false,
+        0.0f64,
+        1024 as usize,
+    );
+}
+
+fn run_trajectory_cache_dit_1024_packed(
+    packed_path: str,
+    threshold_text: str,
+    fixture_directory: str,
+) -> i32 {
+    guard let option::Option[f64]::Some(threshold) = cache_dit_threshold(threshold_text) else {
+        io::eprintln("1024 trajectory Cache-DiT: threshold must be 0.12 or 0.24");
+        return 2;
+    };
+    let text_path: text::Text = "${fixture_directory}/text_input.f32";
+    guard let mapped::MapResult::Ok(text_mapping) = mapped::map_readonly(text_path.view()) else {
+        io::eprintln("1024 trajectory Cache-DiT: could not map ${text_path}");
+        return 1;
+    };
+    let row_bytes: usize = WIDTH *% #size_of::[f32]();
+    if text_mapping.length() == (0 as usize)
+        || text_mapping.length() % row_bytes != (0 as usize) {
+        io::eprintln("1024 trajectory Cache-DiT: invalid text fixture byte count ${text_mapping.length()}");
+        return 1;
+    }
+    let text_rows: usize = text_mapping.length() / row_bytes;
+    if text_rows != (31 as usize) {
+        io::eprintln("1024 trajectory Cache-DiT: expected the pinned 31-row CASABLANCA fixture, got ${text_rows}");
+        return 1;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        "40",
+        fixture_directory,
+        0 as *f32,
+        text_mapping.pointer() as *f32,
+        text_rows,
+        1301 as u64,
+        true,
+        true,
+        true,
+        threshold,
+        1024 as usize,
+    );
+}
+
 // Short 1024px optimization loop using the committed 31-row scale fixture as
 // text conditioning and its pinned seed. Steps 1 and 2 are prefixes of the
 // canonical 40-step schedule: step 1 builds every layer's prefix K/V cache;
@@ -4849,10 +4935,6 @@ fn run_trajectory_packed_impl(
     if !(pixels == (128 as usize) || pixels == (256 as usize) || pixels == (512 as usize)
         || pixels == (1024 as usize)) {
         io::eprintln("trajectory: pixels must be 128, 256, 512, or 1024");
-        return 2;
-    }
-    if validate_reference && pixels != (256 as usize) {
-        io::eprintln("trajectory: reference checkpoints are available only at 256px");
         return 2;
     }
     if validate_reference && step_limit == (25 as usize) {

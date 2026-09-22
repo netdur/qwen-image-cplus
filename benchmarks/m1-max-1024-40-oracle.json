@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
+  "scope": "official 1024x1024 40-step transformer, VAE, cache-off, and ordinary Cache-DiT calibration",
+  "oracle": {
+    "case": "text-1024-middle",
+    "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+    "seed": 1301,
+    "text_rows": 31,
+    "target_rows": 4096,
+    "steps": 40,
+    "transformer_dtype": "BF16",
+    "transformer_step_seconds_sum": 692.6119734158274,
+    "vae_dtype": "FP32",
+    "vae_decode_seconds": 5.736666874960065,
+    "environment": {
+      "torch": "2.9.0",
+      "diffusers": "0.41.0.dev0",
+      "transformers": "5.17.0",
+      "accelerate": "1.10.1",
+      "device": "mps"
+    },
+    "fixture_policy": "large generated tensors and images remain in /private/tmp and are not committed",
+    "reference_png": {
+      "bytes": 1936841,
+      "sha256": "b02b2725a2630022d70616042e3db1c0a5d06f8934086463e3691cd2b87e04a8"
+    }
+  },
+  "native_input_and_early_gates": {
+    "seeded_noise_nrmse": 0.0,
+    "dynamic_rope_nrmse": 2.46333e-7,
+    "step_1_latent_nrmse": 0.000959688,
+    "step_1_limit": 0.001,
+    "step_2_latent_nrmse": 0.0014312,
+    "step_2_limit": 0.0015,
+    "result": "pass"
+  },
+  "native_vae_official_latent_gate": {
+    "gpu_ms": 9648.79,
+    "output_nrmse": 6.47344e-7,
+    "limit": 3e-6,
+    "result": "pass"
+  },
+  "cache_off": {
+    "packed_policy": "transformer:all-matrix-f16-v4",
+    "q8_dispatch_matrices": 0,
+    "cached_approximation_steps": 0,
+    "transformer_loop_wall_ms": 387707,
+    "transformer_phase_wall_ms": 394789,
+    "vae_phase_wall_ms": 10277,
+    "png_wall_ms": 296,
+    "fixture_to_png_wall_ms": 405434,
+    "text_encoder_included": false,
+    "final_latent_nrmse": 0.13211,
+    "decoded_fp32_nrmse": 0.229042,
+    "png_metrics_vs_official": {
+      "mean_absolute_u8": 6.421536922454834,
+      "rmse_u8": 23.934114420939498,
+      "psnr_db": 20.55045635039743,
+      "pixels_with_all_channels_within_8_percent": 80.06315231323242
+    },
+    "png_sha256": "835a8eaacfb245b5125804ef5a7ad68ccace7d29238856d6b487e645fd2fff7f",
+    "visual_result": "close composition, texture, color, and exact requested text; small high-contrast letter-edge shifts",
+    "numerical_result": "not equivalent to the official BF16 trajectory",
+    "policy": "reproducible native default"
+  },
+  "cache_dit_0_12": {
+    "cached_steps": 25,
+    "full_steps": 15,
+    "transformer_loop_wall_ms": 137934,
+    "transformer_phase_wall_ms": 146582,
+    "vae_phase_wall_ms": 10162,
+    "png_wall_ms": 304,
+    "fixture_to_png_wall_ms": 157122,
+    "text_encoder_included": false,
+    "final_latent_nrmse": 0.174586,
+    "decoded_fp32_nrmse": 0.302985,
+    "png_metrics_vs_official": {
+      "mean_absolute_u8": 8.959915399551392,
+      "rmse_u8": 31.659736294464473,
+      "psnr_db": 18.120657745806113,
+      "pixels_with_all_channels_within_8_percent": 77.99806594848633
+    },
+    "png_sha256": "207d4fcce9783f0fd3caae979c7d815632bfb923740a46c36cb83bf1ac8bedde",
+    "visual_result": "all requested text and overall poster structure preserved",
+    "decision": "recommended explicit 1024 Cache-DiT threshold; remains off by default"
+  },
+  "cache_dit_0_24": {
+    "cached_steps": 27,
+    "full_steps": 13,
+    "transformer_loop_wall_ms": 146861,
+    "transformer_phase_wall_ms": 154686,
+    "vae_phase_wall_ms": 11816,
+    "png_wall_ms": 300,
+    "fixture_to_png_wall_ms": 166876,
+    "text_encoder_included": false,
+    "final_latent_nrmse": 0.268949,
+    "decoded_fp32_nrmse": 0.424777,
+    "png_metrics_vs_official": {
+      "mean_absolute_u8": 16.1798095703125,
+      "rmse_u8": 44.384363921879256,
+      "psnr_db": 15.186203602080584,
+      "pixels_with_all_channels_within_8_percent": 54.67681884765625
+    },
+    "png_sha256": "c630d8a96fe63e89e1932d106d508bb0ced8472f88127c9198cf3c5bce5e73b8",
+    "visual_result": "top-line CASABLANCA lettering visibly corrupted",
+    "decision": "reject at 1024x1024 and 40 steps"
+  },
+  "timing_notes": [
+    "MPSGraph fragments command-buffer GPU timestamps, so integrated wall time is authoritative.",
+    "The cache-off fixture-to-PNG run was made on confirmed AC power; cached-prefix steps rose from about 8.6-8.9 seconds early to about 11.2 seconds at the tail.",
+    "An earlier cache-off loop took 479823 ms as step time rose from about 10.5 to 14.6 seconds; it produced the same 0.13211 final-latent nRMSE.",
+    "The 0.24 run followed the other long runs and started hotter. Its slower wall time despite two extra cached steps is not an algorithmic comparison with 0.12.",
+    "Fixture-driven totals exclude tokenization and text encoding because the exact official text embedding is an oracle input."
+  ],
+  "decision": "close the 1024 oracle and ordinary Cache-DiT calibration phase; keep cache-off as default, recommend 0.12 when approximation is requested, reject 0.24, and retain long-horizon BF16-vs-native precision drift as the next correctness investigation"
+}

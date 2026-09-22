@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the pinned 256px, 40-step latent-trajectory oracle.
+"""Generate a pinned 40-step latent-trajectory oracle.
 
 This development-only tool follows the Qwen-Image-2.1 pipeline's exact
 FlowMatch schedule and KV-cache transition.  The runtime fixture contains the
@@ -38,7 +38,7 @@ from calibrate_transformer_quantization import (
 
 
 STEPS = 40
-CASE_NAME = "short-256-early"
+DEFAULT_CASE = "short-256-early"
 CHECKPOINTS = (1, 2, 40)
 
 
@@ -70,7 +70,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument(
-        "--output", type=Path, default=Path("tests/fixtures/trajectory_256_fp32")
+        "--case",
+        choices=tuple(case.name for case in CASES),
+        default=DEFAULT_CASE,
+        help="calibration prompt, resolution, and latent seed to reproduce",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="output directory (defaults to tests/fixtures/trajectory_<pixels>_fp32)",
     )
     args = parser.parse_args()
     model_root = args.model.resolve()
@@ -78,7 +86,7 @@ def main() -> int:
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS is required for trajectory fixture generation")
 
-    case = next(case for case in CASES if case.name == CASE_NAME)
+    case = next(case for case in CASES if case.name == args.case)
     device = torch.device("mps")
     prompt = encode_prompts(model_root, device)[case.prompt_index]
 
@@ -156,7 +164,7 @@ def main() -> int:
                 flush=True,
             )
 
-    directory = args.output
+    directory = args.output or Path(f"tests/fixtures/trajectory_{case.pixels}_fp32")
     directory.mkdir(parents=True, exist_ok=True)
     records: dict[str, dict] = {}
     write_tensor(directory, "image_input", initial_latents.numpy(), records)
@@ -174,7 +182,7 @@ def main() -> int:
 
     metadata = {
         "schema_version": 1,
-        "operation": "Qwen-Image-2.1 256px latent-only 40-step trajectory",
+        "operation": f"Qwen-Image-2.1 {case.pixels}px latent-only 40-step trajectory",
         "model_snapshot": MODEL_SNAPSHOT,
         "diffusers_commit": DIFFUSERS_COMMIT,
         "environment": {

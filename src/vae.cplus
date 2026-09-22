@@ -736,6 +736,17 @@ fn run(
             requested_case == "1024-profile",
         );
     }
+    if requested_case == "trajectory-1024" {
+        return run_impl(
+            model_root,
+            requested_case,
+            fixture_root,
+            0 as *f32,
+            0 as *f32,
+            true,
+            false,
+        );
+    }
     return run_impl(
         model_root,
         requested_case,
@@ -826,8 +837,11 @@ fn run_impl(
     } else if requested_case == "1024" {
         input_height = 64 as usize;
         case_directory = "";
+    } else if requested_case == "trajectory-1024" {
+        input_height = 64 as usize;
+        case_directory = "trajectory_1024";
     } else {
-        io::eprintln("VAE: case must be small, 256, or 1024");
+        io::eprintln("VAE: case must be small, 256, 1024, or trajectory-1024");
         return 2;
     }
     let input_width: usize = input_height;
