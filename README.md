@@ -61,6 +61,7 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
 ./target/debug/qwen-image-cplus quantize-transformer /path/to/model/snapshot transformer.qipack
+./target/debug/qwen-image-cplus quantize-transformer-q4 /path/to/model/snapshot transformer-q4.qipack
 ./target/debug/qwen-image-cplus verify-packed block0.qipack
 ./target/debug/qwen-image-cplus verify-packed transformer.qipack
 ./target/debug/qwen-image-cplus verify-packed-source block0.qipack /path/to/model/snapshot
@@ -103,6 +104,17 @@ cpc test
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
+
+The storage-only Q4 builder implements the plan-6 H256 rotation rather than
+plain scalar Q4. On the M1 Max, the pinned snapshot produced
+`models/qwen-image-2.1-int4-rot-h256-v5.qipack` in 382.05 seconds: 297 tensors,
+231 rotated-Q4 matrices, 3,561,009,408 bytes, and SHA-256
+`11be8fc9939e9c4a16c0736045768a0a0b3edb81a536f1e8678a44d0466a0850`.
+The writer verified the complete payload and independently regenerated every
+rotated weight and scale from the BF16 source before the atomic rename. This
+artifact is intentionally not inference-enabled yet: it separates the costly
+model conversion from the next decision between load-time expansion, a
+per-block FP16 ring, and a native packed Metal dot product.
 
 The five production generation commands accept `25` or `40` as their final
 optional argument. Omitting it preserves the canonical 40-step behavior. A

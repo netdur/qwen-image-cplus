@@ -48,6 +48,7 @@ const SEEK_SET: i32 = 0;
 const SCHEME_BF16: u32 = 0;
 const SCHEME_FP16: u32 = 1;
 const SCHEME_INT8_AFFINE: u32 = 3;
+const SCHEME_INT4_ROTATED: u32 = 4;
 const TYPE_NONE: u32 = 0;
 const TYPE_F16: u32 = 1;
 const TYPE_U8: u32 = 2;
@@ -59,9 +60,11 @@ const LEGACY_FULL_POLICY: str = "transformer:mixed-q8-g64-v1";
 const FP16_MLP_POLICY: str = "transformer:q8-g64-f16-v2";
 const QKV_FP16_Q8_POLICY: str = "transformer:qkv-f16-q8-g64-v3";
 const FULL_POLICY: str = "transformer:all-matrix-f16-v4";
+const INT4_ROTATED_POLICY: str = "transformer:int4-rot-h256-v5";
 const FULL_PARAMETER_COUNT: u64 = 7115124736;
 const LEGACY_FULL_FILE_BYTES: u64 = 13334843392;
 const FULL_FILE_BYTES: u64 = 14230327296;
+const INT4_ROTATED_FILE_BYTES: u64 = 3561009408;
 
 #[repr(C)]
 struct PackedHeader {
@@ -487,12 +490,23 @@ fn full_tensor_uses_fp16(
     return (dense_qkv || role_index >= (6 as usize)) && !spec.quantized;
 }
 
+// H256 rotation requires a matrix K dimension divisible by 256. The only
+// excluded matrix is img_in.weight with K=64; vectors remain BF16.
+fn full_tensor_uses_int4_rotated(index: usize) -> bool {
+    let spec: FullTensorSpec = full_tensor_spec(index);
+    return spec.input >= (256 as u64) && spec.input % (256 as u64) == (0 as u64);
+}
+
 fn full_expected_scheme(
     index: usize,
     fp16_policy: bool,
     qkv_policy: bool = false,
     all_matrix_policy: bool = false,
+    int4_rotated_policy: bool = false,
 ) -> u32 {
+    if int4_rotated_policy && full_tensor_uses_int4_rotated(index) {
+        return SCHEME_INT4_ROTATED;
+    }
     let spec: FullTensorSpec = full_tensor_spec(index);
     if fp16_policy && full_tensor_uses_fp16(index, qkv_policy, all_matrix_policy) {
         return SCHEME_FP16;
@@ -506,24 +520,28 @@ fn make_full_record(
     name: str,
     spec: FullTensorSpec,
     ref cursor: u64,
+    int4_rotated_policy: bool = false,
 ) -> PackedRecord {
     let elements: u64 = if spec.input == (0 as u64) { spec.output } else { spec.output *% spec.input };
-    let scheme: u32 = full_expected_scheme(index, true, true, true);
+    let scheme: u32 = full_expected_scheme(index, true, true, true, int4_rotated_policy);
     let quantized: bool = scheme == SCHEME_INT8_AFFINE;
+    let int4_rotated: bool = scheme == SCHEME_INT4_ROTATED;
     let groups: u64 = if quantized { spec.output *% (spec.input / (64 as u64)) } else { 0 as u64 };
     var record: PackedRecord = PackedRecord {
         name: [0 as u8; 128],
         scheme: scheme,
         rank: if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 },
         dimensions: [spec.output, spec.input, 0 as u64, 0 as u64],
-        group_axis: if quantized { 1 as u32 } else { (0xFFFFFFFF as u32) },
-        group_size: if quantized { 64 as u32 } else { 0 as u32 },
-        scale_type: if quantized { TYPE_F16 } else { TYPE_NONE },
+        group_axis: if quantized || int4_rotated { 1 as u32 } else { (0xFFFFFFFF as u32) },
+        group_size: if int4_rotated { 256 as u32 } else if quantized { 64 as u32 } else { 0 as u32 },
+        scale_type: if quantized || int4_rotated { TYPE_F16 } else { TYPE_NONE },
         zero_type: if quantized { TYPE_U8 } else { TYPE_NONE },
         weights_offset: 0 as u64,
-        weights_length: if quantized { elements } else { elements *% (2 as u64) },
+        weights_length: if int4_rotated {
+            (elements +% (1 as u64)) / (2 as u64)
+        } else if quantized { elements } else { elements *% (2 as u64) },
         scales_offset: 0 as u64,
-        scales_length: groups *% (2 as u64),
+        scales_length: if int4_rotated { spec.output *% (2 as u64) } else { groups *% (2 as u64) },
         zeros_offset: 0 as u64,
         zeros_length: groups,
         elements: elements,
@@ -534,15 +552,33 @@ fn make_full_record(
     cursor = align_up(cursor, TENSOR_ALIGNMENT);
     record.weights_offset = cursor;
     cursor = cursor +% record.weights_length;
-    if quantized {
+    if quantized || int4_rotated {
         cursor = align_up(cursor, TENSOR_ALIGNMENT);
         record.scales_offset = cursor;
         cursor = cursor +% record.scales_length;
+    }
+    if quantized {
         cursor = align_up(cursor, TENSOR_ALIGNMENT);
         record.zeros_offset = cursor;
         cursor = cursor +% record.zeros_length;
     }
     return record;
+}
+
+fn full_layout_file_bytes(int4_rotated_policy: bool) -> u64 {
+    var cursor: u64 = align_up(
+        HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64,
+        DATA_ALIGNMENT,
+    );
+    var index: usize = 0 as usize;
+    while index < FULL_TENSOR_COUNT {
+        let name: text::Text = full_tensor_name(index, true);
+        let _record: PackedRecord = make_full_record(
+            index, name.view(), full_tensor_spec(index), cursor, int4_rotated_policy,
+        );
+        index = index +% (1 as usize);
+    }
+    return align_up(cursor, TENSOR_ALIGNMENT);
 }
 
 fn make_record(spec: TensorSpec, ref cursor: u64) -> PackedRecord {
@@ -639,6 +675,95 @@ fn quantize_tensor(tensor: safetensors::TensorData, record: PackedRecord) -> opt
     return option::Option[[OwnedBytes; 3]]::Some([weights, scales, zeros]);
 }
 
+fn hadamard_256_in_place(values: *f32) {
+    var stride: usize = 1 as usize;
+    while stride < (256 as usize) {
+        let span: usize = stride *% (4 as usize);
+        var base: usize = 0 as usize;
+        while base < (256 as usize) {
+            var offset: usize = 0 as usize;
+            while offset < stride {
+                let a: f32 = values[base +% offset];
+                let b: f32 = values[base +% stride +% offset];
+                let c: f32 = values[base +% (2 as usize) *% stride +% offset];
+                let d: f32 = values[base +% (3 as usize) *% stride +% offset];
+                values[base +% offset] = (a + b + c - d) * 0.5f32;
+                values[base +% stride +% offset] = (a + b - c + d) * 0.5f32;
+                values[base +% (2 as usize) *% stride +% offset] =
+                    (a - b + c + d) * 0.5f32;
+                values[base +% (3 as usize) *% stride +% offset] =
+                    (0.0f32 - a + b + c + d) * 0.5f32;
+                offset = offset +% (1 as usize);
+            }
+            base = base +% span;
+        }
+        stride = stride *% (4 as usize);
+    }
+}
+
+// Rotate each contiguous H256 input group, then apply one symmetric signed-Q4
+// scale per output row. Nibbles are two's-complement signed values in [-7, 7]
+// with the even input column in the low nibble; -8 is intentionally unused.
+fn quantize_tensor_int4_rotated(
+    tensor: safetensors::TensorData,
+    record: PackedRecord,
+) -> option::Option[[OwnedBytes; 2]] {
+    guard let option::Option[OwnedBytes]::Some(weights) = OwnedBytes::allocate(
+        record.weights_length as usize,
+    ) else { return option::Option[[OwnedBytes; 2]]::None; };
+    guard let option::Option[OwnedBytes]::Some(scales) = OwnedBytes::allocate(
+        record.scales_length as usize,
+    ) else { return option::Option[[OwnedBytes; 2]]::None; };
+    let input_count: usize = record.dimensions[1] as usize;
+    guard let option::Option[OwnedBytes]::Some(row_storage) = OwnedBytes::allocate(
+        input_count *% #size_of::[f32](),
+    ) else { return option::Option[[OwnedBytes; 2]]::None; };
+    let source: *u16 = tensor.pointer as *u16;
+    let rotated: *f32 = row_storage.pointer as *f32;
+    let scale_values: *u16 = scales.pointer as *u16;
+    let output_count: usize = record.dimensions[0] as usize;
+    var row: usize = 0 as usize;
+    while row < output_count {
+        var maximum: f32 = 0.0f32;
+        var group_start: usize = 0 as usize;
+        while group_start < input_count {
+            var inner: usize = 0 as usize;
+            while inner < (256 as usize) {
+                rotated[group_start +% inner] = cpu::bf16_to_f32(
+                    source[row *% input_count +% group_start +% inner],
+                );
+                inner = inner +% (1 as usize);
+            }
+            hadamard_256_in_place(rotated + group_start);
+            inner = 0 as usize;
+            while inner < (256 as usize) {
+                maximum = maximum.max(rotated[group_start +% inner].abs());
+                inner = inner +% (1 as usize);
+            }
+            group_start = group_start +% (256 as usize);
+        }
+        var scale: f32 = maximum / 7.0f32;
+        if scale == 0.0f32 { scale = 1.0f32; }
+        let scale_bits: u16 = cpu::f32_to_fp16(scale);
+        let stored_scale: f32 = cpu::fp16_to_f32(scale_bits);
+        scale_values[row] = scale_bits;
+        var column: usize = 0 as usize;
+        while column < input_count {
+            var low: f32 = (rotated[column] / stored_scale).round();
+            low = low.max(0.0f32 - 7.0f32).min(7.0f32);
+            var high: f32 = (rotated[column +% (1 as usize)] / stored_scale).round();
+            high = high.max(0.0f32 - 7.0f32).min(7.0f32);
+            let low_nibble: u8 = ((low as i32) & (15 as i32)) as u8;
+            let high_nibble: u8 = ((high as i32) & (15 as i32)) as u8;
+            let packed_index: usize = (row *% input_count +% column) / (2 as usize);
+            weights.pointer[packed_index] = low_nibble | (high_nibble << (4 as u8));
+            column = column +% (2 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    return option::Option[[OwnedBytes; 2]]::Some([weights, scales]);
+}
+
 fn convert_tensor_to_fp16(tensor: safetensors::TensorData) -> option::Option[OwnedBytes] {
     guard let option::Option[OwnedBytes]::Some(output) = OwnedBytes::allocate(
         tensor.byte_length as usize,
@@ -662,7 +787,10 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
     let qkv_fp16_q8_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, QKV_FP16_Q8_POLICY,
     );
-    let qkv_policy: bool = all_matrix_policy || qkv_fp16_q8_policy;
+    let int4_rotated_policy: bool = fixed_matches(
+        #addr_of((*header).policy[0]), 32 as usize, INT4_ROTATED_POLICY,
+    );
+    let qkv_policy: bool = all_matrix_policy || qkv_fp16_q8_policy || int4_rotated_policy;
     let fp16_mlp_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FP16_MLP_POLICY,
     );
@@ -680,13 +808,16 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
         || (*header).scope != SCOPE_TRANSFORMER
         || (*header).directory_offset != HEADER_BYTES
         || (*header).data_offset != expected_data_offset
-        || (*header).file_bytes != if all_matrix_policy {
+        || (*header).file_bytes != if int4_rotated_policy {
+        INT4_ROTATED_FILE_BYTES
+    } else if all_matrix_policy {
         FULL_FILE_BYTES
     } else { LEGACY_FULL_FILE_BYTES }
     || (*header).file_bytes != file.length() as u64
         || !fixed_matches(#addr_of((*header).model_snapshot[0]), 40 as usize, SNAPSHOT)
         || !fixed_matches(#addr_of((*header).diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT)
-        || !(all_matrix_policy || qkv_fp16_q8_policy || fp16_mlp_policy || legacy_policy) {
+        || !(all_matrix_policy || qkv_fp16_q8_policy || fp16_mlp_policy
+            || legacy_policy || int4_rotated_policy) {
         if !quiet { io::eprintln("packed transformer: invalid header or model identity"); }
         return 1;
     }
@@ -705,13 +836,14 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
     var cursor: u64 = (*header).data_offset;
     var parameter_count: u64 = 0 as u64;
     var quantized_count: usize = 0 as usize;
+    var int4_count: usize = 0 as usize;
     var index: usize = 0 as usize;
     while index < FULL_TENSOR_COUNT {
         let record: *PackedRecord = records + index;
         let name: text::Text = full_tensor_name(index, qkv_policy);
         let spec: FullTensorSpec = full_tensor_spec(index);
         let expected_scheme: u32 = full_expected_scheme(
-            index, fp16_policy, qkv_policy, all_matrix_policy,
+            index, fp16_policy, qkv_policy, all_matrix_policy, int4_rotated_policy,
         );
         let expected_rank: u32 = if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 };
         let expected_elements: u64 = if spec.input == (0 as u64) {
@@ -723,6 +855,9 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
         if expected_scheme == SCHEME_INT8_AFFINE {
             quantized_count = quantized_count +% (1 as usize);
         }
+        if expected_scheme == SCHEME_INT4_ROTATED {
+            int4_count = int4_count +% (1 as usize);
+        }
         if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, name.view())
             || (*record).rank != expected_rank
             || (*record).dimensions[0] != spec.output
@@ -731,6 +866,8 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
             || (*record).scheme != expected_scheme
             || (expected_scheme == SCHEME_INT8_AFFINE
                 && (*record).weights_length != expected_elements)
+            || (expected_scheme == SCHEME_INT4_ROTATED
+                && (*record).weights_length != (expected_elements +% (1 as u64)) / (2 as u64))
             || (*record).weights_offset % TENSOR_ALIGNMENT != (0 as u64)
             || (*record).weights_offset < cursor
             || (*record).weights_offset > (*header).file_bytes
@@ -776,6 +913,25 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
                 (*record).zeros_length as usize,
             );
             cursor = (*record).zeros_offset +% (*record).zeros_length;
+        } else if (*record).scheme == SCHEME_INT4_ROTATED {
+            if (*record).group_axis != (1 as u32) || (*record).group_size != (256 as u32)
+                || (*record).scale_type != TYPE_F16 || (*record).zero_type != TYPE_NONE
+                || (*record).scales_length != spec.output *% (2 as u64)
+                || (*record).zeros_offset != (0 as u64)
+                || (*record).zeros_length != (0 as u64)
+                || (*record).scales_offset % TENSOR_ALIGNMENT != (0 as u64)
+                || (*record).scales_offset < cursor
+                || (*record).scales_offset > (*header).file_bytes
+                || (*record).scales_length > (*header).file_bytes -% (*record).scales_offset {
+                if !quiet { io::eprintln("packed transformer: invalid INT4 rotation metadata ${index}"); }
+                return 1;
+            }
+            tensor_hash = hash_update(
+                tensor_hash,
+                file.pointer() + (*record).scales_offset as usize,
+                (*record).scales_length as usize,
+            );
+            cursor = (*record).scales_offset +% (*record).scales_length;
         } else if ((*record).scheme != SCHEME_BF16 && (*record).scheme != SCHEME_FP16)
             || (*record).weights_length != expected_elements *% (2 as u64)
             || (*record).scales_offset != (0 as u64)
@@ -791,17 +947,19 @@ fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
         }
         index = index +% (1 as usize);
     }
-    let expected_quantized_count: usize = if all_matrix_policy {
+    let expected_quantized_count: usize = if all_matrix_policy || int4_rotated_policy {
         0 as usize
     } else { 40 as usize };
+    let expected_int4_count: usize = if int4_rotated_policy { 231 as usize } else { 0 as usize };
     if parameter_count != FULL_PARAMETER_COUNT || quantized_count != expected_quantized_count
+        || int4_count != expected_int4_count
         || align_up(cursor, TENSOR_ALIGNMENT) != (*header).file_bytes {
         if !quiet { io::eprintln("packed transformer: inventory or trailing data mismatch"); }
         return 1;
     }
     if !quiet {
         io::println(
-            "packed transformer: tensors=${FULL_TENSOR_COUNT} parameters=${parameter_count} q8=${quantized_count} bytes=${(*header).file_bytes}",
+            "packed transformer: tensors=${FULL_TENSOR_COUNT} parameters=${parameter_count} q8=${quantized_count} q4_rotated=${int4_count} bytes=${(*header).file_bytes}",
         );
         io::println("packed transformer: verified");
     }
@@ -1301,11 +1459,14 @@ fn verify_full_against_source(
         return 1;
     };
     let header: *PackedHeader = packed.pointer() as *PackedHeader;
+    let int4_rotated_policy: bool = fixed_matches(
+        #addr_of((*header).policy[0]), 32 as usize, INT4_ROTATED_POLICY,
+    );
     let qkv_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FULL_POLICY,
     ) || fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, QKV_FP16_Q8_POLICY,
-    );
+    ) || int4_rotated_policy;
     if !magic_matches(header) || (*header).scope != SCOPE_TRANSFORMER
         || (*header).tensor_count != FULL_TENSOR_COUNT as u32 {
         return 1;
@@ -1361,6 +1522,27 @@ fn verify_full_against_source(
                     return 1;
                 }
                 element = element +% (1 as usize);
+            }
+        } else if (*record).scheme == SCHEME_INT4_ROTATED {
+            guard let option::Option[[OwnedBytes; 2]]::Some(buffers) =
+                quantize_tensor_int4_rotated(tensor, { *record }) else { return 1; };
+            let packed_weights: *u8 = packed.pointer() + (*record).weights_offset as usize;
+            let packed_scales: *u8 = packed.pointer() + (*record).scales_offset as usize;
+            var byte_index: usize = 0 as usize;
+            while byte_index < buffers[0].length {
+                if packed_weights[byte_index] != buffers[0].pointer[byte_index] {
+                    if !quiet { io::eprintln("packed transformer: INT4 rotated round-trip mismatch ${name}"); }
+                    return 1;
+                }
+                byte_index = byte_index +% (1 as usize);
+            }
+            byte_index = 0 as usize;
+            while byte_index < buffers[1].length {
+                if packed_scales[byte_index] != buffers[1].pointer[byte_index] {
+                    if !quiet { io::eprintln("packed transformer: INT4 scale round-trip mismatch ${name}"); }
+                    return 1;
+                }
+                byte_index = byte_index +% (1 as usize);
             }
         } else {
             let source_values: *u16 = tensor.pointer as *u16;
@@ -1614,7 +1796,11 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
     return 0;
 }
 
-fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
+fn quantize_transformer_impl(
+    model_directory: str,
+    output_path: str,
+    int4_rotated_policy: bool,
+) -> i32 {
     if #size_of::[PackedHeader]() != HEADER_BYTES as usize
         || #size_of::[PackedRecord]() != RECORD_BYTES as usize {
         io::eprintln("packed transformer: ABI layout does not match the format");
@@ -1649,7 +1835,7 @@ fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
     while index < FULL_TENSOR_COUNT {
         let name: text::Text = full_tensor_name(index, true);
         let record: PackedRecord = make_full_record(
-            index, name.view(), full_tensor_spec(index), cursor,
+            index, name.view(), full_tensor_spec(index), cursor, int4_rotated_policy,
         );
         if records.append(record) != status::Status::Ok {
             return 1;
@@ -1657,7 +1843,10 @@ fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
         index = index +% (1 as usize);
     }
     let file_bytes: u64 = align_up(cursor, TENSOR_ALIGNMENT);
-    if file_bytes != FULL_FILE_BYTES {
+    let expected_file_bytes: u64 = if int4_rotated_policy {
+        INT4_ROTATED_FILE_BYTES
+    } else { FULL_FILE_BYTES };
+    if file_bytes != expected_file_bytes {
         io::eprintln("packed transformer: generated layout does not match the pinned size");
         return 1;
     }
@@ -1678,7 +1867,11 @@ fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
     };
     let _snapshot_ok: bool = fixed_text(#addr_of(header.model_snapshot[0]), 40 as usize, SNAPSHOT);
     let _commit_ok: bool = fixed_text(#addr_of(header.diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT);
-    let _policy_ok: bool = fixed_text(#addr_of(header.policy[0]), 32 as usize, FULL_POLICY);
+    let _policy_ok: bool = fixed_text(
+        #addr_of(header.policy[0]),
+        32 as usize,
+        if int4_rotated_policy { INT4_ROTATED_POLICY } else { FULL_POLICY },
+    );
 
     let temporary_path: text::Text = "${output_path}.tmp";
     guard let option::Option[text::CString]::Some(c_temporary) = temporary_path.c_str() else {
@@ -1759,6 +1952,24 @@ fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
             ok = write_payload(fd, converted.pointer, converted.length, payload_checksum);
             tensor_hash = hash_update(tensor_hash, converted.pointer, converted.length);
             position = position +% converted.length as u64;
+        } else if (*record).scheme == SCHEME_INT4_ROTATED {
+            guard let option::Option[[OwnedBytes; 2]]::Some(buffers) =
+                quantize_tensor_int4_rotated(tensor, { *record }) else {
+                ok = false;
+                break;
+            };
+            ok = write_payload(fd, buffers[0].pointer, buffers[0].length, payload_checksum);
+            tensor_hash = hash_update(tensor_hash, buffers[0].pointer, buffers[0].length);
+            position = position +% buffers[0].length as u64;
+            if ok && position < { (*record).scales_offset } {
+                ok = write_zeroes(fd, { (*record).scales_offset } -% position, payload_checksum, true);
+                position = { (*record).scales_offset };
+            }
+            if ok {
+                ok = write_payload(fd, buffers[1].pointer, buffers[1].length, payload_checksum);
+            }
+            tensor_hash = hash_update(tensor_hash, buffers[1].pointer, buffers[1].length);
+            position = position +% buffers[1].length as u64;
         } else {
             guard let option::Option[[OwnedBytes; 3]]::Some(buffers) = quantize_tensor(
                 tensor,
@@ -1831,6 +2042,14 @@ fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
     return 0;
 }
 
+fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
+    return quantize_transformer_impl(model_directory, output_path, false);
+}
+
+fn quantize_transformer_int4_rotated(model_directory: str, output_path: str) -> i32 {
+    return quantize_transformer_impl(model_directory, output_path, true);
+}
+
 #[test]
 fn packed_layout_is_fixed_and_aligned() {
     assert #size_of::[PackedHeader]() == (256 as usize);
@@ -1896,6 +2115,56 @@ fn full_transformer_policy_boundaries_match_calibration() {
         == SCHEME_FP16;
     assert full_expected_scheme(block24 +% (2 as usize), true, true)
         == SCHEME_INT8_AFFINE;
+}
+
+#[test]
+fn int4_rotated_layout_covers_every_h256_matrix() {
+    let data_offset: u64 = align_up(
+        HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64,
+        DATA_ALIGNMENT,
+    );
+    var cursor: u64 = data_offset;
+    var int4_count: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < FULL_TENSOR_COUNT {
+        let name: text::Text = full_tensor_name(index, true);
+        let record: PackedRecord = make_full_record(
+            index, name.view(), full_tensor_spec(index), cursor, true,
+        );
+        if record.scheme == SCHEME_INT4_ROTATED {
+            assert record.group_axis == (1 as u32);
+            assert record.group_size == (256 as u32);
+            assert record.scale_type == TYPE_F16;
+            assert record.zero_type == TYPE_NONE;
+            assert record.scales_length == record.dimensions[0] *% (2 as u64);
+            assert record.zeros_length == (0 as u64);
+            int4_count = int4_count +% (1 as usize);
+        }
+        index = index +% (1 as usize);
+    }
+    assert int4_count == (231 as usize);
+    assert align_up(cursor, TENSOR_ALIGNMENT) == INT4_ROTATED_FILE_BYTES;
+    assert full_layout_file_bytes(true) == INT4_ROTATED_FILE_BYTES;
+}
+
+#[test]
+fn normalized_hadamard_256_is_an_involution() {
+    var values: [f32; 256] = [0.0f32; 256];
+    var original: [f32; 256] = [0.0f32; 256];
+    var index: usize = 0 as usize;
+    while index < (256 as usize) {
+        let value: f32 = (index % (17 as usize)) as f32 - 8.0f32;
+        values[index] = value;
+        original[index] = value;
+        index = index +% (1 as usize);
+    }
+    hadamard_256_in_place(#addr_of(values[0]));
+    hadamard_256_in_place(#addr_of(values[0]));
+    index = 0 as usize;
+    while index < (256 as usize) {
+        assert (values[index] - original[index]).abs() < 0.00001f32;
+        index = index +% (1 as usize);
+    }
 }
 
 #[test]
