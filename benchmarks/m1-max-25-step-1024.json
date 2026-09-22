@@ -4,7 +4,8 @@
   "machine": "Apple M1 Max, 32 GB unified memory",
   "model": "Qwen/Qwen-Image-2.1",
   "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
-  "scope": "Cold-process native 1024x1024 prompt-to-PNG generation with the explicit 25-step FlowMatch schedule and MPSGraph attention",
+  "scope": "Cold-process native-C+ 1024x1024 prompt-to-PNG generation with the explicit community-template 25-step FlowMatch schedule and MPSGraph attention",
+  "step_count_provenance": "25 came from the Comfy-Org Qwen-Image-2.1 workflow template, not Qwen's official recommendation. The template itself says the official pipeline uses about 40-50 Euler steps; Qwen and Diffusers default to 40.",
   "input": {
     "prompt": "A blue ceramic teapot on a windowsill.",
     "prompt_tokens": 18,

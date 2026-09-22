@@ -21,6 +21,23 @@ Diffusers source; those fixtures are plain binary files consumed by C+ tests.
 - Text model reference: Transformers 5.17.0
   [Qwen3-VL implementation](https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py)
 
+## Resolution and step-count policy
+
+Qwen's own model documentation identifies **2048x2048** as the native and
+recommended 1:1 output, with comparable 2K-pixel-budget dimensions for other
+aspect ratios. The Diffusers implementation and Qwen's vLLM/SGLang examples
+also accept 1024x1024, so 1024 is a supported and useful lower-resolution mode,
+but it is not the model's native quality target. This runtime has completed
+256 and 1024 execution; 2048 support and its memory gate remain future work.
+
+The authoritative Qwen and Diffusers sampling default is **40 Euler steps**.
+The 25-step experiment in this repository came from the
+[Comfy-Org workflow template](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_qwen_image_2_1_t2i.json),
+not an official Qwen recommendation. That template explicitly says the
+official pipeline uses about 40-50 steps and that the template itself starts
+at 25. Consequently, 40 remains this runtime's compatibility, oracle, and
+default path; 25 is only a measured opt-in speed/quality tradeoff.
+
 ## Build and verify
 
 ```sh
@@ -84,9 +101,10 @@ cpc test
 The five production generation commands accept `25` or `40` as their final
 optional argument. Omitting it preserves the canonical 40-step behavior. A
 25-step run constructs a fresh 25-step FlowMatch schedule; it does not truncate
-the first 25 points of the 40-step schedule. Both 256 and 1024 paths have
-end-to-end measurements; their numerical gates and remaining 1024 oracle
-limitations are recorded below.
+the first 25 points of the 40-step schedule. It reproduces a community ComfyUI
+template choice rather than Qwen's official recommendation. Both 256 and 1024
+paths have end-to-end measurements; their numerical gates and remaining 1024
+oracle limitations are recorded below.
 
 The two `bottleneck` commands are research diagnostics, not production
 recommendations. They use the fixed 4+13+8 stage experiment described below;
@@ -845,9 +863,14 @@ Inspect a shard, optionally filtering tensor names:
   run took **36.780 s end to end**, including 32.260 s for the three-stage
   transformer phase; its present research implementation also pays transformer
   setup three times. Because both bounded variants failed visibly, no costly
-  1024 run was made. The machinery remains explicit and off by default, while
-  all measurements, checksums, and the revisit condition are recorded in
-  `benchmarks/m1-max-bottleneck-sampling.json`.
+  1024 run was made. This closes the sub-native 1024→512→1024 proposal, but the
+  later discovery that Qwen's native target is 2048 means it does not settle a
+  2048→1024→2048 schedule: its middle stage would still be an officially
+  supported resolution rather than the extreme 128px bottleneck used by this
+  cheap gate. That native-resolution variant should be reconsidered only after
+  a 2048 one-step and memory feasibility gate. The machinery remains explicit
+  and off by default, while all measurements, checksums, and the revisit
+  condition are recorded in `benchmarks/m1-max-bottleneck-sampling.json`.
 - Short 1024 transformer runs now make optimization practical without decoding
   an image: `benchmark-transformer-trajectory-1024 ... 1|2` uses the committed
   31-row text fixture, seed 1301, and the first one or two steps of the normal
@@ -978,8 +1001,10 @@ Inspect a shard, optionally filtering tensor names:
   time than the adjacent 40-step run. Manual side-by-side inspection found the
   25-step image extremely close in composition and detail to the 40-step
   image, with only minor highlight and texture differences. There is no
-  official 25-step numerical oracle, so 40 remains the default and the 25-step
-  result is an explicit speed/quality choice.
+  official 25-step numerical oracle. The value came from Comfy-Org's community
+  workflow template, whose own note distinguishes its 25-step starting point
+  from the official 40-50-step pipeline. Therefore 40 remains the default and
+  the 25-step result is an explicit speed/quality choice.
 - Combining 25 steps with Cache-DiT 0.24 reaches **25.225 s end to end**: 12.604
   s text, 11.366 s transformer phase including a 5.463 s loop, 1.232 s VAE,
   and 21 ms PNG; 16 of 25 steps were cached. This is only 8.9% below the
@@ -1003,30 +1028,41 @@ Inspect a shard, optionally filtering tensor names:
 
 ## Remaining optimization phases
 
-The active product target is now 1024x1024 generation. Work is ordered by its
-effect at the 4,096-target-token shape; an optimization that only helps the
-256x256 benchmark is no longer sufficient evidence:
+The native-quality product target is now 2048x2048; 1024x1024 remains the
+practical performance mode and the largest completed runtime path. Before any
+full 2048 generation, add a 16,384-token one-step transformer smoke, measure
+peak memory, and establish whether VAE arena reuse or tiled decoding is needed.
+Until those gates pass, work is still measured at the 4,096-token 1024 shape;
+an optimization that only helps the 256x256 benchmark is no longer sufficient
+evidence:
 
-1. **1024 correctness and reproducibility gates.** Add official 40-step
+1. **Native 2048 feasibility.** Generalize the fixed square shape to 128x128
+   latent tokens, then run only one transformer step while recording allocation
+   and resident-memory peaks. Separately size or tile the 2048 VAE decode. Do
+   not start a full 40-step image until both phases fit safely on the 32 GB M1
+   Max. If they pass, the first resolution-scheduling candidate is
+   2048→1024→2048 rather than 1024→512→1024.
+2. **1024 correctness and reproducibility gates.** Add official 40-step
    trajectory and VAE oracles at 1024, while keeping their large generated
    data outside Git. Cache-off remains the reproducible path; independently
    assess Cache-DiT image quality because the existing thresholds were
    calibrated only at 256.
-2. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
+3. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
    FP16 normalization/SwiGLU output have completed Plan-5 F1, F2, and F4.
    First-order TaylorSeer F8 is also complete: its predictor passed the 256
    numerical calibration, but the faster cap-four policy failed the controlled
    1024 exact-text visual A/B, so it remains experimental. The
-   Bottleneck Sampling F9 spike is also complete: both the literal FLUX policy
-   and a Qwen terminal-sigma adaptation failed the 256 visual gate, so it is
-   closed unless a Qwen-specific schedule or external evidence justifies a new
-   sweep. The
+   Bottleneck Sampling F9's sub-native spike is complete: both the literal FLUX
+   policy and a Qwen terminal-sigma adaptation failed the 256 visual gate. A
+   1024→512→1024 sweep remains closed, but 2048→1024→2048 is a materially
+   different native-resolution proposal and can be reopened after 2048 memory
+   feasibility is established. The
    remaining conversion candidate is direct FP16 K/V preparation, but F4's
    measured 0.1-1.1% 1024 gain shows that bandwidth-only estimates must be
    profiled before more code is added. Scalar attention variants, further Q8,
    and additional broad activation conversions are closed. Accept any K/V
    change only with full-shape timing and numerical gates.
-3. **1024 working memory.** Shape-specific VAE arena sizing already removed
+4. **1024 working memory.** Shape-specific VAE arena sizing already removed
    1.6875 GiB, and F5 measured a 5,603,394,208-byte peak footprint with
    5,577,375,744 bytes of explicit scratch. Further reduction requires a real
    liveness/aliasing schedule rather than smaller fixed capacities: block 4
@@ -1034,7 +1070,7 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    block-3 upsample owns the remaining wide shortcut. Measure peak footprint
    after every aliasing change so transformer, text, and VAE phases remain safe
    on the 32 GB M1 Max.
-4. **Shared startup and small-kernel work.** Text layer streaming has completed
+5. **Shared startup and small-kernel work.** Text layer streaming has completed
    Plan-5 F3: the measured text working set is below 1 GB and standalone text
    time fell from 16,242 to 3,145 ms without changing output. The short-run
    process still spends about 6.5-7.5 seconds in transformer buffer/prefix
@@ -1044,7 +1080,7 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    readahead is superseded; tensor-order `madvise`, broad text Q8, four-query
    attention at 256, and blanket 256-thread elementwise groups stay rejected
    unless new evidence changes their tradeoffs.
-5. **End-to-end remeasurement.** Repeat cache-off and Cache-DiT 1024 prompts
+6. **End-to-end remeasurement.** Repeat cache-off and Cache-DiT 1024 prompts
    with warm-filesystem and cold-page conditions reported separately.
    Transformer loop, phase wall time, process wall time, memory footprint, and
    numerical/perceptual gates remain separate measurements.

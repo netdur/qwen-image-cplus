@@ -9,6 +9,7 @@
     "schedule": "A complete 25-step FlowMatch schedule generated for 256 latent tokens; not a truncated 40-step schedule",
     "cli": "The final optional generation argument accepts 25 or 40",
     "default_steps": 40,
+    "step_count_provenance": "25 came from the Comfy-Org Qwen-Image-2.1 workflow template. Its own note says the official pipeline uses about 40-50 Euler steps and that the template starts at 25; it is not an official Qwen recommendation.",
     "supported_resolutions": [256, 1024],
     "measured_resolutions": [256],
     "reference_policy": "Official trajectory checkpoints remain restricted to the canonical 40-step schedule"
@@ -50,7 +51,7 @@
     "cache_off_visual_comparison": "Extremely close to the 40-step image in composition and detail; minor highlight and texture differences only",
     "cache_dit_0_24_visual_comparison": "Coherent and prompt-correct, but body, handle, lid geometry, and highlights diverge more visibly from 40-step cache-off",
     "official_25_step_numeric_oracle": false,
-    "decision": "Accept 25 steps as an explicit option; preserve 40 as the compatibility and reproducibility default; keep 25-step Cache-DiT explicitly approximate"
+    "decision": "Accept the community-template 25-step choice as an explicit option; preserve Qwen's 40-step recommendation as the compatibility and reproducibility default; keep 25-step Cache-DiT explicitly approximate"
   },
   "validation": {
     "unit_tests": "334 passed, 0 failed",

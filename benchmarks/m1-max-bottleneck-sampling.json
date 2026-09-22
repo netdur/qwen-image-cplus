@@ -52,7 +52,8 @@
     "1024_run_performed": false,
     "reason_1024_skipped": "Both the paper schedule and the bounded Qwen scheduler adaptation failed the cheaper 256 visual gate dramatically. A 1024 run would spend substantial compute without evidence that this FLUX-tuned policy transfers.",
     "retained_scope": "Explicit experimental commands and tested latent-resize/re-noise/schedule machinery only; ordinary 25/40-step, Cache-DiT, and TaylorSeer paths are unchanged.",
-    "future_revisit_gate": "Require a Qwen-specific strength/shift schedule or published Qwen evidence before spending on a 1024 sweep."
+    "native_resolution_reassessment": "Qwen documents 2048x2048 as native. This experiment's 256-to-128-to-256 quality failure closes the analogous sub-native 1024-to-512-to-1024 proposal, but does not conclusively reject 2048-to-1024-to-2048 because its low stage remains an officially demonstrated resolution.",
+    "future_revisit_gate": "Establish 2048 one-step transformer and VAE memory feasibility first, then require a Qwen-specific strength/shift rationale before spending on a native 2048-to-1024-to-2048 sweep."
   },
   "validation": {
     "project_tests_passed": 337,
@@ -62,5 +63,5 @@
     "debug_build": true,
     "manual_image_comparison": true
   },
-  "phase_status": "F9 implementation spike and feasibility gate complete; FLUX-tuned policy rejected for Qwen-Image 2.1"
+  "phase_status": "F9 sub-native implementation spike complete; 1024-to-512-to-1024 rejected, native 2048-to-1024-to-2048 unresolved"
 }
