@@ -112,6 +112,13 @@ paths have end-to-end measurements. The 1024/40 path now also has external
 official transformer and VAE oracles; their numerical and visual findings are
 recorded below.
 
+Cache-DiT commands accept the calibrated threshold candidates `0.12`, `0.14`,
+`0.16`, and `0.24`. At 1024/40, 0.12 remains the conservative quality setting,
+0.16 is the measured speed-biased setting, and 0.24 is rejected. Intermediate
+values outside that measured set are intentionally not accepted by the
+production CLI. TaylorSeer retains its separately calibrated 0.12/0.24 input
+surface.
+
 The two `bottleneck` commands are research diagnostics, not production
 recommendations. They use the fixed 4+13+8 stage experiment described below;
 the FLUX-tuned policy failed Qwen's 256px visual gate and was not promoted to a
@@ -857,12 +864,16 @@ Inspect a shard, optionally filtering tensor names:
   decoded-output nRMSE, and preserves all poster text and overall structure.
   Its observed loop was 137.934 s and fixture-to-PNG total was 157.122 s;
   cached steps cost about 0.28 s while full steps cost about 8.58 s in that
-  run. Threshold 0.24 caches only two additional steps (**27/40**) but rises
-  to 26.8949% latent and 42.4777% decoded-output nRMSE and visibly corrupts
-  `CASABLANCA`. It is rejected for 1024/40. Ordinary **0.12 is the recommended
-  1024 Cache-DiT threshold**, still explicit and off by default. Because the
-  0.24 run started hotter, its slower absolute wall time is not used to compare
-  thresholds. Full provenance and measurements are in
+  run. The intermediate sweep found that 0.14 caches 26 steps at 21.5439%
+  latent and 35.7685% decoded nRMSE, while **0.16 caches 27 steps** at 22.0154%
+  latent and 36.5093% decoded nRMSE. Both preserve all requested text; 0.16 is
+  retained as the speed-biased option because it removes two full passes.
+  Threshold 0.24 also caches 27 steps but rises to 26.8949% latent and 42.4777%
+  decoded-output nRMSE and visibly corrupts `CASABLANCA`, so it remains
+  rejected. Ordinary **0.12 remains the conservative quality setting** and
+  **0.16 is the speed-biased setting**; both are explicit and off by default.
+  Sequential thermal differences make absolute fixture wall times unsuitable
+  for comparing thresholds. Full provenance and measurements are in
   `benchmarks/m1-max-1024-40-oracle.json`.
 - Fresh-process native-prompt 1024x1024, 40-step inference is now measured from
   tokenization through PNG completion with the same `CASABLANCA` prompt and
@@ -881,6 +892,17 @@ Inspect a shard, optionally filtering tensor names:
   includes its intentional trajectory approximation. Exact timings, memory,
   commands, ordering, and output checksums are in
   `benchmarks/m1-max-native-prompt-pipeline-1024.json`.
+- The speed-biased Cache-DiT 0.16 setting was subsequently measured through
+  the same fresh-process native-prompt path. It made 27 cached decisions and
+  completed in **167.15 seconds process wall**: 3.235 seconds for text,
+  153.082 seconds for the transformer phase (145.842-second loop), 10.493
+  seconds for VAE, and 0.307 seconds for PNG. This is an observed 37.45-second
+  reduction, or 1.224x speedup, against the 204.60-second 0.12 run and 6.02x
+  faster than the measured stable-diffusion.cpp process baseline. The runs
+  occurred at different points in a sustained sequence, so not all 37.45
+  seconds can be attributed to the two extra cached steps; their removal is
+  the repeatable algorithmic difference. The full-prompt output retained all
+  requested text exactly.
 - The 1024 VAE initially reserved every activation arena for the largest
   `[1024,1024,288]` boundary. Shape-specific maxima reduce its explicit scratch
   from 7,389,315,072 to **5,577,375,744 bytes**, saving exactly 1.6875 GiB.
@@ -1128,8 +1150,8 @@ evidence:
    higher-precision accumulation or operand path can reduce that long-horizon
    drift without losing the all-FP16 v4 throughput. Do not loosen a numerical
    gate merely because this poster remains readable. Cache-DiT calibration is
-   also complete: use 0.12 when explicitly requested and reject 0.24 at
-   1024/40.
+   also complete: use 0.12 for the conservative quality tradeoff, use 0.16 for
+   the measured speed-biased tradeoff, and reject 0.24 at 1024/40.
 3. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
    FP16 normalization/SwiGLU output have completed Plan-5 F1, F2, and F4.
    First-order TaylorSeer F8 is also complete: its predictor passed the 256

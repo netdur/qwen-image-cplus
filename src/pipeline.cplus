@@ -85,6 +85,11 @@ fn run_fixture_256(
     return 0;
 }
 
+fn cache_dit_threshold_is_supported(threshold: f64) -> bool {
+    return threshold == 0.12f64 || threshold == 0.14f64
+        || threshold == 0.16f64 || threshold == 0.24f64;
+}
+
 fn run_fixture_cache_dit_256(
     packed_path: str,
     model_root: str,
@@ -93,8 +98,8 @@ fn run_fixture_cache_dit_256(
     trajectory_fixture: str = "tests/fixtures/trajectory_256_fp32",
     vae_fixture_root: str = "tests/fixtures/vae_decoder_fp32",
 ) -> i32 {
-    if !(threshold == 0.12f64 || threshold == 0.24f64) {
-        io::eprintln("pipeline Cache-DiT: threshold must be 0.12 or 0.24");
+    if !cache_dit_threshold_is_supported(threshold) {
+        io::eprintln("pipeline Cache-DiT: unsupported threshold");
         return 2;
     }
     let vae_fixture = "${vae_fixture_root}/trajectory_256";
@@ -166,8 +171,8 @@ fn run_fixture_cache_dit_1024(
     trajectory_fixture: str,
     vae_fixture_root: str,
 ) -> i32 {
-    if !(threshold == 0.12f64 || threshold == 0.24f64) {
-        io::eprintln("pipeline 1024 oracle Cache-DiT: threshold must be 0.12 or 0.24");
+    if !cache_dit_threshold_is_supported(threshold) {
+        io::eprintln("pipeline 1024 oracle Cache-DiT: unsupported threshold");
         return 2;
     }
     return run_fixture_1024_impl(
@@ -531,8 +536,8 @@ fn benchmark_process_reuse_256(
         io::eprintln("resident benchmark: request count must be 2..16");
         return 2;
     }
-    if !(threshold == 0.12f64 || threshold == 0.24f64) {
-        io::eprintln("resident benchmark: threshold must be 0.12 or 0.24");
+    if !cache_dit_threshold_is_supported(threshold) {
+        io::eprintln("resident benchmark: unsupported threshold");
         return 2;
     }
     let session_start_ms: i64 = time::now_millis();

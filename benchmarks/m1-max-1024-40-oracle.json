@@ -89,6 +89,50 @@
     "visual_result": "all requested text and overall poster structure preserved",
     "decision": "recommended explicit 1024 Cache-DiT threshold; remains off by default"
   },
+  "cache_dit_0_14": {
+    "cached_steps": 26,
+    "full_steps": 14,
+    "transformer_loop_wall_ms": 133761,
+    "transformer_phase_wall_ms": 141628,
+    "vae_phase_wall_ms": 9952,
+    "png_wall_ms": 300,
+    "fixture_to_png_wall_ms": 151953,
+    "process_wall_ms": 151960,
+    "text_encoder_included": false,
+    "final_latent_nrmse": 0.215439,
+    "decoded_fp32_nrmse": 0.357685,
+    "png_metrics_vs_official": {
+      "mean_absolute_u8": 11.800031185150146,
+      "rmse_u8": 37.374629385651204,
+      "psnr_db": 16.679265712632528,
+      "pixels_with_all_channels_within_8_percent": 63.899803161621094
+    },
+    "png_sha256": "ad2f55cbc7fff48b172b7874bcbcb3daec28aad0d910f36029c0e0426d58f941",
+    "visual_result": "all requested text and overall poster structure preserved",
+    "decision": "valid intermediate point, but one fewer full pass does not justify preferring it over the clearer 0.12/0.16 quality-speed choices"
+  },
+  "cache_dit_0_16": {
+    "cached_steps": 27,
+    "full_steps": 13,
+    "transformer_loop_wall_ms": 155669,
+    "transformer_phase_wall_ms": 162656,
+    "vae_phase_wall_ms": 10449,
+    "png_wall_ms": 307,
+    "fixture_to_png_wall_ms": 173486,
+    "process_wall_ms": 173500,
+    "text_encoder_included": false,
+    "final_latent_nrmse": 0.220154,
+    "decoded_fp32_nrmse": 0.365093,
+    "png_metrics_vs_official": {
+      "mean_absolute_u8": 12.241109609603882,
+      "rmse_u8": 38.14857502259624,
+      "psnr_db": 16.50123720395228,
+      "pixels_with_all_channels_within_8_percent": 62.442970275878906
+    },
+    "png_sha256": "d58950eedf9b58c5e4a6cc06d8121a7c299019dbaef00dc0a28a8b266089ef81",
+    "visual_result": "all requested text and overall poster structure preserved",
+    "decision": "speed-biased explicit 1024 Cache-DiT option; remains off by default"
+  },
   "cache_dit_0_24": {
     "cached_steps": 27,
     "full_steps": 13,
@@ -114,8 +158,9 @@
     "MPSGraph fragments command-buffer GPU timestamps, so integrated wall time is authoritative.",
     "The cache-off fixture-to-PNG run was made on confirmed AC power; cached-prefix steps rose from about 8.6-8.9 seconds early to about 11.2 seconds at the tail.",
     "An earlier cache-off loop took 479823 ms as step time rose from about 10.5 to 14.6 seconds; it produced the same 0.13211 final-latent nRMSE.",
-    "The 0.24 run followed the other long runs and started hotter. Its slower wall time despite two extra cached steps is not an algorithmic comparison with 0.12.",
+    "The 0.14 and 0.16 runs were sequential and had visibly different full-step rates; their absolute fixture wall times are not a direct threshold-speed comparison.",
+    "The 0.24 run followed other long runs and started hotter. Its slower wall time despite two extra cached steps is not an algorithmic comparison with 0.12.",
     "Fixture-driven totals exclude tokenization and text encoding because the exact official text embedding is an oracle input."
   ],
-  "decision": "close the 1024 oracle and ordinary Cache-DiT calibration phase; keep cache-off as default, recommend 0.12 when approximation is requested, reject 0.24, and retain long-horizon BF16-vs-native precision drift as the next correctness investigation"
+  "decision": "close the 1024 oracle and ordinary Cache-DiT calibration phase; keep cache-off as default, retain 0.12 as the conservative quality setting, offer 0.16 as a speed-biased setting after its exact-text visual pass, reject 0.24, and retain long-horizon BF16-vs-native precision drift as the next correctness investigation"
 }

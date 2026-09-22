@@ -4390,7 +4390,7 @@ fn run_trajectory_cache_dit_1024_packed(
     fixture_directory: str,
 ) -> i32 {
     guard let option::Option[f64]::Some(threshold) = cache_dit_threshold(threshold_text) else {
-        io::eprintln("1024 trajectory Cache-DiT: threshold must be 0.12 or 0.24");
+        io::eprintln("1024 trajectory Cache-DiT: threshold must be 0.12, 0.14, 0.16, or 0.24");
         return 2;
     };
     let text_path: text::Text = "${fixture_directory}/text_input.f32";
@@ -4468,8 +4468,15 @@ fn benchmark_trajectory_1024(
 
 fn cache_dit_threshold(value: str) -> option::Option[f64] {
     if value == "0.12" { return option::Option[f64]::Some(0.12f64); }
+    if value == "0.14" { return option::Option[f64]::Some(0.14f64); }
+    if value == "0.16" { return option::Option[f64]::Some(0.16f64); }
     if value == "0.24" { return option::Option[f64]::Some(0.24f64); }
     return option::Option[f64]::None;
+}
+
+fn cache_dit_threshold_is_supported(threshold: f64) -> bool {
+    return threshold == 0.12f64 || threshold == 0.14f64
+        || threshold == 0.16f64 || threshold == 0.24f64;
 }
 
 fn run_trajectory_cache_dit_packed(
@@ -4478,7 +4485,7 @@ fn run_trajectory_cache_dit_packed(
     fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
 ) -> i32 {
     guard let option::Option[f64]::Some(threshold) = cache_dit_threshold(threshold_text) else {
-        io::eprintln("trajectory Cache-DiT: threshold must be 0.12 or 0.24");
+        io::eprintln("trajectory Cache-DiT: threshold must be 0.12, 0.14, 0.16, or 0.24");
         return 2;
     };
     return run_trajectory_packed_impl(
@@ -4502,9 +4509,13 @@ fn run_trajectory_taylorseer_packed(
     fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
 ) -> i32 {
     guard let option::Option[f64]::Some(threshold) = cache_dit_threshold(threshold_text) else {
-        io::eprintln("trajectory TaylorSeer: threshold must be 0.12 or 0.24");
+        io::eprintln("trajectory TaylorSeer: threshold must be 0.12, 0.14, 0.16, or 0.24");
         return 2;
     };
+    if !(threshold == 0.12f64 || threshold == 0.24f64) {
+        io::eprintln("trajectory TaylorSeer: threshold must be 0.12 or 0.24");
+        return 2;
+    }
     return run_trajectory_packed_impl(
         packed_path,
         "40",
@@ -4528,7 +4539,7 @@ fn run_trajectory_cache_dit_256_to_host(
     threshold: f64,
     fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
 ) -> i32 {
-    if final_latent.is_null() || !(threshold == 0.12f64 || threshold == 0.24f64) {
+    if final_latent.is_null() || !cache_dit_threshold_is_supported(threshold) {
         io::eprintln("trajectory: invalid Cache-DiT fixture handoff");
         return 2;
     }
@@ -4617,7 +4628,7 @@ fn run_prompt_trajectory_cache_dit_256_to_host(
     requested_steps: str = "40",
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null()
-        || !(threshold == 0.12f64 || threshold == 0.24f64) {
+        || !cache_dit_threshold_is_supported(threshold) {
         io::eprintln("trajectory: invalid Cache-DiT prompt handoff");
         return 2;
     }
@@ -4674,7 +4685,7 @@ fn run_prompt_trajectory_cache_dit_1024_to_host(
     requested_steps: str = "40",
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null()
-        || !(threshold == 0.12f64 || threshold == 0.24f64) {
+        || !cache_dit_threshold_is_supported(threshold) {
         io::eprintln("trajectory: invalid 1024px Cache-DiT prompt handoff");
         return 2;
     }

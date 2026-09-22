@@ -40,6 +40,14 @@ fn parse_u64_decimal(value: str) -> option::Option[u64] {
     return option::Option[u64]::Some(result);
 }
 
+fn parse_cache_dit_threshold(value: str) -> option::Option[f64] {
+    if value == "0.12" { return option::Option[f64]::Some(0.12f64); }
+    if value == "0.14" { return option::Option[f64]::Some(0.14f64); }
+    if value == "0.16" { return option::Option[f64]::Some(0.16f64); }
+    if value == "0.24" { return option::Option[f64]::Some(0.24f64); }
+    return option::Option[f64]::None;
+}
+
 #[test]
 fn decimal_seed_parser_checks_syntax_and_overflow() {
     guard let option::Option[u64]::Some(zero) = parse_u64_decimal("0") else {
@@ -68,6 +76,34 @@ fn decimal_seed_parser_checks_syntax_and_overflow() {
     match parse_u64_decimal("18446744073709551616") {
         option::Option[u64]::None => {}
         option::Option[u64]::Some(_) => { assert false; }
+    }
+}
+
+#[test]
+fn cache_dit_threshold_parser_accepts_calibration_candidates() {
+    guard let option::Option[f64]::Some(low) = parse_cache_dit_threshold("0.12") else {
+        assert false;
+        return;
+    };
+    guard let option::Option[f64]::Some(middle_low) = parse_cache_dit_threshold("0.14") else {
+        assert false;
+        return;
+    };
+    guard let option::Option[f64]::Some(middle_high) = parse_cache_dit_threshold("0.16") else {
+        assert false;
+        return;
+    };
+    guard let option::Option[f64]::Some(high) = parse_cache_dit_threshold("0.24") else {
+        assert false;
+        return;
+    };
+    assert low == 0.12f64;
+    assert middle_low == 0.14f64;
+    assert middle_high == 0.16f64;
+    assert high == 0.24f64;
+    match parse_cache_dit_threshold("0.15") {
+        option::Option[f64]::None => {}
+        option::Option[f64]::Some(_) => { assert false; }
     }
 }
 
@@ -443,12 +479,8 @@ fn main() -> i32 {
             io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
             return 2;
         };
-        let threshold: f64 = if threshold_text.view() == "0.12" {
-            0.12f64
-        } else if threshold_text.view() == "0.24" {
-            0.24f64
-        } else {
-            io::eprintln("pipeline 1024 oracle Cache-DiT: threshold must be 0.12 or 0.24");
+        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
+            io::eprintln("pipeline 1024 oracle Cache-DiT: threshold must be 0.12, 0.14, 0.16, or 0.24");
             return 2;
         };
         guard let option::Option[text::Text]::Some(trajectory_fixture) = env::arg(6 as usize) else {
@@ -481,12 +513,8 @@ fn main() -> i32 {
             io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24");
             return 2;
         };
-        let threshold: f64 = if threshold_text == "0.12" {
-            0.12f64
-        } else if threshold_text == "0.24" {
-            0.24f64
-        } else {
-            io::eprintln("test-pipeline-cache-dit-256: threshold must be 0.12 or 0.24");
+        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
+            io::eprintln("test-pipeline-cache-dit-256: threshold must be 0.12, 0.14, 0.16, or 0.24");
             return 2;
         };
         return pipeline::run_fixture_cache_dit_256(
@@ -563,12 +591,8 @@ fn main() -> i32 {
             io::eprintln("usage: qwen-image-cplus generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
             return 2;
         };
-        let threshold: f64 = if threshold_text == "0.12" {
-            0.12f64
-        } else if threshold_text == "0.24" {
-            0.24f64
-        } else {
-            io::eprintln("generate-256-cache-dit: threshold must be 0.12 or 0.24");
+        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
+            io::eprintln("generate-256-cache-dit: threshold must be 0.12, 0.14, 0.16, or 0.24");
             return 2;
         };
         var seed: u64 = 1101 as u64;
@@ -734,12 +758,8 @@ fn main() -> i32 {
             io::eprintln("usage: qwen-image-cplus generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
             return 2;
         };
-        let threshold: f64 = if threshold_text == "0.12" {
-            0.12f64
-        } else if threshold_text == "0.24" {
-            0.24f64
-        } else {
-            io::eprintln("generate-1024-cache-dit: threshold must be 0.12 or 0.24");
+        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
+            io::eprintln("generate-1024-cache-dit: threshold must be 0.12, 0.14, 0.16, or 0.24");
             return 2;
         };
         var seed: u64 = 1101 as u64;
@@ -799,12 +819,8 @@ fn main() -> i32 {
             io::eprintln("usage: qwen-image-cplus benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED]");
             return 2;
         };
-        let threshold: f64 = if threshold_text == "0.12" {
-            0.12f64
-        } else if threshold_text == "0.24" {
-            0.24f64
-        } else {
-            io::eprintln("benchmark-process-reuse-256: threshold must be 0.12 or 0.24");
+        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
+            io::eprintln("benchmark-process-reuse-256: threshold must be 0.12, 0.14, 0.16, or 0.24");
             return 2;
         };
         guard let option::Option[text::Text]::Some(request_count_text) = env::arg(7 as usize) else {

@@ -44,9 +44,10 @@
       "process_policy": "fresh process for each inference",
       "run_order": [
         "cache-off",
-        "Cache-DiT 0.12"
+        "Cache-DiT 0.12",
+        "Cache-DiT 0.16 after two intervening oracle calibration runs"
       ],
-      "thermal_note": "Cache-DiT 0.12 immediately followed the cache-off run on an already-hot machine.",
+      "thermal_note": "Cache-DiT 0.12 immediately followed the cache-off run; 0.16 followed two additional oracle runs. Absolute differences include thermal variation, while the 27-versus-25 cached-step count is algorithmic.",
       "offline_qipack_build_included": false
     },
     "case": {
@@ -95,11 +96,33 @@
       "png_bytes": 4195716,
       "png_sha256": "6841fe32bdbb69b5d9aeca49f8e5244eb21265a99a0471f6039bc3fd8ddd27af"
     },
+    "cache_dit_0_16": {
+      "process_wall_ms": 167150,
+      "pipeline_wall_ms": 167141,
+      "text_wall_ms": 3235,
+      "transformer_startup_wall_ms": 7240,
+      "transformer_loop_wall_ms": 145842,
+      "transformer_phase_wall_ms": 153082,
+      "vae_gpu_ms": 9725.69,
+      "vae_phase_wall_ms": 10493,
+      "image_output_wall_ms": 307,
+      "cache_dit_steps": 27,
+      "full_steps": 13,
+      "maximum_resident_set_bytes": 835076096,
+      "peak_memory_footprint_bytes": 5741609800,
+      "swaps": 0,
+      "png_bytes": 4195716,
+      "png_sha256": "63c1d5eb801f22c67ee0658a4cb44ca25b1125986ec87a2186d532a8f598ae4e"
+    },
     "comparisons": {
       "cache_dit_vs_cache_off_speedup": 2.204887585532747,
       "cache_dit_wall_reduction_percent": 54.64621386770704,
       "cache_off_vs_stable_diffusion_cpp_speedup": 2.230803333924455,
       "cache_dit_vs_stable_diffusion_cpp_speedup": 4.918670576735093,
+      "cache_dit_0_16_vs_0_12_observed_speedup": 1.224050254262638,
+      "cache_dit_0_16_vs_0_12_observed_wall_reduction_percent": 18.304007820136846,
+      "cache_dit_0_16_vs_0_12_observed_wall_saved_ms": 37450,
+      "cache_dit_0_16_vs_stable_diffusion_cpp_speedup": 6.020699970086748,
       "stable_diffusion_cpp_process_wall_ms": 1006360
     },
     "artifact_policy": "PNGs and logs remain in /private/tmp and are not committed"
