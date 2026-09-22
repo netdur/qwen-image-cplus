@@ -1398,6 +1398,42 @@ kernel void qi_block_layernorm_modulate(
     }
 }
 
+// MPS consumes FP16 activations. This variant performs the same FP32
+// normalization and modulation arithmetic, then stores the final value as
+// half directly instead of writing an FP32 tensor for a second conversion
+// pass to read back.
+kernel void qi_block_layernorm_modulate_half(
+    device const float *input [[buffer(0)]],
+    device const float *modulation [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    device const uchar *target_mask [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+    if (row >= params.rows) {
+        return;
+    }
+    const uint start = row * params.width;
+    float partial_mean = 0.0f;
+    for (uint column = lane; column < params.width; column += 32) {
+        partial_mean += input[start + column];
+    }
+    const float mean = simd_sum(partial_mean) / float(params.width);
+    float partial_variance = 0.0f;
+    for (uint column = lane; column < params.width; column += 32) {
+        const float centered = input[start + column] - mean;
+        partial_variance = fma(centered, centered, partial_variance);
+    }
+    const float inverse_std =
+        rsqrt(simd_sum(partial_variance) / float(params.width) + params.epsilon);
+    const uint modulation_row = target_mask[row] != 0 ? 0 : 1;
+    const uint modulation_start = (modulation_row * 4 + params.slot) * params.width;
+    for (uint column = lane; column < params.width; column += 32) {
+        output[start + column] = half((input[start + column] - mean) * inverse_std *
+            (1.0f + modulation[modulation_start + column]));
+    }
+}
+
 // One thread owns one [token, head]. The learned RMSNorm scale is shared by heads.
 kernel void qi_block_qk_norm_rope_scalar(
     device const float *input [[buffer(0)]],
@@ -2002,4 +2038,21 @@ kernel void qi_block_swiglu(
     }
     const float value = gate[index];
     output[index] = (value / (1.0f + exp(-value))) * projected[index];
+}
+
+// The following MPS multiplication consumes FP16. Store the FP32 SwiGLU
+// result as half here so no full-size FP32 intermediate or conversion pass is
+// required.
+kernel void qi_block_swiglu_half(
+    device const float *gate [[buffer(0)]],
+    device const float *projected [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant BlockParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width * 3;
+    if (index >= count) {
+        return;
+    }
+    const float value = gate[index];
+    output[index] = half((value / (1.0f + exp(-value))) * projected[index]);
 }

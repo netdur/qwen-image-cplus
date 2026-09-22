@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "packed_policy": "transformer:all-matrix-f16-v4",
+  "scope": "Plan-5 F4 direct FP16 normalization and SwiGLU output",
+  "implementation": {
+    "enabled_by_default_for_v4": true,
+    "control_environment": "QI_DISABLE_DIRECT_FP16_ACTIVATIONS=1",
+    "legacy_pack_behavior": "v1-v3 retain the FP32 intermediates and explicit conversion dispatches",
+    "removed_dispatches_per_full_block": 3,
+    "removed_dispatches": [
+      "norm1 FP32 to FP16",
+      "norm2 FP32 to FP16",
+      "SwiGLU FP32 to FP16"
+    ],
+    "arithmetic": "normalization and SwiGLU remain FP32; only the final store casts directly to half, matching the removed conversion kernel"
+  },
+  "scratch_memory_1024_prefill": {
+    "rows": 4127,
+    "width": 4096,
+    "mlp_width": 12288,
+    "control_fp32_bytes": 338083840,
+    "direct_path_placeholder_bytes": 6,
+    "saved_bytes": 338083834,
+    "saved_mib": 322.4218692779541
+  },
+  "trajectory_256_adjacent_40_step": {
+    "control": {
+      "gpu_ms": 20234.3,
+      "wall_ms": 20579,
+      "fp32_activation_scratch_bytes": 22773760
+    },
+    "direct": {
+      "gpu_ms": 20027.7,
+      "wall_ms": 20356,
+      "fp32_activation_scratch_bytes": 6
+    },
+    "saving": {
+      "gpu_ms": 206.6,
+      "gpu_percent": 1.02,
+      "wall_ms": 223,
+      "wall_percent": 1.08
+    },
+    "quality": {
+      "step_1_nrmse": 0.000872739,
+      "step_2_nrmse": 0.00126067,
+      "step_40_nrmse": 0.0107623,
+      "step_40_limit": 0.011,
+      "comparison": "identical to control"
+    },
+    "result": "pass"
+  },
+  "cache_dit_256_0_24": {
+    "direct_gpu_ms": 7194.46,
+    "direct_wall_ms": 7404,
+    "previous_f2_gpu_ms": 7292.49,
+    "previous_f2_wall_ms": 7494,
+    "cached_steps": 27,
+    "final_nrmse": 0.100293,
+    "interpretation": "measured approximation quality; the run is not an equivalence gate"
+  },
+  "trajectory_1024_adjacent_two_step_pairs": [
+    {
+      "order": "control then direct",
+      "control": {
+        "prefill_wall_ms": 9871,
+        "cached_wall_ms": 9040,
+        "loop_wall_ms": 18926
+      },
+      "direct": {
+        "prefill_wall_ms": 9867,
+        "cached_wall_ms": 8889,
+        "loop_wall_ms": 18770
+      },
+      "loop_saving_ms": 156,
+      "loop_saving_percent": 0.82
+    },
+    {
+      "order": "direct then control",
+      "direct": {
+        "prefill_wall_ms": 9573,
+        "cached_wall_ms": 8623,
+        "loop_wall_ms": 18210
+      },
+      "control": {
+        "prefill_wall_ms": 9683,
+        "cached_wall_ms": 8713,
+        "loop_wall_ms": 18408
+      },
+      "loop_saving_ms": 198,
+      "loop_saving_percent": 1.08
+    },
+    {
+      "order": "control then direct, after scratch reduction",
+      "control": {
+        "prefill_wall_ms": 9633,
+        "cached_wall_ms": 8662,
+        "loop_wall_ms": 18310,
+        "fp32_activation_scratch_bytes": 338083840
+      },
+      "direct": {
+        "prefill_wall_ms": 9658,
+        "cached_wall_ms": 8617,
+        "loop_wall_ms": 18288,
+        "fp32_activation_scratch_bytes": 6
+      },
+      "loop_saving_ms": 22,
+      "loop_saving_percent": 0.12
+    }
+  ],
+  "trajectory_1024_interpretation": "All three adjacent pairs favored the direct path in total, but the 22-198 ms range over an approximately 18-19 second loop is sensitive to run order, power, and thermal state. Cached-step savings were consistent at 45-151 ms. MPSGraph fragments GPU timestamps, so wall time is authoritative.",
+  "power_state": {
+    "first_pair_before": "Battery Power; battery 46%; discharging",
+    "final_pair_before": "Battery Power; battery 41%; discharging",
+    "final_pair_after": "Battery Power; battery 40%; discharging",
+    "interpretation": "Absolute times across pairs are not compared. Only adjacent within-pair controls are used."
+  },
+  "native_prompt_pipeline_256": {
+    "trajectory_gpu_ms": 20010.9,
+    "trajectory_wall_ms": 20348,
+    "final_latent_nrmse": 0.0190087,
+    "final_latent_limit": 0.02,
+    "vae_nrmse": 0.0182946,
+    "vae_limit": 0.02,
+    "rgba_nrmse": 0.0103176,
+    "rgba_limit": 0.013,
+    "png_sha256": "d9967772c1abc8869f23f6595bf6216b18ff63433d21ececc55dc01ce628bc29",
+    "comparison": "byte-for-byte identical to the pre-F4 v4 PNG",
+    "result": "pass"
+  },
+  "legacy_v3_compatibility": {
+    "direct_fp16_activations": false,
+    "fp32_activation_scratch_bytes": 22773760,
+    "step_1_nrmse": 0.000894272,
+    "step_1_limit": 0.001,
+    "q8_dispatch_matrices": 40,
+    "result": "pass"
+  },
+  "decision": "accept F4 for its small repeatable speedup, removal of three conversion dispatches per block, 322.42 MiB 1024 scratch reduction, and bit-identical output; reject the plan's projected multi-second gain"
+}

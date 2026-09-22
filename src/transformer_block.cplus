@@ -184,10 +184,13 @@ struct BlockWorkspace {
 struct MpsWorkspace {
     device: metal::Device,
     input_pipeline: metal::ComputePipelineState,
+    norm_half_pipeline: metal::ComputePipelineState,
+    swiglu_half_pipeline: metal::ComputePipelineState,
     bf16_pipeline: metal::ComputePipelineState,
     q8_pipeline: metal::ComputePipelineState,
     half_input: metal::Buffer,
     half_weight: metal::Buffer,
+    direct_half_activations: bool,
 }
 
 struct CacheDiffResult {
@@ -2247,6 +2250,7 @@ fn execute_batched_runtime_block(
 fn encode_post_attention_epilogue(
     encoder: metal::ComputeCommandEncoder,
     pipelines: Pipelines,
+    mps_workspace: MpsWorkspace,
     workspace: BlockWorkspace,
     hidden: metal::Buffer,
     rows: usize,
@@ -2262,8 +2266,15 @@ fn encode_post_attention_epilogue(
     encode_buffer_barrier(encoder);
     (*params).slot = 2 as u32;
     encode_simdgroup_1d(
-        encoder, pipelines.norm, workspace.residual1, workspace.modulation,
-        workspace.norm2, workspace.target_mask, workspace.dummy, workspace.dummy,
+        encoder,
+        if mps_workspace.direct_half_activations {
+            mps_workspace.norm_half_pipeline
+        } else { pipelines.norm },
+        workspace.residual1, workspace.modulation,
+        if mps_workspace.direct_half_activations {
+            mps_workspace.half_input
+        } else { workspace.norm2 },
+        workspace.target_mask, workspace.dummy, workspace.dummy,
         params, rows,
     );
 }
@@ -2271,6 +2282,7 @@ fn encode_post_attention_epilogue(
 fn encode_post_attention(
     encoder: metal::ComputeCommandEncoder,
     pipelines: Pipelines,
+    mps_workspace: MpsWorkspace,
     weights: BlockWeights,
     workspace: BlockWorkspace,
     hidden: metal::Buffer,
@@ -2283,7 +2295,7 @@ fn encode_post_attention(
         workspace.attention_projected, WIDTH, WIDTH, rows,
     );
     encode_post_attention_epilogue(
-        encoder, pipelines, workspace, hidden, rows, params,
+        encoder, pipelines, mps_workspace, workspace, hidden, rows, params,
     );
 }
 
@@ -2389,23 +2401,32 @@ fn encode_mps_mlp_runtime_block(
             command_buffer.compute_command_encoder() else { return false; };
         let norm_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(norm_encoder.raw()));
         encode_simdgroup_1d(
-            norm_encoder, pipelines.norm, hidden, workspace.modulation, workspace.norm1,
+            norm_encoder,
+            if mps_workspace.direct_half_activations {
+                mps_workspace.norm_half_pipeline
+            } else { pipelines.norm },
+            hidden, workspace.modulation,
+            if mps_workspace.direct_half_activations {
+                mps_workspace.half_input
+            } else { workspace.norm1 },
             workspace.target_mask, workspace.dummy, workspace.dummy, #addr_of(params), rows,
         );
         let norm_command_encoder: metal::CommandEncoder =
             metal::CommandEncoder::from_raw(norm_encoder.raw());
         norm_command_encoder.end_encoding();
-        guard let option::Option[metal::ComputeCommandEncoder]::Some(conversion_encoder) =
-            command_buffer.compute_command_encoder() else { return false; };
-        let conversion_encoder_owner: OwnedObjc =
-            OwnedObjc::new(rt::retain(conversion_encoder.raw()));
-        encode_mps_input_conversion(
-            conversion_encoder, mps_workspace.input_pipeline, workspace.norm1,
-            mps_workspace.half_input, rows, WIDTH,
-        );
-        let conversion_command_encoder: metal::CommandEncoder =
-            metal::CommandEncoder::from_raw(conversion_encoder.raw());
-        conversion_command_encoder.end_encoding();
+        if !mps_workspace.direct_half_activations {
+            guard let option::Option[metal::ComputeCommandEncoder]::Some(conversion_encoder) =
+                command_buffer.compute_command_encoder() else { return false; };
+            let conversion_encoder_owner: OwnedObjc =
+                OwnedObjc::new(rt::retain(conversion_encoder.raw()));
+            encode_mps_input_conversion(
+                conversion_encoder, mps_workspace.input_pipeline, workspace.norm1,
+                mps_workspace.half_input, rows, WIDTH,
+            );
+            let conversion_command_encoder: metal::CommandEncoder =
+                metal::CommandEncoder::from_raw(conversion_encoder.raw());
+            conversion_command_encoder.end_encoding();
+        }
         qkv_operation.encode(command_buffer);
     }
 
@@ -2498,7 +2519,7 @@ fn encode_mps_mlp_runtime_block(
     }
     if !use_graph_attention && !mps_attention_output {
         encode_post_attention(
-            attention_encoder, pipelines, weights, workspace, hidden, rows,
+            attention_encoder, pipelines, mps_workspace, weights, workspace, hidden, rows,
             #addr_of(params),
         );
     }
@@ -2545,7 +2566,8 @@ fn encode_mps_mlp_runtime_block(
         let epilogue_encoder_owner: OwnedObjc =
             OwnedObjc::new(rt::retain(epilogue_encoder.raw()));
         encode_post_attention_epilogue(
-            epilogue_encoder, pipelines, workspace, hidden, rows, #addr_of(params),
+            epilogue_encoder, pipelines, mps_workspace, workspace, hidden, rows,
+            #addr_of(params),
         );
         let epilogue_command_encoder: metal::CommandEncoder =
             metal::CommandEncoder::from_raw(epilogue_encoder.raw());
@@ -2556,7 +2578,7 @@ fn encode_mps_mlp_runtime_block(
         let post_attention_encoder_owner: OwnedObjc =
             OwnedObjc::new(rt::retain(post_attention_encoder.raw()));
         encode_post_attention(
-            post_attention_encoder, pipelines, weights, workspace, hidden, rows,
+            post_attention_encoder, pipelines, mps_workspace, weights, workspace, hidden, rows,
             #addr_of(params),
         );
         let post_attention_command_encoder: metal::CommandEncoder =
@@ -2564,19 +2586,25 @@ fn encode_mps_mlp_runtime_block(
         post_attention_command_encoder.end_encoding();
     }
 
-    guard let option::Option[metal::ComputeCommandEncoder]::Some(gate_conversion_encoder) =
-        command_buffer.compute_command_encoder() else { return false; };
-    let gate_conversion_owner: OwnedObjc = OwnedObjc::new(rt::retain(gate_conversion_encoder.raw()));
-    encode_mps_input_conversion(
-        gate_conversion_encoder, mps_workspace.input_pipeline, workspace.norm2,
-        mps_workspace.half_input, rows, WIDTH,
-    );
-    encode_mps_weight_conversion(
-        gate_conversion_encoder, mps_workspace, weights.gate, MLP_WIDTH, WIDTH,
-    );
-    let gate_conversion_command_encoder: metal::CommandEncoder =
-        metal::CommandEncoder::from_raw(gate_conversion_encoder.raw());
-    gate_conversion_command_encoder.end_encoding();
+    if !mps_workspace.direct_half_activations
+        || weights.gate.scheme != PACKED_SCHEME_FP16 {
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(gate_conversion_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let gate_conversion_owner: OwnedObjc =
+            OwnedObjc::new(rt::retain(gate_conversion_encoder.raw()));
+        if !mps_workspace.direct_half_activations {
+            encode_mps_input_conversion(
+                gate_conversion_encoder, mps_workspace.input_pipeline, workspace.norm2,
+                mps_workspace.half_input, rows, WIDTH,
+            );
+        }
+        encode_mps_weight_conversion(
+            gate_conversion_encoder, mps_workspace, weights.gate, MLP_WIDTH, WIDTH,
+        );
+        let gate_conversion_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(gate_conversion_encoder.raw());
+        gate_conversion_command_encoder.end_encoding();
+    }
     gate_operation.encode(command_buffer);
 
     if weights.projected.scheme != PACKED_SCHEME_FP16 {
@@ -2598,15 +2626,24 @@ fn encode_mps_mlp_runtime_block(
         command_buffer.compute_command_encoder() else { return false; };
     let swiglu_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(swiglu_encoder.raw()));
     encode_1d(
-        swiglu_encoder, pipelines.swiglu, workspace.gate, workspace.projected,
-        workspace.swiglu, workspace.dummy, workspace.dummy, workspace.dummy,
+        swiglu_encoder,
+        if mps_workspace.direct_half_activations {
+            mps_workspace.swiglu_half_pipeline
+        } else { pipelines.swiglu },
+        workspace.gate, workspace.projected,
+        if mps_workspace.direct_half_activations {
+            mps_workspace.half_input
+        } else { workspace.swiglu },
+        workspace.dummy, workspace.dummy, workspace.dummy,
         #addr_of(params), rows *% MLP_WIDTH,
     );
-    encode_buffer_barrier(swiglu_encoder);
-    encode_mps_input_conversion(
-        swiglu_encoder, mps_workspace.input_pipeline, workspace.swiglu,
-        mps_workspace.half_input, rows, MLP_WIDTH,
-    );
+    if !mps_workspace.direct_half_activations {
+        encode_buffer_barrier(swiglu_encoder);
+        encode_mps_input_conversion(
+            swiglu_encoder, mps_workspace.input_pipeline, workspace.swiglu,
+            mps_workspace.half_input, rows, MLP_WIDTH,
+        );
+    }
     encode_mps_weight_conversion(
         swiglu_encoder, mps_workspace, weights.mlp_output, WIDTH, MLP_WIDTH,
     );
@@ -4503,6 +4540,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(cache_copy_owner) = pipeline(device, library, "qi_copy_prefix_kv") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(flash_prepare_owner) = pipeline(device, library, "qi_flash_prepare_kv") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(mps_input_owner) = pipeline(device, library, "qi_mps_input_to_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(norm_half_owner) = pipeline(device, library, "qi_block_layernorm_modulate_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(swiglu_half_owner) = pipeline(device, library, "qi_block_swiglu_half") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_first_residual_owner) = pipeline(device, library, "qi_cache_first_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_store_residual_owner) = pipeline(device, library, "qi_cache_store_residual") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_apply_residual_owner) = pipeline(device, library, "qi_cache_apply_residual") else { return 1; };
@@ -4545,6 +4584,8 @@ fn run_trajectory_packed_impl(
         metal::ComputePipelineState::from_raw(cache_copy_owner.raw())
     };
     let mps_input_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_input_owner.raw());
+    let norm_half_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(norm_half_owner.raw());
+    let swiglu_half_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(swiglu_half_owner.raw());
     let mps_bf16_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_bf16_owner.raw());
     let mps_q8_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(mps_q8_owner.raw());
     let cache_first_residual_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_first_residual_owner.raw());
@@ -4734,7 +4775,15 @@ fn run_trajectory_packed_impl(
         value
     } else { graph_attention::disabled() };
 
-    guard let option::Option[metal::Buffer]::Some(norm1) = new_buffer(device, activation_bytes) else { return 1; }; let norm1_owner: OwnedObjc = OwnedObjc::new(norm1.raw());
+    let direct_half_activations: bool = weight_file.all_block_matrices_fp16()
+        && !env::has_var("QI_DISABLE_DIRECT_FP16_ACTIVATIONS");
+    let fp32_norm_scratch_bytes: u64 = if direct_half_activations {
+        2 as u64
+    } else { activation_bytes };
+    let fp32_swiglu_scratch_bytes: u64 = if direct_half_activations {
+        2 as u64
+    } else { mlp_bytes };
+    guard let option::Option[metal::Buffer]::Some(norm1) = new_buffer(device, fp32_norm_scratch_bytes) else { return 1; }; let norm1_owner: OwnedObjc = OwnedObjc::new(norm1.raw());
     guard let option::Option[metal::Buffer]::Some(query) = new_buffer(device, activation_bytes) else { return 1; }; let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
     guard let option::Option[metal::Buffer]::Some(key) = new_buffer(device, activation_bytes) else { return 1; }; let key_owner: OwnedObjc = OwnedObjc::new(key.raw());
     guard let option::Option[metal::Buffer]::Some(value) = new_buffer(device, activation_bytes) else { return 1; }; let value_owner: OwnedObjc = OwnedObjc::new(value.raw());
@@ -4743,10 +4792,10 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(attended) = new_buffer(device, activation_bytes) else { return 1; }; let attended_owner: OwnedObjc = OwnedObjc::new(attended.raw());
     guard let option::Option[metal::Buffer]::Some(attention_projected) = new_buffer(device, activation_bytes) else { return 1; }; let attention_projected_owner: OwnedObjc = OwnedObjc::new(attention_projected.raw());
     guard let option::Option[metal::Buffer]::Some(residual1) = new_buffer(device, activation_bytes) else { return 1; }; let residual1_owner: OwnedObjc = OwnedObjc::new(residual1.raw());
-    guard let option::Option[metal::Buffer]::Some(norm2) = new_buffer(device, activation_bytes) else { return 1; }; let norm2_owner: OwnedObjc = OwnedObjc::new(norm2.raw());
+    guard let option::Option[metal::Buffer]::Some(norm2) = new_buffer(device, fp32_norm_scratch_bytes) else { return 1; }; let norm2_owner: OwnedObjc = OwnedObjc::new(norm2.raw());
     guard let option::Option[metal::Buffer]::Some(gate) = new_buffer(device, mlp_bytes) else { return 1; }; let gate_owner: OwnedObjc = OwnedObjc::new(gate.raw());
     guard let option::Option[metal::Buffer]::Some(projected) = new_buffer(device, mlp_bytes) else { return 1; }; let projected_owner: OwnedObjc = OwnedObjc::new(projected.raw());
-    guard let option::Option[metal::Buffer]::Some(swiglu) = new_buffer(device, mlp_bytes) else { return 1; }; let swiglu_buffer_owner: OwnedObjc = OwnedObjc::new(swiglu.raw());
+    guard let option::Option[metal::Buffer]::Some(swiglu) = new_buffer(device, fp32_swiglu_scratch_bytes) else { return 1; }; let swiglu_buffer_owner: OwnedObjc = OwnedObjc::new(swiglu.raw());
     guard let option::Option[metal::Buffer]::Some(mlp_projected) = new_buffer(device, activation_bytes) else { return 1; }; let mlp_projected_owner: OwnedObjc = OwnedObjc::new(mlp_projected.raw());
     guard let option::Option[metal::Buffer]::Some(cache_key_arena) = new_buffer(device, cache_arena_bytes) else { return 1; }; let cache_key_arena_owner: OwnedObjc = OwnedObjc::new(cache_key_arena.raw());
     guard let option::Option[metal::Buffer]::Some(cache_value_arena) = new_buffer(device, cache_arena_bytes) else { return 1; }; let cache_value_arena_owner: OwnedObjc = OwnedObjc::new(cache_value_arena.raw());
@@ -4757,7 +4806,17 @@ fn run_trajectory_packed_impl(
         2 as u64
     } else { (MLP_WIDTH *% WIDTH *% (2 as usize)) as u64 };
     guard let option::Option[metal::Buffer]::Some(mps_half_weight) = new_buffer(device, mps_half_weight_bytes) else { return 1; }; let mps_half_weight_owner: OwnedObjc = OwnedObjc::new(mps_half_weight.raw());
-    let mps_workspace: MpsWorkspace = MpsWorkspace { device: device, input_pipeline: mps_input_pipeline, bf16_pipeline: mps_bf16_pipeline, q8_pipeline: mps_q8_pipeline, half_input: mps_half_input, half_weight: mps_half_weight };
+    let mps_workspace: MpsWorkspace = MpsWorkspace {
+        device: device,
+        input_pipeline: mps_input_pipeline,
+        norm_half_pipeline: norm_half_pipeline,
+        swiglu_half_pipeline: swiglu_half_pipeline,
+        bf16_pipeline: mps_bf16_pipeline,
+        q8_pipeline: mps_q8_pipeline,
+        half_input: mps_half_input,
+        half_weight: mps_half_weight,
+        direct_half_activations: direct_half_activations,
+    };
     guard let option::Option[metal::Buffer]::Some(final_scale) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_owner: OwnedObjc = OwnedObjc::new(final_scale.raw());
     guard let option::Option[metal::Buffer]::Some(final_normalized) = new_buffer(device, activation_bytes) else { return 1; }; let final_normalized_owner: OwnedObjc = OwnedObjc::new(final_normalized.raw());
     guard let option::Option[metal::Buffer]::Some(noise_output) = new_buffer(device, (rows *% IMAGE_CHANNELS *% #size_of::[f32]()) as u64) else { return 1; }; let noise_output_owner: OwnedObjc = OwnedObjc::new(noise_output.raw());
@@ -4777,7 +4836,7 @@ fn run_trajectory_packed_impl(
     var total_cached_steps: usize = 0 as usize;
     let buffers_and_prefix_wall_ms: i64 = time::now_millis() - buffers_and_prefix_start_ms;
     io::println(
-        "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms}",
+        "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms} direct_fp16_activations=${direct_half_activations} fp32_activation_scratch_bytes=${(2 as u64) *% fp32_norm_scratch_bytes +% fp32_swiglu_scratch_bytes}",
     );
     let trajectory_wall_start_ms: i64 = time::now_millis();
     let timestep_values: *f32 = timestep.contents() as *f32;

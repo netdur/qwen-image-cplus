@@ -834,6 +834,26 @@ Inspect a shard, optionally filtering tensor names:
   as a thermally/power-confounded observation rather than a speed comparison.
   The adjacent two-step A/B is the F2 throughput result. Details are in
   `benchmarks/m1-max-all-fp16-v4-1024.json`.
+- Plan-5 F4 now writes LayerNorm/modulation and SwiGLU results directly to the
+  reusable FP16 MPS input buffer. It removes three full FP32-to-FP16 conversion
+  dispatches per block and no longer allocates the two FP32 normalization
+  intermediates or the FP32 SwiGLU intermediate for v4. At the 4,127-row 1024
+  prefill shape this removes **338,083,834 bytes (322.42 MiB)** of scratch.
+  `QI_DISABLE_DIRECT_FP16_ACTIVATIONS=1` restores the old path for A/B testing;
+  legacy v1-v3 packs select it automatically.
+
+  The gain is real but much smaller than Plan 5 projected. An adjacent 256
+  40-step control fell from 20,234.3 to **20,027.7 ms GPU** and from 20,579 to
+  **20,356 ms wall** (about 1.0-1.1%). Step-1, step-2, and step-40 nRMSE are
+  bit-identical at 0.08727%, 0.12607%, and 1.07623%. Cache-DiT retained all 27
+  decisions and measured 7.194 s GPU / 7.404 s wall. Three adjacent 1024
+  two-step pairs all favored the direct path, but only by **22-198 ms** over
+  roughly 18.2-18.9 s (0.1-1.1%); cached-step savings were the consistent part
+  at 45-151 ms. The full native 256 output is byte-for-byte identical to the
+  F2 output (`d9967772...` SHA-256). The large elementwise transfers overlap or
+  consume less of the integrated step than the plan's bandwidth estimate
+  assumed. Exact controls and power-state caveats are in
+  `benchmarks/m1-max-direct-fp16-activations.json`.
 - Smaller scalar variations were closed before adopting flash: FP16 K/V alone
   saved only 3-3.5% and introduced the same numerical loss; eight queries in
   one scalar SIMD group regressed 33-38% from register pressure; and a
@@ -898,14 +918,13 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    data outside Git. Cache-off remains the reproducible path; independently
    assess Cache-DiT image quality because the existing thresholds were
    calibrated only at 256.
-2. **1024 transformer elementwise traffic (plan-5 F4).** MPSGraph SDPA and the
-   all-FP16 v4 pack have reduced clean measured steps to about 9.0 s cached and
-   10.0 s prefill. All block GEMMs are now FP16-backed and Q8 is absent. The
-   next measured opportunity is writing FP16 directly from normalization and
-   SwiGLU into MPS inputs, plus direct FP16 K/V production, to remove conversion
-   dispatches and large intermediate traffic. Scalar attention variants and
-   further Q8 work are closed for this phase. Accept changes only with
-   full-shape timing and numerical gates.
+2. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
+   FP16 normalization/SwiGLU output have completed Plan-5 F1, F2, and F4. The
+   remaining conversion candidate is direct FP16 K/V preparation, but F4's
+   measured 0.1-1.1% 1024 gain shows that bandwidth-only estimates must be
+   profiled before more code is added. Scalar attention variants, further Q8,
+   and additional broad activation conversions are closed. Accept any K/V
+   change only with full-shape timing and numerical gates.
 3. **1024 working memory.** Right-size and safely alias VAE activation arenas;
    the initial decoder path deliberately favors simple ownership and currently
    reserves several maximum-size buffers. Measure peak footprint after every
