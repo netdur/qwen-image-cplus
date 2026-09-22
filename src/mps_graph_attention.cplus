@@ -1,0 +1,499 @@
+import "metal/metal" as metal;
+import "objc/runtime" as rt;
+import "stdlib/option" as option;
+
+#[link_name = "dlopen"]
+extern fn qi_dlopen(path: *u8, mode: i32) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_id_u32_id(
+    receiver: *u8,
+    selector: *u8,
+    first: *u8,
+    second: u32,
+    third: *u8,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_id_u32_id_init(
+    receiver: *u8,
+    selector: *u8,
+    first: *u8,
+    second: *u8,
+    third: u32,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_id_id_id_id_f32_id(
+    receiver: *u8,
+    selector: *u8,
+    query: *u8,
+    key: *u8,
+    value: *u8,
+    mask: *u8,
+    scale: f32,
+    name: *u8,
+) -> *u8;
+
+const RTLD_LAZY: i32 = 1;
+const MPS_DATA_TYPE_FLOAT16: u32 = 0x10000010;
+const MPS_DATA_TYPE_FLOAT32: u32 = 0x10000020;
+const HEADS: usize = 32;
+const HEAD_DIMENSION: usize = 128;
+
+struct OwnedObjc {
+    opaque pointer: *u8,
+}
+
+impl OwnedObjc {
+    fn new(pointer: *u8) -> OwnedObjc {
+        return OwnedObjc { pointer: pointer };
+    }
+
+    fn raw(this) -> *u8 {
+        return this.pointer;
+    }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            rt::release(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+struct Attention {
+    opaque graph: OwnedObjc,
+    opaque query_shape: OwnedObjc,
+    opaque key_value_shape: OwnedObjc,
+    opaque mask_shape: OwnedObjc,
+    opaque query_tensor: OwnedObjc,
+    opaque key_tensor: OwnedObjc,
+    opaque value_tensor: OwnedObjc,
+    opaque mask_tensor: OwnedObjc,
+    opaque output_tensor: OwnedObjc,
+}
+
+struct CommandBufferContext {
+    opaque owner: OwnedObjc,
+}
+
+impl CommandBufferContext {
+    fn metal(this) -> metal::CommandBuffer {
+        return metal::CommandBuffer::from_raw(this.owner.raw());
+    }
+}
+
+fn wrap_command_buffer(
+    base: metal::CommandBuffer,
+    use_mps_graph: bool,
+) -> option::Option[CommandBufferContext] {
+    if !use_mps_graph {
+        return option::Option[CommandBufferContext]::Some(CommandBufferContext {
+            owner: OwnedObjc::new(rt::retain(base.raw())),
+        });
+    }
+    if !load_frameworks() { return option::Option[CommandBufferContext]::None; }
+    let wrapper: *u8 = rt::msg_id_id(
+        rt::get_class(#str_ptr("MPSCommandBuffer\0")),
+        rt::sel(#str_ptr("commandBufferWithCommandBuffer:\0")),
+        base.raw(),
+    );
+    if wrapper.is_null() { return option::Option[CommandBufferContext]::None; }
+    return option::Option[CommandBufferContext]::Some(CommandBufferContext {
+        owner: OwnedObjc::new(rt::retain(wrapper)),
+    });
+}
+
+fn disabled() -> Attention {
+    return Attention {
+        graph: OwnedObjc::new(0 as *u8),
+        query_shape: OwnedObjc::new(0 as *u8),
+        key_value_shape: OwnedObjc::new(0 as *u8),
+        mask_shape: OwnedObjc::new(0 as *u8),
+        query_tensor: OwnedObjc::new(0 as *u8),
+        key_tensor: OwnedObjc::new(0 as *u8),
+        value_tensor: OwnedObjc::new(0 as *u8),
+        mask_tensor: OwnedObjc::new(0 as *u8),
+        output_tensor: OwnedObjc::new(0 as *u8),
+    };
+}
+
+fn load_frameworks() -> bool {
+    let mps: *u8 = qi_dlopen(
+        #str_ptr("/System/Library/Frameworks/MetalPerformanceShaders.framework/MetalPerformanceShaders\0"),
+        RTLD_LAZY,
+    );
+    let graph: *u8 = qi_dlopen(
+        #str_ptr("/System/Library/Frameworks/MetalPerformanceShadersGraph.framework/MetalPerformanceShadersGraph\0"),
+        RTLD_LAZY,
+    );
+    return !mps.is_null() && !graph.is_null();
+}
+
+fn number(value: u64) -> option::Option[OwnedObjc] {
+    let class: *u8 = rt::get_class(#str_ptr("NSNumber\0"));
+    if class.is_null() { return option::Option[OwnedObjc]::None; }
+    let object: *u8 = rt::msg_id_u64(
+        class, rt::sel(#str_ptr("numberWithUnsignedLongLong:\0")), value,
+    );
+    if object.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(object)));
+}
+
+fn shape4(dimension_0: usize, dimension_1: usize, dimension_2: usize, dimension_3: usize)
+    -> option::Option[OwnedObjc] {
+    guard let option::Option[OwnedObjc]::Some(first) = number(dimension_0 as u64) else {
+        return option::Option[OwnedObjc]::None;
+    };
+    guard let option::Option[OwnedObjc]::Some(second) = number(dimension_1 as u64) else {
+        return option::Option[OwnedObjc]::None;
+    };
+    guard let option::Option[OwnedObjc]::Some(third) = number(dimension_2 as u64) else {
+        return option::Option[OwnedObjc]::None;
+    };
+    guard let option::Option[OwnedObjc]::Some(fourth) = number(dimension_3 as u64) else {
+        return option::Option[OwnedObjc]::None;
+    };
+    var objects: [*u8; 4] = [
+        first.raw(), second.raw(), third.raw(), fourth.raw(),
+    ];
+    let array: *u8 = rt::msg_id_id_u64(
+        rt::get_class(#str_ptr("NSArray\0")),
+        rt::sel(#str_ptr("arrayWithObjects:count:\0")),
+        #addr_of(objects[0]) as *u8,
+        4 as u64,
+    );
+    if array.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(array)));
+}
+
+fn placeholder(graph: *u8, shape_pointer: *u8, data_type: u32)
+    -> option::Option[OwnedObjc] {
+    let tensor: *u8 = qi_msg_id_id_u32_id(
+        graph,
+        rt::sel(#str_ptr("placeholderWithShape:dataType:name:\0")),
+        shape_pointer,
+        data_type,
+        0 as *u8,
+    );
+    if tensor.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(tensor)));
+}
+
+fn create(query_rows: usize, key_rows: usize, masked: bool = false) -> option::Option[Attention] {
+    if query_rows == (0 as usize) || key_rows == (0 as usize) || !load_frameworks() {
+        return option::Option[Attention]::None;
+    }
+    let graph_pointer: *u8 = rt::alloc_init(#str_ptr("MPSGraph\0"));
+    if graph_pointer.is_null() { return option::Option[Attention]::None; }
+    let graph: OwnedObjc = OwnedObjc::new(graph_pointer);
+    guard let option::Option[OwnedObjc]::Some(query_shape) = shape4(
+        1 as usize, query_rows, HEADS, HEAD_DIMENSION,
+    ) else {
+        return option::Option[Attention]::None;
+    };
+    guard let option::Option[OwnedObjc]::Some(key_value_shape) = shape4(
+        1 as usize, key_rows, HEADS, HEAD_DIMENSION,
+    ) else {
+        return option::Option[Attention]::None;
+    };
+    let mask_shape: OwnedObjc = if masked {
+        guard let option::Option[OwnedObjc]::Some(value) = shape4(
+            1 as usize, 1 as usize, query_rows, key_rows,
+        ) else { return option::Option[Attention]::None; };
+        value
+    } else { OwnedObjc::new(0 as *u8) };
+    guard let option::Option[OwnedObjc]::Some(query_tensor) = placeholder(
+        graph.raw(), query_shape.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Attention]::None; };
+    guard let option::Option[OwnedObjc]::Some(key_tensor) = placeholder(
+        graph.raw(), key_value_shape.raw(), MPS_DATA_TYPE_FLOAT16,
+    ) else { return option::Option[Attention]::None; };
+    guard let option::Option[OwnedObjc]::Some(value_tensor) = placeholder(
+        graph.raw(), key_value_shape.raw(), MPS_DATA_TYPE_FLOAT16,
+    ) else { return option::Option[Attention]::None; };
+    let mask_tensor: OwnedObjc = if masked {
+        guard let option::Option[OwnedObjc]::Some(value) = placeholder(
+            graph.raw(), mask_shape.raw(), MPS_DATA_TYPE_FLOAT16,
+        ) else { return option::Option[Attention]::None; };
+        value
+    } else { OwnedObjc::new(0 as *u8) };
+
+    let query_half: *u8 = rt::msg_id_id_u64_id(
+        graph.raw(), rt::sel(#str_ptr("castTensor:toType:name:\0")),
+        query_tensor.raw(), MPS_DATA_TYPE_FLOAT16 as u64, 0 as *u8,
+    );
+    let query_heads: *u8 = rt::msg_id_id_u64_u64_id(
+        graph.raw(), rt::sel(#str_ptr("transposeTensor:dimension:withDimension:name:\0")),
+        query_half, 1 as u64, 2 as u64, 0 as *u8,
+    );
+    let key_heads: *u8 = rt::msg_id_id_u64_u64_id(
+        graph.raw(), rt::sel(#str_ptr("transposeTensor:dimension:withDimension:name:\0")),
+        key_tensor.raw(), 1 as u64, 2 as u64, 0 as *u8,
+    );
+    let value_heads: *u8 = rt::msg_id_id_u64_u64_id(
+        graph.raw(), rt::sel(#str_ptr("transposeTensor:dimension:withDimension:name:\0")),
+        value_tensor.raw(), 1 as u64, 2 as u64, 0 as *u8,
+    );
+    if query_half.is_null() || query_heads.is_null() || key_heads.is_null()
+        || value_heads.is_null() {
+        return option::Option[Attention]::None;
+    }
+    let attended_heads: *u8 = qi_msg_id_id_id_id_id_f32_id(
+        graph.raw(),
+        rt::sel(#str_ptr("scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:maskTensor:scale:name:\0")),
+        query_heads,
+        key_heads,
+        value_heads,
+        mask_tensor.raw(),
+        0.08838834764831845f32,
+        0 as *u8,
+    );
+    if attended_heads.is_null() { return option::Option[Attention]::None; }
+    let attended_rows: *u8 = rt::msg_id_id_u64_u64_id(
+        graph.raw(), rt::sel(#str_ptr("transposeTensor:dimension:withDimension:name:\0")),
+        attended_heads, 1 as u64, 2 as u64, 0 as *u8,
+    );
+    if attended_rows.is_null() { return option::Option[Attention]::None; }
+    let output_pointer: *u8 = rt::msg_id_id_u64_id(
+        graph.raw(), rt::sel(#str_ptr("castTensor:toType:name:\0")),
+        attended_rows, MPS_DATA_TYPE_FLOAT32 as u64, 0 as *u8,
+    );
+    if output_pointer.is_null() { return option::Option[Attention]::None; }
+    return option::Option[Attention]::Some(Attention {
+        graph: graph,
+        query_shape: query_shape,
+        key_value_shape: key_value_shape,
+        mask_shape: mask_shape,
+        query_tensor: query_tensor,
+        key_tensor: key_tensor,
+        value_tensor: value_tensor,
+        mask_tensor: mask_tensor,
+        output_tensor: OwnedObjc::new(rt::retain(output_pointer)),
+    });
+}
+
+fn tensor_data(buffer: metal::Buffer, shape_pointer: *u8, data_type: u32)
+    -> option::Option[OwnedObjc] {
+    let class: *u8 = rt::get_class(#str_ptr("MPSGraphTensorData\0"));
+    if class.is_null() { return option::Option[OwnedObjc]::None; }
+    let allocated: *u8 = rt::msg_id(class, rt::sel(#str_ptr("alloc\0")));
+    if allocated.is_null() { return option::Option[OwnedObjc]::None; }
+    let data: *u8 = qi_msg_id_id_u32_id_init(
+        allocated,
+        rt::sel(#str_ptr("initWithMTLBuffer:shape:dataType:\0")),
+        buffer.raw(),
+        shape_pointer,
+        data_type,
+    );
+    if data.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(data));
+}
+
+fn dictionary3(
+    key_0: *u8,
+    key_1: *u8,
+    key_2: *u8,
+    value_0: *u8,
+    value_1: *u8,
+    value_2: *u8,
+) -> option::Option[OwnedObjc] {
+    var keys: [*u8; 3] = [key_0, key_1, key_2];
+    var values: [*u8; 3] = [value_0, value_1, value_2];
+    let dictionary: *u8 = rt::msg_id_id_id_u64(
+        rt::get_class(#str_ptr("NSDictionary\0")),
+        rt::sel(#str_ptr("dictionaryWithObjects:forKeys:count:\0")),
+        #addr_of(values[0]) as *u8,
+        #addr_of(keys[0]) as *u8,
+        3 as u64,
+    );
+    if dictionary.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(dictionary)));
+}
+
+fn dictionary4(
+    key_0: *u8,
+    key_1: *u8,
+    key_2: *u8,
+    key_3: *u8,
+    value_0: *u8,
+    value_1: *u8,
+    value_2: *u8,
+    value_3: *u8,
+) -> option::Option[OwnedObjc] {
+    var keys: [*u8; 4] = [key_0, key_1, key_2, key_3];
+    var values: [*u8; 4] = [value_0, value_1, value_2, value_3];
+    let dictionary: *u8 = rt::msg_id_id_id_u64(
+        rt::get_class(#str_ptr("NSDictionary\0")),
+        rt::sel(#str_ptr("dictionaryWithObjects:forKeys:count:\0")),
+        #addr_of(values[0]) as *u8,
+        #addr_of(keys[0]) as *u8,
+        4 as u64,
+    );
+    if dictionary.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(dictionary)));
+}
+
+fn dictionary1(key: *u8, value: *u8) -> option::Option[OwnedObjc] {
+    let dictionary: *u8 = rt::msg_id_id_id(
+        rt::get_class(#str_ptr("NSDictionary\0")),
+        rt::sel(#str_ptr("dictionaryWithObject:forKey:\0")),
+        value,
+        key,
+    );
+    if dictionary.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(dictionary)));
+}
+
+fn dispatch(
+    attention: *Attention,
+    queue: metal::CommandQueue,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    output: metal::Buffer,
+) -> option::Option[f64] {
+    return dispatch_impl(attention, queue, query, key, value, output, output, false);
+}
+
+fn dispatch_masked(
+    attention: *Attention,
+    queue: metal::CommandQueue,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    mask: metal::Buffer,
+    output: metal::Buffer,
+) -> option::Option[f64] {
+    return dispatch_impl(attention, queue, query, key, value, mask, output, true);
+}
+
+fn dispatch_impl(
+    attention: *Attention,
+    queue: metal::CommandQueue,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    mask: metal::Buffer,
+    output: metal::Buffer,
+    masked: bool,
+) -> option::Option[f64] {
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[CommandBufferContext]::Some(context) =
+        wrap_command_buffer(command_buffer, true) else { return option::Option[f64]::None; };
+    let active_command_buffer: metal::CommandBuffer = context.metal();
+    if !encode_impl(
+        attention, active_command_buffer, query, key, value, mask, output, masked,
+    ) {
+        return option::Option[f64]::None;
+    }
+    active_command_buffer.commit();
+    active_command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (active_command_buffer.g_p_u_end_time() - active_command_buffer.g_p_u_start_time())
+            * 1000.0f64,
+    );
+}
+
+fn encode(
+    attention: *Attention,
+    command_buffer: metal::CommandBuffer,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    output: metal::Buffer,
+) -> bool {
+    return encode_impl(
+        attention, command_buffer, query, key, value, output, output, false,
+    );
+}
+
+fn encode_masked(
+    attention: *Attention,
+    command_buffer: metal::CommandBuffer,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    mask: metal::Buffer,
+    output: metal::Buffer,
+) -> bool {
+    return encode_impl(
+        attention, command_buffer, query, key, value, mask, output, true,
+    );
+}
+
+fn encode_impl(
+    attention: *Attention,
+    command_buffer: metal::CommandBuffer,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    mask: metal::Buffer,
+    output: metal::Buffer,
+    masked: bool,
+) -> bool {
+    if attention.is_null() { return false; }
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return false; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[OwnedObjc]::Some(query_data) = tensor_data(
+        query, (*attention).query_shape.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return false; };
+    guard let option::Option[OwnedObjc]::Some(key_data) = tensor_data(
+        key, (*attention).key_value_shape.raw(), MPS_DATA_TYPE_FLOAT16,
+    ) else { return false; };
+    guard let option::Option[OwnedObjc]::Some(value_data) = tensor_data(
+        value, (*attention).key_value_shape.raw(), MPS_DATA_TYPE_FLOAT16,
+    ) else { return false; };
+    guard let option::Option[OwnedObjc]::Some(output_data) = tensor_data(
+        output, (*attention).query_shape.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return false; };
+    let mask_data: OwnedObjc = if masked {
+        if (*attention).mask_tensor.raw().is_null() {
+            return false;
+        }
+        guard let option::Option[OwnedObjc]::Some(data) = tensor_data(
+            mask, (*attention).mask_shape.raw(), MPS_DATA_TYPE_FLOAT16,
+        ) else { return false; };
+        data
+    } else { OwnedObjc::new(0 as *u8) };
+    let feeds: OwnedObjc = if masked {
+        guard let option::Option[OwnedObjc]::Some(dictionary) = dictionary4(
+            (*attention).query_tensor.raw(),
+            (*attention).key_tensor.raw(),
+            (*attention).value_tensor.raw(),
+            (*attention).mask_tensor.raw(),
+            query_data.raw(),
+            key_data.raw(),
+            value_data.raw(),
+            mask_data.raw(),
+        ) else { return false; };
+        dictionary
+    } else {
+        guard let option::Option[OwnedObjc]::Some(dictionary) = dictionary3(
+            (*attention).query_tensor.raw(),
+            (*attention).key_tensor.raw(),
+            (*attention).value_tensor.raw(),
+            query_data.raw(),
+            key_data.raw(),
+            value_data.raw(),
+        ) else { return false; };
+        dictionary
+    };
+    guard let option::Option[OwnedObjc]::Some(results) = dictionary1(
+        (*attention).output_tensor.raw(), output_data.raw(),
+    ) else { return false; };
+    rt::msg_void_id_id_id_id_id(
+        (*attention).graph.raw(),
+        rt::sel(#str_ptr("encodeToCommandBuffer:feeds:targetOperations:resultsDictionary:executionDescriptor:\0")),
+        command_buffer.raw(),
+        feeds.raw(),
+        0 as *u8,
+        results.raw(),
+        0 as *u8,
+    );
+    return true;
+}

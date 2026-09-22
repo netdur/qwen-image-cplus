@@ -789,6 +789,22 @@ Inspect a shard, optionally filtering tensor names:
   / 23.023 s loop wall total. Prefix K/V storage fell from about 31 MiB to
   **15.5 MiB**. Process wall still includes roughly 6.5-7.0 s of startup buffer
   work, which is intentionally reported separately from transformer execution.
+- MPSGraph's fused scaled-dot-product attention now supersedes the custom flash
+  kernel at 1024. The graph accepts the runtime's row-major FP32 Q and padded
+  FP16 K/V, performs its FP16 cast and row/head transposes itself, preserves the
+  exact block-causal prefill mask, and returns row-major FP32 output. Those
+  conversions are included in the isolated result: prefill fell from 74.232 to
+  **53.644 ms** and cached attention from 72.979 to **49.512 ms**, with
+  0.000306/0.000490 nRMSE against scalar FP32. Two reversed adjacent full-step
+  pairs reduced loop wall from 11.545-11.654 s to **10.573-10.820 s**, a
+  6.3-9.3% saving. A two-step run fell from 22.769 to **21.361 s**; its cached
+  step fell from 11.294 to **10.520 s**. MPSGraph internally uses
+  `commitAndContinue`, so a single command-buffer GPU timestamp covers only a
+  fragment; logs mark this as `gpu_timing_fragmented=true` and wall time is the
+  authoritative integrated measure. `QI_DISABLE_MPSGRAPH_ATTENTION=1` selects
+  the custom flash control. At 256 the isolated gain was only 1.8-3.8%, so the
+  lower-overhead custom kernel remains selected. Full evidence is in
+  `benchmarks/m1-max-mpsgraph-attention-1024.json`.
 - Smaller scalar variations were closed before adopting flash: FP16 K/V alone
   saved only 3-3.5% and introduced the same numerical loss; eight queries in
   one scalar SIMD group regressed 33-38% from register pressure; and a
@@ -843,8 +859,8 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    assess Cache-DiT image quality because the existing thresholds were
    calibrated only at 256.
 2. **1024 transformer throughput.** Flash Attention has removed the former
-   roughly 24-second attention wall: a complete step is now about 11.2-11.7 s
-   GPU. Profile this new shape before acting. The next plausible work is direct
+   roughly 24-second attention wall, and MPSGraph SDPA has reduced a complete
+   measured step to about 10.6-10.8 s wall. The next plausible work is direct
    FP16 K/V production (removing the preparation pass), then the remaining QKV,
    output, and MLP GEMMs; scalar attention variants are closed. Accept changes
    only with full-shape timing and numerical gates.

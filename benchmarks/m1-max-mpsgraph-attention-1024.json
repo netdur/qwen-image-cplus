@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Production adoption of MPSGraph fused scaled-dot-product attention at 1024x1024",
+  "implementation": {
+    "operator": "MPSGraph scaledDotProductAttention",
+    "shape": "32 heads, dimension 128, 4096 image rows plus 31 prompt rows",
+    "inputs": "Row-major FP32 Q and padded row-major FP16 K/V",
+    "graph_work": "Cast Q to FP16, transpose row/head dimensions, fused SDPA, transpose output, and cast output to FP32",
+    "prefill_mask": "Additive FP16 block-causal mask preserving causal text and bidirectional image attention",
+    "cached_mask": "None; all 4096 image queries attend the 31 cached prompt rows and all image rows",
+    "command_buffer": "MPSCommandBuffer wrapper is required because MPSGraph uses commitAndContinue internally",
+    "resolution_policy": "MPSGraph at 1024 only; custom Flash Attention remains selected at 256 and the exact two-query kernel remains selected at 512",
+    "control": "QI_DISABLE_MPSGRAPH_ATTENTION=1"
+  },
+  "isolated_attention_1024": {
+    "prefill_rows": 4127,
+    "cached_query_rows": 4096,
+    "key_rows": 4127,
+    "custom_flash_prefill_gpu_ms": 74.2319,
+    "mpsgraph_prefill_gpu_ms": 53.6441,
+    "prefill_speedup": 1.38378,
+    "prefill_nrmse_vs_scalar_fp32": 0.000305982,
+    "custom_flash_cached_gpu_ms": 72.979,
+    "mpsgraph_cached_gpu_ms": 49.5116,
+    "cached_speedup": 1.47398,
+    "cached_nrmse_vs_scalar_fp32": 0.000489983,
+    "nrmse_limit": 0.001,
+    "timing_includes_graph_casts_and_transposes": true
+  },
+  "integrated_1024_one_step_adjacent_pairs": [
+    {
+      "order": "mpsgraph_then_custom_flash",
+      "mpsgraph_step_wall_ms": 10560,
+      "mpsgraph_loop_wall_ms": 10573,
+      "custom_flash_step_wall_ms": 11640,
+      "custom_flash_loop_wall_ms": 11654,
+      "loop_reduction_ms": 1081,
+      "loop_reduction_percent": 9.3
+    },
+    {
+      "order": "custom_flash_then_mpsgraph",
+      "custom_flash_step_wall_ms": 11531,
+      "custom_flash_loop_wall_ms": 11545,
+      "mpsgraph_step_wall_ms": 10807,
+      "mpsgraph_loop_wall_ms": 10820,
+      "loop_reduction_ms": 725,
+      "loop_reduction_percent": 6.3
+    }
+  ],
+  "integrated_1024_two_step": {
+    "mpsgraph_prefill_step_wall_ms": 10827,
+    "mpsgraph_cached_step_wall_ms": 10520,
+    "mpsgraph_loop_wall_ms": 21361,
+    "custom_flash_prefill_step_wall_ms": 11460,
+    "custom_flash_cached_step_wall_ms": 11294,
+    "custom_flash_loop_wall_ms": 22769,
+    "loop_reduction_ms": 1408,
+    "loop_reduction_percent": 6.2
+  },
+  "rejected_at_256": {
+    "custom_flash_prefill_gpu_ms": 0.444833,
+    "mpsgraph_prefill_gpu_ms": 0.437069,
+    "prefill_speedup": 1.01776,
+    "custom_flash_cached_gpu_ms": 0.377097,
+    "mpsgraph_cached_gpu_ms": 0.363347,
+    "cached_speedup": 1.03784,
+    "prefill_nrmse_vs_scalar_fp32": 0.000301935,
+    "cached_nrmse_vs_scalar_fp32": 0.000399073,
+    "decision": "Retain the custom Flash Attention kernel because the 1.8-3.8% isolated difference is noise-sized and does not justify graph command overhead."
+  },
+  "validation": {
+    "official_256_step_1_latent_nrmse": 0.000894272,
+    "official_256_step_1_limit": 0.001,
+    "official_256_step_2_latent_nrmse": 0.00127067,
+    "official_256_step_2_limit": 0.0015,
+    "official_256_step_40_latent_nrmse": 0.0104073,
+    "official_256_step_40_limit": 0.011,
+    "unit_tests": "334 passed, 0 failed",
+    "metal_runtime_compile": true,
+    "native_256_prompt_to_png_pipeline": "passed",
+    "complete_1024_oracle_available": false
+  },
+  "measurement_notes": [
+    "MPSGraph commitAndContinue fragments the command buffer, so its single gpu_ms field is not a complete integrated-step measurement. Integrated comparisons use step and loop wall time.",
+    "macOS pmset reported 'Now drawing from AC Power' while also reporting the battery as '100%; discharging'. No stronger power-state claim is made; acceptance uses adjacent A/B pairs in both orders.",
+    "The one- and two-step runs exclude text encoding, VAE decoding, and PNG output and are prefixes of the canonical 40-step schedule.",
+    "No official complete 1024 trajectory oracle exists. The fused operator passes its scalar-FP32 gate and shared runtime plumbing passes the official 256 one-, two-, and forty-step trajectory gates."
+  ]
+}

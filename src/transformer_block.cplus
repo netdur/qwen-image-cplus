@@ -1,6 +1,7 @@
 import "./cpu_ops" as cpu;
 import "./metal_primitives" as metrics;
 import "./mmap_macos" as mapped;
+import "./mps_graph_attention" as graph_attention;
 import "./mps_matrix" as mps;
 import "./packed_model" as packed;
 import "./random" as random;
@@ -2243,6 +2244,36 @@ fn execute_batched_runtime_block(
     );
 }
 
+fn encode_post_attention(
+    encoder: metal::ComputeCommandEncoder,
+    pipelines: Pipelines,
+    weights: BlockWeights,
+    workspace: BlockWorkspace,
+    hidden: metal::Buffer,
+    rows: usize,
+    params: *BlockParams,
+) {
+    encode_buffer_barrier(encoder);
+    encode_weighted_linear(
+        encoder, pipelines, workspace.attended, weights.attention_output,
+        workspace.attention_projected, WIDTH, WIDTH, rows,
+    );
+    encode_buffer_barrier(encoder);
+    (*params).slot = 1 as u32;
+    encode_1d(
+        encoder, pipelines.residual, hidden, workspace.modulation, workspace.residual1,
+        workspace.attention_projected, workspace.target_mask, workspace.dummy,
+        params, rows *% WIDTH,
+    );
+    encode_buffer_barrier(encoder);
+    (*params).slot = 2 as u32;
+    encode_simdgroup_1d(
+        encoder, pipelines.norm, workspace.residual1, workspace.modulation,
+        workspace.norm2, workspace.target_mask, workspace.dummy, workspace.dummy,
+        params, rows,
+    );
+}
+
 fn encode_mps_mlp_runtime_block(
     command_buffer: metal::CommandBuffer,
     pipelines: Pipelines,
@@ -2258,6 +2289,10 @@ fn encode_mps_mlp_runtime_block(
     cache_value: metal::Buffer,
     cache_offset: u64,
     prefix_rows: usize,
+    use_graph_attention: bool,
+    graph_prefill_attention: *graph_attention::Attention,
+    graph_cached_attention: *graph_attention::Attention,
+    graph_mask: metal::Buffer,
 ) -> bool {
     let gate_weight_buffer: metal::Buffer = if weights.gate.scheme == PACKED_SCHEME_FP16 {
         weights.gate.storage
@@ -2409,13 +2444,15 @@ fn encode_mps_mlp_runtime_block(
             if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
         );
         encode_buffer_barrier(attention_encoder);
-        encode_flash_attention(
-            attention_encoder, pipelines.attention, workspace.query_rope,
-            workspace.key, workspace.attended, workspace.projected,
-            workspace.image_ids, workspace.key_valid, rows,
-            if cached { prefix_rows +% rows } else { rows },
-            if cached { prefix_rows } else { 0 as usize },
-        );
+        if !use_graph_attention {
+            encode_flash_attention(
+                attention_encoder, pipelines.attention, workspace.query_rope,
+                workspace.key, workspace.attended, workspace.projected,
+                workspace.image_ids, workspace.key_valid, rows,
+                if cached { prefix_rows +% rows } else { rows },
+                if cached { prefix_rows } else { 0 as usize },
+            );
+        }
     } else {
         if cache_mode == (1 as u32) {
             encode_copy_prefix(
@@ -2440,28 +2477,44 @@ fn encode_mps_mlp_runtime_block(
             pipelines.attention_queries_per_group,
         );
     }
-    encode_buffer_barrier(attention_encoder);
-    encode_weighted_linear(
-        attention_encoder, pipelines, workspace.attended, weights.attention_output,
-        workspace.attention_projected, WIDTH, WIDTH, rows,
-    );
-    encode_buffer_barrier(attention_encoder);
-    params.slot = 1 as u32;
-    encode_1d(
-        attention_encoder, pipelines.residual, hidden, workspace.modulation, workspace.residual1,
-        workspace.attention_projected, workspace.target_mask, workspace.dummy,
-        #addr_of(params), rows *% WIDTH,
-    );
-    encode_buffer_barrier(attention_encoder);
-    params.slot = 2 as u32;
-    encode_simdgroup_1d(
-        attention_encoder, pipelines.norm, workspace.residual1, workspace.modulation,
-        workspace.norm2, workspace.target_mask, workspace.dummy, workspace.dummy,
-        #addr_of(params), rows,
-    );
+    if !use_graph_attention {
+        encode_post_attention(
+            attention_encoder, pipelines, weights, workspace, hidden, rows,
+            #addr_of(params),
+        );
+    }
     let attention_command_encoder: metal::CommandEncoder =
         metal::CommandEncoder::from_raw(attention_encoder.raw());
     attention_command_encoder.end_encoding();
+
+    if use_graph_attention {
+        let graph_ok: bool = if cached {
+            graph_attention::encode(
+                graph_cached_attention, command_buffer, workspace.query_rope,
+                workspace.key, workspace.projected, workspace.attended,
+            )
+        } else {
+            graph_attention::encode_masked(
+                graph_prefill_attention, command_buffer, workspace.query_rope,
+                workspace.key, workspace.projected, graph_mask, workspace.attended,
+            )
+        };
+        if !graph_ok { return false; }
+    }
+
+    if use_graph_attention {
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(post_attention_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let post_attention_encoder_owner: OwnedObjc =
+            OwnedObjc::new(rt::retain(post_attention_encoder.raw()));
+        encode_post_attention(
+            post_attention_encoder, pipelines, weights, workspace, hidden, rows,
+            #addr_of(params),
+        );
+        let post_attention_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(post_attention_encoder.raw());
+        post_attention_command_encoder.end_encoding();
+    }
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(gate_conversion_encoder) =
         command_buffer.compute_command_encoder() else { return false; };
@@ -2541,6 +2594,10 @@ fn execute_mps_mlp_runtime_block(
     cache_value: metal::Buffer,
     cache_offset: u64,
     prefix_rows: usize,
+    use_graph_attention: bool,
+    graph_prefill_attention: *graph_attention::Attention,
+    graph_cached_attention: *graph_attention::Attention,
+    graph_mask: metal::Buffer,
     profile: bool = false,
     metadata_wall_ms: i64 = 0,
     block_index: usize = 0,
@@ -2552,15 +2609,22 @@ fn execute_mps_mlp_runtime_block(
     guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
         queue.command_buffer() else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[graph_attention::CommandBufferContext]::Some(command_context) =
+        graph_attention::wrap_command_buffer(command_buffer, use_graph_attention) else {
+        return option::Option[f64]::None;
+    };
+    let active_command_buffer: metal::CommandBuffer = command_context.metal();
     if !encode_mps_mlp_runtime_block(
-        command_buffer, pipelines, mps_workspace, weights, workspace, hidden, output, rows,
+        active_command_buffer, pipelines, mps_workspace, weights, workspace, hidden, output, rows,
         cache_mode, cache_copy_pipeline, cache_key, cache_value, cache_offset, prefix_rows,
+        use_graph_attention, graph_prefill_attention, graph_cached_attention, graph_mask,
     ) { return option::Option[f64]::None; }
     let encode_wall_ms: i64 = time::now_millis() - block_wall_start_ms;
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    active_command_buffer.commit();
+    active_command_buffer.wait_until_completed();
     let gpu_ms: f64 =
-        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64;
+        (active_command_buffer.g_p_u_end_time() - active_command_buffer.g_p_u_start_time())
+            * 1000.0f64;
     if profile {
         io::println(
             "trajectory cached block profile: block=${block_index} rows=${rows} metadata_wall_ms=${metadata_wall_ms} encode_wall_ms=${encode_wall_ms} execute_wall_ms=${time::now_millis() - block_wall_start_ms} gpu_ms=${gpu_ms}",
@@ -4300,7 +4364,7 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: reference checkpoints are available only at 256px");
         return 2;
     }
-    if validate_reference && step_limit != (40 as usize) {
+    if validate_reference && step_limit == (25 as usize) {
         io::eprintln("trajectory: reference checkpoints require the canonical 40-step schedule");
         return 2;
     }
@@ -4310,13 +4374,16 @@ fn run_trajectory_packed_impl(
     let latent_count: usize = target_rows *% IMAGE_CHANNELS;
     var sigmas: [f32; 41] = [0.0f32; 41];
     var timesteps: [f32; 40] = [0.0f32; 40];
+    let schedule_steps: usize = if step_limit <= (2 as usize) {
+        40 as usize
+    } else { step_limit };
     if !flow::fill_schedule(
-        step_limit,
+        schedule_steps,
         target_rows,
         #addr_of(sigmas[0]),
         #addr_of(timesteps[0]),
     ) {
-        io::eprintln("trajectory: could not construct the ${step_limit}-step FlowMatch schedule");
+        io::eprintln("trajectory: could not construct the ${schedule_steps}-step FlowMatch schedule");
         return 1;
     }
     let packed_load_start_ms: i64 = time::now_millis();
@@ -4361,6 +4428,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
     let flash_attention: bool = pixels == (256 as usize) || pixels == (1024 as usize);
+    let use_graph_attention: bool = pixels == (1024 as usize)
+        && !env::has_var("QI_DISABLE_MPSGRAPH_ATTENTION");
     let attention_kernel_name: str = if flash_attention {
         "qi_block_attention_flash128"
     } else {
@@ -4576,6 +4645,39 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(cached_target_mask) = new_buffer(device, target_rows as u64) else { return 1; }; let cached_target_mask_owner: OwnedObjc = OwnedObjc::new(cached_target_mask.raw());
     row = 0 as usize;
     while row < target_rows { (cached_target_mask.contents())[row] = 1 as u8; row = row +% (1 as usize); }
+    guard let option::Option[metal::Buffer]::Some(graph_mask) = new_buffer(
+        device,
+        if use_graph_attention {
+            (rows *% rows *% #size_of::[u16]()) as u64
+        } else { #size_of::[u16]() as u64 },
+    ) else { return 1; };
+    let graph_mask_owner: OwnedObjc = OwnedObjc::new(graph_mask.raw());
+    if use_graph_attention {
+        let graph_mask_values: *u16 = graph_mask.contents() as *u16;
+        var query_row: usize = 0 as usize;
+        while query_row < rows {
+            var key_row: usize = 0 as usize;
+            while key_row < rows {
+                let same_image: bool = query_row >= text_rows && key_row >= text_rows;
+                graph_mask_values[query_row *% rows +% key_row] =
+                    if query_row >= key_row || same_image {
+                    0 as u16
+                } else { 0xFBFF as u16 };
+                key_row = key_row +% (1 as usize);
+            }
+            query_row = query_row +% (1 as usize);
+        }
+    }
+    let graph_prefill_attention: graph_attention::Attention = if use_graph_attention {
+        guard let option::Option[graph_attention::Attention]::Some(value) =
+            graph_attention::create(rows, rows, true) else { return 1; };
+        value
+    } else { graph_attention::disabled() };
+    let graph_cached_attention: graph_attention::Attention = if use_graph_attention {
+        guard let option::Option[graph_attention::Attention]::Some(value) =
+            graph_attention::create(target_rows, rows) else { return 1; };
+        value
+    } else { graph_attention::disabled() };
 
     guard let option::Option[metal::Buffer]::Some(norm1) = new_buffer(device, activation_bytes) else { return 1; }; let norm1_owner: OwnedObjc = OwnedObjc::new(norm1.raw());
     guard let option::Option[metal::Buffer]::Some(query) = new_buffer(device, activation_bytes) else { return 1; }; let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
@@ -4719,10 +4821,17 @@ fn run_trajectory_packed_impl(
 
         let profile_cached_block: bool = env::has_var("QI_PROFILE_CACHED_BLOCK");
         let batch_transformer_step: bool = !cache_dit_enabled && !profile_cached_block;
-        guard let option::Option[metal::CommandBuffer]::Some(transformer_command_buffer) =
+        guard let option::Option[metal::CommandBuffer]::Some(base_transformer_command_buffer) =
             queue.command_buffer() else { return 1; };
         let transformer_command_buffer_owner: OwnedObjc =
-            OwnedObjc::new(rt::retain(transformer_command_buffer.raw()));
+            OwnedObjc::new(rt::retain(base_transformer_command_buffer.raw()));
+        guard let option::Option[graph_attention::CommandBufferContext]::Some(
+            transformer_command_context,
+        ) = graph_attention::wrap_command_buffer(
+            base_transformer_command_buffer, use_graph_attention,
+        ) else { return 1; };
+        let transformer_command_buffer: metal::CommandBuffer =
+            transformer_command_context.metal();
 
         var step_quantized_matrices: usize = 0 as usize;
         var block: usize = 0 as usize;
@@ -4761,12 +4870,16 @@ fn run_trajectory_packed_impl(
                     active_workspace, current, next, active_rows, cache_mode,
                     cache_copy_pipeline, cache_key_arena, cache_value_arena, cache_offset,
                     text_rows,
+                    use_graph_attention, #addr_of(graph_prefill_attention),
+                    #addr_of(graph_cached_attention), graph_mask,
                 ) { return 1; }
             } else {
                 let block_result: option::Option[f64] = execute_mps_mlp_runtime_block(
                     queue, pipelines, mps_workspace, block_weights, active_workspace,
                     current, next, active_rows, cache_mode, cache_copy_pipeline,
                     cache_key_arena, cache_value_arena, cache_offset, text_rows,
+                    use_graph_attention, #addr_of(graph_prefill_attention),
+                    #addr_of(graph_cached_attention), graph_mask,
                     profile_cached_block
                         && step == (1 as usize)
                         && (block == (0 as usize) || block == (1 as usize)
@@ -4943,17 +5056,17 @@ fn run_trajectory_packed_impl(
                 0.011f64
             };
             if cache_dit_enabled && completed_step == (40 as usize) {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps} latent_nRMSE=${error} validation=measured-only");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps} latent_nRMSE=${error} validation=measured-only");
                 all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
             } else {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} latent_nRMSE=${error} limit=${error_limit}");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} latent_nRMSE=${error} limit=${error_limit}");
                 all_ok = error <= error_limit && finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
             }
         } else {
             if cache_dit_enabled {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps}");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps}");
             } else {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} wall_ms=${step_wall_ms}");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms}");
             }
             all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         }
@@ -4968,7 +5081,7 @@ fn run_trajectory_packed_impl(
         }
     }
     let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
-    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} total_wall_ms=${trajectory_wall_ms}");
+    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
         if cache_dit_enabled {
             io::println("Qwen-Image-2.1 Cache-DiT trajectory: complete; quality requires measured acceptance");
@@ -6071,6 +6184,7 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     guard let option::Option[metal::Buffer]::Some(full_simdgroup_output) = new_buffer(device, full_bytes) else { return 1; }; let full_simdgroup_output_owner: OwnedObjc = OwnedObjc::new(full_simdgroup_output.raw());
     guard let option::Option[metal::Buffer]::Some(full_four_query_output) = new_buffer(device, full_bytes) else { return 1; }; let full_four_query_output_owner: OwnedObjc = OwnedObjc::new(full_four_query_output.raw());
     guard let option::Option[metal::Buffer]::Some(full_flash_output) = new_buffer(device, full_bytes) else { return 1; }; let full_flash_output_owner: OwnedObjc = OwnedObjc::new(full_flash_output.raw());
+    guard let option::Option[metal::Buffer]::Some(full_graph_output) = new_buffer(device, full_bytes) else { return 1; }; let full_graph_output_owner: OwnedObjc = OwnedObjc::new(full_graph_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_query) = new_buffer(device, target_bytes) else { return 1; }; let target_query_owner: OwnedObjc = OwnedObjc::new(target_query.raw());
     guard let option::Option[metal::Buffer]::Some(target_key) = new_buffer(device, target_bytes) else { return 1; }; let target_key_owner: OwnedObjc = OwnedObjc::new(target_key.raw());
     guard let option::Option[metal::Buffer]::Some(target_value) = new_buffer(device, target_bytes) else { return 1; }; let target_value_owner: OwnedObjc = OwnedObjc::new(target_value.raw());
@@ -6078,12 +6192,16 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     guard let option::Option[metal::Buffer]::Some(target_simdgroup_output) = new_buffer(device, target_bytes) else { return 1; }; let target_simdgroup_output_owner: OwnedObjc = OwnedObjc::new(target_simdgroup_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_four_query_output) = new_buffer(device, target_bytes) else { return 1; }; let target_four_query_output_owner: OwnedObjc = OwnedObjc::new(target_four_query_output.raw());
     guard let option::Option[metal::Buffer]::Some(target_flash_output) = new_buffer(device, target_bytes) else { return 1; }; let target_flash_output_owner: OwnedObjc = OwnedObjc::new(target_flash_output.raw());
+    guard let option::Option[metal::Buffer]::Some(target_graph_output) = new_buffer(device, target_bytes) else { return 1; }; let target_graph_output_owner: OwnedObjc = OwnedObjc::new(target_graph_output.raw());
     guard let option::Option[metal::Buffer]::Some(flash_key) = new_buffer(device, flash_kv_bytes) else { return 1; }; let flash_key_owner: OwnedObjc = OwnedObjc::new(flash_key.raw());
     guard let option::Option[metal::Buffer]::Some(flash_value) = new_buffer(device, flash_kv_bytes) else { return 1; }; let flash_value_owner: OwnedObjc = OwnedObjc::new(flash_value.raw());
     guard let option::Option[metal::Buffer]::Some(cache_key) = new_buffer(device, prefix_bytes) else { return 1; }; let cache_key_owner: OwnedObjc = OwnedObjc::new(cache_key.raw());
     guard let option::Option[metal::Buffer]::Some(cache_value) = new_buffer(device, prefix_bytes) else { return 1; }; let cache_value_owner: OwnedObjc = OwnedObjc::new(cache_value.raw());
     guard let option::Option[metal::Buffer]::Some(image_ids) = new_buffer(device, (padded_key_rows *% #size_of::[i32]()) as u64) else { return 1; }; let image_ids_owner: OwnedObjc = OwnedObjc::new(image_ids.raw());
     guard let option::Option[metal::Buffer]::Some(key_valid) = new_buffer(device, padded_key_rows as u64) else { return 1; }; let key_valid_owner: OwnedObjc = OwnedObjc::new(key_valid.raw());
+    guard let option::Option[metal::Buffer]::Some(graph_mask) = new_buffer(
+        device, (full_rows *% full_rows *% #size_of::[u16]()) as u64,
+    ) else { return 1; }; let graph_mask_owner: OwnedObjc = OwnedObjc::new(graph_mask.raw());
 
     let full_query_values: *f32 = full_query.contents() as *f32;
     let full_key_values: *f32 = full_key.contents() as *f32;
@@ -6132,6 +6250,18 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         (key_valid.contents())[index] = if index < full_rows { 1 as u8 } else { 0 as u8 };
         index = index +% (1 as usize);
     }
+    let graph_mask_values: *u16 = graph_mask.contents() as *u16;
+    var query_row: usize = 0 as usize;
+    while query_row < full_rows {
+        var key_row: usize = 0 as usize;
+        while key_row < full_rows {
+            let same_image: bool = query_row >= prefix_rows && key_row >= prefix_rows;
+            graph_mask_values[query_row *% full_rows +% key_row] = if query_row >= key_row
+                || same_image { 0 as u16 } else { 0xFBFF as u16 };
+            key_row = key_row +% (1 as usize);
+        }
+        query_row = query_row +% (1 as usize);
+    }
 
     guard let option::Option[f64]::Some(_prefill_warmup) = dispatch_attention(
         queue, attention_pipeline, full_query, full_key, full_output, full_value,
@@ -6171,6 +6301,18 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         flash_value, image_ids, key_valid, target_rows, full_rows, padded_key_rows,
         prefix_rows,
     ) else { return 1; };
+    guard let option::Option[graph_attention::Attention]::Some(graph_cached_attention) =
+        graph_attention::create(target_rows, full_rows) else { return 1; };
+    guard let option::Option[graph_attention::Attention]::Some(graph_prefill_attention) =
+        graph_attention::create(full_rows, full_rows, true) else { return 1; };
+    guard let option::Option[f64]::Some(_prefill_graph_warmup) = graph_attention::dispatch_masked(
+        #addr_of(graph_prefill_attention), queue, full_query, flash_key, flash_value,
+        graph_mask, full_graph_output,
+    ) else { return 1; };
+    guard let option::Option[f64]::Some(_cached_graph_warmup) = graph_attention::dispatch(
+        #addr_of(graph_cached_attention), queue, target_query, flash_key, flash_value,
+        target_graph_output,
+    ) else { return 1; };
     var prefill_total_ms: f64 = 0.0f64;
     var cached_total_ms: f64 = 0.0f64;
     var prefill_simdgroup_total_ms: f64 = 0.0f64;
@@ -6179,6 +6321,8 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     var cached_four_query_total_ms: f64 = 0.0f64;
     var prefill_flash_total_ms: f64 = 0.0f64;
     var cached_flash_total_ms: f64 = 0.0f64;
+    var cached_graph_total_ms: f64 = 0.0f64;
+    var prefill_graph_total_ms: f64 = 0.0f64;
     index = 0 as usize;
     while index < iterations {
         guard let option::Option[f64]::Some(prefill_ms) = dispatch_attention(
@@ -6211,6 +6355,14 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
             flash_value, image_ids, key_valid, target_rows, full_rows, padded_key_rows,
             prefix_rows,
         ) else { return 1; };
+        guard let option::Option[f64]::Some(cached_graph_ms) = graph_attention::dispatch(
+            #addr_of(graph_cached_attention), queue, target_query, flash_key, flash_value,
+            target_graph_output,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(prefill_graph_ms) = graph_attention::dispatch_masked(
+            #addr_of(graph_prefill_attention), queue, full_query, flash_key, flash_value,
+            graph_mask, full_graph_output,
+        ) else { return 1; };
         guard let option::Option[f64]::Some(prefill_simdgroup_ms) = dispatch_attention(
             queue, simdgroup_attention_pipeline, full_query, full_key, full_simdgroup_output,
             full_value, image_ids, key_valid, full_rows, full_rows, cache_key, cache_value, 0 as u64,
@@ -6230,6 +6382,8 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         cached_four_query_total_ms = cached_four_query_total_ms + cached_four_query_ms;
         prefill_flash_total_ms = prefill_flash_total_ms + prefill_flash_ms;
         cached_flash_total_ms = cached_flash_total_ms + cached_flash_ms;
+        cached_graph_total_ms = cached_graph_total_ms + cached_graph_ms;
+        prefill_graph_total_ms = prefill_graph_total_ms + prefill_graph_ms;
         index = index +% (1 as usize);
     }
     if !finite("production attention prefill", full_output, full_rows *% WIDTH)
@@ -6248,6 +6402,8 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     let cached_four_query_average_ms: f64 = cached_four_query_total_ms / iterations as f64;
     let prefill_flash_average_ms: f64 = prefill_flash_total_ms / iterations as f64;
     let cached_flash_average_ms: f64 = cached_flash_total_ms / iterations as f64;
+    let cached_graph_average_ms: f64 = cached_graph_total_ms / iterations as f64;
+    let prefill_graph_average_ms: f64 = prefill_graph_total_ms / iterations as f64;
     let projected_trajectory_ms: f64 = (prefill_average_ms
         + (39 as f64) * cached_average_ms) * (32 as f64);
     let simdgroup_projected_trajectory_ms: f64 = (prefill_simdgroup_average_ms
@@ -6274,6 +6430,12 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     let flash_cached_error: f64 = normalized_rms_buffers(
         target_flash_output, 0 as usize, target_output, 0 as usize, target_rows *% WIDTH,
     );
+    let graph_cached_error: f64 = normalized_rms_buffers(
+        target_graph_output, 0 as usize, target_output, 0 as usize, target_rows *% WIDTH,
+    );
+    let graph_prefill_error: f64 = normalized_rms_buffers(
+        full_graph_output, 0 as usize, full_output, 0 as usize, full_rows *% WIDTH,
+    );
     io::println(
         "production attention benchmark: pixels=${pixels} prefill_rows=${full_rows} prefill_gpu_ms=${prefill_average_ms} cached_query_rows=${target_rows} cached_key_rows=${full_rows} cached_gpu_ms=${cached_average_ms} projected_40_step_32_block_gpu_ms=${projected_trajectory_ms} iterations=${iterations}",
     );
@@ -6286,9 +6448,13 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     io::println(
         "production attention benchmark: kernel=flash128-fp16-kv prefill_gpu_ms=${prefill_flash_average_ms} speedup_vs_simdgroup4=${prefill_four_query_average_ms / prefill_flash_average_ms} prefill_nRMSE=${flash_prefill_error} cached_gpu_ms=${cached_flash_average_ms} cached_speedup_vs_simdgroup4=${cached_four_query_average_ms / cached_flash_average_ms} cached_nRMSE=${flash_cached_error} projected_40_step_32_block_gpu_ms=${flash_projected_trajectory_ms}",
     );
+    io::println(
+        "production attention benchmark: kernel=mpsgraph-fp16 prefill_gpu_ms=${prefill_graph_average_ms} prefill_speedup_vs_flash=${prefill_flash_average_ms / prefill_graph_average_ms} prefill_nRMSE=${graph_prefill_error} cached_gpu_ms=${cached_graph_average_ms} cached_speedup_vs_flash=${cached_flash_average_ms / cached_graph_average_ms} cached_nRMSE=${graph_cached_error}",
+    );
     return if prefill_error <= 0.00001f64 && cached_error <= 0.00001f64
         && four_query_prefill_error <= 0.00001f64 && four_query_cached_error <= 0.00001f64
-        && flash_prefill_error <= 0.001f64 && flash_cached_error <= 0.001f64 {
+        && flash_prefill_error <= 0.001f64 && flash_cached_error <= 0.001f64
+        && graph_prefill_error <= 0.001f64 && graph_cached_error <= 0.001f64 {
         0
     } else { 1 };
 }
