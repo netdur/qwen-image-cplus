@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "date": "2026-09-21",
+  "date": "2026-09-22",
   "model": "Qwen/Qwen-Image-2.1",
   "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
   "diffusers_commit": "80c7ed262aeffbeb43ef13ae04baeb9b84515a69",
@@ -35,6 +35,74 @@
     "finite_output": true,
     "visually_coherent": true,
     "requested_text_substantially_legible": true
+  },
+  "production_40_step_remeasurement": {
+    "date": "2026-09-22",
+    "conditions": {
+      "power": "AC power, battery charged at 100%",
+      "filesystem_cache": "warm",
+      "process_policy": "fresh process for each inference",
+      "run_order": [
+        "cache-off",
+        "Cache-DiT 0.12"
+      ],
+      "thermal_note": "Cache-DiT 0.12 immediately followed the cache-off run on an already-hot machine.",
+      "offline_qipack_build_included": false
+    },
+    "case": {
+      "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+      "seed": 1301,
+      "pixels": 1024,
+      "steps": 40,
+      "text_rows": 31,
+      "target_rows": 4096,
+      "packed_policy": "transformer:all-matrix-f16-v4",
+      "packed_bytes": 14230327296,
+      "q8_dispatch_matrices": 0
+    },
+    "cache_off": {
+      "process_wall_ms": 451120,
+      "pipeline_wall_ms": 451109,
+      "text_wall_ms": 3493,
+      "transformer_startup_wall_ms": 8976,
+      "transformer_loop_wall_ms": 425513,
+      "transformer_phase_wall_ms": 434489,
+      "vae_gpu_ms": 12027.3,
+      "vae_phase_wall_ms": 12797,
+      "image_output_wall_ms": 305,
+      "cache_dit_steps": 0,
+      "maximum_resident_set_bytes": 831750144,
+      "peak_memory_footprint_bytes": 5670110120,
+      "swaps": 0,
+      "png_bytes": 4195716,
+      "png_sha256": "88a864a3ab457d04047626be3f2095f1526dd161fb5f2dec66961742829cf476"
+    },
+    "cache_dit_0_12": {
+      "process_wall_ms": 204600,
+      "pipeline_wall_ms": 204588,
+      "text_wall_ms": 3102,
+      "transformer_startup_wall_ms": 7680,
+      "transformer_loop_wall_ms": 182412,
+      "transformer_phase_wall_ms": 190092,
+      "vae_gpu_ms": 10324.7,
+      "vae_phase_wall_ms": 11061,
+      "image_output_wall_ms": 309,
+      "cache_dit_steps": 25,
+      "full_steps": 15,
+      "maximum_resident_set_bytes": 832372736,
+      "peak_memory_footprint_bytes": 5739922296,
+      "swaps": 0,
+      "png_bytes": 4195716,
+      "png_sha256": "6841fe32bdbb69b5d9aeca49f8e5244eb21265a99a0471f6039bc3fd8ddd27af"
+    },
+    "comparisons": {
+      "cache_dit_vs_cache_off_speedup": 2.204887585532747,
+      "cache_dit_wall_reduction_percent": 54.64621386770704,
+      "cache_off_vs_stable_diffusion_cpp_speedup": 2.230803333924455,
+      "cache_dit_vs_stable_diffusion_cpp_speedup": 4.918670576735093,
+      "stable_diffusion_cpp_process_wall_ms": 1006360
+    },
+    "artifact_policy": "PNGs and logs remain in /private/tmp and are not committed"
   },
   "one_step_functional_smoke": {
     "scope": "Temporary one-step diagnostic using the first timestep of the canonical 40-step schedule; it proves the full 1024 handoff and PNG shape, not image convergence.",
@@ -71,9 +139,9 @@
     "resolution": "The PNG encoder, transformer latent grid, scheduler, VAE decode, and host buffers all use the real 1024x1024 path; this is not an upscaled 256 image."
   },
   "limitations": [
-    "No official 40-step 1024 trajectory or decoded-image oracle has been generated yet.",
+    "The original 2026-09-21 native section predates the official 40-step 1024 trajectory and decoded-image oracle; current oracle results are recorded in m1-max-1024-40-oracle.json.",
     "Cache-DiT intentionally changes the denoising trajectory and remains opt-in.",
-    "The cache-off 40-step 1024 end-to-end path is implemented but was not timed in this phase because one full step costs roughly 40-55 seconds.",
-    "The recorded full run used the original 7.39 GB VAE scratch allocation; the corrected smaller allocation was verified afterward with a direct 1024 VAE smoke test."
+    "The production remeasurement covers warm-filesystem fresh-process conditions; no reboot-cold repeat was made.",
+    "The original 2026-09-21 full run used the original 7.39 GB VAE scratch allocation; the corrected smaller allocation is used by the 2026-09-22 production remeasurement."
   ]
 }

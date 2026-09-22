@@ -864,6 +864,23 @@ Inspect a shard, optionally filtering tensor names:
   0.24 run started hotter, its slower absolute wall time is not used to compare
   thresholds. Full provenance and measurements are in
   `benchmarks/m1-max-1024-40-oracle.json`.
+- Fresh-process native-prompt 1024x1024, 40-step inference is now measured from
+  tokenization through PNG completion with the same `CASABLANCA` prompt and
+  seed 1301. Cache-off took **451.12 seconds process wall**: 3.493 seconds for
+  text, 434.489 seconds for the transformer phase (425.513-second loop),
+  12.797 seconds for VAE, and 0.305 seconds for PNG output. Cache-DiT 0.12 ran
+  second on the already-hot machine, made the expected 25 cached decisions,
+  and took **204.60 seconds process wall**: 3.102 seconds for text, 190.092
+  seconds for the transformer phase (182.412-second loop), 11.061 seconds for
+  VAE, and 0.309 seconds for PNG output. That observed sequential-run result is
+  2.20x faster than cache-off. Both ran on AC from a warm filesystem cache,
+  used fresh processes, completed without swapping, and excluded the one-time
+  offline QIPACK build. Cache-off is 2.23x faster than the measured
+  stable-diffusion.cpp cache-off process baseline (451.12 versus 1006.36
+  seconds); opt-in Cache-DiT is 4.92x faster, although that comparison also
+  includes its intentional trajectory approximation. Exact timings, memory,
+  commands, ordering, and output checksums are in
+  `benchmarks/m1-max-native-prompt-pipeline-1024.json`.
 - The 1024 VAE initially reserved every activation arena for the largest
   `[1024,1024,288]` boundary. Shape-specific maxima reduce its explicit scratch
   from 7,389,315,072 to **5,577,375,744 bytes**, saving exactly 1.6875 GiB.
@@ -1146,15 +1163,11 @@ evidence:
    readahead is superseded; tensor-order `madvise`, broad text Q8, four-query
    attention at 256, and blanket 256-thread elementwise groups stay rejected
    unless new evidence changes their tradeoffs.
-6. **Production end-to-end remeasurement.** The fixture-driven cache-off and
-   Cache-DiT 0.12 oracle-to-PNG paths are measured. Repeat arbitrary native
-   prompts including text encoding with warm-filesystem and cold-page
-   conditions reported separately.
-   Transformer loop, phase wall time, process wall time, memory footprint, and
-   numerical/perceptual gates remain separate measurements.
-
 Completed transformer submission batching, fused QKV, and the remaining VAE
-work are no longer remaining phases. Other closed branches are not remaining phases: selective text readahead
+work are no longer remaining phases. Native-prompt 1024/40 cache-off and
+Cache-DiT 0.12 production timings are also complete for warm-filesystem,
+fresh-process conditions; a reboot-cold run is an environmental repeat rather
+than an implementation phase. Other closed branches are not remaining phases: selective text readahead
 regressed wall time; the calibrated text-Q8 policies failed the downstream latent gate;
 process reuse without simultaneous model residency provided no warm-request
 gain; four-query attention remains rejected at 256 (but is now selected at
