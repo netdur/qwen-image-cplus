@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.qipack
+/models/
 target/
 tests/fixtures/small/
 vendor

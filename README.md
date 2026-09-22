@@ -1202,9 +1202,11 @@ evidence:
    Plan-5 F3: the measured text working set is below 1 GB and standalone text
    time fell from 16,242 to 3,145 ms without changing output. The short-run
    process still spends about 6.5-7.5 seconds in transformer buffer/prefix
-   setup before denoising. Separate allocation, first-touch, and
-   page-residency costs there, then return to kernel-specific elementwise
-   fusion only after the dominant 1024 costs are measured. Whole-shard text
+   setup before denoising. **Status: explicitly deferred for later
+   exploration.** When resumed, first separate allocation, first-touch, and
+   page-residency costs; only then consider reusable workspaces or
+   kernel-specific elementwise fusion. The expected fresh-process opportunity
+   is a realistic 3-5 seconds, not the entire inference loop. Whole-shard text
    readahead is superseded; tensor-order `madvise`, broad text Q8, four-query
    attention at 256, and blanket 256-thread elementwise groups stay rejected
    unless new evidence changes their tradeoffs.
