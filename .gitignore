@@ -6,3 +6,4 @@ target/
 tests/fixtures/small/
 vendor
 /plan.md
+/plan-*.md
