@@ -57,6 +57,7 @@ cpc test
 ./target/debug/qwen-image-cplus benchmark-production-attention 1024
 ./target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 1
 ./target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 2
+./target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 13
 ./target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
 ./target/debug/qwen-image-cplus quantize-transformer /path/to/model/snapshot transformer.qipack
@@ -903,6 +904,20 @@ Inspect a shard, optionally filtering tensor names:
   seconds can be attributed to the two extra cached steps; their removal is
   the repeatable algorithmic difference. The full-prompt output retained all
   requested text exactly.
+- A transformer-only sustained-load diagnostic closes the question of whether
+  later 1024 steps accumulate software work. The benchmark command now accepts
+  4, 8, 13, 25, and 40 steps in addition to its original canonical-prefix
+  1/2-step modes. On AC at 100%, a 13-step run held cached steps between 8.677
+  and 9.072 seconds and its last six averaged 0.218 seconds faster than its
+  first six. An immediately following, already-hot 25-step run started at a
+  13.337-second average for cached steps 2-7, then improved to 12.621 seconds
+  for steps 20-25. Cached steps use the same 4,096-row shape, fixed buffers,
+  and operation count throughout. The large absolute spread is therefore
+  sustained GPU frequency/thermal state, not a denoising-loop leak or
+  step-dependent algorithmic cost. Short A/B tests remain the right kernel
+  acceptance tool; end-to-end numbers must record power state and cannot be
+  extrapolated from one hot run. Exact series are in
+  `benchmarks/m1-max-sustained-transformer-1024.json`.
 - The 1024 VAE initially reserved every activation arena for the largest
   `[1024,1024,288]` boundary. Shape-specific maxima reduce its explicit scratch
   from 7,389,315,072 to **5,577,375,744 bytes**, saving exactly 1.6875 GiB.

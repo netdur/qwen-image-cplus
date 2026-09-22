@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "conditions": {
+    "power_before": "AC Power, battery 100%, charged",
+    "power_after": "AC Power, battery 100%, charged",
+    "ordering": "The 25-step run immediately followed the 13-step run and therefore began from a hotter sustained state.",
+    "scope": "Transformer startup, conditioning, and denoising only; no text encoder, VAE, or PNG output.",
+    "weights": "all-FP16 QIPACK v4",
+    "attention": "MPSGraph SDPA",
+    "cache_dit": false
+  },
+  "benchmark_interface": {
+    "command": "benchmark-transformer-trajectory-1024 PACKED STEPS",
+    "accepted_steps": [1, 2, 4, 8, 13, 25, 40],
+    "schedule_note": "One and two steps retain the first one/two values of the canonical 40-step schedule. Longer timing diagnostics use their requested step-count schedule; tensor shapes and operation counts are unchanged."
+  },
+  "run_13": {
+    "process_wall_seconds": 123.63,
+    "startup_ms": 7287,
+    "trajectory_wall_ms": 115725,
+    "step_wall_ms": [9857, 9044, 9072, 8935, 8919, 8928, 8680, 8686, 8680, 8680, 8677, 8824, 8726],
+    "cached_average_ms": 8820.917,
+    "cached_first_six_average_ms": 8929.667,
+    "cached_last_six_average_ms": 8712.167,
+    "last_minus_first_ms_per_step": -217.5
+  },
+  "run_25_hot": {
+    "process_wall_seconds": 332.34,
+    "startup_ms": 7070,
+    "trajectory_wall_ms": 325109,
+    "step_wall_ms": [15829, 13960, 13638, 13261, 13166, 13045, 12950, 13044, 12840, 12803, 12793, 12763, 12800, 13113, 12595, 12779, 12608, 12595, 12762, 13119, 12911, 12711, 12397, 12263, 12326],
+    "cached_average_ms": 12885.083,
+    "cached_steps_2_through_7_average_ms": 13336.667,
+    "cached_steps_20_through_25_average_ms": 12621.167,
+    "late_minus_early_ms_per_step": -715.5
+  },
+  "interpretation": {
+    "software_accumulation": "rejected",
+    "evidence": "Within both runs, fixed-shape cached steps do not become progressively slower. The already-hot second run begins at a uniformly lower throughput and recovers somewhat over time.",
+    "likely_cause": "Sustained hardware frequency and thermal state; direct temperature/frequency telemetry was unavailable because powermetrics requires superuser access.",
+    "benchmark_policy": "Use adjacent short A/B pairs for kernel acceptance, and record AC/battery/order for long end-to-end observations."
+  }
+}

@@ -4426,17 +4426,22 @@ fn run_trajectory_cache_dit_1024_packed(
 }
 
 // Short 1024px optimization loop using the committed 31-row scale fixture as
-// text conditioning and its pinned seed. Steps 1 and 2 are prefixes of the
-// canonical 40-step schedule: step 1 builds every layer's prefix K/V cache;
-// step 2 exercises the target-only cached-prefix path. No VAE or text encoder
-// is involved, so the reported time isolates transformer startup and compute.
+// text conditioning and its pinned seed. One- and two-step runs are prefixes
+// of the canonical 40-step schedule. Longer runs use the requested step-count
+// schedule and exist for sustained-throughput diagnostics. Step 1 builds every
+// layer's prefix K/V cache; later steps exercise the target-only cached-prefix
+// path. No VAE or text encoder is involved, so the reported time isolates
+// transformer startup and compute.
 fn benchmark_trajectory_1024(
     packed_path: str,
     requested_steps: str,
     fixture_root: str = "tests/fixtures/transformer_scale_fp32",
 ) -> i32 {
-    if !(requested_steps == "1" || requested_steps == "2") {
-        io::eprintln("1024 trajectory benchmark: steps must be 1 or 2");
+    if !(requested_steps == "1" || requested_steps == "2"
+        || requested_steps == "4" || requested_steps == "8"
+        || requested_steps == "13" || requested_steps == "25"
+        || requested_steps == "40") {
+        io::eprintln("1024 trajectory benchmark: steps must be 1, 2, 4, 8, 13, 25, or 40");
         return 2;
     }
     let text_path: text::Text = "${fixture_root}/1024/text_input.f32";
