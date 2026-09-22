@@ -655,6 +655,32 @@ Inspect a shard, optionally filtering tensor names:
   resident service would still be required to approach the loop time for
   repeated requests, but residency alone is constrained by the combined model
   working set as measured below.
+- Plan-5 F3 supersedes that whole-shard readahead strategy. The encoder now
+  keeps the Safetensors mappings metadata-only, reads the eleven tensors for
+  one 385,892,864-byte decoder layer with positional `pread`, and binds their
+  unchanged BF16 bytes from a reusable shared Metal buffer. Two 416 MiB slots
+  alternate: while Metal executes layer N, one worker fills the other slot
+  with layer N+1. `F_NOCACHE` marks this one-pass stream so text weights do not
+  unnecessarily displace later denoiser and VAE pages. The vocabulary matrix
+  is no longer wired in full either; only the prompt's requested 8 KiB rows
+  are copied into a compact embedding buffer. This is deliberately streaming,
+  not a persistent inference cache: every request still reads the weights it
+  uses.
+- The latest pre-F3 text timing was 16,242 ms, including 7,208 ms inside the
+  four whole-shard `MADV_WILLNEED` calls. A single-slot streaming prototype
+  took 4,226 ms, and the accepted two-slot path took **3,145 ms** with the
+  exact same 3.61069% text-output nRMSE (5.16x faster than that recent
+  whole-shard run and 1.34x faster than synchronous streaming). A separate
+  `/usr/bin/time -l` sample took 2,903 ms internally / 3.06 seconds process
+  wall and reported 831,946,752 bytes maximum RSS and 932,988,152 bytes peak
+  footprint. In adjacent native 256 pipelines, text fell from 3,329 to
+  **2,144 ms**. End to end moved only from 32,222 to **31,838 ms** because
+  transformer buffer/prefix setup was 804 ms slower in the second run, so the
+  text-phase delta is the supported speed claim and the 384 ms total delta is
+  reported only as an observation. The final PNG remained byte-identical at
+  SHA-256 `d9967772c1abc8869f23f6595bf6216b18ff63433d21ececc55dc01ce628bc29`.
+  Exact phase, memory, oracle, and unit-test results are in
+  `benchmarks/m1-max-text-layer-streaming.json`.
 - A two-request same-process baseline disproved the assumption that process and
   tokenizer reuse alone would materially improve warm latency. The tokenizer
   initialized once in 138 ms, then request 1 took 35,675 ms and request 2 took
@@ -929,14 +955,16 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    the initial decoder path deliberately favors simple ownership and currently
    reserves several maximum-size buffers. Measure peak footprint after every
    change so transformer, text, and VAE phases remain safe on the 32 GB M1 Max.
-4. **Shared startup and small-kernel work.** The short-run process still spends
-   about 6.5-7.0 seconds in buffer/prefix setup before denoising. Separate
-   allocation, first-touch, and page-residency costs, then return to text-encoder GPU
-   efficiency and kernel-specific elementwise fusion only after the dominant
-   1024 costs are measured. Whole-shard readahead stays accepted; tensor-order
-   selective advice, broad text Q8, four-query attention at 256, and blanket
-   256-thread elementwise groups stay rejected unless new evidence changes
-   their tradeoffs.
+4. **Shared startup and small-kernel work.** Text layer streaming has completed
+   Plan-5 F3: the measured text working set is below 1 GB and standalone text
+   time fell from 16,242 to 3,145 ms without changing output. The short-run
+   process still spends about 6.5-7.5 seconds in transformer buffer/prefix
+   setup before denoising. Separate allocation, first-touch, and
+   page-residency costs there, then return to kernel-specific elementwise
+   fusion only after the dominant 1024 costs are measured. Whole-shard text
+   readahead is superseded; tensor-order `madvise`, broad text Q8, four-query
+   attention at 256, and blanket 256-thread elementwise groups stay rejected
+   unless new evidence changes their tradeoffs.
 5. **End-to-end remeasurement.** Repeat cache-off and Cache-DiT 1024 prompts
    with warm-filesystem and cold-page conditions reported separately.
    Transformer loop, phase wall time, process wall time, memory footprint, and
@@ -1005,8 +1033,8 @@ noise, denoising, VAE decode, postprocessing, and PNG output now form one
 native `generate-256` command. The pinned fox case verifies the complete path;
 arbitrary prompts use the same path but naturally have no numeric oracle unless
 a matching reference fixture is generated. Production use still needs larger
-output sizes, a text-weight storage strategy that passes the downstream gates,
-and further kernel optimization; the measured affine-Q8 candidates do not.
+output-size validation and further kernel optimization. Text weights now use
+the exact two-slot layer streamer rather than the rejected affine-Q8 candidates.
 The current VAE path intentionally implements the pinned one-frame first-chunk
 semantics; temporal continuation and tiled decode remain outside its verified
 scope.

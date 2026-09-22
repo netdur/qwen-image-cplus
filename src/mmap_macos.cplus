@@ -18,9 +18,16 @@ extern fn qi_munmap(address: *u8, length: usize) -> i32;
 #[link_name = "madvise"]
 extern fn qi_madvise(address: *u8, length: usize, advice: i32) -> i32;
 
+#[link_name = "pread"]
+extern fn qi_pread(fd: i32, buffer: *u8, count: usize, offset: i64) -> isize;
+
+#[link_name = "fcntl"]
+extern fn qi_fcntl(fd: i32, command: i32, ...) -> i32;
+
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MADV_WILLNEED: i32 = 3;
+const F_NOCACHE: i32 = 48;
 
 enum MapError {
     NotFound,
@@ -33,6 +40,50 @@ enum MapError {
 struct MappedFile {
     opaque _ptr: *u8,
     _length: usize,
+}
+
+// A positional reader for large, one-pass weight streams. F_NOCACHE keeps
+// those reads from evicting the denoiser and VAE working sets from the unified
+// page cache after the text phase has consumed them.
+struct PositionalReader {
+    opaque _fd: i32,
+}
+
+impl PositionalReader {
+    fn descriptor(this) -> i32 {
+        return this._fd;
+    }
+
+    fn read_at(this, destination: *u8, length: usize, offset: u64) -> bool {
+        return read_at_descriptor(this._fd, destination, length, offset);
+    }
+
+    fn drop(ref this) {
+        if this._fd >= (0 as i32) {
+            let _closed: i32 = qi_close(this._fd);
+            this._fd = -1 as i32;
+        }
+    }
+}
+
+fn read_at_descriptor(fd: i32, destination: *u8, length: usize, offset: u64) -> bool {
+    if destination.is_null() || length == (0 as usize) {
+        return length == (0 as usize);
+    }
+    var completed: usize = 0 as usize;
+    while completed < length {
+        let count: isize = qi_pread(
+            fd,
+            destination + completed,
+            length -% completed,
+            (offset +% completed as u64) as i64,
+        );
+        if count <= (0 as isize) {
+            return false;
+        }
+        completed = completed +% count as usize;
+    }
+    return true;
 }
 
 impl MappedFile {
@@ -67,6 +118,21 @@ fn advise_range_willneed(pointer: *u8, length: usize) -> bool {
         return false;
     }
     return qi_madvise(pointer, length, MADV_WILLNEED) == (0 as i32);
+}
+
+fn open_positional_reader(path: str) -> option::Option[PositionalReader] {
+    let path_owner: text::Text = text::from_str(path);
+    guard let option::Option[text::CString]::Some(c_path) = path_owner.c_str() else {
+        return option::Option[PositionalReader]::None;
+    };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) {
+        return option::Option[PositionalReader]::None;
+    }
+    // This is a performance policy rather than a correctness requirement.
+    // Continue if an older platform rejects the advisory command.
+    let _no_cache: i32 = qi_fcntl(fd, F_NOCACHE, 1 as i32);
+    return option::Option[PositionalReader]::Some(PositionalReader { _fd: fd });
 }
 
 fn map_readonly(path: str) -> MapResult {

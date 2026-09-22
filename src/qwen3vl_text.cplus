@@ -8,6 +8,7 @@ import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
+import "stdlib/thread" as thread;
 import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 
@@ -23,7 +24,8 @@ const LAYERS: usize = 36;
 const VOCABULARY: usize = 151936;
 const SYSTEM_PREFIX_TOKENS: usize = 14;
 const TILE: usize = 16;
-const VM_PAGE_BYTES: usize = 16384;
+const LAYER_STREAM_BYTES: usize = 416 * 1024 * 1024;
+const STREAM_ALIGNMENT: usize = 256;
 
 struct OwnedObjc {
     opaque pointer: *u8,
@@ -39,22 +41,6 @@ impl OwnedObjc {
         }
     }
 }
-
-#[repr(C)]
-struct MappedDeallocatorBlock {
-    opaque isa: *u8,
-    flags: i32,
-    reserved: i32,
-    invoke: fn(*u8, *u8, u64),
-    opaque descriptor: *u8,
-}
-
-static MAPPED_DEALLOCATOR_DESCRIPTOR: rt::BlockDescriptor = rt::BlockDescriptor {
-    reserved: 0 as u64,
-    size: 32 as u64,
-};
-
-fn mapped_deallocator_invoke(_block: *u8, _pointer: *u8, _length: u64) {}
 
 #[repr(C)]
 struct LinearParams {
@@ -81,6 +67,57 @@ struct Weight {
     offset: u64,
 }
 
+struct SourceTensor {
+    tensor: safetensors::TensorData,
+    shard: u32,
+}
+
+struct ShardSpan {
+    begin: u64,
+    end: u64,
+    destination: u64,
+}
+
+struct LayerSpanLayout {
+    span_0: ShardSpan,
+    span_1: ShardSpan,
+    span_2: ShardSpan,
+    span_3: ShardSpan,
+    bytes: u64,
+}
+
+struct LayerReadJob {
+    fd_0: i32,
+    fd_1: i32,
+    fd_2: i32,
+    fd_3: i32,
+    opaque destination: *u8,
+    layout: LayerSpanLayout,
+}
+
+impl LayerReadJob: Send {}
+
+impl ShardSpan {
+    fn empty() -> ShardSpan {
+        return ShardSpan {
+            begin: (0 as u64) -% (1 as u64),
+            end: 0 as u64,
+            destination: 0 as u64,
+        };
+    }
+
+    fn include(ref this, tensor: safetensors::TensorData) {
+        if tensor.file_offset < this.begin { this.begin = tensor.file_offset; }
+        let end: u64 = tensor.file_offset +% tensor.byte_length;
+        if end > this.end { this.end = end; }
+    }
+
+    fn length(this) -> u64 {
+        if this.end <= this.begin { return 0 as u64; }
+        return this.end -% this.begin;
+    }
+}
+
 struct Pipelines {
     embedding: metal::ComputePipelineState,
     rms_norm: metal::ComputePipelineState,
@@ -102,31 +139,6 @@ fn new_buffer(device: metal::Device, bytes: u64) -> option::Option[metal::Buffer
     );
 }
 
-fn mapped_storage_buffer(device: metal::Device, file: safetensors::File) -> option::Option[metal::Buffer] {
-    let mapped_bytes: usize = round_up(file.mapping_length(), VM_PAGE_BYTES);
-    if mapped_bytes as u64 > device.max_buffer_length() {
-        io::eprintln("text encoder: shard ${mapped_bytes} exceeds Metal buffer limit ${device.max_buffer_length()}");
-        return option::Option[metal::Buffer]::None;
-    }
-    var deallocator: MappedDeallocatorBlock = MappedDeallocatorBlock {
-        isa: rt::stack_block_isa(),
-        flags: 0 as i32,
-        reserved: 0 as i32,
-        invoke: mapped_deallocator_invoke,
-        descriptor: #addr_of(MAPPED_DEALLOCATOR_DESCRIPTOR) as *u8,
-    };
-    let object: *u8 = rt::msg_id_id_u64_u64_id(
-        device.raw(),
-        rt::sel(#str_ptr("newBufferWithBytesNoCopy:length:options:deallocator:\0")),
-        file.mapping_pointer(),
-        mapped_bytes as u64,
-        metal::resource_options_m_t_l_resource_storage_mode_shared,
-        #addr_of(deallocator) as *u8,
-    );
-    if object.is_null() { return option::Option[metal::Buffer]::None; }
-    return option::Option[metal::Buffer]::Some(metal::Buffer::from_raw(object));
-}
-
 fn pipeline(device: metal::Device, library: metal::Library, name: str) -> option::Option[OwnedObjc] {
     guard let option::Option[metal::Function]::Some(function) = library.new_function_with_name(name) else {
         io::eprintln("text encoder: missing Metal function ${name}");
@@ -142,46 +154,167 @@ fn pipeline(device: metal::Device, library: metal::Library, name: str) -> option
     return option::Option[OwnedObjc]::Some(OwnedObjc::new(state.raw()));
 }
 
-fn tensor_weight_in(
+fn source_tensor_in(
     file: safetensors::File,
-    storage: metal::Buffer,
+    shard: u32,
     name: str,
     dimension_0: u64,
     dimension_1: u64 = 0 as u64,
-) -> option::Option[Weight] {
-    if !file.has_tensor(name) { return option::Option[Weight]::None; }
+) -> option::Option[SourceTensor] {
+    if !file.has_tensor(name) { return option::Option[SourceTensor]::None; }
     guard let option::Option[safetensors::TensorData]::Some(tensor) = file.tensor(name) else {
-        return option::Option[Weight]::None;
+        return option::Option[SourceTensor]::None;
     };
     let rank: usize = if dimension_1 == (0 as u64) { 1 as usize } else { 2 as usize };
     if tensor.dtype.name() != "BF16" || tensor.rank != rank
         || tensor.dimensions[0] != dimension_0
         || (rank == (2 as usize) && tensor.dimensions[1] != dimension_1) {
         io::eprintln("text encoder: invalid tensor metadata for ${name}");
-        return option::Option[Weight]::None;
+        return option::Option[SourceTensor]::None;
     }
-    return option::Option[Weight]::Some(Weight { storage: storage, offset: tensor.file_offset });
+    return option::Option[SourceTensor]::Some(SourceTensor { tensor: tensor, shard: shard });
 }
 
-fn tensor_weight(
+fn source_tensor(
     file_0: safetensors::File,
-    storage_0: metal::Buffer,
     file_1: safetensors::File,
-    storage_1: metal::Buffer,
     file_2: safetensors::File,
-    storage_2: metal::Buffer,
     file_3: safetensors::File,
-    storage_3: metal::Buffer,
     name: str,
     dimension_0: u64,
     dimension_1: u64 = 0 as u64,
-) -> option::Option[Weight] {
-    if file_0.has_tensor(name) { return tensor_weight_in(file_0, storage_0, name, dimension_0, dimension_1); }
-    if file_1.has_tensor(name) { return tensor_weight_in(file_1, storage_1, name, dimension_0, dimension_1); }
-    if file_2.has_tensor(name) { return tensor_weight_in(file_2, storage_2, name, dimension_0, dimension_1); }
-    if file_3.has_tensor(name) { return tensor_weight_in(file_3, storage_3, name, dimension_0, dimension_1); }
+) -> option::Option[SourceTensor] {
+    if file_0.has_tensor(name) { return source_tensor_in(file_0, 0 as u32, name, dimension_0, dimension_1); }
+    if file_1.has_tensor(name) { return source_tensor_in(file_1, 1 as u32, name, dimension_0, dimension_1); }
+    if file_2.has_tensor(name) { return source_tensor_in(file_2, 2 as u32, name, dimension_0, dimension_1); }
+    if file_3.has_tensor(name) { return source_tensor_in(file_3, 3 as u32, name, dimension_0, dimension_1); }
     io::eprintln("text encoder: missing tensor ${name}");
-    return option::Option[Weight]::None;
+    return option::Option[SourceTensor]::None;
+}
+
+fn include_source(
+    ref span_0: ShardSpan,
+    ref span_1: ShardSpan,
+    ref span_2: ShardSpan,
+    ref span_3: ShardSpan,
+    source: SourceTensor,
+) {
+    if source.shard == (0 as u32) { span_0.include(source.tensor); }
+    else if source.shard == (1 as u32) { span_1.include(source.tensor); }
+    else if source.shard == (2 as u32) { span_2.include(source.tensor); }
+    else { span_3.include(source.tensor); }
+}
+
+fn place_span(ref span: ShardSpan, destination: u64) -> u64 {
+    span.destination = destination;
+    return round_up((destination +% span.length()) as usize, STREAM_ALIGNMENT) as u64;
+}
+
+fn stream_span(
+    reader: mapped::PositionalReader,
+    destination: *u8,
+    span: ShardSpan,
+) -> bool {
+    if span.length() == (0 as u64) { return true; }
+    return reader.read_at(destination + span.destination as usize, span.length() as usize, span.begin);
+}
+
+fn stream_source_range(
+    reader_0: mapped::PositionalReader,
+    reader_1: mapped::PositionalReader,
+    reader_2: mapped::PositionalReader,
+    reader_3: mapped::PositionalReader,
+    destination: *u8,
+    source: SourceTensor,
+    source_offset: u64,
+    length: usize,
+) -> bool {
+    let file_offset: u64 = source.tensor.file_offset +% source_offset;
+    if source.shard == (0 as u32) { return reader_0.read_at(destination, length, file_offset); }
+    if source.shard == (1 as u32) { return reader_1.read_at(destination, length, file_offset); }
+    if source.shard == (2 as u32) { return reader_2.read_at(destination, length, file_offset); }
+    return reader_3.read_at(destination, length, file_offset);
+}
+
+fn streamed_weight(
+    storage: metal::Buffer,
+    source: SourceTensor,
+    span_0: ShardSpan,
+    span_1: ShardSpan,
+    span_2: ShardSpan,
+    span_3: ShardSpan,
+) -> Weight {
+    let span: ShardSpan = if source.shard == (0 as u32) { span_0 }
+    else if source.shard == (1 as u32) { span_1 }
+    else if source.shard == (2 as u32) { span_2 }
+    else { span_3 };
+    return Weight {
+        storage: storage,
+        offset: span.destination +% (source.tensor.file_offset -% span.begin),
+    };
+}
+
+fn empty_layer_layout() -> LayerSpanLayout {
+    return LayerSpanLayout {
+        span_0: ShardSpan::empty(),
+        span_1: ShardSpan::empty(),
+        span_2: ShardSpan::empty(),
+        span_3: ShardSpan::empty(),
+        bytes: 0 as u64,
+    };
+}
+
+fn layer_span_layout(
+    file_0: safetensors::File,
+    file_1: safetensors::File,
+    file_2: safetensors::File,
+    file_3: safetensors::File,
+    layer: usize,
+) -> option::Option[LayerSpanLayout] {
+    let prefix: text::Text = "model.language_model.layers.${layer}.";
+    guard let option::Option[SourceTensor]::Some(input_norm) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}input_layernorm.weight", WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(q_weight) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.q_proj.weight", WIDTH as u64, WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(k_weight) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.k_proj.weight", KV_WIDTH as u64, WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(v_weight) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.v_proj.weight", KV_WIDTH as u64, WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(q_norm) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.q_norm.weight", HEAD_DIMENSION as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(k_norm) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.k_norm.weight", HEAD_DIMENSION as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(o_weight) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.o_proj.weight", WIDTH as u64, WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(post_norm) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}post_attention_layernorm.weight", WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(gate_weight) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}mlp.gate_proj.weight", INTERMEDIATE_WIDTH as u64, WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(up_weight) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}mlp.up_proj.weight", INTERMEDIATE_WIDTH as u64, WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    guard let option::Option[SourceTensor]::Some(down_weight) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}mlp.down_proj.weight", WIDTH as u64, INTERMEDIATE_WIDTH as u64) else { return option::Option[LayerSpanLayout]::None; };
+    var layout: LayerSpanLayout = empty_layer_layout();
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, input_norm);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, q_weight);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, k_weight);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, v_weight);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, q_norm);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, k_norm);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, o_weight);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, post_norm);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, gate_weight);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, up_weight);
+    include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, down_weight);
+    layout.bytes = place_span(layout.span_0, 0 as u64);
+    layout.bytes = place_span(layout.span_1, layout.bytes);
+    layout.bytes = place_span(layout.span_2, layout.bytes);
+    layout.bytes = place_span(layout.span_3, layout.bytes);
+    if layout.bytes > LAYER_STREAM_BYTES as u64 {
+        io::eprintln("text encoder: layer ${layer} stream needs ${layout.bytes} bytes, capacity is ${LAYER_STREAM_BYTES}");
+        return option::Option[LayerSpanLayout]::None;
+    }
+    return option::Option[LayerSpanLayout]::Some(layout);
+}
+
+fn read_layer_job(take job: LayerReadJob) -> i64 {
+    let started_ms: i64 = time::now_millis();
+    if !mapped::read_at_descriptor(job.fd_0, job.destination + job.layout.span_0.destination as usize, job.layout.span_0.length() as usize, job.layout.span_0.begin)
+        || !mapped::read_at_descriptor(job.fd_1, job.destination + job.layout.span_1.destination as usize, job.layout.span_1.length() as usize, job.layout.span_1.begin)
+        || !mapped::read_at_descriptor(job.fd_2, job.destination + job.layout.span_2.destination as usize, job.layout.span_2.length() as usize, job.layout.span_2.begin)
+        || !mapped::read_at_descriptor(job.fd_3, job.destination + job.layout.span_3.destination as usize, job.layout.span_3.length() as usize, job.layout.span_3.begin) {
+        return -1 as i64;
+    }
+    return time::now_millis() - started_ms;
 }
 
 fn dispatch_linear(
@@ -376,15 +509,12 @@ fn run_impl(
     guard let safetensors::LoadResult::Ok(file_2) = safetensors::load(shard_2_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 3: ${error.name()}"); return 1; };
     guard let safetensors::LoadResult::Ok(file_3) = safetensors::load(shard_3_path.view()) else safetensors::LoadResult::Err(error) { io::eprintln("text encoder: shard 4: ${error.name()}"); return 1; };
     let mapping_wall_ms: i64 = time::now_millis() - mapping_start_ms;
-    // These four shards are 17.5 GB of BF16 weights and the phase is disk
-    // bound, not GPU bound. Start the reads before Metal setup. The timing
-    // below makes the cost of this advisory operation explicit.
-    let advise_start_ms: i64 = time::now_millis();
-    let _advised_0: bool = mapped::advise_range_willneed(file_0.mapping_pointer(), file_0.mapping_length());
-    let _advised_1: bool = mapped::advise_range_willneed(file_1.mapping_pointer(), file_1.mapping_length());
-    let _advised_2: bool = mapped::advise_range_willneed(file_2.mapping_pointer(), file_2.mapping_length());
-    let _advised_3: bool = mapped::advise_range_willneed(file_3.mapping_pointer(), file_3.mapping_length());
-    let advise_wall_ms: i64 = time::now_millis() - advise_start_ms;
+    let reader_start_ms: i64 = time::now_millis();
+    guard let option::Option[mapped::PositionalReader]::Some(reader_0) = mapped::open_positional_reader(shard_0_path.view()) else { io::eprintln("text encoder: could not open shard 1 stream"); return 1; };
+    guard let option::Option[mapped::PositionalReader]::Some(reader_1) = mapped::open_positional_reader(shard_1_path.view()) else { io::eprintln("text encoder: could not open shard 2 stream"); return 1; };
+    guard let option::Option[mapped::PositionalReader]::Some(reader_2) = mapped::open_positional_reader(shard_2_path.view()) else { io::eprintln("text encoder: could not open shard 3 stream"); return 1; };
+    guard let option::Option[mapped::PositionalReader]::Some(reader_3) = mapped::open_positional_reader(shard_3_path.view()) else { io::eprintln("text encoder: could not open shard 4 stream"); return 1; };
+    let reader_wall_ms: i64 = time::now_millis() - reader_start_ms;
 
     let device_queue_start_ms: i64 = time::now_millis();
     let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
@@ -394,17 +524,6 @@ fn run_impl(
     guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else { return 1; };
     let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
     let device_queue_wall_ms: i64 = time::now_millis() - device_queue_start_ms;
-
-    let storage_start_ms: i64 = time::now_millis();
-    guard let option::Option[metal::Buffer]::Some(storage_0) = mapped_storage_buffer(device, file_0) else { return 1; };
-    let storage_0_owner: OwnedObjc = OwnedObjc::new(storage_0.raw());
-    guard let option::Option[metal::Buffer]::Some(storage_1) = mapped_storage_buffer(device, file_1) else { return 1; };
-    let storage_1_owner: OwnedObjc = OwnedObjc::new(storage_1.raw());
-    guard let option::Option[metal::Buffer]::Some(storage_2) = mapped_storage_buffer(device, file_2) else { return 1; };
-    let storage_2_owner: OwnedObjc = OwnedObjc::new(storage_2.raw());
-    guard let option::Option[metal::Buffer]::Some(storage_3) = mapped_storage_buffer(device, file_3) else { return 1; };
-    let storage_3_owner: OwnedObjc = OwnedObjc::new(storage_3.raw());
-    let storage_wall_ms: i64 = time::now_millis() - storage_start_ms;
 
     let compile_start_ms: i64 = time::now_millis();
     let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
@@ -443,12 +562,28 @@ fn run_impl(
     };
     let compile_wall_ms: i64 = time::now_millis() - compile_start_ms;
 
+    guard let option::Option[SourceTensor]::Some(embedding_source) = source_tensor(
+        file_0,
+        file_1,
+        file_2,
+        file_3,
+        "model.language_model.embed_tokens.weight",
+        VOCABULARY as u64,
+        WIDTH as u64,
+    ) else { return 1; };
+
     let scratch_start_ms: i64 = time::now_millis();
     let hidden_bytes: u64 = (rows *% WIDTH *% #size_of::[f32]()) as u64;
     let kv_bytes: u64 = (rows *% KV_WIDTH *% #size_of::[f32]()) as u64;
     let intermediate_bytes: u64 = (rows *% INTERMEDIATE_WIDTH *% #size_of::[f32]()) as u64;
-    guard let option::Option[metal::Buffer]::Some(ids) = device.new_buffer_with_bytes(token_ids as *u8, (rows *% #size_of::[u32]()) as u64, metal::resource_options_m_t_l_resource_storage_mode_shared) else { return 1; };
+    guard let option::Option[metal::Buffer]::Some(ids) = new_buffer(device, (rows *% #size_of::[u32]()) as u64) else { return 1; };
     let ids_owner: OwnedObjc = OwnedObjc::new(ids.raw());
+    guard let option::Option[metal::Buffer]::Some(embedding_rows) = new_buffer(device, (rows *% WIDTH *% #size_of::[u16]()) as u64) else { return 1; };
+    let embedding_rows_owner: OwnedObjc = OwnedObjc::new(embedding_rows.raw());
+    guard let option::Option[metal::Buffer]::Some(layer_storage_0) = new_buffer(device, LAYER_STREAM_BYTES as u64) else { return 1; };
+    let layer_storage_0_owner: OwnedObjc = OwnedObjc::new(layer_storage_0.raw());
+    guard let option::Option[metal::Buffer]::Some(layer_storage_1) = new_buffer(device, LAYER_STREAM_BYTES as u64) else { return 1; };
+    let layer_storage_1_owner: OwnedObjc = OwnedObjc::new(layer_storage_1.raw());
     guard let option::Option[metal::Buffer]::Some(hidden_a) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_a_owner: OwnedObjc = OwnedObjc::new(hidden_a.raw());
     guard let option::Option[metal::Buffer]::Some(hidden_b) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_b_owner: OwnedObjc = OwnedObjc::new(hidden_b.raw());
     guard let option::Option[metal::Buffer]::Some(norm) = new_buffer(device, hidden_bytes) else { return 1; }; let norm_owner: OwnedObjc = OwnedObjc::new(norm.raw());
@@ -464,6 +599,35 @@ fn run_impl(
     guard let option::Option[metal::Buffer]::Some(activated) = new_buffer(device, intermediate_bytes) else { return 1; }; let activated_owner: OwnedObjc = OwnedObjc::new(activated.raw());
     let scratch_wall_ms: i64 = time::now_millis() - scratch_start_ms;
 
+    let embedding_stream_start_ms: i64 = time::now_millis();
+    let compact_ids: *u32 = ids.contents() as *u32;
+    let compact_embedding: *u8 = embedding_rows.contents();
+    let embedding_row_bytes: usize = WIDTH *% #size_of::[u16]();
+    var embedding_row: usize = 0 as usize;
+    while embedding_row < rows {
+        compact_ids[embedding_row] = embedding_row as u32;
+        let token: u64 = token_ids[embedding_row] as u64;
+        if token >= VOCABULARY as u64 {
+            io::eprintln("text encoder: token ID ${token} exceeds vocabulary");
+            return 1;
+        }
+        if !stream_source_range(
+            reader_0,
+            reader_1,
+            reader_2,
+            reader_3,
+            compact_embedding + embedding_row *% embedding_row_bytes,
+            embedding_source,
+            token *% embedding_row_bytes as u64,
+            embedding_row_bytes,
+        ) {
+            io::eprintln("text encoder: could not stream embedding row ${embedding_row}");
+            return 1;
+        }
+        embedding_row = embedding_row +% (1 as usize);
+    }
+    let embedding_stream_wall_ms: i64 = time::now_millis() - embedding_stream_start_ms;
+
     let execution_start_ms: i64 = time::now_millis();
     var params: TextParams = TextParams {
         rows: rows as u32,
@@ -475,8 +639,7 @@ fn run_impl(
         epsilon: 0.000001f32,
         rope_theta: 5000000.0f32,
     };
-    guard let option::Option[Weight]::Some(embedding_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "model.language_model.embed_tokens.weight", VOCABULARY as u64, WIDTH as u64) else { return 1; };
-    guard let option::Option[f64]::Some(embedding_ms) = dispatch_element(queue, pipelines.embedding, ids, embedding_weight.storage, hidden_a, #addr_of(params), rows *% WIDTH, 0 as u64, embedding_weight.offset) else { return 1; };
+    guard let option::Option[f64]::Some(embedding_ms) = dispatch_element(queue, pipelines.embedding, ids, embedding_rows, hidden_a, #addr_of(params), rows *% WIDTH) else { return 1; };
     var total_ms: f64 = embedding_ms;
     if validate_reference {
         match normalized_rms_output(hidden_a, SYSTEM_PREFIX_TOKENS, output_rows, "tests/fixtures/text_encoder_fp32/embedding.f32") {
@@ -486,20 +649,69 @@ fn run_impl(
     }
 
     var layer: usize = 0 as usize;
+    var prefetched_stream_wall_ms: i64 = 0 as i64;
     while layer < LAYERS {
         let layer_wall_start_ms: i64 = time::now_millis();
         let prefix: text::Text = "model.language_model.layers.${layer}.";
-        guard let option::Option[Weight]::Some(input_norm) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}input_layernorm.weight", WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(q_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}self_attn.q_proj.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(k_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}self_attn.k_proj.weight", KV_WIDTH as u64, WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(v_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}self_attn.v_proj.weight", KV_WIDTH as u64, WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(q_norm) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}self_attn.q_norm.weight", HEAD_DIMENSION as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(k_norm) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}self_attn.k_norm.weight", HEAD_DIMENSION as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(o_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}self_attn.o_proj.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(post_norm) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}post_attention_layernorm.weight", WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(gate_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}mlp.gate_proj.weight", INTERMEDIATE_WIDTH as u64, WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(up_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}mlp.up_proj.weight", INTERMEDIATE_WIDTH as u64, WIDTH as u64) else { return 1; };
-        guard let option::Option[Weight]::Some(down_weight) = tensor_weight(file_0, storage_0, file_1, storage_1, file_2, storage_2, file_3, storage_3, "${prefix}mlp.down_proj.weight", WIDTH as u64, INTERMEDIATE_WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(input_norm_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}input_layernorm.weight", WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(q_weight_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.q_proj.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(k_weight_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.k_proj.weight", KV_WIDTH as u64, WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(v_weight_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.v_proj.weight", KV_WIDTH as u64, WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(q_norm_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.q_norm.weight", HEAD_DIMENSION as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(k_norm_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.k_norm.weight", HEAD_DIMENSION as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(o_weight_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}self_attn.o_proj.weight", WIDTH as u64, WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(post_norm_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}post_attention_layernorm.weight", WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(gate_weight_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}mlp.gate_proj.weight", INTERMEDIATE_WIDTH as u64, WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(up_weight_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}mlp.up_proj.weight", INTERMEDIATE_WIDTH as u64, WIDTH as u64) else { return 1; };
+        guard let option::Option[SourceTensor]::Some(down_weight_source) = source_tensor(file_0, file_1, file_2, file_3, "${prefix}mlp.down_proj.weight", WIDTH as u64, INTERMEDIATE_WIDTH as u64) else { return 1; };
+
+        guard let option::Option[LayerSpanLayout]::Some(layout) = layer_span_layout(file_0, file_1, file_2, file_3, layer) else { return 1; };
+        let span_0: ShardSpan = layout.span_0;
+        let span_1: ShardSpan = layout.span_1;
+        let span_2: ShardSpan = layout.span_2;
+        let span_3: ShardSpan = layout.span_3;
+        let layer_storage: metal::Buffer = if layer % (2 as usize) == (0 as usize) { layer_storage_0 } else { layer_storage_1 };
+        var layer_stream_wall_ms: i64 = prefetched_stream_wall_ms;
+        if layer == (0 as usize) {
+            let layer_stream_start_ms: i64 = time::now_millis();
+            let layer_destination: *u8 = layer_storage.contents();
+            if !stream_span(reader_0, layer_destination, span_0)
+                || !stream_span(reader_1, layer_destination, span_1)
+                || !stream_span(reader_2, layer_destination, span_2)
+                || !stream_span(reader_3, layer_destination, span_3) {
+                io::eprintln("text encoder: could not stream layer ${layer}");
+                return 1;
+            }
+            layer_stream_wall_ms = time::now_millis() - layer_stream_start_ms;
+        }
+        var next_layout: LayerSpanLayout = empty_layer_layout();
+        if layer +% (1 as usize) < LAYERS {
+            guard let option::Option[LayerSpanLayout]::Some(found_next_layout) = layer_span_layout(file_0, file_1, file_2, file_3, layer +% (1 as usize)) else { return 1; };
+            next_layout = found_next_layout;
+        }
+        let next_storage: metal::Buffer = if layer % (2 as usize) == (0 as usize) { layer_storage_1 } else { layer_storage_0 };
+        let prefetch_handle: thread::JoinHandle[i64] = thread::spawn_with::[LayerReadJob, i64](
+            LayerReadJob {
+                fd_0: reader_0.descriptor(),
+                fd_1: reader_1.descriptor(),
+                fd_2: reader_2.descriptor(),
+                fd_3: reader_3.descriptor(),
+                destination: next_storage.contents(),
+                layout: next_layout,
+            },
+            read_layer_job,
+        );
+        let input_norm: Weight = streamed_weight(layer_storage, input_norm_source, span_0, span_1, span_2, span_3);
+        let q_weight: Weight = streamed_weight(layer_storage, q_weight_source, span_0, span_1, span_2, span_3);
+        let k_weight: Weight = streamed_weight(layer_storage, k_weight_source, span_0, span_1, span_2, span_3);
+        let v_weight: Weight = streamed_weight(layer_storage, v_weight_source, span_0, span_1, span_2, span_3);
+        let q_norm: Weight = streamed_weight(layer_storage, q_norm_source, span_0, span_1, span_2, span_3);
+        let k_norm: Weight = streamed_weight(layer_storage, k_norm_source, span_0, span_1, span_2, span_3);
+        let o_weight: Weight = streamed_weight(layer_storage, o_weight_source, span_0, span_1, span_2, span_3);
+        let post_norm: Weight = streamed_weight(layer_storage, post_norm_source, span_0, span_1, span_2, span_3);
+        let gate_weight: Weight = streamed_weight(layer_storage, gate_weight_source, span_0, span_1, span_2, span_3);
+        let up_weight: Weight = streamed_weight(layer_storage, up_weight_source, span_0, span_1, span_2, span_3);
+        let down_weight: Weight = streamed_weight(layer_storage, down_weight_source, span_0, span_1, span_2, span_3);
 
         guard let option::Option[f64]::Some(norm_ms) = dispatch_element(queue, pipelines.rms_norm, hidden_a, input_norm.storage, norm, #addr_of(params), rows, 0 as u64, input_norm.offset) else { return 1; }; total_ms = total_ms + norm_ms;
         guard let option::Option[f64]::Some(q_ms) = dispatch_linear(queue, pipelines.linear, norm, q_weight, query, rows, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + q_ms;
@@ -519,7 +731,14 @@ fn run_impl(
         guard let option::Option[f64]::Some(swiglu_ms) = dispatch_element(queue, pipelines.swiglu, gate, up, activated, #addr_of(params), rows *% INTERMEDIATE_WIDTH) else { return 1; }; total_ms = total_ms + swiglu_ms;
         guard let option::Option[f64]::Some(down_ms) = dispatch_linear(queue, pipelines.linear, activated, down_weight, branch, rows, WIDTH, INTERMEDIATE_WIDTH) else { return 1; }; total_ms = total_ms + down_ms;
         guard let option::Option[f64]::Some(add_mlp_ms) = dispatch_element(queue, pipelines.add, hidden_b, branch, hidden_a, #addr_of(params), rows *% WIDTH) else { return 1; }; total_ms = total_ms + add_mlp_ms;
-        io::println("text encoder: layer=${layer} cumulative_gpu_ms=${total_ms} wall_ms=${time::now_millis() - layer_wall_start_ms} cumulative_wall_ms=${time::now_millis() - execution_start_ms}");
+        let prefetch_wait_start_ms: i64 = time::now_millis();
+        prefetched_stream_wall_ms = prefetch_handle.join();
+        let prefetch_wait_wall_ms: i64 = time::now_millis() - prefetch_wait_start_ms;
+        if prefetched_stream_wall_ms < (0 as i64) {
+            io::eprintln("text encoder: could not prefetch layer ${layer +% (1 as usize)}");
+            return 1;
+        }
+        io::println("text encoder: layer=${layer} bytes=${layout.bytes} stream_ms=${layer_stream_wall_ms} next_stream_ms=${prefetched_stream_wall_ms} prefetch_wait_ms=${prefetch_wait_wall_ms} cumulative_gpu_ms=${total_ms} wall_ms=${time::now_millis() - layer_wall_start_ms} cumulative_wall_ms=${time::now_millis() - execution_start_ms}");
         if validate_reference && (
             layer == (0 as usize) || layer == (17 as usize) || layer == (23 as usize)
                 || layer >= (31 as usize)
@@ -554,7 +773,7 @@ fn run_impl(
     if !finite_ok { return 1; }
     let execution_wall_ms: i64 = time::now_millis() - execution_start_ms;
     io::println(
-        "text encoder timing: mapping_ms=${mapping_wall_ms} advise_ms=${advise_wall_ms} device_queue_ms=${device_queue_wall_ms} storage_buffers_ms=${storage_wall_ms} metal_compile_pipeline_ms=${compile_wall_ms} scratch_buffers_ms=${scratch_wall_ms} execution_ms=${execution_wall_ms} total_wall_ms=${time::now_millis() - run_wall_start_ms}",
+        "text encoder timing: mapping_ms=${mapping_wall_ms} reader_open_ms=${reader_wall_ms} device_queue_ms=${device_queue_wall_ms} metal_compile_pipeline_ms=${compile_wall_ms} scratch_buffers_ms=${scratch_wall_ms} embedding_stream_ms=${embedding_stream_wall_ms} execution_ms=${execution_wall_ms} total_wall_ms=${time::now_millis() - run_wall_start_ms}",
     );
     if !output.is_null() {
         let values: *f32 = hidden_a.contents() as *f32;

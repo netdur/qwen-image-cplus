@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Plan-5 F3 text-encoder weight streaming",
+  "implementation": {
+    "source_weight_storage": "approximately 17.5 GB across four BF16 shards",
+    "layer_payload_bytes": 385892864,
+    "stream_slots": 2,
+    "slot_capacity_bytes": 436207616,
+    "read_api": "pread",
+    "cache_policy": "F_NOCACHE",
+    "embedding_policy": "read only each requested 8 KiB BF16 row into a compact prompt-sized buffer",
+    "overlap": "while Metal executes decoder layer N, one worker reads layer N+1 into the alternate shared Metal buffer",
+    "correctness_note": "Safetensors mappings remain metadata-only; GPU weights are byte-identical BF16 payloads copied without conversion"
+  },
+  "standalone_text_oracle": {
+    "recent_whole_shard_path": {
+      "total_wall_ms": 16242,
+      "whole_shard_advise_ms": 7208,
+      "description": "last pre-F3 integrated text timing from the F4 validation run"
+    },
+    "single_slot_synchronous_stream": {
+      "total_wall_ms": 4226,
+      "execution_ms": 4161,
+      "gpu_ms": 1089.22
+    },
+    "two_slot_overlapped_stream": {
+      "total_wall_ms": 3145,
+      "execution_ms": 3081,
+      "gpu_ms": 1079.86
+    },
+    "saving_vs_recent_whole_shard": {
+      "wall_ms": 13097,
+      "wall_percent": 80.64,
+      "speedup": 5.16
+    },
+    "overlap_saving_vs_single_slot": {
+      "wall_ms": 1081,
+      "wall_percent": 25.58,
+      "speedup": 1.34
+    },
+    "quality": {
+      "embedding_nrmse": 0,
+      "output_nrmse": 0.0361069,
+      "output_limit": 0.04,
+      "boundary_values_unchanged": true,
+      "result": "pass"
+    }
+  },
+  "standalone_memory_sample": {
+    "command": "/usr/bin/time -l ./target/debug/qwen-image-cplus test-text-encoder MODEL_DIR",
+    "internal_total_wall_ms": 2903,
+    "process_real_seconds": 3.06,
+    "maximum_resident_set_bytes": 831946752,
+    "peak_memory_footprint_bytes": 932988152,
+    "note": "timing varies with filesystem and power state; this run is retained primarily as the memory measurement"
+  },
+  "native_pipeline_256_adjacent": {
+    "single_slot": {
+      "text_wall_ms": 3329,
+      "transformer_wall_ms": 27625,
+      "vae_wall_ms": 1245,
+      "image_output_wall_ms": 22,
+      "total_wall_ms": 32222
+    },
+    "two_slot": {
+      "text_wall_ms": 2144,
+      "transformer_wall_ms": 28429,
+      "vae_wall_ms": 1239,
+      "image_output_wall_ms": 24,
+      "total_wall_ms": 31838
+    },
+    "text_saving_ms": 1185,
+    "text_saving_percent": 35.60,
+    "total_saving_ms": 384,
+    "total_saving_percent": 1.19,
+    "interpretation": "the text-phase gain is direct; the end-to-end pair understates it because transformer buffer/prefix setup was 804 ms slower in the overlapped run",
+    "quality": {
+      "final_latent_nrmse": 0.0190087,
+      "final_latent_limit": 0.02,
+      "vae_nrmse": 0.0182946,
+      "vae_limit": 0.02,
+      "rgba_nrmse": 0.0103176,
+      "rgba_limit": 0.013,
+      "png_sha256": "d9967772c1abc8869f23f6595bf6216b18ff63433d21ececc55dc01ce628bc29",
+      "comparison": "byte-for-byte identical to the pre-F3 v4 PNG",
+      "result": "pass"
+    }
+  },
+  "unit_tests": {
+    "passed": 332,
+    "failed": 2,
+    "failures": [
+      "stdlib::src::net::net_accept_reports_cancellation_instead_of_blocking",
+      "stdlib::src::net::net_listen_tcp_binds_on_ephemeral_port"
+    ],
+    "interpretation": "environment-sensitive TCP sandbox failures unrelated to the text path; all project tests passed"
+  },
+  "decision": "accept the two-slot streamer; it removes whole-shard readahead, cuts standalone text wall time by about 80.6%, bounds the text working set below 1 GB in the measured run, and preserves the exact downstream PNG"
+}
