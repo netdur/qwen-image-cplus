@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Plan-5 F5 dispatch-level 1024 VAE profile",
+  "commands": {
+    "production_shape": "test-vae-decoder MODEL_DIR 1024",
+    "dispatch_profile": "test-vae-decoder MODEL_DIR 1024-profile"
+  },
+  "production_batched": {
+    "before_instrumentation": {
+      "gpu_ms": 9177.81,
+      "process_wall_seconds": 10.39,
+      "scratch_bytes": 5577375744,
+      "maximum_resident_set_bytes": 37732352,
+      "peak_memory_footprint_bytes": 5603394208
+    },
+    "after_instrumentation_gpu_ms": 8997.58,
+    "interpretation": "the profiler is off by default and does not change the one-command-buffer production path; the GPU spread is ordinary run-to-run variation"
+  },
+  "synchronous_dispatch_profile": {
+    "gpu_ms": 9373.18,
+    "convolution_gpu_ms": 8957.362405,
+    "convolution_percent": 95.5638,
+    "middle_attention_gpu_ms": 272.305,
+    "middle_attention_percent": 2.9052,
+    "all_other_gpu_ms": 143.512595,
+    "all_other_percent": 1.531,
+    "up_blocks": [
+      { "block": 0, "output": "128x128x1152", "gpu_ms": 469.343 },
+      { "block": 1, "output": "256x256x1152", "gpu_ms": 1800.52 },
+      { "block": 2, "output": "512x512x576", "gpu_ms": 2091.73 },
+      { "block": 3, "output": "1024x1024x288", "gpu_ms": 2133.67 },
+      { "block": 4, "output": "1024x1024x144", "gpu_ms": 2191.91 }
+    ],
+    "up_blocks_gpu_ms": 8687.173,
+    "up_blocks_percent": 92.6812,
+    "note": "profile mode intentionally commits and waits per dispatch to obtain GPU timestamps, so its aggregate is diagnostic rather than the production latency"
+  },
+  "correctness": {
+    "profile_1024": "finite deterministic zero-latent smoke; no official 1024 VAE oracle is currently available",
+    "post_profile_256_output_nrmse": 0.000000664769,
+    "post_profile_256_limit": 0.000003,
+    "post_profile_256_result": "pass"
+  },
+  "unit_tests": {
+    "passed": 332,
+    "failed": 2,
+    "failures": [
+      "stdlib::src::net::net_accept_reports_cancellation_instead_of_blocking",
+      "stdlib::src::net::net_listen_tcp_binds_on_ephemeral_port"
+    ],
+    "interpretation": "environment-sensitive TCP sandbox failures unrelated to the VAE; all project tests passed"
+  },
+  "decision": {
+    "middle_attention": "no-go: even deleting it entirely could save only 2.91%",
+    "elementwise_and_submission": "no-go: norms, adds, clamp, and all remaining work total only 1.53%; production already uses one command buffer",
+    "fp16_convolution": "no-go under the existing tight FP32 decoder oracle",
+    "remaining_compute_target": "the FP32 cooperative-matrix convolution family, including parity-decomposed upsample convolution",
+    "f5_status": "complete; retain the current runtime and use this profile to gate any future convolution-kernel or exact FP32 MPSGraph experiment"
+  }
+}

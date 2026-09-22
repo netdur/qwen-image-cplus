@@ -618,6 +618,7 @@ fn execute_residual(
     input_channels: usize,
     output_channels: usize,
     deferred: *u8 = 0 as *u8,
+    profile_dispatches: bool = false,
 ) -> option::Option[f64] {
     let norm1_name: text::Text = "${prefix}.norm1.gamma";
     let norm2_name: text::Text = "${prefix}.norm2.gamma";
@@ -628,12 +629,14 @@ fn execute_residual(
     guard let option::Option[ConvWeight]::Some(conv1) = conv_weight(file, conv1_name.view(), output_channels, input_channels, 3) else { return option::Option[f64]::None; };
     guard let option::Option[ConvWeight]::Some(conv2) = conv_weight(file, conv2_name.view(), output_channels, output_channels, 3) else { return option::Option[f64]::None; };
     var total: f64 = 0.0f64;
+    var shortcut_ms: f64 = 0.0f64;
     var shortcut: metal::Buffer = input;
     if input_channels != output_channels {
         let shortcut_name: text::Text = "${prefix}.conv_shortcut";
         guard let option::Option[ConvWeight]::Some(shortcut_weight) = conv_weight(file, shortcut_name.view(), output_channels, input_channels, 1) else { return option::Option[f64]::None; };
         guard let option::Option[f64]::Some(elapsed) = dispatch_conv(queue, pipelines.conv, storage, shortcut_weight, input, shortcut_buffer, height, width, input_channels, output_channels, 1, 0, false, deferred) else { return option::Option[f64]::None; };
         total = total + elapsed;
+        shortcut_ms = elapsed;
         shortcut = shortcut_buffer;
     }
     guard let option::Option[f64]::Some(norm1_ms) = dispatch_norm(queue, pipelines.norm, storage, norm1, input, norm_buffer, height *% width, input_channels, true, deferred) else { return option::Option[f64]::None; };
@@ -641,6 +644,9 @@ fn execute_residual(
     guard let option::Option[f64]::Some(norm2_ms) = dispatch_norm(queue, pipelines.norm, storage, norm2, conv_buffer, norm_buffer, height *% width, output_channels, true, deferred) else { return option::Option[f64]::None; };
     guard let option::Option[f64]::Some(conv2_ms) = dispatch_conv(queue, pipelines.conv, storage, conv2, norm_buffer, output, height, width, output_channels, output_channels, 3, 1, false, deferred) else { return option::Option[f64]::None; };
     guard let option::Option[f64]::Some(add_ms) = dispatch_element(queue, pipelines.add, output, shortcut, shortcut, output, height *% width *% output_channels, output_channels, 1 as u32, deferred) else { return option::Option[f64]::None; };
+    if profile_dispatches {
+        io::println("VAE profile: residual=${prefix} height=${height} width=${width} input_channels=${input_channels} output_channels=${output_channels} shortcut_conv_ms=${shortcut_ms} norm_1_ms=${norm1_ms} conv_1_ms=${conv1_ms} norm_2_ms=${norm2_ms} conv_2_ms=${conv2_ms} add_ms=${add_ms}");
+    }
     return option::Option[f64]::Some(total + norm1_ms + conv1_ms + norm2_ms + conv2_ms + add_ms);
 }
 
@@ -711,7 +717,7 @@ fn run(
     // case. A 1024 request is a finite-execution and allocation-shape smoke
     // test with a deterministic zero normalized latent; its numerical oracle
     // is intentionally a separate phase rather than a large Git fixture.
-    if requested_case == "1024" {
+    if requested_case == "1024" || requested_case == "1024-profile" {
         let latent_values: usize = (64 as usize) *% (64 as usize) *% (64 as usize);
         var latent: vec::Vec[f32] = vec::Vec[f32]::with_capacity(latent_values);
         var index: usize = 0 as usize;
@@ -721,12 +727,13 @@ fn run(
         }
         return run_impl(
             model_root,
-            requested_case,
+            "1024",
             "",
             #slice_ptr(latent.as_slice()),
             0 as *f32,
             false,
             false,
+            requested_case == "1024-profile",
         );
     }
     return run_impl(
@@ -806,6 +813,7 @@ fn run_impl(
     decoded_destination: *f32,
     validate_reference: bool,
     native_prompt_source: bool,
+    profile_dispatches: bool = false,
 ) -> i32 {
     var input_height: usize = 0 as usize;
     var case_directory: str = "";
@@ -921,10 +929,10 @@ fn run_impl(
         queue.command_buffer() else { return 1; };
     let decode_command_buffer_owner: OwnedObjc =
         OwnedObjc::new(rt::retain(decode_command_buffer.raw()));
-    // The 256px path has no intermediate host reads, so encode its entire
-    // dependency chain before one commit/wait. The small diagnostic path keeps
-    // synchronous dispatches because every boundary is compared on the CPU.
-    let deferred: *u8 = if requested_case != "small" {
+    // Production has no intermediate host reads, so encode the dependency
+    // chain before one commit/wait. Small-oracle and explicit profile modes
+    // stay synchronous to expose individual command-buffer GPU timestamps.
+    let deferred: *u8 = if requested_case != "small" && !profile_dispatches {
         decode_command_buffer.raw()
     } else {
         0 as *u8
@@ -946,7 +954,7 @@ fn run_impl(
     total_ms = total_ms + conv_in_ms;
     if requested_case == "small" { all_ok = report_boundary("decoder conv_in", buffer_a, fixture_directory, "conv_in", input_height *% input_width *% (1152 as usize), 0.000001f64) && all_ok; }
 
-    guard let option::Option[f64]::Some(mid_residual_0_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.0", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(mid_residual_0_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.0", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152, deferred, profile_dispatches) else { return 1; };
     total_ms = total_ms + mid_residual_0_ms;
     guard let option::Option[u64]::Some(attention_norm) = gamma_offset(file, "decoder.mid_block.attentions.0.norm.gamma", 1152) else { return 1; };
     guard let option::Option[f64]::Some(attention_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, attention_norm, buffer_b, buffer_c, input_height *% input_width, 1152, false, deferred) else { return 1; };
@@ -961,8 +969,12 @@ fn run_impl(
     total_ms = total_ms + attention_projection_ms;
     guard let option::Option[f64]::Some(attention_add_ms) = dispatch_element(queue, pipelines.add, buffer_a, buffer_b, buffer_b, buffer_a, input_height *% input_width *% (1152 as usize), 1152, 1 as u32, deferred) else { return 1; };
     total_ms = total_ms + attention_add_ms;
-    guard let option::Option[f64]::Some(mid_residual_1_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.1", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(mid_residual_1_ms) = execute_residual(queue, pipelines, file, storage, "decoder.mid_block.resnets.1", buffer_a, buffer_b, buffer_c, buffer_d, shortcut, input_height, input_width, 1152, 1152, deferred, profile_dispatches) else { return 1; };
     total_ms = total_ms + mid_residual_1_ms;
+    if profile_dispatches {
+        io::println("VAE profile: stage=input denormalize_ms=${denormalize_ms} post_quant_ms=${post_quant_ms} conv_in_ms=${conv_in_ms}");
+        io::println("VAE profile: stage=middle residual_0_ms=${mid_residual_0_ms} attention_norm_ms=${attention_norm_ms} qkv_ms=${qkv_ms} attention_ms=${attention_ms} attention_projection_ms=${attention_projection_ms} attention_add_ms=${attention_add_ms} residual_1_ms=${mid_residual_1_ms}");
+    }
     if requested_case == "small" { all_ok = report_boundary("middle block", buffer_b, fixture_directory, "mid", input_height *% input_width *% (1152 as usize), 0.000001f64) && all_ok; }
 
     let input_channels_by_block: [usize; 5] = [1152 as usize, 1152 as usize, 1152 as usize, 576 as usize, 288 as usize];
@@ -988,23 +1000,26 @@ fn run_impl(
                 all_ok = report_boundary("up block ${block} shortcut", block_shortcut, fixture_directory, shortcut_name.view(), height *% (2 as usize) *% width *% (2 as usize) *% output_channels, 0.000005f64) && all_ok;
             }
         }
-        guard let option::Option[f64]::Some(resnet_0_ms) = execute_residual(queue, pipelines, file, storage, resnet_0.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, input_channels, output_channels, deferred) else { return 1; };
+        guard let option::Option[f64]::Some(resnet_0_ms) = execute_residual(queue, pipelines, file, storage, resnet_0.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, input_channels, output_channels, deferred, profile_dispatches) else { return 1; };
         if requested_case == "small" {
             let name: text::Text = "up_block_0${block}_resnet_0";
             all_ok = report_boundary("up block ${block} residual 0", buffer_a, fixture_directory, name.view(), height *% width *% output_channels, 0.000005f64) && all_ok;
         }
-        guard let option::Option[f64]::Some(resnet_1_ms) = execute_residual(queue, pipelines, file, storage, resnet_1.view(), buffer_a, buffer_b, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels, deferred) else { return 1; };
+        guard let option::Option[f64]::Some(resnet_1_ms) = execute_residual(queue, pipelines, file, storage, resnet_1.view(), buffer_a, buffer_b, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels, deferred, profile_dispatches) else { return 1; };
         if requested_case == "small" {
             let name: text::Text = "up_block_0${block}_resnet_1";
             all_ok = report_boundary("up block ${block} residual 1", buffer_b, fixture_directory, name.view(), height *% width *% output_channels, 0.000005f64) && all_ok;
         }
-        guard let option::Option[f64]::Some(resnet_2_ms) = execute_residual(queue, pipelines, file, storage, resnet_2.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels, deferred) else { return 1; };
+        guard let option::Option[f64]::Some(resnet_2_ms) = execute_residual(queue, pipelines, file, storage, resnet_2.view(), buffer_b, buffer_a, buffer_c, buffer_d, shortcut, height, width, output_channels, output_channels, deferred, profile_dispatches) else { return 1; };
         if requested_case == "small" {
             let name: text::Text = "up_block_0${block}_resnet_2";
             all_ok = report_boundary("up block ${block} residual 2", buffer_a, fixture_directory, name.view(), height *% width *% output_channels, 0.000005f64) && all_ok;
         }
-        total_ms = total_ms + shortcut_ms + resnet_0_ms + resnet_1_ms + resnet_2_ms;
+        var block_ms: f64 = shortcut_ms + resnet_0_ms + resnet_1_ms + resnet_2_ms;
+        total_ms = total_ms + block_ms;
         var boundary: metal::Buffer = buffer_a;
+        var upsample_ms_profile: f64 = 0.0f64;
+        var upsample_add_ms_profile: f64 = 0.0f64;
         if block < (4 as usize) {
             let upsample_name: text::Text = "decoder.up_blocks.${block}.upsampler.resample.1";
             guard let option::Option[ConvWeight]::Some(upsample_weight) = conv_weight(file, upsample_name.view(), output_channels, output_channels, 3) else { return 1; };
@@ -1020,6 +1035,9 @@ fn run_impl(
             let upsample_elements: usize = height *% (2 as usize) *% width *% (2 as usize) *% output_channels;
             guard let option::Option[f64]::Some(add_ms) = dispatch_element(queue, pipelines.add, buffer_b, block_shortcut, shortcut, buffer_b, upsample_elements, output_channels, 1 as u32, deferred) else { return 1; };
             total_ms = total_ms + upsample_ms + add_ms;
+            block_ms = block_ms + upsample_ms + add_ms;
+            upsample_ms_profile = upsample_ms;
+            upsample_add_ms_profile = add_ms;
             height = height *% (2 as usize);
             width = width *% (2 as usize);
             boundary = buffer_b;
@@ -1027,6 +1045,9 @@ fn run_impl(
         if requested_case == "small" {
             let boundary_name: text::Text = "up_block_0${block}";
             all_ok = report_boundary("up block ${block}", boundary, fixture_directory, boundary_name.view(), height *% width *% output_channels, 0.000005f64) && all_ok;
+        }
+        if profile_dispatches {
+            io::println("VAE profile: stage=up_block block=${block} height=${height} width=${width} input_channels=${input_channels} output_channels=${output_channels} shortcut_ms=${shortcut_ms} residual_0_ms=${resnet_0_ms} residual_1_ms=${resnet_1_ms} residual_2_ms=${resnet_2_ms} upsample_ms=${upsample_ms_profile} upsample_add_ms=${upsample_add_ms_profile} total_ms=${block_ms}");
         }
         block = block +% (1 as usize);
     }
@@ -1045,6 +1066,9 @@ fn run_impl(
     if requested_case == "small" { all_ok = report_boundary("decoder conv_out", buffer_b, fixture_directory, "conv_out", height *% width *% (4 as usize), 0.000002f64) && all_ok; }
     guard let option::Option[f64]::Some(clamp_ms) = dispatch_clamp(queue, pipelines.clamp, buffer_b, buffer_a, height *% width *% (4 as usize), deferred) else { return 1; };
     total_ms = total_ms + clamp_ms;
+    if profile_dispatches {
+        io::println("VAE profile: stage=output norm_silu_ms=${final_norm_silu_ms} conv_out_ms=${conv_out_ms} clamp_ms=${clamp_ms}");
+    }
     if !deferred.is_null() {
         decode_command_buffer.commit();
         decode_command_buffer.wait_until_completed();

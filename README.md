@@ -60,6 +60,7 @@ cpc test
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024
+./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024-profile
 ./target/debug/qwen-image-cplus test-image-output reference.png
 ./target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./target/debug/qwen-image-cplus test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
@@ -78,8 +79,9 @@ cpc test
 The four production generation commands accept `25` or `40` as their final
 optional argument. Omitting it preserves the canonical 40-step behavior. A
 25-step run constructs a fresh 25-step FlowMatch schedule; it does not truncate
-the first 25 points of the 40-step schedule. The 25-step path is measured at
-256, while 1024 support currently has build and unit-test coverage only.
+the first 25 points of the 40-step schedule. Both 256 and 1024 paths have
+end-to-end measurements; their numerical gates and remaining 1024 oracle
+limitations are recorded below.
 
 Inspect a shard, optionally filtering tensor names:
 
@@ -780,6 +782,21 @@ Inspect a shard, optionally filtering tensor names:
   finite 1024 smoke in 9,390.94 ms GPU. Full timing, the output checksum,
   prior single-prediction correctness evidence, and limitations are recorded in
   `benchmarks/m1-max-native-prompt-pipeline-1024.json`.
+- Plan-5 F5 now has the missing dispatch-level 1024 profile. The normal
+  `1024` case retains one command buffer; `1024-profile` intentionally commits
+  and waits per dispatch so each GPU interval is observable. In the final
+  9,373.18 ms diagnostic run, FP32 convolution consumed **8,957.36 ms
+  (95.56%)**, the 4,096-token middle attention consumed 272.31 ms (2.91%),
+  and every norm, add, clamp, and other operation combined consumed 143.51 ms
+  (1.53%). The five up blocks accounted for 8,687.17 ms (92.68%). This closes
+  the plan's attention question: even deleting middle attention entirely
+  cannot materially change decode latency, and production already batches
+  submission. A post-profile production run remained at 8,997.58 ms GPU, and
+  the exact 256 oracle still passed at 6.64769e-7 nRMSE under its 3e-6 limit.
+  Future VAE compute work must improve the existing FP32 cooperative-matrix
+  convolution or demonstrate an equally accurate FP32 framework path; FP16
+  operands remain outside the numerical gate. Raw per-residual and per-block
+  measurements are in `benchmarks/m1-max-vae-1024-profile.json`.
 - Short 1024 transformer runs now make optimization practical without decoding
   an image: `benchmark-transformer-trajectory-1024 ... 1|2` uses the committed
   31-row text fixture, seed 1301, and the first one or two steps of the normal
@@ -951,10 +968,14 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    profiled before more code is added. Scalar attention variants, further Q8,
    and additional broad activation conversions are closed. Accept any K/V
    change only with full-shape timing and numerical gates.
-3. **1024 working memory.** Right-size and safely alias VAE activation arenas;
-   the initial decoder path deliberately favors simple ownership and currently
-   reserves several maximum-size buffers. Measure peak footprint after every
-   change so transformer, text, and VAE phases remain safe on the 32 GB M1 Max.
+3. **1024 working memory.** Shape-specific VAE arena sizing already removed
+   1.6875 GiB, and F5 measured a 5,603,394,208-byte peak footprint with
+   5,577,375,744 bytes of explicit scratch. Further reduction requires a real
+   liveness/aliasing schedule rather than smaller fixed capacities: block 4
+   simultaneously needs two wide and three narrow residual buffers, while the
+   block-3 upsample owns the remaining wide shortcut. Measure peak footprint
+   after every aliasing change so transformer, text, and VAE phases remain safe
+   on the 32 GB M1 Max.
 4. **Shared startup and small-kernel work.** Text layer streaming has completed
    Plan-5 F3: the measured text working set is below 1 GB and standalone text
    time fell from 16,242 to 3,145 ms without changing output. The short-run
