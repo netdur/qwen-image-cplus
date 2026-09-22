@@ -38,6 +38,49 @@ fn exponential_time_shift(mu: f32, timestep: f32) -> f32 {
     return scale / (scale + (1.0f32 / timestep - 1.0f32));
 }
 
+// Bottleneck Sampling uses the SD3/flow rational shift for each independently
+// re-noised stage. Qwen-Image's scheduler additionally stretches its final
+// model evaluation to TERMINAL_SHIFT before the zero Euler endpoint. Preserve
+// that model-specific invariant here: the FLUX paper's raw rational schedules
+// otherwise leave a very large final step when a stage has only 4-13 samples.
+// `strength` is the unshifted starting noise level.
+fn rational_time_shift(shift: f32, timestep: f32) -> f32 {
+    if timestep == 0.0f32 { return 0.0f32; }
+    return shift * timestep / (1.0f32 + (shift - 1.0f32) * timestep);
+}
+
+fn fill_bottleneck_schedule(
+    step_count: usize,
+    shift: f32,
+    strength: f32,
+    sigmas: *f32,
+    timesteps: *f32,
+) -> bool {
+    if step_count < (2 as usize) || shift <= 0.0f32
+        || strength <= 0.0f32 || strength > 1.0f32
+        || sigmas.is_null() || timesteps.is_null() {
+        return false;
+    }
+    let final_unshifted: f32 = strength / step_count as f32;
+    let final_shifted: f32 = rational_time_shift(shift, final_unshifted);
+    let terminal_scale: f32 = (1.0f32 - final_shifted)
+        / (1.0f32 - TERMINAL_SHIFT);
+    if terminal_scale <= 0.0f32 { return false; }
+
+    var index: usize = 0 as usize;
+    while index < step_count {
+        let unshifted: f32 = strength
+            * (step_count -% index) as f32 / step_count as f32;
+        let shifted: f32 = rational_time_shift(shift, unshifted);
+        let sigma: f32 = 1.0f32 - (1.0f32 - shifted) / terminal_scale;
+        sigmas[index] = sigma;
+        timesteps[index] = sigma * TRAIN_TIMESTEPS;
+        index = index +% (1 as usize);
+    }
+    sigmas[step_count] = 0.0f32;
+    return true;
+}
+
 fn build_schedule(step_count: usize, image_sequence_length: usize) -> ScheduleResult {
     if step_count < (2 as usize) {
         return ScheduleResult::Err(ScheduleError::InvalidStepCount);
@@ -234,4 +277,25 @@ fn bf16_euler_step_matches_scheduler_cast_back() {
     let second: f32 = sample[1] + (0.7f32 - 0.9f32) * prediction[1];
     assert output[0] == cpu::bf16_to_f32(cpu::f32_to_bf16(first));
     assert output[1] == cpu::bf16_to_f32(cpu::f32_to_bf16(second));
+}
+
+#[test]
+fn bottleneck_schedule_applies_strength_rational_and_terminal_shift() {
+    var sigmas: [f32; 5] = [0.0f32; 5];
+    var timesteps: [f32; 4] = [0.0f32; 4];
+    assert fill_bottleneck_schedule(
+        4 as usize, 9.0f32, 0.6f32,
+        #addr_of(sigmas[0]), #addr_of(timesteps[0]),
+    );
+    let first_shifted: f32 = 5.4f32 / 5.8f32;
+    let last_shifted: f32 = 1.35f32 / 2.2f32;
+    let terminal_scale: f32 = (1.0f32 - last_shifted) / 0.98f32;
+    let expected_first: f32 = 1.0f32 - (1.0f32 - first_shifted) / terminal_scale;
+    assert close(sigmas[0], expected_first, 0.000001f32);
+    assert close(sigmas[3], TERMINAL_SHIFT, 0.000001f32);
+    assert sigmas[0] > sigmas[1];
+    assert sigmas[1] > sigmas[2];
+    assert sigmas[2] > sigmas[3];
+    assert sigmas[4] == 0.0f32;
+    assert close(timesteps[0], sigmas[0] * TRAIN_TIMESTEPS, 0.0001f32);
 }

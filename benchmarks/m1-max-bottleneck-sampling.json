@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Plan-5 F9 Bottleneck Sampling feasibility gate",
+  "implementation": {
+    "enabled_by_default": false,
+    "resolution_path_256": [256, 128, 256],
+    "resolution_path_1024": [1024, 512, 1024],
+    "stage_steps": [4, 13, 8],
+    "stage_strengths": [1.0, 0.8, 0.6],
+    "stage_shift_factors": [9.0, 6.0, 9.0],
+    "resize": "Lanczos-3 with half-pixel coordinates over the native 64-channel spatial latent",
+    "transition": "(1 - strength) * resized_latent + strength * fresh_gaussian_noise, rounded to BF16",
+    "model_layout_verification": "The pinned official Qwen-Image 2.1 pipeline says the 64-channel VAE latent is unpatched and only spatially flattened; no FLUX-style 2x2 unpack is applicable.",
+    "runtime_limitation": "This correctness spike invokes the existing trajectory runtime once per stage, so it remaps the pack and recreates buffers/prefix state three times. Process reuse would be required before a successful policy could become a speed path."
+  },
+  "calibration_256": {
+    "case": {
+      "prompt": "A red fox asleep beside a mossy stone in soft morning light.",
+      "seed": 1101,
+      "packed_transformer": "/private/tmp/qwen-image-2.1-all-fp16-v4.qipack",
+      "ordinary_reference_png_sha256": "d9967772c1abc8869f23f6595bf6216b18ff63433d21ececc55dc01ce628bc29"
+    },
+    "paper_schedule_direct": {
+      "terminal_policy": "Raw rational shift followed by zero",
+      "stage_trajectory_wall_ms": [2231, 2435, 4247],
+      "staged_transformer_wall_ms": 36576,
+      "end_to_end_wall_ms": 39350,
+      "step_40_oracle_latent_nrmse": 0.699725,
+      "png_sha256": "459849462e137a45bc2baf0f4fa581cfe41716b884ee9dbba624deb8956603cb",
+      "visual": "Severely blurred and structurally degraded; a pale animal and dark block replace the detailed red fox, mossy stone, and forest scene."
+    },
+    "qwen_terminal_shift_adaptation": {
+      "terminal_policy": "Each rationally shifted stage is linearly stretched so its final model evaluation is Qwen's sigma 0.02, then zero",
+      "stage_trajectory_wall_ms": [2239, 2434, 4299],
+      "staged_transformer_wall_ms": 32260,
+      "text_wall_ms": 3211,
+      "vae_wall_ms": 1288,
+      "png_wall_ms": 19,
+      "end_to_end_wall_ms": 36780,
+      "step_40_oracle_latent_nrmse": 0.844049,
+      "png_sha256": "7c525d2d687d1222897b84cc34cb72d4bf99958471d6c22ba26a72cef0c95cc2",
+      "visual": "Recognizable sleeping animal, but still loses the red fox color, forest, stone detail, lighting, and most composition. The Qwen terminal policy does not rescue the FLUX-tuned stage parameters."
+    },
+    "oracle_note": "The nRMSE comparison is diagnostic rather than an equivalence gate because staged re-noising deliberately changes the denoising path. Its large value is consistent with the decisive visual failure."
+  },
+  "decision": {
+    "accepted_for_1024": false,
+    "1024_run_performed": false,
+    "reason_1024_skipped": "Both the paper schedule and the bounded Qwen scheduler adaptation failed the cheaper 256 visual gate dramatically. A 1024 run would spend substantial compute without evidence that this FLUX-tuned policy transfers.",
+    "retained_scope": "Explicit experimental commands and tested latent-resize/re-noise/schedule machinery only; ordinary 25/40-step, Cache-DiT, and TaylorSeer paths are unchanged.",
+    "future_revisit_gate": "Require a Qwen-specific strength/shift schedule or published Qwen evidence before spending on a 1024 sweep."
+  },
+  "validation": {
+    "project_tests_passed": 337,
+    "environment_sensitive_tcp_tests_failed": 2,
+    "format_check": true,
+    "type_check": true,
+    "debug_build": true,
+    "manual_image_comparison": true
+  },
+  "phase_status": "F9 implementation spike and feasibility gate complete; FLUX-tuned policy rejected for Qwen-Image 2.1"
+}

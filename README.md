@@ -58,6 +58,7 @@ cpc test
 ./target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
 ./target/debug/qwen-image-cplus test-transformer-cache-dit transformer.qipack 0.12
 ./target/debug/qwen-image-cplus test-transformer-taylorseer transformer.qipack 0.24
+./target/debug/qwen-image-cplus test-transformer-bottleneck transformer.qipack
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024
@@ -69,9 +70,11 @@ cpc test
 ./target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
 ./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
+./target/debug/qwen-image-cplus generate-256-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
 ./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
 ./target/debug/qwen-image-cplus generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
 ./target/debug/qwen-image-cplus generate-1024-taylorseer transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 1101 40
+./target/debug/qwen-image-cplus generate-1024-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
 ./target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
 ./target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
@@ -84,6 +87,11 @@ optional argument. Omitting it preserves the canonical 40-step behavior. A
 the first 25 points of the 40-step schedule. Both 256 and 1024 paths have
 end-to-end measurements; their numerical gates and remaining 1024 oracle
 limitations are recorded below.
+
+The two `bottleneck` commands are research diagnostics, not production
+recommendations. They use the fixed 4+13+8 stage experiment described below;
+the FLUX-tuned policy failed Qwen's 256px visual gate and was not promoted to a
+1024px run.
 
 Inspect a shard, optionally filtering tensor names:
 
@@ -820,6 +828,26 @@ Inspect a shard, optionally filtering tensor names:
   ordinary Cache-DiT. The implementation, all calibration points, checksums,
   timing caveat, and visual decision are recorded in
   `benchmarks/m1-max-taylorseer.json`.
+- Plan-5 F9 implements the Bottleneck Sampling mechanics as an explicit
+  experiment: a 256→128→256 or 1024→512→1024 resolution path, Lanczos-3
+  spatial latent resizing, fresh-noise reinjection, and independent 4+13+8
+  rationally shifted schedules with strengths 1.0/0.8/0.6 and shifts 9/6/9.
+  This model does **not** use FLUX-style 16-channel 2×2 latent packing: the
+  pinned official Qwen-Image 2.1 pipeline exposes a native 64-channel VAE
+  latent and only spatially flattens it, so the implementation resizes those
+  64 channels directly.
+- The transfer failed the cheap 256 visual gate. The literal paper schedule
+  produced 0.699725 diagnostic nRMSE against the ordinary 40-step final latent
+  and a severely blurred, structurally wrong image. Preserving Qwen's sigma
+  0.02 final model evaluation in each stage did not rescue it: nRMSE became
+  0.844049 and the output remained a flat, pale sleeping animal without the
+  requested red fox, forest, mossy-stone detail, or lighting. That corrected
+  run took **36.780 s end to end**, including 32.260 s for the three-stage
+  transformer phase; its present research implementation also pays transformer
+  setup three times. Because both bounded variants failed visibly, no costly
+  1024 run was made. The machinery remains explicit and off by default, while
+  all measurements, checksums, and the revisit condition are recorded in
+  `benchmarks/m1-max-bottleneck-sampling.json`.
 - Short 1024 transformer runs now make optimization practical without decoding
   an image: `benchmark-transformer-trajectory-1024 ... 1|2` uses the committed
   31-row text fixture, seed 1301, and the first one or two steps of the normal
@@ -989,6 +1017,10 @@ effect at the 4,096-target-token shape; an optimization that only helps the
    First-order TaylorSeer F8 is also complete: its predictor passed the 256
    numerical calibration, but the faster cap-four policy failed the controlled
    1024 exact-text visual A/B, so it remains experimental. The
+   Bottleneck Sampling F9 spike is also complete: both the literal FLUX policy
+   and a Qwen terminal-sigma adaptation failed the 256 visual gate, so it is
+   closed unless a Qwen-specific schedule or external evidence justifies a new
+   sweep. The
    remaining conversion candidate is direct FP16 K/V preparation, but F4's
    measured 0.1-1.1% 1024 gain shows that bandwidth-only estimates must be
    profiled before more code is added. Scalar attention variants, further Q8,

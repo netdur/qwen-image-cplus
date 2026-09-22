@@ -14,8 +14,10 @@ import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
+import "stdlib/status" as status;
 import "stdlib/text" as text;
 import "stdlib/time" as time;
+import "stdlib/vec" as vec;
 
 extern fn MTLCreateSystemDefaultDevice() -> *u8;
 
@@ -3973,6 +3975,139 @@ fn fill_seeded_latent(destination: *f32, count: usize, seed: u64) -> bool {
     return true;
 }
 
+fn lanczos3_weight(distance: f32) -> f32 {
+    let absolute: f32 = distance.abs();
+    if absolute >= 3.0f32 { return 0.0f32; }
+    if absolute < 0.000001f32 { return 1.0f32; }
+    let pi_x: f32 = 3.14159265358979323846f32 * distance;
+    return (pi_x.sin() / pi_x)
+        * ((pi_x / 3.0f32).sin() / (pi_x / 3.0f32));
+}
+
+// Qwen-Image 2.1 consumes the VAE's 64-channel latent without patch packing;
+// its official pipeline only spatially flattens [64, side, side] into tokens.
+// This is therefore a direct resize of the underlying latent, not a resize of
+// packed 2x2 subpixels. The half-pixel mapping and Lanczos-3 filter follow
+// Bottleneck Sampling for both resolution transitions.
+fn resize_latent_lanczos3(
+    source: *f32,
+    source_side: usize,
+    destination: *f32,
+    destination_side: usize,
+) -> bool {
+    if source.is_null() || destination.is_null()
+        || source_side == (0 as usize) || destination_side == (0 as usize) {
+        return false;
+    }
+    if source_side == destination_side {
+        var copy_index: usize = 0 as usize;
+        let copy_count: usize = source_side *% source_side *% IMAGE_CHANNELS;
+        while copy_index < copy_count {
+            destination[copy_index] = source[copy_index];
+            copy_index = copy_index +% (1 as usize);
+        }
+        return true;
+    }
+    let scale: f32 = source_side as f32 / destination_side as f32;
+    var output_y: usize = 0 as usize;
+    while output_y < destination_side {
+        let source_y: f32 = (output_y as f32 + 0.5f32) * scale - 0.5f32;
+        var output_x: usize = 0 as usize;
+        while output_x < destination_side {
+            let source_x: f32 = (output_x as f32 + 0.5f32) * scale - 0.5f32;
+            var channel: usize = 0 as usize;
+            while channel < IMAGE_CHANNELS {
+                var weighted: f32 = 0.0f32;
+                var weight_sum: f32 = 0.0f32;
+                var sample_y: usize = 0 as usize;
+                while sample_y < source_side {
+                    let weight_y: f32 = lanczos3_weight(source_y - sample_y as f32);
+                    if weight_y != 0.0f32 {
+                        var sample_x: usize = 0 as usize;
+                        while sample_x < source_side {
+                            let weight: f32 = weight_y
+                                * lanczos3_weight(source_x - sample_x as f32);
+                            if weight != 0.0f32 {
+                                let source_index: usize =
+                                    (sample_y *% source_side +% sample_x)
+                                        *% IMAGE_CHANNELS +% channel;
+                                weighted = weighted + weight * source[source_index];
+                                weight_sum = weight_sum + weight;
+                            }
+                            sample_x = sample_x +% (1 as usize);
+                        }
+                    }
+                    sample_y = sample_y +% (1 as usize);
+                }
+                let output_index: usize =
+                    (output_y *% destination_side +% output_x)
+                        *% IMAGE_CHANNELS +% channel;
+                destination[output_index] = weighted / weight_sum;
+                channel = channel +% (1 as usize);
+            }
+            output_x = output_x +% (1 as usize);
+        }
+        output_y = output_y +% (1 as usize);
+    }
+    return true;
+}
+
+fn reintroduce_bottleneck_noise(
+    latent: *f32,
+    noise: *f32,
+    count: usize,
+    strength: f32,
+) -> bool {
+    if latent.is_null() || noise.is_null() || strength < 0.0f32 || strength > 1.0f32 {
+        return false;
+    }
+    var index: usize = 0 as usize;
+    while index < count {
+        let mixed: f32 = (1.0f32 - strength) * latent[index]
+            + strength * noise[index];
+        latent[index] = cpu::bf16_to_f32(cpu::f32_to_bf16(mixed));
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+#[test]
+fn bottleneck_lanczos_weight_has_expected_center() {
+    assert (lanczos3_weight(0.0f32) - 1.0f32).abs() < 0.000001f32;
+    assert lanczos3_weight(3.0f32) == 0.0f32;
+}
+
+#[test]
+fn bottleneck_lanczos_resize_preserves_constant_channels() {
+    var source: [f32; 256] = [0.0f32; 256];
+    var destination: [f32; 1024] = [0.0f32; 1024];
+    var index: usize = 0 as usize;
+    while index < (256 as usize) {
+        source[index] = (index % IMAGE_CHANNELS) as f32 - 32.0f32;
+        index = index +% (1 as usize);
+    }
+    assert resize_latent_lanczos3(
+        #addr_of(source[0]), 2 as usize,
+        #addr_of(destination[0]), 4 as usize,
+    );
+    index = 0 as usize;
+    while index < (1024 as usize) {
+        assert (destination[index] - ((index % IMAGE_CHANNELS) as f32 - 32.0f32)).abs()
+            < 0.00001f32;
+        index = index +% (1 as usize);
+    }
+}
+
+#[test]
+fn bottleneck_noise_endpoints_are_exact_after_bf16_rounding() {
+    var latent: [f32; 2] = [1.0f32, 2.0f32];
+    var noise: [f32; 2] = [3.0f32, 4.0f32];
+    assert reintroduce_bottleneck_noise(
+        #addr_of(latent[0]), #addr_of(noise[0]), 2 as usize, 1.0f32,
+    );
+    assert latent[0] == 3.0f32 && latent[1] == 4.0f32;
+}
+
 fn host_normalized_rms(actual: *f32, expected: *f32, count: usize) -> f64 {
     var squared_error: f64 = 0.0f64;
     var squared_reference: f64 = 0.0f64;
@@ -4504,6 +4639,163 @@ fn run_prompt_trajectory_taylorseer_1024_to_host(
     );
 }
 
+fn zero_f32_vector(count: usize) -> option::Option[vec::Vec[f32]] {
+    var values: vec::Vec[f32] = vec::Vec[f32]::with_capacity(count);
+    var index: usize = 0 as usize;
+    while index < count {
+        if values.append(0.0f32) != status::Status::Ok {
+            return option::Option[vec::Vec[f32]]::None;
+        }
+        index = index +% (1 as usize);
+    }
+    return option::Option[vec::Vec[f32]]::Some(values);
+}
+
+fn run_prompt_trajectory_bottleneck_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+    pixels: usize,
+) -> i32 {
+    if text_input.is_null() || final_latent.is_null()
+        || !(pixels == (256 as usize) || pixels == (1024 as usize)) {
+        io::eprintln("trajectory: invalid Bottleneck Sampling handoff");
+        return 2;
+    }
+    let full_side: usize = pixels / (16 as usize);
+    let low_pixels: usize = pixels / (2 as usize);
+    let low_side: usize = low_pixels / (16 as usize);
+    let full_count: usize = full_side *% full_side *% IMAGE_CHANNELS;
+    let low_count: usize = low_side *% low_side *% IMAGE_CHANNELS;
+    let bottleneck_wall_start_ms: i64 = time::now_millis();
+
+    io::println("bottleneck trajectory: stage=1 pixels=${pixels} steps=4 strength=1 shift=9");
+    if run_trajectory_packed_impl(
+        packed_path, "4", "", final_latent, text_input, text_rows, seed,
+        true, false, false, 0.0f64, pixels, false,
+        0 as *f32, 9.0f32, 1.0f32,
+    ) != (0 as i32) {
+        return 1;
+    }
+
+    guard let option::Option[vec::Vec[f32]]::Some(low_latent) =
+        zero_f32_vector(low_count) else { return 1; };
+    guard let option::Option[vec::Vec[f32]]::Some(low_noise) =
+        zero_f32_vector(low_count) else { return 1; };
+    if !resize_latent_lanczos3(
+        final_latent, full_side, #slice_ptr(low_latent.as_slice()), low_side,
+    ) || !fill_seeded_latent(
+        #slice_ptr(low_noise.as_slice()), low_count, seed +% (1 as u64),
+    ) || !reintroduce_bottleneck_noise(
+        #slice_ptr(low_latent.as_slice()), #slice_ptr(low_noise.as_slice()),
+        low_count, 0.8f32,
+    ) {
+        io::eprintln("bottleneck trajectory: low-resolution transition failed");
+        return 1;
+    }
+    io::println("bottleneck trajectory: stage=2 pixels=${low_pixels} steps=13 strength=0.8 shift=6");
+    if run_trajectory_packed_impl(
+        packed_path, "13", "", #slice_ptr(low_latent.as_slice()),
+        text_input, text_rows, seed +% (1 as u64), true, false, false, 0.0f64,
+        low_pixels, false, #slice_ptr(low_latent.as_slice()), 6.0f32, 0.8f32,
+    ) != (0 as i32) {
+        return 1;
+    }
+
+    if !resize_latent_lanczos3(
+        #slice_ptr(low_latent.as_slice()), low_side, final_latent, full_side,
+    ) {
+        io::eprintln("bottleneck trajectory: high-resolution transition failed");
+        return 1;
+    }
+    guard let option::Option[vec::Vec[f32]]::Some(high_noise) =
+        zero_f32_vector(full_count) else { return 1; };
+    if !fill_seeded_latent(
+        #slice_ptr(high_noise.as_slice()), full_count, seed +% (2 as u64),
+    ) || !reintroduce_bottleneck_noise(
+        final_latent, #slice_ptr(high_noise.as_slice()), full_count, 0.6f32,
+    ) {
+        io::eprintln("bottleneck trajectory: high-resolution noise transition failed");
+        return 1;
+    }
+    io::println("bottleneck trajectory: stage=3 pixels=${pixels} steps=8 strength=0.6 shift=9");
+    let status: i32 = run_trajectory_packed_impl(
+        packed_path, "8", "", final_latent, text_input, text_rows,
+        seed +% (2 as u64), true, false, false, 0.0f64, pixels, false,
+        final_latent, 9.0f32, 0.6f32,
+    );
+    io::println("bottleneck trajectory: pixels=${pixels} stages=4+13+8 total_wall_ms=${time::now_millis() - bottleneck_wall_start_ms}");
+    return status;
+}
+
+fn run_prompt_trajectory_bottleneck_1024_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+) -> i32 {
+    return run_prompt_trajectory_bottleneck_to_host(
+        packed_path, text_input, text_rows, seed, final_latent, 1024 as usize,
+    );
+}
+
+fn run_prompt_trajectory_bottleneck_256_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+) -> i32 {
+    return run_prompt_trajectory_bottleneck_to_host(
+        packed_path, text_input, text_rows, seed, final_latent, 256 as usize,
+    );
+}
+
+fn run_trajectory_bottleneck_packed(
+    packed_path: str,
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+) -> i32 {
+    let text_path: text::Text = "${fixture_directory}/text_input.f32";
+    guard let mapped::MapResult::Ok(text_mapping) = mapped::map_readonly(text_path.view()) else {
+        io::eprintln("bottleneck trajectory: could not map ${text_path}");
+        return 1;
+    };
+    let expected_path: text::Text = "${fixture_directory}/latent_step_40.f32";
+    guard let mapped::MapResult::Ok(expected_mapping) =
+        mapped::map_readonly(expected_path.view()) else {
+        io::eprintln("bottleneck trajectory: could not map ${expected_path}");
+        return 1;
+    };
+    let text_rows: usize = 22 as usize;
+    let latent_count: usize = (16 as usize) *% (16 as usize) *% IMAGE_CHANNELS;
+    if text_mapping.length() != text_rows *% WIDTH *% #size_of::[f32]()
+        || expected_mapping.length() != latent_count *% #size_of::[f32]() {
+        io::eprintln("bottleneck trajectory: fixture size mismatch");
+        return 1;
+    }
+    guard let option::Option[vec::Vec[f32]]::Some(final_latent) =
+        zero_f32_vector(latent_count) else { return 1; };
+    let status: i32 = run_prompt_trajectory_bottleneck_to_host(
+        packed_path,
+        text_mapping.pointer() as *f32,
+        text_rows,
+        1101 as u64,
+        #slice_ptr(final_latent.as_slice()),
+        256 as usize,
+    );
+    if status != (0 as i32) { return status; }
+    let error: f64 = host_normalized_rms(
+        #slice_ptr(final_latent.as_slice()),
+        expected_mapping.pointer() as *f32,
+        latent_count,
+    );
+    io::println("bottleneck trajectory 256: steps=4+13+8 latent_nRMSE=${error} validation=measured-only");
+    return 0;
+}
+
 fn run_trajectory_packed_impl(
     packed_path: str,
     requested_steps: str,
@@ -4518,6 +4810,9 @@ fn run_trajectory_packed_impl(
     cache_dit_threshold_value: f64,
     pixels: usize = 256 as usize,
     taylorseer_enabled: bool = false,
+    initial_latent: *f32 = 0 as *f32,
+    bottleneck_shift: f32 = 0.0f32,
+    bottleneck_strength: f32 = 1.0f32,
 ) -> i32 {
     if taylorseer_enabled && !cache_dit_enabled {
         io::eprintln("trajectory: TaylorSeer requires Cache-DiT");
@@ -4532,12 +4827,18 @@ fn run_trajectory_packed_impl(
         step_limit = 1 as usize;
     } else if requested_steps == "2" {
         step_limit = 2 as usize;
+    } else if requested_steps == "4" {
+        step_limit = 4 as usize;
+    } else if requested_steps == "8" {
+        step_limit = 8 as usize;
+    } else if requested_steps == "13" {
+        step_limit = 13 as usize;
     } else if requested_steps == "25" {
         step_limit = 25 as usize;
     } else if requested_steps == "40" {
         step_limit = 40 as usize;
     } else {
-        io::eprintln("trajectory: steps must be 1, 2, 25, or 40");
+        io::eprintln("trajectory: steps must be 1, 2, 4, 8, 13, 25, or 40");
         return 2;
     }
     let text_rows: usize = if native_inputs { native_text_rows } else { 22 as usize };
@@ -4545,9 +4846,9 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: text row count must be 1..512, got ${text_rows}");
         return 2;
     }
-    if !(pixels == (256 as usize) || pixels == (512 as usize)
+    if !(pixels == (128 as usize) || pixels == (256 as usize) || pixels == (512 as usize)
         || pixels == (1024 as usize)) {
-        io::eprintln("trajectory: pixels must be 256, 512, or 1024");
+        io::eprintln("trajectory: pixels must be 128, 256, 512, or 1024");
         return 2;
     }
     if validate_reference && pixels != (256 as usize) {
@@ -4567,12 +4868,23 @@ fn run_trajectory_packed_impl(
     let schedule_steps: usize = if step_limit <= (2 as usize) {
         40 as usize
     } else { step_limit };
-    if !flow::fill_schedule(
-        schedule_steps,
-        target_rows,
-        #addr_of(sigmas[0]),
-        #addr_of(timesteps[0]),
-    ) {
+    let schedule_ok: bool = if bottleneck_shift > 0.0f32 {
+        flow::fill_bottleneck_schedule(
+            schedule_steps,
+            bottleneck_shift,
+            bottleneck_strength,
+            #addr_of(sigmas[0]),
+            #addr_of(timesteps[0]),
+        )
+    } else {
+        flow::fill_schedule(
+            schedule_steps,
+            target_rows,
+            #addr_of(sigmas[0]),
+            #addr_of(timesteps[0]),
+        )
+    };
+    if !schedule_ok {
         io::eprintln("trajectory: could not construct the ${schedule_steps}-step FlowMatch schedule");
         return 1;
     }
@@ -4732,9 +5044,18 @@ fn run_trajectory_packed_impl(
         fixture_buffer(device, fixture_directory, "image_input", image_input_bytes)
     } else { return 1; };
     let latents_owner: OwnedObjc = OwnedObjc::new(latents.raw());
-    if native_inputs && !fill_seeded_latent(latents.contents() as *f32, latent_count, latent_seed) {
-        io::eprintln("trajectory: could not generate the seeded latent");
-        return 1;
+    if native_inputs {
+        if !initial_latent.is_null() {
+            let latent_values: *f32 = latents.contents() as *f32;
+            var latent_index: usize = 0 as usize;
+            while latent_index < latent_count {
+                latent_values[latent_index] = initial_latent[latent_index];
+                latent_index = latent_index +% (1 as usize);
+            }
+        } else if !fill_seeded_latent(latents.contents() as *f32, latent_count, latent_seed) {
+            io::eprintln("trajectory: could not generate the seeded latent");
+            return 1;
+        }
     }
     guard let option::Option[metal::Buffer]::Some(text_input) = if native_inputs {
         device.new_buffer_with_bytes(
@@ -5371,7 +5692,7 @@ fn run_trajectory_packed_impl(
         }
     }
     let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
-    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} taylorseer=${taylorseer_enabled} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
+    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} taylorseer=${taylorseer_enabled} bottleneck_shift=${bottleneck_shift} bottleneck_strength=${bottleneck_strength} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
         if taylorseer_enabled {
             io::println("Qwen-Image-2.1 TaylorSeer trajectory: complete; quality requires measured acceptance");
