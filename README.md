@@ -1162,11 +1162,19 @@ evidence:
    1024→512→1024 sweep remains closed, but 2048→1024→2048 is a materially
    different native-resolution proposal and can be reopened after 2048 memory
    feasibility is established. The
-   remaining conversion candidate is direct FP16 K/V preparation, but F4's
-   measured 0.1-1.1% 1024 gain shows that bandwidth-only estimates must be
-   profiled before more code is added. Scalar attention variants, further Q8,
-   and additional broad activation conversions are closed. Accept any K/V
-   change only with full-shape timing and numerical gates.
+   direct FP16 K/V preparation is now also closed. A K-only prototype that
+   preserved FP32 QKV projection output and rounded normalized/rotated K at its
+   final store was numerically identical to the established two-step oracle,
+   but changed the 1024 two-step transformer loop by only 14 ms (18.390 s
+   versus 18.404 s, 0.08%). A broader prototype made the fused MPS QKV
+   multiplication write FP16 directly, then consumed half Q/K/V without the
+   intermediate FP32 traffic. Across two adjacent pairs it averaged 18.442 s
+   versus 18.222 s for the current FP32-output path: a 0.220 s / 1.21%
+   regression. Its fragmented GPU counter was slightly lower, but end-to-end
+   loop wall time is the acceptance metric. Both prototypes were removed;
+   see `benchmarks/m1-max-direct-fp16-qkv-1024.json`. Scalar attention
+   variants, further Q8, and additional broad activation conversions remain
+   closed.
 4. **1024 working memory.** Shape-specific VAE arena sizing already removed
    1.6875 GiB, and F5 measured a 5,603,394,208-byte peak footprint with
    5,577,375,744 bytes of explicit scratch. Further reduction requires a real

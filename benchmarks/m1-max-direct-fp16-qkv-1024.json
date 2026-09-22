@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "shape": {
+    "pixels": "1024x1024",
+    "latent_tokens": 4096,
+    "steps": 2,
+    "schedule": "first two steps of the canonical 40-step schedule",
+    "weights": "all-FP16 QIPACK v4",
+    "attention": "MPSGraph SDPA"
+  },
+  "acceptance_metric": "transformer loop wall time",
+  "k_only_prototype": {
+    "design": "Keep the fused MPS QKV result in FP32, but have K RMSNorm plus RoPE store FP16 directly and let K/V preparation read that FP16 K.",
+    "optimized_loop_wall_ms": 18390,
+    "adjacent_control_loop_wall_ms": 18404,
+    "wall_delta_ms": -14,
+    "wall_delta_percent": -0.0761,
+    "official_oracle": {
+      "step_1_latent_nrmse": 0.000959688,
+      "step_2_latent_nrmse": 0.0014312,
+      "values_unchanged_from_control": true,
+      "passed": true
+    },
+    "result": "rejected as indistinguishable from run-to-run noise"
+  },
+  "direct_fp16_qkv_prototype": {
+    "design": "Make fused MPS QKV write FP16 directly; read half Q and K in RMSNorm plus RoPE, retain FP32 normalized/rotated Q, store normalized/rotated K as FP16, and prepare K/V from half inputs.",
+    "adjacent_pairs": [
+      {
+        "optimized_loop_wall_ms": 18455,
+        "control_loop_wall_ms": 18194,
+        "optimized_fragmented_gpu_ms": 382.852,
+        "control_fragmented_gpu_ms": 387.441
+      },
+      {
+        "optimized_loop_wall_ms": 18428,
+        "control_loop_wall_ms": 18249,
+        "optimized_fragmented_gpu_ms": 388.122,
+        "control_fragmented_gpu_ms": 389.204
+      }
+    ],
+    "optimized_average_loop_wall_ms": 18441.5,
+    "control_average_loop_wall_ms": 18221.5,
+    "wall_regression_ms": 220.0,
+    "wall_regression_percent": 1.2074,
+    "finite_validation": "A one-step run checked every block and completed with finite outputs.",
+    "oracle_validation": "Not continued after the performance gate failed.",
+    "result": "rejected and removed"
+  },
+  "conclusion": "The production FP32 fused-QKV output remains faster in measured wall time. Reduced transient bandwidth alone did not improve this MPSMatrix/MPSGraph pipeline."
+}
