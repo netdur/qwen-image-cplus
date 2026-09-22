@@ -847,6 +847,17 @@ Inspect a shard, optionally filtering tensor names:
   remains opt-in. Full measurements and the acceptance rationale are in
   `benchmarks/m1-max-25-step-256.json`.
 
+- The first complete 1024, 25-step, cache-off prompt-to-PNG measurement is
+  **298.408 s end to end (4m 58.4s)** for the blue-teapot prompt at seed 42.
+  It comprised 12.982 s text conditioning, 275.028 s transformer phase
+  including a 268.459 s denoising loop, 10.065 s VAE decode, and 308 ms PNG
+  output. The loop averaged **10.738 s per step** and produced a verified
+  1024x1024, 4,195,716-byte PNG. MPSGraph fragments command-buffer timestamps,
+  so these are wall measurements. During the run macOS reported `AC Power`
+  together with `discharging`; battery charge moved from 95% to 87%, and the
+  conflicting state is retained rather than normalized away. Full details are
+  in `benchmarks/m1-max-25-step-1024.json`.
+
 ## Remaining optimization phases
 
 The active product target is now 1024x1024 generation. Work is ordered by its

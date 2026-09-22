@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Cold-process native 1024x1024 prompt-to-PNG generation with the explicit 25-step FlowMatch schedule and MPSGraph attention",
+  "input": {
+    "prompt": "A blue ceramic teapot on a windowsill.",
+    "prompt_tokens": 18,
+    "seed": 42,
+    "pixels": 1024,
+    "steps": 25,
+    "cache_dit": false,
+    "packed_model": "qwen-image-2.1-qkv-fp16.qipack"
+  },
+  "timing_wall_ms": {
+    "text": 12982,
+    "transformer_phase": 275028,
+    "transformer_startup_and_conditioning": 6569,
+    "denoising_loop": 268459,
+    "average_denoising_step": 10738.36,
+    "vae": 10065,
+    "png_output": 308,
+    "end_to_end": 298408
+  },
+  "denoising": {
+    "step_1_wall_ms": 10965,
+    "minimum_step_wall_ms": 10331,
+    "maximum_step_wall_ms": 11931,
+    "q8_dispatch_matrices": 1000,
+    "prefix_cache_bytes": 9437184,
+    "gpu_timing_fragmented": true,
+    "note": "MPSGraph uses commitAndContinue, so the reported aggregate GPU timestamp covers fragments rather than the complete transformer workload. Wall time is authoritative."
+  },
+  "vae": {
+    "input": "64x64",
+    "output": "1024x1024",
+    "gpu_ms": 9331.81,
+    "scratch_bytes": 5577375744
+  },
+  "output": {
+    "format": "PNG",
+    "width": 1024,
+    "height": 1024,
+    "bytes": 4195716,
+    "path_not_committed": "/private/tmp/qwen-image-cplus-1024-25-blue-teapot.png"
+  },
+  "power_state": {
+    "before": "Now drawing from AC Power; battery 95%; discharging; 7:27 remaining",
+    "after": "Now drawing from AC Power; battery 87%; discharging; 6:07 remaining",
+    "interpretation": "macOS reported mutually ambiguous source and battery states, so no plugged-versus-battery normalization is claimed."
+  },
+  "result": "generation completed successfully"
+}
