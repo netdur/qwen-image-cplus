@@ -142,6 +142,7 @@ struct TensorData {
     input: u64,
     scheme: u32,
     group_size: u32,
+    eager_fp16_offset: u64,
 }
 
 struct RuntimeHashJob {
@@ -191,6 +192,7 @@ impl File {
                     input: (*record).dimensions[1],
                     scheme: (*record).scheme,
                     group_size: (*record).group_size,
+                    eager_fp16_offset: full_fp16_weight_offset(index),
                 });
             }
             index = index +% (1 as usize);
@@ -219,6 +221,48 @@ impl File {
         return fixed_matches(
             #addr_of((*header).policy[0]), 32 as usize, FULL_POLICY,
         );
+    }
+
+    fn int4_rotated(this) -> bool {
+        let header: *PackedHeader = this._mapping.pointer() as *PackedHeader;
+        return fixed_matches(
+            #addr_of((*header).policy[0]), 32 as usize, INT4_ROTATED_POLICY,
+        );
+    }
+
+    fn tensor_count(this) -> usize {
+        let header: *PackedHeader = this._mapping.pointer() as *PackedHeader;
+        return (*header).tensor_count as usize;
+    }
+
+    fn tensor_at(this, index: usize) -> option::Option[TensorData] {
+        let header: *PackedHeader = this._mapping.pointer() as *PackedHeader;
+        if index >= (*header).tensor_count as usize {
+            return option::Option[TensorData]::None;
+        }
+        let records: *PackedRecord =
+            (this._mapping.pointer() + (*header).directory_offset as usize) as *PackedRecord;
+        let record: *PackedRecord = records + index;
+        return option::Option[TensorData]::Some(TensorData {
+            weights: this._mapping.pointer() + (*record).weights_offset as usize,
+            scales: this._mapping.pointer() + (*record).scales_offset as usize,
+            zeros: this._mapping.pointer() + (*record).zeros_offset as usize,
+            weights_offset: (*record).weights_offset,
+            scales_offset: (*record).scales_offset,
+            zeros_offset: (*record).zeros_offset,
+            weights_length: (*record).weights_length,
+            scales_length: (*record).scales_length,
+            zeros_length: (*record).zeros_length,
+            output: (*record).dimensions[0],
+            input: (*record).dimensions[1],
+            scheme: (*record).scheme,
+            group_size: (*record).group_size,
+            eager_fp16_offset: full_fp16_weight_offset(index),
+        });
+    }
+
+    fn eager_fp16_bytes(this) -> u64 {
+        return FULL_FILE_BYTES;
     }
 }
 
@@ -563,6 +607,26 @@ fn make_full_record(
         cursor = cursor +% record.zeros_length;
     }
     return record;
+}
+
+// Eager Q4 expansion deliberately uses the established all-FP16 v4 offsets.
+// In particular, Q/K/V stay adjacent so the production runtime can retain its
+// single 4096-to-12288 MPS multiplication after expansion.
+fn full_fp16_weight_offset(target_index: usize) -> u64 {
+    var cursor: u64 = align_up(
+        HEADER_BYTES +% RECORD_BYTES *% FULL_TENSOR_COUNT as u64,
+        DATA_ALIGNMENT,
+    );
+    var index: usize = 0 as usize;
+    while index <= target_index && index < FULL_TENSOR_COUNT {
+        let name: text::Text = full_tensor_name(index, true);
+        let record: PackedRecord = make_full_record(
+            index, name.view(), full_tensor_spec(index), cursor, false,
+        );
+        if index == target_index { return record.weights_offset; }
+        index = index +% (1 as usize);
+    }
+    return 0 as u64;
 }
 
 fn full_layout_file_bytes(int4_rotated_policy: bool) -> u64 {
@@ -978,7 +1042,10 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
     let qkv_fp16_q8_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, QKV_FP16_Q8_POLICY,
     );
-    let qkv_policy: bool = all_matrix_policy || qkv_fp16_q8_policy;
+    let int4_rotated_policy: bool = fixed_matches(
+        #addr_of((*header).policy[0]), 32 as usize, INT4_ROTATED_POLICY,
+    );
+    let qkv_policy: bool = all_matrix_policy || qkv_fp16_q8_policy || int4_rotated_policy;
     let fp16_mlp_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FP16_MLP_POLICY,
     );
@@ -996,13 +1063,16 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
         || (*header).scope != SCOPE_TRANSFORMER
         || (*header).directory_offset != HEADER_BYTES
         || (*header).data_offset != expected_data_offset
-        || (*header).file_bytes != if all_matrix_policy {
+        || (*header).file_bytes != if int4_rotated_policy {
+        INT4_ROTATED_FILE_BYTES
+    } else if all_matrix_policy {
         FULL_FILE_BYTES
     } else { LEGACY_FULL_FILE_BYTES }
     || (*header).file_bytes != file.length() as u64
         || !fixed_matches(#addr_of((*header).model_snapshot[0]), 40 as usize, SNAPSHOT)
         || !fixed_matches(#addr_of((*header).diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT)
-        || !(all_matrix_policy || qkv_fp16_q8_policy || fp16_mlp_policy || legacy_policy) {
+        || !(all_matrix_policy || qkv_fp16_q8_policy || fp16_mlp_policy
+            || legacy_policy || int4_rotated_policy) {
         if !quiet { io::eprintln("packed transformer: invalid runtime header or model identity"); }
         return 1;
     }
@@ -1012,13 +1082,14 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
     var cursor: u64 = (*header).data_offset;
     var parameter_count: u64 = 0 as u64;
     var quantized_count: usize = 0 as usize;
+    var int4_count: usize = 0 as usize;
     var index: usize = 0 as usize;
     while index < FULL_TENSOR_COUNT {
         let record: *PackedRecord = records + index;
         let name: text::Text = full_tensor_name(index, qkv_policy);
         let spec: FullTensorSpec = full_tensor_spec(index);
         let expected_scheme: u32 = full_expected_scheme(
-            index, fp16_policy, qkv_policy, all_matrix_policy,
+            index, fp16_policy, qkv_policy, all_matrix_policy, int4_rotated_policy,
         );
         let expected_rank: u32 = if spec.input == (0 as u64) { 1 as u32 } else { 2 as u32 };
         let expected_elements: u64 = if spec.input == (0 as u64) {
@@ -1030,6 +1101,9 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
         if expected_scheme == SCHEME_INT8_AFFINE {
             quantized_count = quantized_count +% (1 as usize);
         }
+        if expected_scheme == SCHEME_INT4_ROTATED {
+            int4_count = int4_count +% (1 as usize);
+        }
         if !fixed_matches(#addr_of((*record).name[0]), 128 as usize, name.view())
             || (*record).rank != expected_rank
             || (*record).dimensions[0] != spec.output
@@ -1038,6 +1112,8 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
             || (*record).scheme != expected_scheme
             || (expected_scheme == SCHEME_INT8_AFFINE
                 && (*record).weights_length != expected_elements)
+            || (expected_scheme == SCHEME_INT4_ROTATED
+                && (*record).weights_length != (expected_elements +% (1 as u64)) / (2 as u64))
             || (*record).weights_offset % TENSOR_ALIGNMENT != (0 as u64)
             || (*record).weights_offset < cursor
             || (*record).weights_offset > (*header).file_bytes
@@ -1068,6 +1144,20 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
                 return 1;
             }
             cursor = (*record).zeros_offset +% (*record).zeros_length;
+        } else if (*record).scheme == SCHEME_INT4_ROTATED {
+            if (*record).group_axis != (1 as u32) || (*record).group_size != (256 as u32)
+                || (*record).scale_type != TYPE_F16 || (*record).zero_type != TYPE_NONE
+                || (*record).scales_length != spec.output *% (2 as u64)
+                || (*record).zeros_offset != (0 as u64)
+                || (*record).zeros_length != (0 as u64)
+                || (*record).scales_offset % TENSOR_ALIGNMENT != (0 as u64)
+                || (*record).scales_offset < cursor
+                || (*record).scales_offset > (*header).file_bytes
+                || (*record).scales_length > (*header).file_bytes -% (*record).scales_offset {
+                if !quiet { io::eprintln("packed transformer: invalid runtime INT4 metadata ${index}"); }
+                return 1;
+            }
+            cursor = (*record).scales_offset +% (*record).scales_length;
         } else if ((*record).scheme != SCHEME_BF16 && (*record).scheme != SCHEME_FP16)
             || (*record).weights_length != expected_elements *% (2 as u64)
             || (*record).scales_offset != (0 as u64)
@@ -1082,7 +1172,12 @@ fn verify_full_runtime_structure(file: mapped::MappedFile, quiet: bool) -> i32 {
     let expected_quantized_count: usize = if all_matrix_policy {
         0 as usize
     } else { 40 as usize };
-    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != expected_quantized_count
+    let expected_int4_count: usize = if int4_rotated_policy { 231 as usize } else { 0 as usize };
+    let adjusted_quantized_count: usize = if int4_rotated_policy {
+        0 as usize
+    } else { expected_quantized_count };
+    if parameter_count != FULL_PARAMETER_COUNT || quantized_count != adjusted_quantized_count
+        || int4_count != expected_int4_count
         || align_up(cursor, TENSOR_ALIGNMENT) != (*header).file_bytes {
         if !quiet { io::eprintln("packed transformer: runtime inventory or trailing data mismatch"); }
         return 1;
@@ -1109,6 +1204,12 @@ fn verify_runtime_hash_range(take job: RuntimeHashJob) -> i32 {
                 tensor_hash,
                 job.file_pointer + (*record).zeros_offset as usize,
                 (*record).zeros_length as usize,
+            );
+        } else if (*record).scheme == SCHEME_INT4_ROTATED {
+            tensor_hash = hash_update(
+                tensor_hash,
+                job.file_pointer + (*record).scales_offset as usize,
+                (*record).scales_length as usize,
             );
         }
         if tensor_hash != (*record).tensor_checksum {

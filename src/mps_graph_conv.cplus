@@ -1,0 +1,349 @@
+import "./mps_graph_attention" as graph;
+import "metal/metal" as metal;
+import "objc/runtime" as rt;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/vec" as vec;
+
+// FP32 NHWC convolution through MPSGraph. On the M1 Max its 3x3 convolution
+// exceeds the scalar FP32 FMA peak at every VAE shape while measuring below
+// CPU FP32 error against an FP64 reference, so it is an exact-FP32 framework
+// path rather than a precision change. Weights and bias stay in the read-only
+// Safetensors mapping; each is bound at its file offset as a flat MPSNDArray
+// and reshaped to OIHW inside the graph.
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_u32_id(receiver: *u8, selector: *u8, first: u32, second: *u8) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_id_u64_id(
+    receiver: *u8,
+    selector: *u8,
+    first: *u8,
+    second: u64,
+    third: *u8,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_id_id_id_id(
+    receiver: *u8,
+    selector: *u8,
+    first: *u8,
+    second: *u8,
+    third: *u8,
+    fourth: *u8,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_id_u64x8(
+    receiver: *u8,
+    selector: *u8,
+    stride_x: u64,
+    stride_y: u64,
+    dilation_x: u64,
+    dilation_y: u64,
+    groups: u64,
+    padding_style: u64,
+    data_layout: u64,
+    weights_layout: u64,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_resize(
+    receiver: *u8,
+    selector: *u8,
+    tensor: *u8,
+    size: *u8,
+    mode: u64,
+    center_result: i8,
+    align_corners: i8,
+    layout: u64,
+    name: *u8,
+) -> *u8;
+
+#[link_name = "objc_msgSend"]
+extern fn qi_msg_void_u64x4(
+    receiver: *u8,
+    selector: *u8,
+    left: u64,
+    right: u64,
+    top: u64,
+    bottom: u64,
+);
+
+const MPS_DATA_TYPE_FLOAT32: u32 = 0x10000020;
+const PADDING_STYLE_EXPLICIT: u64 = 0;
+const LAYOUT_NHWC: u64 = 1;
+const LAYOUT_OIHW: u64 = 2;
+const RESIZE_NEAREST: u64 = 0;
+
+struct Conv {
+    height: usize,
+    width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+    padding: usize,
+    upsample: bool,
+    opaque graph: graph::OwnedObjc,
+    opaque input_shape: graph::OwnedObjc,
+    opaque output_shape: graph::OwnedObjc,
+    opaque weight_elements: graph::OwnedObjc,
+    opaque bias_elements: graph::OwnedObjc,
+    opaque input_tensor: graph::OwnedObjc,
+    opaque weight_tensor: graph::OwnedObjc,
+    opaque bias_tensor: graph::OwnedObjc,
+    opaque output_tensor: graph::OwnedObjc,
+}
+
+// One compiled graph per distinct layer shape; the 1024 decoder has about a
+// dozen. MPSGraph additionally caches its executable after the first encode.
+struct Cache {
+    entries: vec::Vec[Conv],
+}
+
+fn new_cache() -> Cache {
+    return Cache { entries: vec::Vec[Conv]::with_capacity(16 as usize) };
+}
+
+fn shape1(dimension: usize) -> option::Option[graph::OwnedObjc] {
+    guard let option::Option[graph::OwnedObjc]::Some(first) = graph::number(dimension as u64) else {
+        return option::Option[graph::OwnedObjc]::None;
+    };
+    var objects: [*u8; 1] = [first.raw()];
+    let array: *u8 = rt::msg_id_id_u64(
+        rt::get_class(#str_ptr("NSArray\0")),
+        rt::sel(#str_ptr("arrayWithObjects:count:\0")),
+        #addr_of(objects[0]) as *u8,
+        1 as u64,
+    );
+    if array.is_null() { return option::Option[graph::OwnedObjc]::None; }
+    return option::Option[graph::OwnedObjc]::Some(graph::OwnedObjc::new(rt::retain(array)));
+}
+
+fn create(
+    height: usize,
+    width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+    padding: usize,
+    upsample: bool,
+) -> option::Option[Conv] {
+    if !graph::load_frameworks() { return option::Option[Conv]::None; }
+    let graph_pointer: *u8 = rt::alloc_init(#str_ptr("MPSGraph\0"));
+    if graph_pointer.is_null() { return option::Option[Conv]::None; }
+    let graph_owner: graph::OwnedObjc = graph::OwnedObjc::new(graph_pointer);
+    let weight_count: usize = output_channels *% input_channels *% kernel *% kernel;
+    guard let option::Option[graph::OwnedObjc]::Some(input_shape) = graph::shape4(
+        1 as usize, height, width, input_channels,
+    ) else { return option::Option[Conv]::None; };
+    let scale: usize = if upsample { 2 as usize } else { 1 as usize };
+    guard let option::Option[graph::OwnedObjc]::Some(output_shape) = graph::shape4(
+        1 as usize, height *% scale, width *% scale, output_channels,
+    ) else { return option::Option[Conv]::None; };
+    guard let option::Option[graph::OwnedObjc]::Some(weight_shape) = graph::shape4(
+        output_channels, input_channels, kernel, kernel,
+    ) else { return option::Option[Conv]::None; };
+    guard let option::Option[graph::OwnedObjc]::Some(weight_elements) = shape1(weight_count) else {
+        return option::Option[Conv]::None;
+    };
+    guard let option::Option[graph::OwnedObjc]::Some(bias_elements) = shape1(output_channels) else {
+        return option::Option[Conv]::None;
+    };
+    guard let option::Option[graph::OwnedObjc]::Some(input_tensor) = graph::placeholder(
+        graph_owner.raw(), input_shape.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Conv]::None; };
+    guard let option::Option[graph::OwnedObjc]::Some(weight_tensor) = graph::placeholder(
+        graph_owner.raw(), weight_elements.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Conv]::None; };
+    guard let option::Option[graph::OwnedObjc]::Some(bias_tensor) = graph::placeholder(
+        graph_owner.raw(), bias_elements.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Conv]::None; };
+
+    let descriptor: *u8 = qi_msg_id_u64x8(
+        rt::get_class(#str_ptr("MPSGraphConvolution2DOpDescriptor\0")),
+        rt::sel(#str_ptr("descriptorWithStrideInX:strideInY:dilationRateInX:dilationRateInY:groups:paddingStyle:dataLayout:weightsLayout:\0")),
+        1 as u64, 1 as u64, 1 as u64, 1 as u64, 1 as u64,
+        PADDING_STYLE_EXPLICIT, LAYOUT_NHWC, LAYOUT_OIHW,
+    );
+    if descriptor.is_null() { return option::Option[Conv]::None; }
+    qi_msg_void_u64x4(
+        descriptor,
+        rt::sel(#str_ptr("setExplicitPaddingWithPaddingLeft:paddingRight:paddingTop:paddingBottom:\0")),
+        padding as u64, padding as u64, padding as u64, padding as u64,
+    );
+    let weights_oihw: *u8 = rt::msg_id_id_id_id(
+        graph_owner.raw(), rt::sel(#str_ptr("reshapeTensor:withShape:name:\0")),
+        weight_tensor.raw(), weight_shape.raw(), 0 as *u8,
+    );
+    if weights_oihw.is_null() { return option::Option[Conv]::None; }
+    // Nearest 2x with centered sampling maps output (2k or 2k+1) to input k,
+    // matching the decoder's nearest-exact upsample before its 3x3 convolution.
+    var source: *u8 = input_tensor.raw();
+    if upsample {
+        guard let option::Option[graph::OwnedObjc]::Some(size_height) = graph::number(
+            (height *% (2 as usize)) as u64,
+        ) else { return option::Option[Conv]::None; };
+        guard let option::Option[graph::OwnedObjc]::Some(size_width) = graph::number(
+            (width *% (2 as usize)) as u64,
+        ) else { return option::Option[Conv]::None; };
+        var size_objects: [*u8; 2] = [size_height.raw(), size_width.raw()];
+        let size: *u8 = rt::msg_id_id_u64(
+            rt::get_class(#str_ptr("NSArray\0")),
+            rt::sel(#str_ptr("arrayWithObjects:count:\0")),
+            #addr_of(size_objects[0]) as *u8,
+            2 as u64,
+        );
+        if size.is_null() { return option::Option[Conv]::None; }
+        source = qi_msg_resize(
+            graph_owner.raw(),
+            rt::sel(#str_ptr("resizeTensor:size:mode:centerResult:alignCorners:layout:name:\0")),
+            input_tensor.raw(), size, RESIZE_NEAREST, 1 as i8, 0 as i8, LAYOUT_NHWC, 0 as *u8,
+        );
+        if source.is_null() { return option::Option[Conv]::None; }
+    }
+    let convolved: *u8 = qi_msg_id_id_id_id_id(
+        graph_owner.raw(),
+        rt::sel(#str_ptr("convolution2DWithSourceTensor:weightsTensor:descriptor:name:\0")),
+        source, weights_oihw, descriptor, 0 as *u8,
+    );
+    if convolved.is_null() { return option::Option[Conv]::None; }
+    let biased: *u8 = rt::msg_id_id_id_id(
+        graph_owner.raw(), rt::sel(#str_ptr("additionWithPrimaryTensor:secondaryTensor:name:\0")),
+        convolved, bias_tensor.raw(), 0 as *u8,
+    );
+    if biased.is_null() { return option::Option[Conv]::None; }
+    return option::Option[Conv]::Some(Conv {
+        height: height,
+        width: width,
+        input_channels: input_channels,
+        output_channels: output_channels,
+        kernel: kernel,
+        padding: padding,
+        upsample: upsample,
+        graph: graph_owner,
+        input_shape: input_shape,
+        output_shape: output_shape,
+        weight_elements: weight_elements,
+        bias_elements: bias_elements,
+        input_tensor: input_tensor,
+        weight_tensor: weight_tensor,
+        bias_tensor: bias_tensor,
+        output_tensor: graph::OwnedObjc::new(rt::retain(biased)),
+    });
+}
+
+fn find_or_create(
+    cache: *Cache,
+    height: usize,
+    width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+    padding: usize,
+    upsample: bool,
+) -> *Conv {
+    var index: usize = 0 as usize;
+    while index < (*cache).entries.count() {
+        guard let option::Option[*Conv]::Some(entry) = (*cache).entries.at_ptr(index) else {
+            return 0 as *Conv;
+        };
+        if (*entry).height == height && (*entry).width == width
+            && (*entry).input_channels == input_channels
+            && (*entry).output_channels == output_channels
+            && (*entry).kernel == kernel && (*entry).padding == padding
+            && (*entry).upsample == upsample {
+            return entry;
+        }
+        index = index +% (1 as usize);
+    }
+    guard let option::Option[Conv]::Some(created) = create(
+        height, width, input_channels, output_channels, kernel, padding, upsample,
+    ) else { return 0 as *Conv; };
+    if (*cache).entries.append(created) != status::Status::Ok { return 0 as *Conv; }
+    guard let option::Option[*Conv]::Some(entry) = (*cache).entries.at_ptr(
+        (*cache).entries.count() -% (1 as usize),
+    ) else { return 0 as *Conv; };
+    return entry;
+}
+
+fn flat_array_data(buffer: metal::Buffer, offset: u64, elements: *u8)
+    -> option::Option[graph::OwnedObjc] {
+    let descriptor: *u8 = qi_msg_id_u32_id(
+        rt::get_class(#str_ptr("MPSNDArrayDescriptor\0")),
+        rt::sel(#str_ptr("descriptorWithDataType:shape:\0")),
+        MPS_DATA_TYPE_FLOAT32,
+        elements,
+    );
+    if descriptor.is_null() { return option::Option[graph::OwnedObjc]::None; }
+    let allocated: *u8 = rt::msg_id(
+        rt::get_class(#str_ptr("MPSNDArray\0")), rt::sel(#str_ptr("alloc\0")),
+    );
+    if allocated.is_null() { return option::Option[graph::OwnedObjc]::None; }
+    let array: *u8 = qi_msg_id_id_u64_id(
+        allocated, rt::sel(#str_ptr("initWithBuffer:offset:descriptor:\0")),
+        buffer.raw(), offset, descriptor,
+    );
+    if array.is_null() { return option::Option[graph::OwnedObjc]::None; }
+    let array_owner: graph::OwnedObjc = graph::OwnedObjc::new(array);
+    let data_allocated: *u8 = rt::msg_id(
+        rt::get_class(#str_ptr("MPSGraphTensorData\0")), rt::sel(#str_ptr("alloc\0")),
+    );
+    if data_allocated.is_null() { return option::Option[graph::OwnedObjc]::None; }
+    let data: *u8 = rt::msg_id_id(
+        data_allocated, rt::sel(#str_ptr("initWithMPSNDArray:\0")), array_owner.raw(),
+    );
+    if data.is_null() { return option::Option[graph::OwnedObjc]::None; }
+    return option::Option[graph::OwnedObjc]::Some(graph::OwnedObjc::new(data));
+}
+
+// `command_buffer` must be an MPSCommandBuffer (see
+// mps_graph_attention::wrap_command_buffer).
+fn encode(
+    conv: *Conv,
+    command_buffer: metal::CommandBuffer,
+    input: metal::Buffer,
+    storage: metal::Buffer,
+    weight_offset: u64,
+    bias_offset: u64,
+    output: metal::Buffer,
+) -> bool {
+    if conv.is_null() { return false; }
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return false; }
+    let pool: graph::OwnedObjc = graph::OwnedObjc::new(pool_pointer);
+    guard let option::Option[graph::OwnedObjc]::Some(input_data) = graph::tensor_data(
+        input, (*conv).input_shape.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return false; };
+    guard let option::Option[graph::OwnedObjc]::Some(weight_data) = flat_array_data(
+        storage, weight_offset, (*conv).weight_elements.raw(),
+    ) else { return false; };
+    guard let option::Option[graph::OwnedObjc]::Some(bias_data) = flat_array_data(
+        storage, bias_offset, (*conv).bias_elements.raw(),
+    ) else { return false; };
+    guard let option::Option[graph::OwnedObjc]::Some(output_data) = graph::tensor_data(
+        output, (*conv).output_shape.raw(), MPS_DATA_TYPE_FLOAT32,
+    ) else { return false; };
+    guard let option::Option[graph::OwnedObjc]::Some(feeds) = graph::dictionary3(
+        (*conv).input_tensor.raw(),
+        (*conv).weight_tensor.raw(),
+        (*conv).bias_tensor.raw(),
+        input_data.raw(),
+        weight_data.raw(),
+        bias_data.raw(),
+    ) else { return false; };
+    guard let option::Option[graph::OwnedObjc]::Some(results) = graph::dictionary1(
+        (*conv).output_tensor.raw(), output_data.raw(),
+    ) else { return false; };
+    rt::msg_void_id_id_id_id_id(
+        (*conv).graph.raw(),
+        rt::sel(#str_ptr("encodeToCommandBuffer:feeds:targetOperations:resultsDictionary:executionDescriptor:\0")),
+        command_buffer.raw(),
+        feeds.raw(),
+        0 as *u8,
+        results.raw(),
+        0 as *u8,
+    );
+    return true;
+}

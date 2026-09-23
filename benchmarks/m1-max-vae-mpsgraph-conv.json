@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "machine": "Apple M1 Max, 32 GB unified memory, macOS 26.6.2",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Replace every VAE decoder convolution (3x3, 1x1, and nearest-2x upsample plus 3x3) with MPSGraph FP32 NHWC convolution; now the default, QI_DISABLE_VAE_MPSGRAPH_CONV=1 restores the custom kernels",
+  "diagnosis": {
+    "custom_kernel_throughput_tflops": "about 1.6-1.7 FP32 at every up block (about 16% of the 10.6 TFLOP/s peak), estimated from the F5 dispatch profile and layer FLOPs",
+    "causes": [
+      "per-element integer division and modulo to decode pixel, channel, and tap in the implicit-GEMM gather",
+      "K ordered channel-major over OIHW taps, so neighbouring lanes read different pixels instead of contiguous HWC channels",
+      "sixteen SIMD groups each computing four 8x8 blocks: five threadgroup loads per four MMAs"
+    ]
+  },
+  "external_probe": {
+    "tool": "PyTorch 2.8 MPS (FP32), throwaway scratch script",
+    "conv2d_tflops_by_shape": {"64x64 1152->1152": 10.44, "128x128 1152->1152": 10.79, "256x256 576->576": 11.29, "512x512 288->288": 11.54, "1024x1024 144->144": 10.40},
+    "fp32_matmul_tflops_im2col_shape": {"64x64 1152": 8.49, "128x128 1152": 8.73, "256x256 576": 7.36},
+    "accuracy_nrmse_vs_fp64": {
+      "64x64 1152->1152": {"cpu_fp32": 2.21e-06, "mps_conv2d": 7.31e-07, "mps_matmul": 1.29e-06},
+      "128x128 576->576": {"cpu_fp32": 1.57e-06, "mps_conv2d": 5.22e-07, "mps_matmul": 9.22e-07},
+      "256x256 144->144": {"cpu_fp32": 7.79e-07, "mps_conv2d": 2.73e-07, "mps_matmul": 4.66e-07}
+    },
+    "interpretation": "Above-peak FP32 conv throughput with below-CPU-FP32 error indicates a fast convolution algorithm computed carefully in FP32, not reduced precision.",
+    "caveat": "GPU showed about 30% desktop load during the throughput probe"
+  },
+  "implementation": {
+    "module": "src/mps_graph_conv.cplus",
+    "graph": "NHWC FP32 placeholder -> optional resizeTensor nearest 2x (centerResult YES, alignCorners NO) -> convolution2D (explicit padding, OIHW weights) -> bias addition",
+    "weights": "Bound in place from the read-only Safetensors mapping as flat MPSNDArrays at their file offsets and reshaped to OIHW in the graph; no copy or repack",
+    "graph_cache": "One graph per distinct layer shape, created on first use",
+    "command_buffer": "Production decode wraps its single command buffer as an MPSCommandBuffer; MPSGraph may commit-and-continue, so the reported GPU timestamp is fragmented and wall time is authoritative"
+  },
+  "correctness": {
+    "small_fixture_35_boundaries": {"result": "all pass", "final_output_nrmse": {"custom": 5.51e-07, "mpsgraph": 1.5078e-07}, "limit": 2e-06, "upsample_boundaries_nrmse": [5.28016e-07, 1.19784e-06, 5.48351e-07, 5.12603e-07], "upsample_limit": 5e-06},
+    "oracle_256": {"custom": 6.64769e-07, "mpsgraph": 2.42725e-07, "limit": 3e-06},
+    "official_oracle_1024": {"fixture": "/private/tmp/qwen-image-2.1-vae-oracle-1024 (not committed)", "custom": 6.47344e-07, "mpsgraph": 2.25238e-07, "limit": 3e-06}
+  },
+  "timing": {
+    "decode_1024_process_wall_seconds": {"custom": [9.29, 9.27], "mpsgraph_non_upsample_only": [2.81, 2.81], "mpsgraph_all": [2.40, 2.42, 2.39]},
+    "decode_256_process_wall_seconds": {"custom": 0.79, "mpsgraph_non_upsample_only": 0.51},
+    "peak_memory_footprint_bytes_1024": {"custom": 5603394208, "mpsgraph_all": 7758496536},
+    "memory_note": "About 2.15 GB more peak footprint, attributed to MPSGraph internal scratch; the VAE phase runs after the transformer mapping is released."
+  },
+  "end_to_end_1024": {
+    "command": "generate-1024-cache-dit models/qwen-image-2.1-all-fp16-v4.qipack MODEL_DIR OUT 'A vintage travel poster for CASABLANCA reading ''MEET ME AT SUNSET'', bold geometric lettering.' 0.16 1301 40",
+    "timing_wall_ms": {"text": 3256, "transformer_phase": 129125, "denoising_loop": 120982, "vae": 2843, "png_output": 301, "end_to_end": 135550},
+    "process_wall_seconds": 135.56,
+    "cached_steps": 27,
+    "peak_memory_footprint_bytes": 7864976320,
+    "swaps": 0,
+    "png_sha256": "c643335238f96b5fa015338a1ecf6344e96907d7a1698fb52463bb4597697ebf",
+    "visual": "CASABLANCA, MEET ME AT, and SUNSET exact",
+    "comparison": "Previous best 145.18 s with a 10.230 s VAE phase; the VAE phase fell by 7.39 s and the whole run by 9.63 s. The PNG checksum differs because the decoder's FP32 summation order changed; the official 1024 oracle error fell from 6.47e-07 to 2.25e-07.",
+    "power_state": "AC Power; battery 100%; charged; GPU idle before the run"
+  },
+  "decision": "Accepted as default. The F5 closing condition asked for an equally accurate FP32 framework path; this is more accurate at every oracle and 3.9x faster at 1024."
+}

@@ -116,5 +116,81 @@
     "ordinary_cache_dit_policy_changed": false,
     "taylorseer_is_equivalence_gated": false
   },
-  "phase_status": "F8 implementation and calibration complete; experimental capability retained, production policy rejected for now"
+  "phase_status": "F8 implementation and calibration complete; experimental capability retained, production policy rejected for now",
+  "placement_followup_1024_2026_09_23": {
+    "status": "parked",
+    "case": {
+      "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+      "seed": 1301,
+      "steps": 40,
+      "threshold": 0.24,
+      "packed_transformer": "models/qwen-image-2.1-all-fp16-v4.qipack"
+    },
+    "decision_observation": "Every cached-step relative-L1 stayed below 0.24 (maximum 0.193), so the continuous cap alone set the full-step pattern (every fifth step); the threshold made no decisions.",
+    "switches": {
+      "QI_TAYLOR_SIGMA_SPACING": "Differentiate and extrapolate over sigma distance instead of step count; the shifted schedule is non-uniform, and step counting under-extrapolated the last window by about 17%.",
+      "QI_TAYLOR_FULL_FINAL_STEP": "Never predict the final model evaluation.",
+      "QI_TAYLOR_EARLY_CAP3": "Cap consecutive predicted steps at three in the first half of the schedule and four afterwards."
+    },
+    "runs": [
+      {
+        "variant": "original (repeat)",
+        "full_steps": 11,
+        "cached_steps": 29,
+        "end_to_end_ms": 125575,
+        "loop_ms": 104518,
+        "png_sha256": "3a3c964d34dff3a4cbc2673f5d282977e6504277380e3d3619e345a33d741ef1",
+        "text": "CASABLANCCA; byte-identical to the 2026-09-22 run"
+      },
+      {
+        "variant": "sigma spacing",
+        "full_steps": 11,
+        "cached_steps": 29,
+        "end_to_end_ms": 125578,
+        "loop_ms": 104854,
+        "png_sha256": "25d81906cc4ab5610ad9f3592d0b128ff3da37c34d84bb5e046c4ff262bb779d",
+        "text": "CASABLANCCA; fine detail changed, letter layout unchanged"
+      },
+      {
+        "variant": "sigma spacing + full final step",
+        "full_steps": 12,
+        "cached_steps": 28,
+        "end_to_end_ms": 146390,
+        "loop_ms": 126186,
+        "png_sha256": "c9e51beb905452f25edb6f9c27eb97daaa2e2af059eeb5776ce602868abaae7a",
+        "text": "CASABLANCCA",
+        "timing_caveat": "Fourth consecutive long run; full steps averaged 9.71 s instead of about 8.67 s. Structural cost is one extra full step, about 134 s cool."
+      },
+      {
+        "variant": "sigma spacing + early cap 3",
+        "full_steps": 12,
+        "cached_steps": 28,
+        "full_step_numbers": [
+          1,
+          2,
+          3,
+          4,
+          8,
+          12,
+          16,
+          20,
+          25,
+          30,
+          35,
+          40
+        ],
+        "end_to_end_ms": 134382,
+        "loop_ms": 112823,
+        "png_sha256": "e299e681e46438581f7627987c92d01c77da00e63ae654653c659df3dfca3552",
+        "text": "Approximately CASABLANICA: the duplicated C collapsed to a residual stroke between N and C"
+      }
+    ],
+    "power_state": "AC Power; battery 100%; charged; GPU idle before each run",
+    "findings": [
+      "The letter-count error is fixed during early layout; late-schedule accuracy (sigma spacing, a full final step) does not change it.",
+      "Moving one extra full step into the first half is the only change that reduced the error, but not to exact text.",
+      "Ordinary Cache-DiT 0.16 renders exact text with 13 full steps at 145.18 s, so the remaining TaylorSeer opportunity is at most about one full step (about 9-10 s, 7%) at 12 full steps, and no exact-text placement was found."
+    ],
+    "quality_decision": "Parked. TaylorSeer and all three switches remain explicit and off by default."
+  }
 }

@@ -288,6 +288,8 @@ fn run_native_impl(
     bottleneck: bool,
     cache_dit_threshold: f64,
     steps: str = "40",
+    q4_eager_expand: bool = false,
+    q4_direct_packed: bool = false,
 ) -> i32 {
     let pipeline_wall_start_ms: i64 = time::now_millis();
     guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
@@ -309,6 +311,8 @@ fn run_native_impl(
         steps,
         pipeline_wall_start_ms,
         pipeline_wall_start_ms,
+        q4_eager_expand,
+        q4_direct_packed,
     );
 }
 
@@ -327,6 +331,8 @@ fn run_native_tokens_impl(
     steps: str,
     pipeline_wall_start_ms: i64,
     text_wall_start_ms: i64,
+    q4_eager_expand: bool = false,
+    q4_direct_packed: bool = false,
 ) -> i32 {
     if !(pixels == (256 as usize) || pixels == (1024 as usize)) {
         io::eprintln("pipeline: pixels must be 256 or 1024");
@@ -420,6 +426,8 @@ fn run_native_tokens_impl(
                 seed,
                 #slice_ptr(latent.as_slice()),
                 steps,
+                q4_eager_expand,
+                q4_direct_packed,
             )
         }
     } else if bottleneck {
@@ -639,6 +647,22 @@ fn generate_1024(
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
         false, false, false, false, 0.0f64, steps,
+    );
+}
+
+fn generate_1024_q4_speed(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    eager_expand: bool,
+    direct_packed: bool = false,
+    seed: u64 = 1101 as u64,
+    steps: str = "40",
+) -> i32 {
+    return run_native_impl(
+        packed_path, model_root, output_path, prompt, seed, 1024 as usize,
+        false, false, false, false, 0.0f64, steps, eager_expand, direct_packed,
     );
 }
 

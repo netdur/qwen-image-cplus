@@ -151,6 +151,268 @@ kernel void qi_mps_q8_weight_to_half(
         half(int(weights[index]) - int(zeros[group_index])) * scales[group_index];
 }
 
+inline short qi_signed_q4(uchar packed, uint shift) {
+    const ushort nibble = (ushort(packed) >> shift) & 0xFu;
+    return short((nibble ^ 0x8u) - 0x8u);
+}
+
+// Startup-only eager expansion. QIPACK stores two signed nibbles per byte and
+// one FP16 scale per output row. The destination follows the established v4
+// FP16 record offsets, preserving contiguous Q/K/V matrices for MPS.
+kernel void qi_q4_weight_to_half(
+    device const uchar *weights [[buffer(0)]],
+    device const half *scales [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant Int8LinearParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.output_columns * params.input_columns;
+    if (index >= count) { return; }
+    const uchar packed = weights[index / 2];
+    const short code = qi_signed_q4(packed, (index & 1u) * 4u);
+    const uint output_column = index / params.input_columns;
+    output[index] = half(code) * scales[output_column];
+}
+
+// Startup-only packed-layout conversion for the direct Q4 experiment. The
+// QIPACK source is row-major [N,K/2]. The direct dot keeps all four weights in
+// one ushort and stores [K/4,N], so adjacent SIMD lanes read adjacent output
+// columns without ever materializing an FP16 weight.
+kernel void qi_q4_repack_direct(
+    device const uchar *source [[buffer(0)]],
+    device ushort *destination [[buffer(1)]],
+    constant Int8LinearParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint words_per_row = params.input_columns / 4;
+    const uint count = words_per_row * params.output_columns;
+    if (index >= count) { return; }
+    const uint word = index / params.output_columns;
+    const uint output_column = index % params.output_columns;
+    const uint source_byte = output_column * (params.input_columns / 2) + word * 2;
+    destination[index] = ushort(source[source_byte])
+        | (ushort(source[source_byte + 1]) << 8);
+}
+
+// Genuinely direct packed-Q4 dot. Packed nibbles stay packed until each lane's
+// half4 dot; there is no threadgroup or global FP16 weight tile. One SIMD group
+// owns 32 output columns and reuses each packed word across up to 16 rows.
+kernel void qi_block_q4_direct_half4_16x32(
+    device const float *input [[buffer(0)]],
+    device const ushort *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant Int8LinearParams &params [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    constexpr uint rows_per_group = 16;
+    const uint output_column = group_position.x * 32 + lane;
+    const uint row_base = group_position.y * rows_per_group;
+    const uint words = params.input_columns / 4;
+    float accumulator[rows_per_group];
+    for (uint local_row = 0; local_row < rows_per_group; ++local_row) {
+        accumulator[local_row] = 0.0f;
+    }
+    if (output_column < params.output_columns) {
+        for (uint word = 0; word < words; ++word) {
+            const ushort packed = weights[word * params.output_columns + output_column];
+            const half4 q = half4(
+                half(qi_signed_q4(uchar(packed), 0)),
+                half(qi_signed_q4(uchar(packed), 4)),
+                half(qi_signed_q4(uchar(packed >> 8), 0)),
+                half(qi_signed_q4(uchar(packed >> 8), 4))
+            );
+            const uint input_column = word * 4;
+            for (uint local_row = 0; local_row < rows_per_group; ++local_row) {
+                const uint row = row_base + local_row;
+                if (row < params.rows) {
+                    device const float *x = input + row * params.input_columns + input_column;
+                    accumulator[local_row] += float(dot(
+                        half4(half(x[0]), half(x[1]), half(x[2]), half(x[3])), q));
+                }
+            }
+        }
+        const float scale = float(scales[output_column]);
+        for (uint local_row = 0; local_row < rows_per_group; ++local_row) {
+            const uint row = row_base + local_row;
+            if (row < params.rows) {
+                output[row * params.output_columns + output_column] =
+                    accumulator[local_row] * scale;
+            }
+        }
+    }
+}
+
+// Inference-time destination expansion. Packed weights remain in the mapped
+// QIPACK file; each 32x64 tile is expanded into threadgroup FP16 exactly where
+// the native SIMD-group MMA consumes it. Bounds cover the 4127-row prompt pass.
+kernel void qi_block_q4_simdgroup_half_64x64(
+    device const float *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant Int8LinearParams &params [[buffer(4)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][64];
+    threadgroup float output_tile[64][64];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 64;
+    const uint simd_row = simd_index / 8;
+    const uint simd_column = simd_index % 8;
+    const uint packed_columns = params.input_columns / 2;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            const uint input_row = row_base + local_row;
+            input_tile[local_row][local_input] = input_row < params.rows
+                ? half(input[input_row * params.input_columns + input_base + local_input])
+                : half(0.0h);
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_output = linear / 16;
+            const uint local_pair = linear % 16;
+            const uint output_column = output_base + local_output;
+            const uint local_input = local_pair * 2;
+            if (output_column < params.output_columns) {
+                const uint packed_index = output_column * packed_columns
+                    + input_base / 2 + local_pair;
+                const uchar packed = weights[packed_index];
+                weight_tile[local_input][local_output] = half(qi_signed_q4(packed, 0));
+                weight_tile[local_input + 1][local_output] = half(qi_signed_q4(packed, 4));
+            } else {
+                weight_tile[local_input][local_output] = half(0.0h);
+                weight_tile[local_input + 1][local_output] = half(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[16 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[48 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 64);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(accumulator_0, &output_tile[simd_row * 8][simd_column * 8], 64);
+    simdgroup_store(accumulator_1, &output_tile[16 + simd_row * 8][simd_column * 8], 64);
+    simdgroup_store(accumulator_2, &output_tile[32 + simd_row * 8][simd_column * 8], 64);
+    simdgroup_store(accumulator_3, &output_tile[48 + simd_row * 8][simd_column * 8], 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = thread_index; linear < 4096; linear += 512) {
+        const uint local_row = linear / 64;
+        const uint local_output = linear % 64;
+        const uint output_row = row_base + local_row;
+        const uint output_column = output_base + local_output;
+        if (output_row < params.rows && output_column < params.output_columns) {
+            output[output_row * params.output_columns + output_column] =
+                output_tile[local_row][local_output] * float(scales[output_column]);
+        }
+    }
+}
+
+// Exact-tile Q4 counterpart of qi_block_linear_simdgroup_half_64x64_direct.
+// Everything after the weight load is deliberately identical. The packed
+// path expands and scales one 32x64 weight tile directly into threadgroup
+// half, then uses the same FP16 SIMD-group MMA and direct output stores.
+// Dispatch only when both output dimensions are complete 64-element tiles.
+kernel void qi_block_q4_simdgroup_half_64x64_direct(
+    device const float *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant Int8LinearParams &params [[buffer(4)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint2 group_position [[threadgroup_position_in_grid]]) {
+    threadgroup half input_tile[64][32];
+    threadgroup half weight_tile[32][64];
+
+    const uint row_base = group_position.y * 64;
+    const uint output_base = group_position.x * 64;
+    const uint simd_row = simd_index / 8;
+    const uint simd_column = simd_index % 8;
+    const uint packed_columns = params.input_columns / 2;
+    simdgroup_float8x8 accumulator_0(0.0f);
+    simdgroup_float8x8 accumulator_1(0.0f);
+    simdgroup_float8x8 accumulator_2(0.0f);
+    simdgroup_float8x8 accumulator_3(0.0f);
+
+    for (uint input_base = 0; input_base < params.input_columns; input_base += 32) {
+        for (uint linear = thread_index; linear < 2048; linear += 512) {
+            const uint local_row = linear / 32;
+            const uint local_input = linear % 32;
+            input_tile[local_row][local_input] = half(
+                input[(row_base + local_row) * params.input_columns + input_base + local_input]
+            );
+        }
+        for (uint linear = thread_index; linear < 1024; linear += 512) {
+            const uint local_output = linear / 16;
+            const uint local_pair = linear % 16;
+            const uint output_column = output_base + local_output;
+            const uint local_input = local_pair * 2;
+            const uchar packed = weights[
+                output_column * packed_columns + input_base / 2 + local_pair
+            ];
+            const half scale = scales[output_column];
+            weight_tile[local_input][local_output] =
+                half(qi_signed_q4(packed, 0)) * scale;
+            weight_tile[local_input + 1][local_output] =
+                half(qi_signed_q4(packed, 4)) * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint inner = 0; inner < 32; inner += 8) {
+            simdgroup_half8x8 left_0;
+            simdgroup_half8x8 left_1;
+            simdgroup_half8x8 left_2;
+            simdgroup_half8x8 left_3;
+            simdgroup_half8x8 right;
+            simdgroup_load(left_0, &input_tile[simd_row * 8][inner], 32);
+            simdgroup_load(left_1, &input_tile[16 + simd_row * 8][inner], 32);
+            simdgroup_load(left_2, &input_tile[32 + simd_row * 8][inner], 32);
+            simdgroup_load(left_3, &input_tile[48 + simd_row * 8][inner], 32);
+            simdgroup_load(right, &weight_tile[inner][simd_column * 8], 64);
+            simdgroup_multiply_accumulate(accumulator_0, left_0, right, accumulator_0);
+            simdgroup_multiply_accumulate(accumulator_1, left_1, right, accumulator_1);
+            simdgroup_multiply_accumulate(accumulator_2, left_2, right, accumulator_2);
+            simdgroup_multiply_accumulate(accumulator_3, left_3, right, accumulator_3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint output_column = output_base + simd_column * 8;
+    simdgroup_store(accumulator_0,
+        output + (row_base + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_1,
+        output + (row_base + 16 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_2,
+        output + (row_base + 32 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+    simdgroup_store(accumulator_3,
+        output + (row_base + 48 + simd_row * 8) * params.output_columns + output_column,
+        params.output_columns);
+}
+
 // Cache-DiT compares the first-block residual h_1 - h_0 and reuses the
 // residual produced by the remaining blocks. `slot` is a row offset used by
 // the first joint text+image pass; subsequent target-only passes use zero.

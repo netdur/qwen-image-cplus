@@ -81,7 +81,14 @@ fn fill_bottleneck_schedule(
     return true;
 }
 
-fn build_schedule(step_count: usize, image_sequence_length: usize) -> ScheduleResult {
+// `stretch_terminal=false` reproduces `shift_terminal: null`, which the
+// Viggle 4-step distillation experiment requires; the base model always
+// stretches its final evaluation to TERMINAL_SHIFT.
+fn build_schedule(
+    step_count: usize,
+    image_sequence_length: usize,
+    stretch_terminal: bool = true,
+) -> ScheduleResult {
     if step_count < (2 as usize) {
         return ScheduleResult::Err(ScheduleError::InvalidStepCount);
     }
@@ -100,7 +107,9 @@ fn build_schedule(step_count: usize, image_sequence_length: usize) -> ScheduleRe
     guard let option::Option[f32]::Some(last_shifted) = shifted.last() else {
         return ScheduleResult::Err(ScheduleError::InvalidStepCount);
     };
-    let terminal_scale: f32 = (1.0f32 - last_shifted) / (1.0f32 - TERMINAL_SHIFT);
+    let terminal_scale: f32 = if stretch_terminal {
+        (1.0f32 - last_shifted) / (1.0f32 - TERMINAL_SHIFT)
+    } else { 1.0f32 };
     var sigmas: vec::Vec[f32] = vec::Vec[f32]::with_capacity(step_count +% (1 as usize));
     var timesteps: vec::Vec[f32] = vec::Vec[f32]::with_capacity(step_count);
     index = 0 as usize;
@@ -138,8 +147,9 @@ fn fill_schedule(
     image_sequence_length: usize,
     sigmas: *f32,
     timesteps: *f32,
+    stretch_terminal: bool = true,
 ) -> bool {
-    match build_schedule(step_count, image_sequence_length) {
+    match build_schedule(step_count, image_sequence_length, stretch_terminal) {
         ScheduleResult::Ok(schedule) => {
             var index: usize = 0 as usize;
             while index < step_count {
@@ -217,6 +227,21 @@ fn qwen_1024_schedule_matches_pinned_reference_points() {
         }
         ScheduleResult::Err(_error) => { assert false; }
     }
+}
+
+#[test]
+fn unstretched_four_step_1024_schedule_keeps_shifted_endpoint() {
+    var sigmas: [f32; 5] = [0.0f32; 5];
+    var timesteps: [f32; 4] = [0.0f32; 4];
+    assert fill_schedule(
+        4 as usize, 4096 as usize, #addr_of(sigmas[0]), #addr_of(timesteps[0]), false,
+    );
+    assert close(sigmas[0], 1.0f32, 0.000001f32);
+    assert close(sigmas[1], 0.8571919f32, 0.000001f32);
+    assert close(sigmas[2], 0.6667558f32, 0.000001f32);
+    assert close(sigmas[3], 0.4000963f32, 0.000001f32);
+    assert close(timesteps[3], 400.0963f32, 0.0001f32);
+    assert sigmas[4] == 0.0f32;
 }
 
 #[test]

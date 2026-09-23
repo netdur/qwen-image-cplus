@@ -1,0 +1,65 @@
+{
+  "date": "2026-09-23",
+  "device": "Apple M1 Max",
+  "purpose": "Compare FP16 weights with packed Q4 weights while holding tile geometry and FP16 SIMD-group matrix arithmetic constant, then compare the integrated Q4 path with the production FP16/MPS path.",
+  "isolated": {
+    "warmup_dispatches": 1,
+    "measured_dispatches": 9,
+    "correctness": "All outputs exactly matched the representable synthetic reference.",
+    "shapes": [
+      {
+        "m": 256,
+        "n": 4096,
+        "k": 4096,
+        "fp16_average_ms": 2.29767,
+        "fp16_min_ms": 1.89871,
+        "q4_average_ms": 1.73288,
+        "q4_min_ms": 1.73046,
+        "average_speedup": 1.32593,
+        "caveat": "FP16 maximum was a 3.8735 ms outlier; minimum-to-minimum speedup is 1.09723x."
+      },
+      {
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "fp16_average_ms": 28.8679,
+        "q4_average_ms": 26.5923,
+        "speedup": 1.08557
+      },
+      {
+        "m": 256,
+        "n": 12288,
+        "k": 4096,
+        "fp16_average_ms": 5.69688,
+        "q4_average_ms": 5.05062,
+        "speedup": 1.12796
+      },
+      {
+        "m": 256,
+        "n": 4096,
+        "k": 12288,
+        "fp16_average_ms": 6.07387,
+        "q4_average_ms": 5.20509,
+        "speedup": 1.16691
+      }
+    ]
+  },
+  "integrated_adjacent_two_step": {
+    "prompt_rows": 31,
+    "q4": {
+      "step_1_wall_ms": 16721,
+      "step_1_gpu_ms": 11400.4,
+      "step_2_wall_ms": 13255,
+      "step_2_gpu_ms": 8898.59,
+      "representative_cached_block_gpu_ms": [277.988, 277.967, 277.943]
+    },
+    "fp16": {
+      "step_1_wall_ms": 9844,
+      "step_1_gpu_ms": 6259.25,
+      "step_2_wall_ms": 9230,
+      "step_2_gpu_ms": 5742.37,
+      "representative_cached_block_gpu_ms": [181.866, 185.701, 180.445]
+    },
+    "conclusion": "Tile-local Q4 unpacking beats the otherwise identical custom FP16 kernel, but the integrated Q4 path remains slower than the production FP16 path, whose large MLP projections use MPS. Step 2 Q4 wall time is 1.436x FP16 and representative block GPU time is about 1.522x FP16."
+  }
+}

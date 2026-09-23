@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "machine": "Apple M1 Max, 32 GB unified memory, macOS 26.6.2",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Integrated cost of each part of one cached 1024 transformer step (4,096 target rows plus a 31-row cached prefix), measured by omitting that work from all 32 blocks with QI_PROFILE_SKIP and subtracting step-2 wall time from adjacent full runs",
+  "command": "QI_PROFILE_SKIP=<part> benchmark-transformer-trajectory-1024 models/qwen-image-2.1-all-fp16-v4.qipack 2",
+  "method_caveat": "Ablation measures what the step loses when a part is absent, including overlap effects; skipped runs produce meaningless output. GPU utilization was 5-32% from desktop activity before the first series, and a steady 5% before the second.",
+  "baselines_step2_ms": [8854, 8977, 8816, 8796],
+  "series_1": {
+    "baseline_mean_ms": 8915.5,
+    "step2_without_ms": {"attention": 7566, "qkv": 7362, "attnout": 8445, "mlp": 3971}
+  },
+  "series_2": {
+    "baseline_mean_ms": 8806,
+    "step2_without_ms": {"gate": 7233, "down": 7041},
+    "proj": "Run aborted non-finite: the stale projected buffer later feeds padded K/V. Its cost is inferred as MLP minus gate minus down."
+  },
+  "breakdown": [
+    {"part": "MLP GEMMs (gate, projection, down)", "ms": 4945, "share_percent": 55.5, "tflops": 8.0, "peak_percent": 76},
+    {"part": "gate 4096->12288", "ms": 1573, "tflops": 8.39, "peak_percent": 79},
+    {"part": "projection 4096->12288 (inferred)", "ms": 1607, "tflops": 8.2, "peak_percent": 77},
+    {"part": "down 12288->4096", "ms": 1765, "tflops": 7.47, "peak_percent": 70},
+    {"part": "fused QKV 4096->12288", "ms": 1554, "share_percent": 17.4, "tflops": 8.5, "peak_percent": 80},
+    {"part": "MPSGraph attention", "ms": 1350, "share_percent": 15.1, "tflops": 6.6, "peak_percent": 62},
+    {"part": "attention output 4096->4096", "ms": 471, "share_percent": 5.3, "tflops": 9.3, "peak_percent": 88},
+    {"part": "all other kernels (norms, RoPE, SwiGLU, residuals, K/V preparation)", "ms": 596, "share_percent": 6.7}
+  ],
+  "peak_assumption": "10.6 TFLOP/s FP16/FP32 for the 32-core M1 Max GPU",
+  "rejected_split_gemm": {
+    "idea": "Encode each 12288-wide or 12288-deep MPS GEMM as three 4096-wide slices (deep slices accumulate with beta 1), hoping each slice would match the 88% attention-output shape",
+    "abba_step2_ms": {"current": [8869, 8747], "split": [8697, 8736]},
+    "result": "8.81 s versus 8.72 s mean, within the 0.12 s spread between identical current-path runs. Slices run at the same efficiency as the whole GEMM, so the shortfall is inside MPS kernel selection rather than the call shape. The prototype was removed."
+  },
+  "conclusion": "Attention is the least efficient part (62% of peak) but only 15% of the step; MLP GEMMs are 55% at 76%, but reshaping MPS calls does not recover the gap. Expected exact-arithmetic opportunity per 13-full-step Cache-DiT image: about 5 s from attention at 85% of peak."
+}

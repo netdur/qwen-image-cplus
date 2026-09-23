@@ -2,6 +2,7 @@ import "./metal_probe" as metal_probe;
 import "./metal_primitives" as metal_primitives;
 import "./metal_linear" as metal_linear;
 import "./metal_int8_linear" as metal_int8_linear;
+import "./metal_q4_dot" as metal_q4_dot;
 import "./transformer_block" as transformer_block;
 import "./packed_model" as packed_model;
 import "./model_inventory" as model_inventory;
@@ -110,7 +111,7 @@ fn cache_dit_threshold_parser_accepts_calibration_candidates() {
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -140,6 +141,15 @@ fn main() -> i32 {
     }
     if command == "benchmark-int8-linear" {
         return metal_int8_linear::run_benchmark();
+    }
+    if command == "probe-metal-q4-integer" {
+        return metal_q4_dot::run_integer_probe();
+    }
+    if command == "test-metal-q4-dot" {
+        return metal_q4_dot::run_validation();
+    }
+    if command == "benchmark-metal-q4-dot" {
+        return metal_q4_dot::run_benchmark();
     }
     if command == "test-attention-cache" {
         match env::arg(2 as usize) {
@@ -660,7 +670,9 @@ fn main() -> i32 {
             packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
         );
     }
-    if command == "generate-1024" {
+    if command == "generate-1024" || command == "benchmark-q4-eager-1024"
+        || command == "benchmark-q4-inference-1024"
+        || command == "benchmark-q4-direct-1024" {
         guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
             io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
             return 2;
@@ -688,21 +700,45 @@ fn main() -> i32 {
             }
             option::Option[text::Text]::None => {}
         }
-        var use_25_steps: bool = false;
+        var requested_steps: str = "40";
         match env::arg(7 as usize) {
             option::Option[text::Text]::Some(steps_text) => {
-                if steps_text == "25" {
-                    use_25_steps = true;
+                if steps_text == "1" && command != "generate-1024" {
+                    requested_steps = "1";
+                } else if steps_text == "4" && command == "generate-1024" {
+                    // Viggle distillation experiment; pair with
+                    // QI_EXPERIMENT_NO_SHIFT_TERMINAL=1.
+                    requested_steps = "4";
+                } else if steps_text == "25" {
+                    requested_steps = "25";
                 } else if steps_text != "40" {
-                    io::eprintln("generate-1024: steps must be 25 or 40");
+                    io::eprintln("generate-1024: steps must be 25 or 40 (Q4 benchmarks also accept 1)");
                     return 2;
                 }
             }
             option::Option[text::Text]::None => {}
         }
+        if command == "benchmark-q4-eager-1024" {
+            return pipeline::generate_1024_q4_speed(
+                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+                true, false, seed, requested_steps,
+            );
+        }
+        if command == "benchmark-q4-inference-1024" {
+            return pipeline::generate_1024_q4_speed(
+                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+                false, false, seed, requested_steps,
+            );
+        }
+        if command == "benchmark-q4-direct-1024" {
+            return pipeline::generate_1024_q4_speed(
+                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+                false, true, seed, requested_steps,
+            );
+        }
         return pipeline::generate_1024(
             packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
-            if use_25_steps { "25" } else { "40" },
+            requested_steps,
         );
     }
     if command == "generate-1024-bottleneck" {

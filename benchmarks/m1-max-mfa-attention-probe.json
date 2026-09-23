@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "machine": "Apple M1 Max, 32 GB unified memory, macOS 26.6.2, Apple Swift 6.4",
+  "scope": "Rejected probe: Metal FlashAttention (philipturner/metal-flash-attention, MIT, main at probe time) forward kernel at Qwen-Image-2.1's cached 1024 shape, as a replacement for MPSGraph SDPA",
+  "shape": {"query_rows": 4096, "key_rows": 4127, "head_dimension": 128, "heads": 32, "inputs": "FP16", "intermediates": "FP32 unless noted", "output": "FP32"},
+  "harness": "Throwaway SwiftPM executable in the session scratchpad; one dispatch per head in one command buffer; GPU timestamps; median of 5-7 runs; head 0 checked against a CPU FP64 reference on every 97th row",
+  "compiler_finding": "MFA's generated source relies on private air.simdgroup_async_copy_* and air.wait_simdgroup_events intrinsics, which this Metal compiler rejects ('illegal string literal in asm'). They were replaced by a synchronous lane-strided copy with identical semantics so the kernel could run.",
+  "results_ms_32_heads": {
+    "mfa_default_m1_path_async_load_emulated": 356.93,
+    "mfa_direct_device_loads_default_blocks_32x80x16": 73.35,
+    "mfa_async_cache_path_emulated": 205.14,
+    "block_sweep_direct": {"32x64x32": 87.86, "32x32x32": 58.29, "16x64x32": 88.34, "32x64x64": 164.92, "32x32x64": 100.01, "16x64x64": 261.45, "32x16x128": 148.44},
+    "block_sweep_direct_q_o_in_registers": {"32x80x16": 59.48, "16x64x32": 76.04, "32x32x32": 64.51, "16x32x64": 78.22, "8x64x128": 649.87},
+    "fp16_intermediates_default_blocks": 119.41
+  },
+  "best": {"configuration": "direct loads, blocks 32x32x32", "ms": 58.29, "tflops": 4.75},
+  "accuracy": "head 0 nRMSE versus FP64 1.1e-06 to 1.25e-06 with FP32 intermediates (6.5e-04 with FP16 intermediates); MPSGraph SDPA measures 4.9e-04 against scalar FP32",
+  "mpsgraph_reference_ms": {"isolated_cached_with_conversions": 49.512, "integrated_ablation_per_block": 42.2},
+  "decision": "Rejected. Without the removed asynchronous-copy intrinsics MFA reaches 4.75 TFLOP/s at best, slower than MPSGraph before counting the head-major layout conversions it would need. MPSGraph SDPA remains the 1024 attention path. The published 83% M1 Max utilization depends on those intrinsics."
+}

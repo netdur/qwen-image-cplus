@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "machine": "Apple M1 Max, 32 GB unified memory, macOS 26.6.2",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Parked experiment: Viggle's 4-step DMD distillation of Qwen-Image-2.1 versus the base model at 25 steps with and without Cache-DiT 0.16, all through the unchanged fresh-process native 1024x1024 prompt-to-PNG path",
+  "distilled_checkpoint": {
+    "repository": "Viggle/Qwen-Image-2.1-viggle-turbo",
+    "revision": "bafc91e4cc934f5fb1406b22496a0bed9b99c548",
+    "variant": "transformer/diffusion_pytorch_model.safetensors (full fine-tune, not the rank-64 LoRA)",
+    "license": "Qwen Research License (non-commercial)",
+    "status_per_model_card": "v0.1 preview; text may garble more often than the 40-step base",
+    "source_bytes": 14230284584,
+    "inventory": "297 BF16 tensors and 7,115,124,736 parameters, identical names and shapes to the pinned base transformer",
+    "scheduler_difference": "shift_terminal null instead of 0.02; every other scheduler field matches the base"
+  },
+  "packing": {
+    "method": "A throwaway Python splitter copied tensor bytes verbatim into the base index's two-shard partition (211 + 86 tensors) so the unchanged quantize-transformer could consume it",
+    "command": "quantize-transformer models/viggle-turbo-bafc91e/split models/qwen-image-2.1-viggle-turbo-EXPERIMENT-fp16-v4.qipack",
+    "wall_seconds": 438.34,
+    "pack_bytes": 14230327296,
+    "verification": "structural verify plus exact source round-trip passed",
+    "identity_caveat": "The header still records the base snapshot because the loader requires it; the pack is experiment-only and must not be treated as the pinned model."
+  },
+  "runtime_switches": {
+    "steps": "generate-1024 accepts 4 as an experiment-only step count",
+    "schedule": "QI_EXPERIMENT_NO_SHIFT_TERMINAL=1 skips the terminal stretch; the log recorded model timesteps 1000, 857.192, 666.756, and 400.096, matching the unit test"
+  },
+  "input": {
+    "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+    "prompt_tokens": 31,
+    "seed": 1301,
+    "pixels": 1024
+  },
+  "runs": [
+    {
+      "name": "viggle_4_step",
+      "packed_model": "qwen-image-2.1-viggle-turbo-EXPERIMENT-fp16-v4.qipack",
+      "steps": 4,
+      "cache_dit": false,
+      "full_steps": 4,
+      "cached_steps": 0,
+      "timing_wall_ms": {
+        "text": 3460,
+        "transformer_phase": 44075,
+        "denoising_loop": 35856,
+        "step_walls": [9783, 8678, 8706, 8676],
+        "vae": 9828,
+        "png_output": 305,
+        "end_to_end": 57692
+      },
+      "process_wall_seconds": 57.70,
+      "vae_gpu_ms": 9086.9,
+      "peak_memory_footprint_bytes": 5741200200,
+      "maximum_rss_bytes": 832094208,
+      "swaps": 0,
+      "png_sha256": "640de3872b2f3428944844f65d0abf49bd9787a265056c84f92b175be6e83f0c",
+      "text_result": "CASABLANCA absent; 'MEET ME AT' rendered as 'MEET MEAT'; SUNSET legible with a malformed U",
+      "visual_result": "Coherent painterly Moroccan harbor scene; style departs from the base model's flat poster"
+    },
+    {
+      "name": "base_25_step_cache_off",
+      "packed_model": "qwen-image-2.1-all-fp16-v4.qipack",
+      "steps": 25,
+      "cache_dit": false,
+      "full_steps": 25,
+      "cached_steps": 0,
+      "timing_wall_ms": {
+        "text": 3787,
+        "transformer_phase": 234179,
+        "denoising_loop": 226128,
+        "average_step": 9045.12,
+        "minimum_step": 8676,
+        "maximum_step": 9707,
+        "vae": 9752,
+        "png_output": 300,
+        "end_to_end": 248044
+      },
+      "process_wall_seconds": 248.07,
+      "vae_gpu_ms": 8984.99,
+      "peak_memory_footprint_bytes": 5699666832,
+      "maximum_rss_bytes": 831176704,
+      "swaps": 0,
+      "png_sha256": "0be284f0cd25105ec9f564a56fb1b55a30a209874ae3c195a9369b5b64fe4e6d",
+      "text_result": "CASABLANCA garbled beyond recognition; 'MEET ME AT' and SUNSET exact; invented footer text 'CASSEE' and 'AULNAT'",
+      "visual_result": "Clean flat Art Deco poster matching the 40-step composition family"
+    },
+    {
+      "name": "base_25_step_cache_dit_0_16",
+      "packed_model": "qwen-image-2.1-all-fp16-v4.qipack",
+      "steps": 25,
+      "cache_dit": true,
+      "cache_dit_threshold": 0.16,
+      "full_steps": 10,
+      "cached_steps": 15,
+      "timing_wall_ms": {
+        "text": 4000,
+        "transformer_phase": 101854,
+        "denoising_loop": 93564,
+        "full_step_range": [8639, 9804],
+        "cached_step_range": [278, 351],
+        "vae": 9920,
+        "png_output": 302,
+        "end_to_end": 116100
+      },
+      "process_wall_seconds": 116.11,
+      "vae_gpu_ms": 9143.95,
+      "peak_memory_footprint_bytes": 5703779216,
+      "maximum_rss_bytes": 832421888,
+      "swaps": 0,
+      "png_sha256": "51046c60c6e5f045344f125f3809fcc4371bea2e0af4a119b7722205767ae8e6",
+      "text_result": "'CASABLANCHA' (one inserted letter); 'MEET ME AT' and SUNSET exact; no invented footer text",
+      "visual_result": "Layout nearly identical to the 25-step cache-off image"
+    }
+  ],
+  "reference": {
+    "name": "base_40_step_cache_dit_0_16",
+    "source": "benchmarks/m1-max-native-prompt-pipeline-1024.json",
+    "end_to_end_seconds": 145.18,
+    "full_steps": 13,
+    "cached_steps": 27,
+    "text_result": "all requested text exact"
+  },
+  "power_state": {
+    "viggle_run": "AC Power; battery 80-81%; charging; no thermal or performance warning recorded",
+    "base_runs": "AC Power; battery 94%; charging",
+    "ordering": "Viggle first, then base 25 cache-off, then base 25 Cache-DiT, sequentially on one machine"
+  },
+  "findings": [
+    "The distilled checkpoint runs unchanged on the native runtime at the same per-step cost (8.96 s average) and completes 1024 prompt-to-PNG in 57.7 s, 2.5x faster than the fastest exact-text path (40-step Cache-DiT 0.16, 145.18 s).",
+    "It fails the exact-text gate by omitting CASABLANCA, so it is parked rather than promoted.",
+    "At four steps, work outside the denoising loop (VAE 9.8 s, transformer setup 8.2 s, text 3.5 s) is 38% of end-to-end time.",
+    "Twenty-five steps is not text-safe at 1024 on this prompt: cache-off garbles CASABLANCA and Cache-DiT 0.16 inserts one letter. The earlier 25-step acceptance came from a text-free 256 teapot.",
+    "These are single-prompt, single-seed observations; the text comparison between the two 25-step runs is not evidence that Cache-DiT improves quality."
+  ],
+  "result": "Viggle v0.1 parked: fastest measured 1024 path, but fails exact text"
+}

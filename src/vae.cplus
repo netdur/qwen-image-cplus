@@ -1,8 +1,11 @@
 import "./mmap_macos" as mapped;
+import "./mps_graph_attention" as graph_attention;
+import "./mps_graph_conv" as graph_conv;
 import "./safetensors" as safetensors;
 import "metal/metal" as metal;
 import "objc/bridge" as bridge;
 import "objc/runtime" as rt;
+import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
@@ -132,6 +135,8 @@ struct Pipelines {
     dup: metal::ComputePipelineState,
     attention: metal::ComputePipelineState,
     clamp: metal::ComputePipelineState,
+    // Non-null selects the MPSGraph FP32 convolution path.
+    opaque graph_convs: *graph_conv::Cache,
 }
 
 fn round_up(value: usize, alignment: usize) -> usize {
@@ -307,7 +312,7 @@ fn dispatch_command_buffer(
 
 fn dispatch_conv(
     queue: metal::CommandQueue,
-    pipeline_state: metal::ComputePipelineState,
+    pipelines: Pipelines,
     storage: metal::Buffer,
     weight: ConvWeight,
     input: metal::Buffer,
@@ -328,6 +333,32 @@ fn dispatch_conv(
         return option::Option[f64]::None;
     };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    if !pipelines.graph_convs.is_null() {
+        let conv: *graph_conv::Conv = graph_conv::find_or_create(
+            pipelines.graph_convs, input_height, input_width, input_channels,
+            output_channels, kernel, padding, upsample,
+        );
+        // A deferred buffer is already an MPSCommandBuffer; wrap a synchronous one.
+        guard let option::Option[graph_attention::CommandBufferContext]::Some(context) =
+            graph_attention::wrap_command_buffer(command_buffer, deferred.is_null()) else {
+            return option::Option[f64]::None;
+        };
+        let graph_command_buffer: metal::CommandBuffer = context.metal();
+        if !graph_conv::encode(
+            conv, graph_command_buffer, input, storage, weight.weight_offset,
+            weight.bias_offset, output,
+        ) {
+            io::eprintln("VAE: MPSGraph convolution failed for ${input_height}x${input_width}x${input_channels}->${output_channels} k${kernel}");
+            return option::Option[f64]::None;
+        }
+        if !deferred.is_null() { return option::Option[f64]::Some(0.0f64); }
+        graph_command_buffer.commit();
+        graph_command_buffer.wait_until_completed();
+        return option::Option[f64]::Some(
+            (graph_command_buffer.g_p_u_end_time() - graph_command_buffer.g_p_u_start_time())
+                * 1000.0f64,
+        );
+    }
     guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else {
         return option::Option[f64]::None;
     };
@@ -341,7 +372,7 @@ fn dispatch_conv(
         kernel_size: kernel as u32, padding: padding as u32,
         upsample: if upsample { 1 as u32 } else { 0 as u32 },
     };
-    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_compute_pipeline_state(pipelines.conv);
     encoder.set_buffer(input, 0 as u64, 0 as u64);
     encoder.set_buffer(storage, weight.weight_offset, 1 as u64);
     encoder.set_buffer(storage, weight.bias_offset, 2 as u64);
@@ -634,15 +665,15 @@ fn execute_residual(
     if input_channels != output_channels {
         let shortcut_name: text::Text = "${prefix}.conv_shortcut";
         guard let option::Option[ConvWeight]::Some(shortcut_weight) = conv_weight(file, shortcut_name.view(), output_channels, input_channels, 1) else { return option::Option[f64]::None; };
-        guard let option::Option[f64]::Some(elapsed) = dispatch_conv(queue, pipelines.conv, storage, shortcut_weight, input, shortcut_buffer, height, width, input_channels, output_channels, 1, 0, false, deferred) else { return option::Option[f64]::None; };
+        guard let option::Option[f64]::Some(elapsed) = dispatch_conv(queue, pipelines, storage, shortcut_weight, input, shortcut_buffer, height, width, input_channels, output_channels, 1, 0, false, deferred) else { return option::Option[f64]::None; };
         total = total + elapsed;
         shortcut_ms = elapsed;
         shortcut = shortcut_buffer;
     }
     guard let option::Option[f64]::Some(norm1_ms) = dispatch_norm(queue, pipelines.norm, storage, norm1, input, norm_buffer, height *% width, input_channels, true, deferred) else { return option::Option[f64]::None; };
-    guard let option::Option[f64]::Some(conv1_ms) = dispatch_conv(queue, pipelines.conv, storage, conv1, norm_buffer, conv_buffer, height, width, input_channels, output_channels, 3, 1, false, deferred) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(conv1_ms) = dispatch_conv(queue, pipelines, storage, conv1, norm_buffer, conv_buffer, height, width, input_channels, output_channels, 3, 1, false, deferred) else { return option::Option[f64]::None; };
     guard let option::Option[f64]::Some(norm2_ms) = dispatch_norm(queue, pipelines.norm, storage, norm2, conv_buffer, norm_buffer, height *% width, output_channels, true, deferred) else { return option::Option[f64]::None; };
-    guard let option::Option[f64]::Some(conv2_ms) = dispatch_conv(queue, pipelines.conv, storage, conv2, norm_buffer, output, height, width, output_channels, output_channels, 3, 1, false, deferred) else { return option::Option[f64]::None; };
+    guard let option::Option[f64]::Some(conv2_ms) = dispatch_conv(queue, pipelines, storage, conv2, norm_buffer, output, height, width, output_channels, output_channels, 3, 1, false, deferred) else { return option::Option[f64]::None; };
     guard let option::Option[f64]::Some(add_ms) = dispatch_element(queue, pipelines.add, output, shortcut, shortcut, output, height *% width *% output_channels, output_channels, 1 as u32, deferred) else { return option::Option[f64]::None; };
     if profile_dispatches {
         io::println("VAE profile: residual=${prefix} height=${height} width=${width} input_channels=${input_channels} output_channels=${output_channels} shortcut_conv_ms=${shortcut_ms} norm_1_ms=${norm1_ms} conv_1_ms=${conv1_ms} norm_2_ms=${norm2_ms} conv_2_ms=${conv2_ms} add_ms=${add_ms}");
@@ -887,6 +918,13 @@ fn run_impl(
     guard let option::Option[OwnedObjc]::Some(dup_owner) = pipeline(device, library, "vae_dup_up_shortcut") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "vae_single_head_attention") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(clamp_owner) = pipeline(device, library, "vae_clamp") else { return 1; };
+    // Every convolution, including nearest-2x upsample convolutions, runs
+    // through MPSGraph's FP32 convolution: about 6.9 s faster at 1024 and more
+    // accurate against the official oracle. QI_DISABLE_VAE_MPSGRAPH_CONV=1
+    // restores the custom cooperative-matrix kernels for A/B testing.
+    let use_graph_conv: bool = !env::has_var("QI_DISABLE_VAE_MPSGRAPH_CONV")
+        && graph_attention::load_frameworks();
+    var graph_convs: graph_conv::Cache = graph_conv::new_cache();
     let pipelines: Pipelines = Pipelines {
         conv: metal::ComputePipelineState::from_raw(conv_owner.raw()),
         upsample_pack: metal::ComputePipelineState::from_raw(upsample_pack_owner.raw()),
@@ -897,6 +935,7 @@ fn run_impl(
         dup: metal::ComputePipelineState::from_raw(dup_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         clamp: metal::ComputePipelineState::from_raw(clamp_owner.raw()),
+        graph_convs: if use_graph_conv { #addr_of(graph_convs) } else { 0 as *graph_conv::Cache },
     };
 
     guard let option::Option[metal::Buffer]::Some(storage) = mapped_storage_buffer(device, file) else {
@@ -939,10 +978,17 @@ fn run_impl(
     guard let option::Option[metal::Buffer]::Some(block_shortcut) = new_buffer(device, wide_activation_bytes) else { return 1; }; let block_shortcut_owner: OwnedObjc = OwnedObjc::new(block_shortcut.raw());
     guard let option::Option[metal::Buffer]::Some(qkv) = new_buffer(device, qkv_bytes) else { return 1; }; let qkv_owner: OwnedObjc = OwnedObjc::new(qkv.raw());
     guard let option::Option[metal::Buffer]::Some(packed_upsample_weight) = new_buffer(device, upsample_weight_bytes) else { return 1; }; let packed_upsample_weight_owner: OwnedObjc = OwnedObjc::new(packed_upsample_weight.raw());
-    guard let option::Option[metal::CommandBuffer]::Some(decode_command_buffer) =
+    guard let option::Option[metal::CommandBuffer]::Some(base_decode_command_buffer) =
         queue.command_buffer() else { return 1; };
-    let decode_command_buffer_owner: OwnedObjc =
-        OwnedObjc::new(rt::retain(decode_command_buffer.raw()));
+    let base_decode_command_buffer_owner: OwnedObjc =
+        OwnedObjc::new(rt::retain(base_decode_command_buffer.raw()));
+    // MPSGraph encodes only into an MPSCommandBuffer, which may internally
+    // commit-and-continue; GPU timestamps then cover only the final fragment.
+    guard let option::Option[graph_attention::CommandBufferContext]::Some(decode_context) =
+        graph_attention::wrap_command_buffer(base_decode_command_buffer, use_graph_conv) else {
+        return 1;
+    };
+    let decode_command_buffer: metal::CommandBuffer = decode_context.metal();
     // Production has no intermediate host reads, so encode the dependency
     // chain before one commit/wait. Small-oracle and explicit profile modes
     // stay synchronous to expose individual command-buffer GPU timestamps.
@@ -960,11 +1006,11 @@ fn run_impl(
         all_ok = report_boundary("latent de-normalization", buffer_a, fixture_directory, "denormalized_latent", input_elements, 0.000001f64) && all_ok;
     }
     guard let option::Option[ConvWeight]::Some(post_quant_weight) = conv_weight(file, "post_quant_conv", 64, 64, 1) else { return 1; };
-    guard let option::Option[f64]::Some(post_quant_ms) = dispatch_conv(queue, pipelines.conv, storage, post_quant_weight, buffer_a, buffer_b, input_height, input_width, 64, 64, 1, 0, false, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(post_quant_ms) = dispatch_conv(queue, pipelines, storage, post_quant_weight, buffer_a, buffer_b, input_height, input_width, 64, 64, 1, 0, false, deferred) else { return 1; };
     total_ms = total_ms + post_quant_ms;
     if requested_case == "small" { all_ok = report_boundary("post-quant convolution", buffer_b, fixture_directory, "post_quant", input_height *% input_width *% (64 as usize), 0.000001f64) && all_ok; }
     guard let option::Option[ConvWeight]::Some(conv_in_weight) = conv_weight(file, "decoder.conv_in", 1152, 64, 3) else { return 1; };
-    guard let option::Option[f64]::Some(conv_in_ms) = dispatch_conv(queue, pipelines.conv, storage, conv_in_weight, buffer_b, buffer_a, input_height, input_width, 64, 1152, 3, 1, false, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(conv_in_ms) = dispatch_conv(queue, pipelines, storage, conv_in_weight, buffer_b, buffer_a, input_height, input_width, 64, 1152, 3, 1, false, deferred) else { return 1; };
     total_ms = total_ms + conv_in_ms;
     if requested_case == "small" { all_ok = report_boundary("decoder conv_in", buffer_a, fixture_directory, "conv_in", input_height *% input_width *% (1152 as usize), 0.000001f64) && all_ok; }
 
@@ -974,12 +1020,12 @@ fn run_impl(
     guard let option::Option[f64]::Some(attention_norm_ms) = dispatch_norm(queue, pipelines.norm, storage, attention_norm, buffer_b, buffer_c, input_height *% input_width, 1152, false, deferred) else { return 1; };
     total_ms = total_ms + attention_norm_ms;
     guard let option::Option[ConvWeight]::Some(qkv_weight) = conv_weight(file, "decoder.mid_block.attentions.0.to_qkv", 3456, 1152, 1) else { return 1; };
-    guard let option::Option[f64]::Some(qkv_ms) = dispatch_conv(queue, pipelines.conv, storage, qkv_weight, buffer_c, qkv, input_height, input_width, 1152, 3456, 1, 0, false, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(qkv_ms) = dispatch_conv(queue, pipelines, storage, qkv_weight, buffer_c, qkv, input_height, input_width, 1152, 3456, 1, 0, false, deferred) else { return 1; };
     total_ms = total_ms + qkv_ms;
     guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(queue, pipelines.attention, qkv, buffer_d, input_height *% input_width, deferred) else { return 1; };
     total_ms = total_ms + attention_ms;
     guard let option::Option[ConvWeight]::Some(attention_projection) = conv_weight(file, "decoder.mid_block.attentions.0.proj", 1152, 1152, 1) else { return 1; };
-    guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_conv(queue, pipelines.conv, storage, attention_projection, buffer_d, buffer_a, input_height, input_width, 1152, 1152, 1, 0, false, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_conv(queue, pipelines, storage, attention_projection, buffer_d, buffer_a, input_height, input_width, 1152, 1152, 1, 0, false, deferred) else { return 1; };
     total_ms = total_ms + attention_projection_ms;
     guard let option::Option[f64]::Some(attention_add_ms) = dispatch_element(queue, pipelines.add, buffer_a, buffer_b, buffer_b, buffer_a, input_height *% input_width *% (1152 as usize), 1152, 1 as u32, deferred) else { return 1; };
     total_ms = total_ms + attention_add_ms;
@@ -1037,11 +1083,19 @@ fn run_impl(
         if block < (4 as usize) {
             let upsample_name: text::Text = "decoder.up_blocks.${block}.upsampler.resample.1";
             guard let option::Option[ConvWeight]::Some(upsample_weight) = conv_weight(file, upsample_name.view(), output_channels, output_channels, 3) else { return 1; };
-            guard let option::Option[f64]::Some(upsample_ms) = dispatch_upsample_conv(
-                queue, pipelines.upsample_pack, pipelines.upsample_conv, storage,
-                upsample_weight, packed_upsample_weight, buffer_a, buffer_b, height,
-                width, output_channels, deferred,
-            ) else { return 1; };
+            let upsample_result: option::Option[f64] = if pipelines.graph_convs.is_null() {
+                dispatch_upsample_conv(
+                    queue, pipelines.upsample_pack, pipelines.upsample_conv, storage,
+                    upsample_weight, packed_upsample_weight, buffer_a, buffer_b, height,
+                    width, output_channels, deferred,
+                )
+            } else {
+                dispatch_conv(
+                    queue, pipelines, storage, upsample_weight, buffer_a, buffer_b, height,
+                    width, output_channels, output_channels, 3, 1, true, deferred,
+                )
+            };
+            guard let option::Option[f64]::Some(upsample_ms) = upsample_result else { return 1; };
             if requested_case == "small" {
                 let main_name: text::Text = "up_block_0${block}_main_upsample";
                 all_ok = report_boundary("up block ${block} main upsample", buffer_b, fixture_directory, main_name.view(), height *% (2 as usize) *% width *% (2 as usize) *% output_channels, 0.000005f64) && all_ok;
@@ -1075,7 +1129,7 @@ fn run_impl(
     guard let option::Option[f64]::Some(final_norm_silu_ms) = dispatch_norm(queue, pipelines.norm, storage, final_norm_gamma, buffer_a, buffer_d, height *% width, 144, true, deferred) else { return 1; };
     total_ms = total_ms + final_norm_silu_ms;
     guard let option::Option[ConvWeight]::Some(conv_out_weight) = conv_weight(file, "decoder.conv_out", 4, 144, 3) else { return 1; };
-    guard let option::Option[f64]::Some(conv_out_ms) = dispatch_conv(queue, pipelines.conv, storage, conv_out_weight, buffer_d, buffer_b, height, width, 144, 4, 3, 1, false, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(conv_out_ms) = dispatch_conv(queue, pipelines, storage, conv_out_weight, buffer_d, buffer_b, height, width, 144, 4, 3, 1, false, deferred) else { return 1; };
     total_ms = total_ms + conv_out_ms;
     if requested_case == "small" { all_ok = report_boundary("decoder conv_out", buffer_b, fixture_directory, "conv_out", height *% width *% (4 as usize), 0.000002f64) && all_ok; }
     guard let option::Option[f64]::Some(clamp_ms) = dispatch_clamp(queue, pipelines.clamp, buffer_b, buffer_a, height *% width *% (4 as usize), deferred) else { return 1; };

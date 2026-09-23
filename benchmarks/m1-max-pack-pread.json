@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "machine": "Apple M1 Max, 32 GB unified memory, macOS 26.6.2",
+  "model": "Qwen/Qwen-Image-2.1",
+  "scope": "Transformer startup: replace the no-copy QIPACK mapping with parallel F_NOCACHE pread into an ordinary shared Metal buffer; now the default, QI_DISABLE_PACK_PREAD=1 restores the mapping",
+  "diagnosis": {
+    "startup_detail_1024_ms": {"inputs": 11, "conditioning_buffers": 0, "first_weight_dispatch_text_projection": 6497, "masks": 53, "graphs": 3, "workspaces": 0},
+    "release_build": "CPU setup falls from about 75 to 15 ms; the 6.4-7.1 s first-dispatch cost is identical, so the debug build is not the bottleneck",
+    "cause": "The first GPU dispatch touching the 14.2 GB no-copy buffer faults and wires the whole mapping at about 2 GB/s, even with a warm page cache"
+  },
+  "implementation": "8 threads, each one contiguous pack slice, positional reads through an F_NOCACHE descriptor into buffer.contents()",
+  "benchmark_1024_one_step": {
+    "mapped": {"first_dispatch_ms": [6497, 6388], "buffers_and_prefix_ms": [6565, 6457], "process_wall_s": [16.85, 16.40], "peak_footprint_bytes": 1411728992},
+    "pread": {"read_ms": [1898, 1933, 1868, 1872], "first_dispatch_ms": [322, 293], "buffers_and_prefix_ms": [387, 361, 338, 347], "process_wall_s": [12.12, 12.03, 12.38, 11.94], "peak_footprint_bytes": 15649631896},
+    "step_1_wall_ms": {"mapped": [9604, 9727], "pread": [9520, 9515]}
+  },
+  "pipeline_1024_40_cache_dit_0_16": {
+    "png_sha256_all_runs": "c643335238f96b5fa015338a1ecf6344e96907d7a1698fb52463bb4597697ebf (byte-identical across mapped and pread)",
+    "runs_in_order": [
+      {"mode": "pread", "read_ms": 4983, "buffers_and_prefix_ms": 606, "loop_ms": 121406, "end_to_end_ms": 133292, "full_step_wall_ms": "8618-8775", "note": "about 5.1 GB swap in use; allocation competed with reclaim (13.05 s sys)"},
+      {"mode": "mapped", "buffers_and_prefix_ms": 6643, "loop_ms": 128277, "end_to_end_ms": 141186, "full_step_wall_ms": "8719 rising to 9992"},
+      {"mode": "pread", "read_ms": 2247, "buffers_and_prefix_ms": 338, "loop_ms": 153648, "end_to_end_ms": 162756, "full_step_wall_ms": "10502-11683"}
+    ],
+    "thermal_caveat": "The A/B pair ran after about ten consecutive long GPU runs. Mapped full steps rose from 8.7 to 10.0 s during its run and the following pread run started there, so the loop difference is sustained-thermal ordering. The first pread run's full steps (8.62-8.78 s) match the best observed. Startup I/O is not GPU-clock bound and is the supported comparison."
+  },
+  "result": "Startup falls from about 6.6 s to about 2.3-2.6 s (about 4 s per image), or about 1 s under heavy swap pressure, with byte-identical output.",
+  "tradeoff": "The weights count as process footprint (15.6-16.0 GB peak) instead of wired file-backed pages; physical residency is similar. The pack is no longer retained in the page cache between processes."
+}

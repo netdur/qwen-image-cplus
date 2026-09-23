@@ -1,0 +1,1225 @@
+import "./cpu_ops" as cpu;
+import "./metal_primitives" as metrics;
+import "metal/metal" as metal;
+import "objc/bridge" as bridge;
+import "objc/runtime" as rt;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+
+extern fn MTLCreateSystemDefaultDevice() -> *u8;
+
+const SIMD_WIDTH: usize = 32;
+
+struct OwnedObjc {
+    opaque pointer: *u8,
+}
+
+impl OwnedObjc {
+    fn new(pointer: *u8) -> OwnedObjc {
+        return OwnedObjc { pointer: pointer };
+    }
+
+    fn raw(this) -> *u8 {
+        return this.pointer;
+    }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            rt::release(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+#[repr(C)]
+struct Q4DotParams {
+    vector_count: u32,
+    dimension: u32,
+}
+
+#[repr(C)]
+struct Q4GemmParams {
+    rows: u32,
+    output_columns: u32,
+    input_columns: u32,
+    reserved: u32,
+}
+
+fn encode_q4(value: i32) -> u16 {
+    return (value & (15 as i32)) as u16;
+}
+
+fn decode_q4(word: u16, shift: u16) -> i32 {
+    let nibble: i32 = ((word >> shift) & (15 as u16)) as i32;
+    return (nibble ^ (8 as i32)) -% (8 as i32);
+}
+
+fn pack_q4(a: i32, b: i32, c: i32, d: i32) -> u16 {
+    return encode_q4(a)
+        | (encode_q4(b) << (4 as u16))
+        | (encode_q4(c) << (8 as u16))
+        | (encode_q4(d) << (12 as u16));
+}
+
+fn new_buffer(device: metal::Device, bytes: u64) -> option::Option[metal::Buffer] {
+    return device.new_buffer_with_length(
+        bytes,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    );
+}
+
+fn dispatch(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    query: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4DotParams,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(query, 0 as u64, 0 as u64);
+    encoder.set_buffer(weights, 0 as u64, 1 as u64);
+    encoder.set_buffer(scales, 0 as u64, 2 as u64);
+    encoder.set_buffer(output, 0 as u64, 3 as u64);
+    encoder.set_bytes(params as *u8, #size_of::[Q4DotParams]() as u64, 4 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: (*params).vector_count as u64,
+            height: 1 as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: SIMD_WIDTH as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn dispatch_gemm(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4GemmParams,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weights, 0 as u64, 1 as u64);
+    encoder.set_buffer(scales, 0 as u64, 2 as u64);
+    encoder.set_buffer(output, 0 as u64, 3 as u64);
+    encoder.set_bytes(params as *u8, #size_of::[Q4GemmParams]() as u64, 4 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: ((*params).output_columns / (64 as u32)) as u64,
+            height: ((*params).rows / (64 as u32)) as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 512 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn dispatch_direct_half4_gemm(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4GemmParams,
+    rows_per_group: u32,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weights, 0 as u64, 1 as u64);
+    encoder.set_buffer(scales, 0 as u64, 2 as u64);
+    encoder.set_buffer(output, 0 as u64, 3 as u64);
+    encoder.set_bytes(params as *u8, #size_of::[Q4GemmParams]() as u64, 4 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: ((*params).output_columns / (32 as u32)) as u64,
+            height: ((*params).rows / rows_per_group) as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 32 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn dispatch_gemm_then_scale(
+    queue: metal::CommandQueue,
+    gemm_pipeline: metal::ComputePipelineState,
+    scale_pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4GemmParams,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(gemm_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let gemm_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(gemm_encoder.raw()));
+    gemm_encoder.set_compute_pipeline_state(gemm_pipeline);
+    gemm_encoder.set_buffer(input, 0 as u64, 0 as u64);
+    gemm_encoder.set_buffer(weights, 0 as u64, 1 as u64);
+    gemm_encoder.set_buffer(scales, 0 as u64, 2 as u64);
+    gemm_encoder.set_buffer(output, 0 as u64, 3 as u64);
+    gemm_encoder.set_bytes(params as *u8, #size_of::[Q4GemmParams]() as u64, 4 as u64);
+    gemm_encoder.dispatch_threadgroups(
+        metal::Size {
+            width: ((*params).output_columns / (64 as u32)) as u64,
+            height: ((*params).rows / (64 as u32)) as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 512 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let first_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(gemm_encoder.raw());
+    first_command_encoder.end_encoding();
+
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(scale_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let scale_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(scale_encoder.raw()));
+    scale_encoder.set_compute_pipeline_state(scale_pipeline);
+    scale_encoder.set_buffer(input, 0 as u64, 0 as u64);
+    scale_encoder.set_buffer(weights, 0 as u64, 1 as u64);
+    scale_encoder.set_buffer(scales, 0 as u64, 2 as u64);
+    scale_encoder.set_buffer(output, 0 as u64, 3 as u64);
+    scale_encoder.set_bytes(params as *u8, #size_of::[Q4GemmParams]() as u64, 4 as u64);
+    scale_encoder.dispatch_threads(
+        metal::Size {
+            width: (*params).output_columns as u64,
+            height: (*params).rows as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 16 as u64, height: 16 as u64, depth: 1 as u64 },
+    );
+    let second_command_encoder: metal::CommandEncoder =
+        metal::CommandEncoder::from_raw(scale_encoder.raw());
+    second_command_encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn make_pipeline(
+    device: metal::Device,
+    library: metal::Library,
+    name: str,
+) -> option::Option[[OwnedObjc; 2]] {
+    guard let option::Option[metal::Function]::Some(function) =
+        library.new_function_with_name(name) else { return option::Option[[OwnedObjc; 2]]::None; };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+    guard let option::Option[metal::ComputePipelineState]::Some(pipeline) =
+        device.new_compute_pipeline_state_with_function(function, 0 as *u8) else {
+        return option::Option[[OwnedObjc; 2]]::None;
+    };
+    let pipeline_owner: OwnedObjc = OwnedObjc::new(pipeline.raw());
+    return option::Option[[OwnedObjc; 2]]::Some([function_owner, pipeline_owner]);
+}
+
+fn fill_validation(
+    query: metal::Buffer,
+    fp16_weights: metal::Buffer,
+    q4_weights: metal::Buffer,
+    scales: metal::Buffer,
+    expected: *f32,
+    vector_count: usize,
+    dimension: usize,
+) {
+    let query_values: *u16 = query.contents() as *u16;
+    var input_index: usize = 0 as usize;
+    while input_index < dimension {
+        let value: f32 = ((input_index as i32 % (15 as i32)) -% (7 as i32)) as f32 / 16.0f32;
+        query_values[input_index] = cpu::f32_to_fp16(value);
+        input_index = input_index +% (1 as usize);
+    }
+
+    let dense_values: *u16 = fp16_weights.contents() as *u16;
+    let packed_values: *u16 = q4_weights.contents() as *u16;
+    let scale_values: *u16 = scales.contents() as *u16;
+    let words_per_row: usize = dimension / (4 as usize);
+    var vector_index: usize = 0 as usize;
+    while vector_index < vector_count {
+        let scale: f32 = if vector_index % (2 as usize) == (0 as usize) {
+            0.125f32
+        } else { 0.25f32 };
+        scale_values[vector_index] = cpu::f32_to_fp16(scale);
+        var sum: f32 = 0.0f32;
+        var word_index: usize = 0 as usize;
+        while word_index < words_per_row {
+            let base: usize = word_index *% (4 as usize);
+            let q0: i32 = ((vector_index +% base) % (15 as usize)) as i32 -% (7 as i32);
+            let q1: i32 = ((vector_index *% (3 as usize) +% base +% (1 as usize))
+                % (15 as usize)) as i32 -% (7 as i32);
+            let q2: i32 = ((vector_index *% (5 as usize) +% base +% (2 as usize))
+                % (15 as usize)) as i32 -% (7 as i32);
+            let q3: i32 = ((vector_index *% (7 as usize) +% base +% (3 as usize))
+                % (15 as usize)) as i32 -% (7 as i32);
+            packed_values[vector_index *% words_per_row +% word_index] = pack_q4(q0, q1, q2, q3);
+            let values: [i32; 4] = [q0, q1, q2, q3];
+            var inner: usize = 0 as usize;
+            while inner < (4 as usize) {
+                dense_values[vector_index *% dimension +% base +% inner] =
+                    cpu::f32_to_fp16(values[inner] as f32 * scale);
+                let x: f32 = cpu::fp16_to_f32(query_values[base +% inner]);
+                let product: f32 = cpu::fp16_to_f32(
+                    cpu::f32_to_fp16(x * values[inner] as f32),
+                );
+                sum = sum + product;
+                inner = inner +% (1 as usize);
+            }
+            word_index = word_index +% (1 as usize);
+        }
+        expected[vector_index] = sum * scale;
+        vector_index = vector_index +% (1 as usize);
+    }
+}
+
+fn validate_one(
+    label: str,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    query: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4DotParams,
+    expected: *f32,
+) -> bool {
+    guard let option::Option[f64]::Some(gpu_ms) = dispatch(
+        queue, pipeline, query, weights, scales, output, params,
+    ) else { return false; };
+    io::println("${label}: ${gpu_ms} ms");
+    return metrics::report(
+        label,
+        metrics::compare_f32(
+            output.contents() as *f32,
+            expected,
+            (*params).vector_count as usize,
+            0.00001f64,
+            0.00001f64,
+        ),
+        (*params).vector_count as usize,
+    );
+}
+
+fn validate_gemm(
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    fp16_pipeline: metal::ComputePipelineState,
+    q4_pipeline: metal::ComputePipelineState,
+    q4_direct_pipeline: metal::ComputePipelineState,
+    scale_pipeline: metal::ComputePipelineState,
+    direct_half4_pipeline: metal::ComputePipelineState,
+    direct_half4_8_pipeline: metal::ComputePipelineState,
+    direct_half4_16_pipeline: metal::ComputePipelineState,
+) -> bool {
+    let rows: usize = 64;
+    let output_columns: usize = 64;
+    let input_columns: usize = 256;
+    guard let option::Option[metal::Buffer]::Some(input) = new_buffer(
+        device, (rows *% input_columns *% #size_of::[u16]()) as u64,
+    ) else { return false; };
+    let input_owner: OwnedObjc = OwnedObjc::new(input.raw());
+    guard let option::Option[metal::Buffer]::Some(fp16_weights) = new_buffer(
+        device, (output_columns *% input_columns *% #size_of::[u16]()) as u64,
+    ) else { return false; };
+    let fp16_weights_owner: OwnedObjc = OwnedObjc::new(fp16_weights.raw());
+    guard let option::Option[metal::Buffer]::Some(q4_weights) = new_buffer(
+        device, (output_columns *% input_columns / (2 as usize)) as u64,
+    ) else { return false; };
+    let q4_weights_owner: OwnedObjc = OwnedObjc::new(q4_weights.raw());
+    guard let option::Option[metal::Buffer]::Some(interleaved_weights) = new_buffer(
+        device, (output_columns *% input_columns / (2 as usize)) as u64,
+    ) else { return false; };
+    let interleaved_weights_owner: OwnedObjc = OwnedObjc::new(interleaved_weights.raw());
+    guard let option::Option[metal::Buffer]::Some(scales) =
+        new_buffer(device, (output_columns *% #size_of::[u16]()) as u64) else { return false; };
+    let scales_owner: OwnedObjc = OwnedObjc::new(scales.raw());
+    guard let option::Option[metal::Buffer]::Some(output) = new_buffer(
+        device, (rows *% output_columns *% #size_of::[f32]()) as u64,
+    ) else { return false; };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+
+    let input_values: *u16 = input.contents() as *u16;
+    var index: usize = 0 as usize;
+    while index < rows *% input_columns {
+        input_values[index] = cpu::f32_to_fp16(0.0625f32);
+        index = index +% (1 as usize);
+    }
+    let fp16_values: *u16 = fp16_weights.contents() as *u16;
+    index = 0 as usize;
+    while index < output_columns *% input_columns {
+        fp16_values[index] = cpu::f32_to_fp16((index % (4 as usize)) as f32 * 0.125f32);
+        index = index +% (1 as usize);
+    }
+    let packed_byte: u8 = (encode_q4(0 as i32)
+        | (encode_q4(1 as i32) << (4 as u16))) as u8;
+    let packed_byte_second: u8 = (encode_q4(2 as i32)
+        | (encode_q4(3 as i32) << (4 as u16))) as u8;
+    let q4_values: *u8 = q4_weights.contents();
+    index = 0 as usize;
+    while index < output_columns *% input_columns / (2 as usize) {
+        q4_values[index] = if index % (2 as usize) == (0 as usize) {
+            packed_byte
+        } else { packed_byte_second };
+        index = index +% (1 as usize);
+    }
+    let interleaved_values: *u16 = interleaved_weights.contents() as *u16;
+    let packed_word: u16 = pack_q4(0 as i32, 1 as i32, 2 as i32, 3 as i32);
+    index = 0 as usize;
+    while index < output_columns *% input_columns / (4 as usize) {
+        interleaved_values[index] = packed_word;
+        index = index +% (1 as usize);
+    }
+    let scale_values: *u16 = scales.contents() as *u16;
+    index = 0 as usize;
+    while index < output_columns {
+        scale_values[index] = cpu::f32_to_fp16(0.125f32);
+        index = index +% (1 as usize);
+    }
+    var expected: [f32; 4096] = [3.0f32; 4096];
+    var params: Q4GemmParams = Q4GemmParams {
+        rows: rows as u32,
+        output_columns: output_columns as u32,
+        input_columns: input_columns as u32,
+        reserved: 0 as u32,
+    };
+    guard let option::Option[f64]::Some(fp16_ms) = dispatch_gemm(
+        queue, fp16_pipeline, input, fp16_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    io::println("FP16 SIMD-group GEMM validation: ${fp16_ms} ms");
+    let fp16_ok: bool = metrics::report(
+        "FP16 SIMD-group GEMM",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00001f64,
+            0.00001f64,
+        ),
+        rows *% output_columns,
+    );
+    guard let option::Option[f64]::Some(q4_ms) = dispatch_gemm(
+        queue, q4_pipeline, input, q4_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    io::println("Q4 destination-expand GEMM validation: ${q4_ms} ms");
+    let q4_ok: bool = metrics::report(
+        "Q4 destination-expand GEMM",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00001f64,
+            0.00001f64,
+        ),
+        rows *% output_columns,
+    );
+    index = 0 as usize;
+    while index < rows *% output_columns {
+        expected[index] = 24.0f32;
+        index = index +% (1 as usize);
+    }
+    guard let option::Option[f64]::Some(q4_direct_ms) = dispatch_gemm(
+        queue, q4_direct_pipeline, input, q4_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    io::println("Q4 unscaled direct GEMM validation: ${q4_direct_ms} ms");
+    let q4_direct_ok: bool = metrics::report(
+        "Q4 unscaled direct GEMM",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00001f64,
+            0.00001f64,
+        ),
+        rows *% output_columns,
+    );
+    index = 0 as usize;
+    while index < rows *% output_columns {
+        expected[index] = 3.0f32;
+        index = index +% (1 as usize);
+    }
+    guard let option::Option[f64]::Some(q4_complete_ms) = dispatch_gemm_then_scale(
+        queue,
+        q4_direct_pipeline,
+        scale_pipeline,
+        input,
+        q4_weights,
+        scales,
+        output,
+        #addr_of(params),
+    ) else { return false; };
+    io::println("Q4 direct GEMM + destination scale validation: ${q4_complete_ms} ms");
+    let q4_complete_ok: bool = metrics::report(
+        "Q4 direct GEMM + destination scale",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00001f64,
+            0.00001f64,
+        ),
+        rows *% output_columns,
+    );
+    guard let option::Option[f64]::Some(direct_half4_ms) = dispatch_direct_half4_gemm(
+        queue,
+        direct_half4_pipeline,
+        input,
+        interleaved_weights,
+        scales,
+        output,
+        #addr_of(params),
+        4 as u32,
+    ) else { return false; };
+    io::println("direct packed-Q4 half4 GEMM validation: ${direct_half4_ms} ms");
+    let direct_half4_ok: bool = metrics::report(
+        "direct packed-Q4 half4 GEMM",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00001f64,
+            0.00001f64,
+        ),
+        rows *% output_columns,
+    );
+    guard let option::Option[f64]::Some(direct_half4_8_ms) = dispatch_direct_half4_gemm(
+        queue,
+        direct_half4_8_pipeline,
+        input,
+        interleaved_weights,
+        scales,
+        output,
+        #addr_of(params),
+        8 as u32,
+    ) else { return false; };
+    io::println("direct packed-Q4 half4 8-row GEMM validation: ${direct_half4_8_ms} ms");
+    let direct_half4_8_ok: bool = metrics::report(
+        "direct packed-Q4 half4 8-row GEMM",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00001f64,
+            0.00001f64,
+        ),
+        rows *% output_columns,
+    );
+    guard let option::Option[f64]::Some(direct_half4_16_ms) = dispatch_direct_half4_gemm(
+        queue,
+        direct_half4_16_pipeline,
+        input,
+        interleaved_weights,
+        scales,
+        output,
+        #addr_of(params),
+        16 as u32,
+    ) else { return false; };
+    io::println("direct packed-Q4 half4 16-row GEMM validation: ${direct_half4_16_ms} ms");
+    let direct_half4_16_ok: bool = metrics::report(
+        "direct packed-Q4 half4 16-row GEMM",
+        metrics::compare_f32(
+            output.contents() as *f32,
+            #addr_of(expected[0]),
+            rows *% output_columns,
+            0.00001f64,
+            0.00001f64,
+        ),
+        rows *% output_columns,
+    );
+    return fp16_ok && q4_ok && q4_direct_ok && q4_complete_ok && direct_half4_ok
+        && direct_half4_8_ok && direct_half4_16_ok;
+}
+
+fn validate(
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    fp16_pipeline: metal::ComputePipelineState,
+    half4_pipeline: metal::ComputePipelineState,
+    scalar_pipeline: metal::ComputePipelineState,
+    fp16_gemm_pipeline: metal::ComputePipelineState,
+    q4_gemm_pipeline: metal::ComputePipelineState,
+    q4_direct_pipeline: metal::ComputePipelineState,
+    scale_pipeline: metal::ComputePipelineState,
+    direct_half4_pipeline: metal::ComputePipelineState,
+    direct_half4_8_pipeline: metal::ComputePipelineState,
+    direct_half4_16_pipeline: metal::ComputePipelineState,
+) -> bool {
+    let vector_count: usize = 65;
+    let dimension: usize = 256;
+    let words_per_row: usize = dimension / (4 as usize);
+    guard let option::Option[metal::Buffer]::Some(query) =
+        new_buffer(device, (dimension *% #size_of::[u16]()) as u64) else { return false; };
+    let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
+    guard let option::Option[metal::Buffer]::Some(fp16_weights) = new_buffer(
+        device, (vector_count *% dimension *% #size_of::[u16]()) as u64,
+    ) else { return false; };
+    let fp16_weights_owner: OwnedObjc = OwnedObjc::new(fp16_weights.raw());
+    guard let option::Option[metal::Buffer]::Some(q4_weights) = new_buffer(
+        device, (vector_count *% words_per_row *% #size_of::[u16]()) as u64,
+    ) else { return false; };
+    let q4_weights_owner: OwnedObjc = OwnedObjc::new(q4_weights.raw());
+    guard let option::Option[metal::Buffer]::Some(scales) =
+        new_buffer(device, (vector_count *% #size_of::[u16]()) as u64) else { return false; };
+    let scales_owner: OwnedObjc = OwnedObjc::new(scales.raw());
+    guard let option::Option[metal::Buffer]::Some(output) =
+        new_buffer(device, (vector_count *% #size_of::[f32]()) as u64) else { return false; };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+    var expected: [f32; 65] = [0.0f32; 65];
+    fill_validation(
+        query, fp16_weights, q4_weights, scales, #addr_of(expected[0]), vector_count, dimension,
+    );
+    var params: Q4DotParams = Q4DotParams {
+        vector_count: vector_count as u32,
+        dimension: dimension as u32,
+    };
+    let fp16_ok: bool = validate_one(
+        "FP16 streaming dot", queue, fp16_pipeline, query, fp16_weights,
+        scales, output, #addr_of(params), #addr_of(expected[0]),
+    );
+    let half4_ok: bool = validate_one(
+        "packed Q4 half4 dot", queue, half4_pipeline, query, q4_weights,
+        scales, output, #addr_of(params), #addr_of(expected[0]),
+    );
+    let scalar_ok: bool = validate_one(
+        "packed Q4 scalar dot", queue, scalar_pipeline, query, q4_weights,
+        scales, output, #addr_of(params), #addr_of(expected[0]),
+    );
+    let gemm_ok: bool = validate_gemm(
+        device,
+        queue,
+        fp16_gemm_pipeline,
+        q4_gemm_pipeline,
+        q4_direct_pipeline,
+        scale_pipeline,
+        direct_half4_pipeline,
+        direct_half4_8_pipeline,
+        direct_half4_16_pipeline,
+    );
+    return fp16_ok && half4_ok && scalar_ok && gemm_ok;
+}
+
+fn average_dispatch(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    query: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4DotParams,
+) -> option::Option[f64] {
+    guard let option::Option[f64]::Some(_warmup) = dispatch(
+        queue, pipeline, query, weights, scales, output, params,
+    ) else { return option::Option[f64]::None; };
+    var total_ms: f64 = 0.0f64;
+    var repetition: usize = 0 as usize;
+    while repetition < (5 as usize) {
+        guard let option::Option[f64]::Some(elapsed) = dispatch(
+            queue, pipeline, query, weights, scales, output, params,
+        ) else { return option::Option[f64]::None; };
+        total_ms = total_ms + elapsed;
+        repetition = repetition +% (1 as usize);
+    }
+    return option::Option[f64]::Some(total_ms / 5.0f64);
+}
+
+fn average_gemm(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4GemmParams,
+) -> option::Option[f64] {
+    guard let option::Option[f64]::Some(_warmup) = dispatch_gemm(
+        queue, pipeline, input, weights, scales, output, params,
+    ) else { return option::Option[f64]::None; };
+    var total_ms: f64 = 0.0f64;
+    var repetition: usize = 0 as usize;
+    while repetition < (5 as usize) {
+        guard let option::Option[f64]::Some(elapsed) = dispatch_gemm(
+            queue, pipeline, input, weights, scales, output, params,
+        ) else { return option::Option[f64]::None; };
+        total_ms = total_ms + elapsed;
+        repetition = repetition +% (1 as usize);
+    }
+    return option::Option[f64]::Some(total_ms / 5.0f64);
+}
+
+fn average_gemm_then_scale(
+    queue: metal::CommandQueue,
+    gemm_pipeline: metal::ComputePipelineState,
+    scale_pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4GemmParams,
+) -> option::Option[f64] {
+    guard let option::Option[f64]::Some(_warmup) = dispatch_gemm_then_scale(
+        queue, gemm_pipeline, scale_pipeline, input, weights, scales, output, params,
+    ) else { return option::Option[f64]::None; };
+    var total_ms: f64 = 0.0f64;
+    var repetition: usize = 0 as usize;
+    while repetition < (5 as usize) {
+        guard let option::Option[f64]::Some(elapsed) = dispatch_gemm_then_scale(
+            queue, gemm_pipeline, scale_pipeline, input, weights, scales, output, params,
+        ) else { return option::Option[f64]::None; };
+        total_ms = total_ms + elapsed;
+        repetition = repetition +% (1 as usize);
+    }
+    return option::Option[f64]::Some(total_ms / 5.0f64);
+}
+
+fn average_direct_half4_gemm(
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weights: metal::Buffer,
+    scales: metal::Buffer,
+    output: metal::Buffer,
+    params: *Q4GemmParams,
+    rows_per_group: u32,
+) -> option::Option[f64] {
+    guard let option::Option[f64]::Some(_warmup) = dispatch_direct_half4_gemm(
+        queue, pipeline, input, weights, scales, output, params, rows_per_group,
+    ) else { return option::Option[f64]::None; };
+    var total_ms: f64 = 0.0f64;
+    var repetition: usize = 0 as usize;
+    while repetition < (5 as usize) {
+        guard let option::Option[f64]::Some(elapsed) = dispatch_direct_half4_gemm(
+            queue, pipeline, input, weights, scales, output, params, rows_per_group,
+        ) else { return option::Option[f64]::None; };
+        total_ms = total_ms + elapsed;
+        repetition = repetition +% (1 as usize);
+    }
+    return option::Option[f64]::Some(total_ms / 5.0f64);
+}
+
+fn benchmark_gemm(
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    fp16_pipeline: metal::ComputePipelineState,
+    q4_pipeline: metal::ComputePipelineState,
+    q4_direct_pipeline: metal::ComputePipelineState,
+    scale_pipeline: metal::ComputePipelineState,
+    direct_half4_pipeline: metal::ComputePipelineState,
+    direct_half4_8_pipeline: metal::ComputePipelineState,
+    direct_half4_16_pipeline: metal::ComputePipelineState,
+    fp16_weights: metal::Buffer,
+    q4_weights: metal::Buffer,
+    scales: metal::Buffer,
+) -> bool {
+    let rows: usize = 256;
+    let output_columns: usize = 4096;
+    let input_columns: usize = 4096;
+    guard let option::Option[metal::Buffer]::Some(input) = new_buffer(
+        device, (rows *% input_columns *% #size_of::[u16]()) as u64,
+    ) else { return false; };
+    let input_owner: OwnedObjc = OwnedObjc::new(input.raw());
+    guard let option::Option[metal::Buffer]::Some(output) = new_buffer(
+        device, (rows *% output_columns *% #size_of::[f32]()) as u64,
+    ) else { return false; };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+    guard let option::Option[metal::Buffer]::Some(interleaved_weights) = new_buffer(
+        device, (output_columns *% input_columns / (2 as usize)) as u64,
+    ) else { return false; };
+    let interleaved_weights_owner: OwnedObjc = OwnedObjc::new(interleaved_weights.raw());
+    let interleaved_values: *u16 = interleaved_weights.contents() as *u16;
+    let packed_word: u16 = pack_q4(0 as i32, 1 as i32, 2 as i32, 3 as i32);
+    var interleaved_index: usize = 0 as usize;
+    while interleaved_index < output_columns *% input_columns / (4 as usize) {
+        interleaved_values[interleaved_index] = packed_word;
+        interleaved_index = interleaved_index +% (1 as usize);
+    }
+    let input_values: *u16 = input.contents() as *u16;
+    var index: usize = 0 as usize;
+    while index < rows *% input_columns {
+        input_values[index] = cpu::f32_to_fp16(0.0625f32);
+        index = index +% (1 as usize);
+    }
+    var params: Q4GemmParams = Q4GemmParams {
+        rows: rows as u32,
+        output_columns: output_columns as u32,
+        input_columns: input_columns as u32,
+        reserved: 0 as u32,
+    };
+    guard let option::Option[f64]::Some(fp16_ms) = average_gemm(
+        queue, fp16_pipeline, input, fp16_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    guard let option::Option[f64]::Some(q4_ms) = average_gemm(
+        queue, q4_pipeline, input, q4_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    guard let option::Option[f64]::Some(q4_direct_ms) = average_gemm(
+        queue, q4_direct_pipeline, input, q4_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    guard let option::Option[f64]::Some(q4_complete_ms) = average_gemm_then_scale(
+        queue,
+        q4_direct_pipeline,
+        scale_pipeline,
+        input,
+        q4_weights,
+        scales,
+        output,
+        #addr_of(params),
+    ) else { return false; };
+    guard let option::Option[f64]::Some(direct_half4_ms) = average_direct_half4_gemm(
+        queue,
+        direct_half4_pipeline,
+        input,
+        interleaved_weights,
+        scales,
+        output,
+        #addr_of(params),
+        4 as u32,
+    ) else { return false; };
+    guard let option::Option[f64]::Some(direct_half4_8_ms) = average_direct_half4_gemm(
+        queue,
+        direct_half4_8_pipeline,
+        input,
+        interleaved_weights,
+        scales,
+        output,
+        #addr_of(params),
+        8 as u32,
+    ) else { return false; };
+    guard let option::Option[f64]::Some(direct_half4_16_ms) = average_direct_half4_gemm(
+        queue,
+        direct_half4_16_pipeline,
+        input,
+        interleaved_weights,
+        scales,
+        output,
+        #addr_of(params),
+        16 as u32,
+    ) else { return false; };
+    let operations: f64 =
+        2.0f64 * rows as f64 * output_columns as f64 * input_columns as f64;
+    io::println(
+        "FP16 GEMM M=256 N=4096 K=4096: time=${fp16_ms} ms TFLOP/s=${operations / (fp16_ms * 1000000000.0f64)}",
+    );
+    io::println(
+        "Q4 destination-expand GEMM M=256 N=4096 K=4096: time=${q4_ms} ms TFLOP/s=${operations / (q4_ms * 1000000000.0f64)} speedup=${fp16_ms / q4_ms}x",
+    );
+    io::println(
+        "Q4 unscaled direct GEMM M=256 N=4096 K=4096: time=${q4_direct_ms} ms TFLOP/s=${operations / (q4_direct_ms * 1000000000.0f64)} speedup=${fp16_ms / q4_direct_ms}x",
+    );
+    io::println(
+        "Q4 direct GEMM + destination scale M=256 N=4096 K=4096: time=${q4_complete_ms} ms effective-TFLOP/s=${operations / (q4_complete_ms * 1000000000.0f64)} speedup=${fp16_ms / q4_complete_ms}x",
+    );
+    io::println(
+        "direct packed-Q4 half4 GEMM M=256 N=4096 K=4096: time=${direct_half4_ms} ms effective-TFLOP/s=${operations / (direct_half4_ms * 1000000000.0f64)} speedup=${fp16_ms / direct_half4_ms}x",
+    );
+    io::println(
+        "direct packed-Q4 half4 8-row GEMM M=256 N=4096 K=4096: time=${direct_half4_8_ms} ms effective-TFLOP/s=${operations / (direct_half4_8_ms * 1000000000.0f64)} speedup=${fp16_ms / direct_half4_8_ms}x",
+    );
+    io::println(
+        "direct packed-Q4 half4 16-row GEMM M=256 N=4096 K=4096: time=${direct_half4_16_ms} ms effective-TFLOP/s=${operations / (direct_half4_16_ms * 1000000000.0f64)} speedup=${fp16_ms / direct_half4_16_ms}x",
+    );
+    let output_values: *f32 = output.contents() as *f32;
+    index = 0 as usize;
+    while index < rows *% output_columns {
+        if (output_values[index] - 48.0f32).abs() > 0.0001f32 {
+            io::eprintln("Q4 GEMM benchmark: invalid output ${index}: ${output_values[index]}");
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn benchmark(
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    fp16_pipeline: metal::ComputePipelineState,
+    half4_pipeline: metal::ComputePipelineState,
+    scalar_pipeline: metal::ComputePipelineState,
+    fp16_gemm_pipeline: metal::ComputePipelineState,
+    q4_gemm_pipeline: metal::ComputePipelineState,
+    q4_direct_pipeline: metal::ComputePipelineState,
+    scale_pipeline: metal::ComputePipelineState,
+    direct_half4_pipeline: metal::ComputePipelineState,
+    direct_half4_8_pipeline: metal::ComputePipelineState,
+    direct_half4_16_pipeline: metal::ComputePipelineState,
+) -> bool {
+    let vector_count: usize = 16384;
+    let dimension: usize = 4096;
+    let words_per_row: usize = dimension / (4 as usize);
+    let fp16_weight_bytes: u64 =
+        (vector_count *% dimension *% #size_of::[u16]()) as u64;
+    let q4_weight_bytes: u64 =
+        (vector_count *% words_per_row *% #size_of::[u16]()) as u64;
+    guard let option::Option[metal::Buffer]::Some(query) =
+        new_buffer(device, (dimension *% #size_of::[u16]()) as u64) else { return false; };
+    let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
+    guard let option::Option[metal::Buffer]::Some(fp16_weights) =
+        new_buffer(device, fp16_weight_bytes) else { return false; };
+    let fp16_weights_owner: OwnedObjc = OwnedObjc::new(fp16_weights.raw());
+    guard let option::Option[metal::Buffer]::Some(q4_weights) =
+        new_buffer(device, q4_weight_bytes) else { return false; };
+    let q4_weights_owner: OwnedObjc = OwnedObjc::new(q4_weights.raw());
+    guard let option::Option[metal::Buffer]::Some(scales) =
+        new_buffer(device, (vector_count *% #size_of::[u16]()) as u64) else { return false; };
+    let scales_owner: OwnedObjc = OwnedObjc::new(scales.raw());
+    guard let option::Option[metal::Buffer]::Some(output) =
+        new_buffer(device, (vector_count *% #size_of::[f32]()) as u64) else { return false; };
+    let output_owner: OwnedObjc = OwnedObjc::new(output.raw());
+
+    let query_values: *u16 = query.contents() as *u16;
+    var index: usize = 0 as usize;
+    while index < dimension {
+        query_values[index] = cpu::f32_to_fp16(0.0625f32);
+        index = index +% (1 as usize);
+    }
+    let fp16_values: *u16 = fp16_weights.contents() as *u16;
+    index = 0 as usize;
+    while index < vector_count *% dimension {
+        let q: f32 = (index % (4 as usize)) as f32;
+        fp16_values[index] = cpu::f32_to_fp16(q * 0.125f32);
+        index = index +% (1 as usize);
+    }
+    let packed_word: u16 = pack_q4(0 as i32, 1 as i32, 2 as i32, 3 as i32);
+    let q4_values: *u16 = q4_weights.contents() as *u16;
+    index = 0 as usize;
+    while index < vector_count *% words_per_row {
+        q4_values[index] = packed_word;
+        index = index +% (1 as usize);
+    }
+    let scale_bits: u16 = cpu::f32_to_fp16(0.125f32);
+    let scale_values: *u16 = scales.contents() as *u16;
+    index = 0 as usize;
+    while index < vector_count {
+        scale_values[index] = scale_bits;
+        index = index +% (1 as usize);
+    }
+
+    var params: Q4DotParams = Q4DotParams {
+        vector_count: vector_count as u32,
+        dimension: dimension as u32,
+    };
+    guard let option::Option[f64]::Some(fp16_ms) = average_dispatch(
+        queue, fp16_pipeline, query, fp16_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    guard let option::Option[f64]::Some(half4_ms) = average_dispatch(
+        queue, half4_pipeline, query, q4_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+    guard let option::Option[f64]::Some(scalar_ms) = average_dispatch(
+        queue, scalar_pipeline, query, q4_weights, scales, output, #addr_of(params),
+    ) else { return false; };
+
+    let fp16_gbps: f64 = fp16_weight_bytes as f64 / (fp16_ms * 1000000.0f64);
+    let half4_gbps: f64 = q4_weight_bytes as f64 / (half4_ms * 1000000.0f64);
+    let scalar_gbps: f64 = q4_weight_bytes as f64 / (scalar_ms * 1000000.0f64);
+    io::println(
+        "FP16 stream: weights=${fp16_weight_bytes} bytes time=${fp16_ms} ms effective=${fp16_gbps} GB/s",
+    );
+    io::println(
+        "Q4 half4: weights=${q4_weight_bytes} bytes time=${half4_ms} ms effective=${half4_gbps} GB/s speedup=${fp16_ms / half4_ms}x",
+    );
+    io::println(
+        "Q4 scalar: weights=${q4_weight_bytes} bytes time=${scalar_ms} ms effective=${scalar_gbps} GB/s speedup=${fp16_ms / scalar_ms}x",
+    );
+    let expected: f32 = 48.0f32;
+    let output_values: *f32 = output.contents() as *f32;
+    index = 0 as usize;
+    while index < vector_count {
+        if (output_values[index] - expected).abs() > 0.0001f32 {
+            io::eprintln("Q4 dot benchmark: invalid output ${index}: ${output_values[index]}");
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return benchmark_gemm(
+        device,
+        queue,
+        fp16_gemm_pipeline,
+        q4_gemm_pipeline,
+        q4_direct_pipeline,
+        scale_pipeline,
+        direct_half4_pipeline,
+        direct_half4_8_pipeline,
+        direct_half4_16_pipeline,
+        fp16_weights,
+        q4_weights,
+        scales,
+    );
+}
+
+fn run_mode(benchmark_mode: bool) -> i32 {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return 1; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() {
+        io::eprintln("Q4 dot: no Metal device");
+        return 1;
+    }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) =
+        device.new_command_queue() else { return 1; };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() { return 1; }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        #include_str("../kernels/q4_dot.metal"),
+        options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 = rt::msg_id(
+                compile_error, rt::sel(#str_ptr("localizedDescription\0")),
+            );
+            io::eprintln("Q4 dot Metal compile: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[[OwnedObjc; 2]]::Some(fp16_objects) = make_pipeline(
+        device, library, "qi_fp16_streaming_dot",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(half4_objects) = make_pipeline(
+        device, library, "qi_q4_streaming_dot_half4",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(scalar_objects) = make_pipeline(
+        device, library, "qi_q4_streaming_dot_scalar",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(fp16_gemm_objects) = make_pipeline(
+        device, library, "qi_fp16_gemm_64x64",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(q4_gemm_objects) = make_pipeline(
+        device, library, "qi_q4_gemm_64x64",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(q4_direct_objects) = make_pipeline(
+        device, library, "qi_q4_gemm_64x64_unscaled_direct",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(scale_objects) = make_pipeline(
+        device, library, "qi_q4_scale_output",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(direct_half4_objects) = make_pipeline(
+        device, library, "qi_q4_direct_half4_gemm_4x32_interleaved",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(direct_half4_8_objects) = make_pipeline(
+        device, library, "qi_q4_direct_half4_gemm_8x32_interleaved",
+    ) else { return 1; };
+    guard let option::Option[[OwnedObjc; 2]]::Some(direct_half4_16_objects) = make_pipeline(
+        device, library, "qi_q4_direct_half4_gemm_16x32_interleaved",
+    ) else { return 1; };
+    let fp16_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(
+        fp16_objects[1].raw(),
+    );
+    let half4_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(
+        half4_objects[1].raw(),
+    );
+    let scalar_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(
+        scalar_objects[1].raw(),
+    );
+    let fp16_gemm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(
+        fp16_gemm_objects[1].raw(),
+    );
+    let q4_gemm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(
+        q4_gemm_objects[1].raw(),
+    );
+    let q4_direct_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(
+        q4_direct_objects[1].raw(),
+    );
+    let scale_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(
+        scale_objects[1].raw(),
+    );
+    let direct_half4_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(direct_half4_objects[1].raw());
+    let direct_half4_8_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(direct_half4_8_objects[1].raw());
+    let direct_half4_16_pipeline: metal::ComputePipelineState =
+        metal::ComputePipelineState::from_raw(direct_half4_16_objects[1].raw());
+    if !benchmark_mode {
+        if validate(
+            device,
+            queue,
+            fp16_pipeline,
+            half4_pipeline,
+            scalar_pipeline,
+            fp16_gemm_pipeline,
+            q4_gemm_pipeline,
+            q4_direct_pipeline,
+            scale_pipeline,
+            direct_half4_pipeline,
+            direct_half4_8_pipeline,
+            direct_half4_16_pipeline,
+        ) {
+            io::println("Metal packed Q4 dot validation: ok");
+            return 0;
+        }
+        return 1;
+    }
+    if benchmark(
+        device,
+        queue,
+        fp16_pipeline,
+        half4_pipeline,
+        scalar_pipeline,
+        fp16_gemm_pipeline,
+        q4_gemm_pipeline,
+        q4_direct_pipeline,
+        scale_pipeline,
+        direct_half4_pipeline,
+        direct_half4_8_pipeline,
+        direct_half4_16_pipeline,
+    ) {
+        io::println("Metal packed Q4 dot benchmark: ok");
+        return 0;
+    }
+    return 1;
+}
+
+fn run_validation() -> i32 {
+    return run_mode(false);
+}
+
+fn run_benchmark() -> i32 {
+    return run_mode(true);
+}
+
+fn run_integer_probe() -> i32 {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return 1; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() {
+        io::eprintln("Q4 integer probe: no Metal device");
+        return 1;
+    }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() { return 1; }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        #include_str("../kernels/q4_integer_probe.metal"),
+        options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 = rt::msg_id(
+                compile_error, rt::sel(#str_ptr("localizedDescription\0")),
+            );
+            io::println("Metal signed-char4 dot: unsupported (${bridge::to_text(description)})");
+        } else {
+            io::println("Metal signed-char4 dot: unsupported");
+        }
+        return 0;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[metal::Function]::Some(function) =
+        library.new_function_with_name("qi_probe_char4_dot") else {
+        io::println("Metal signed-char4 dot: compiler accepted source but no function exists");
+        return 1;
+    };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+    guard let option::Option[metal::ComputePipelineState]::Some(pipeline) =
+        device.new_compute_pipeline_state_with_function(function, 0 as *u8) else {
+        io::println("Metal signed-char4 dot: function exists but pipeline creation failed");
+        return 1;
+    };
+    let pipeline_owner: OwnedObjc = OwnedObjc::new(pipeline.raw());
+    io::println("Metal signed-char4 dot: supported");
+    return 0;
+}
+
+#[test]
+fn signed_q4_pack_roundtrips_all_representable_values() {
+    var a: i32 = -8 as i32;
+    while a <= (7 as i32) {
+        var b: i32 = -8 as i32;
+        while b <= (7 as i32) {
+            var c: i32 = -8 as i32;
+            while c <= (7 as i32) {
+                var d: i32 = -8 as i32;
+                while d <= (7 as i32) {
+                    let word: u16 = pack_q4(a, b, c, d);
+                    assert decode_q4(word, 0 as u16) == a;
+                    assert decode_q4(word, 4 as u16) == b;
+                    assert decode_q4(word, 8 as u16) == c;
+                    assert decode_q4(word, 12 as u16) == d;
+                    d = d +% (1 as i32);
+                }
+                c = c +% (1 as i32);
+            }
+            b = b +% (1 as i32);
+        }
+        a = a +% (1 as i32);
+    }
+}
+
+#[test]
+fn q4_dot_parameters_match_metal_abi() {
+    assert #size_of::[Q4DotParams]() == (8 as usize);
+    assert #size_of::[Q4GemmParams]() == (16 as usize);
+    assert (256 as usize) % (4 as usize) == (0 as usize);
+    assert (4096 as usize) % (4 as usize) == (0 as usize);
+}
