@@ -270,7 +270,7 @@ argument. Omitting it preserves the canonical 40-step behavior, unless pack
 metadata sets `steps`.
 
 `generate-1024 PACK MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [CACHE]` reads
-its defaults from pack metadata (see `docs/packed-format-v1.md`).
+its defaults from pack metadata.
 
 - **`STEPS`** accepts 3, 4, 8, 25, or 40. The default is the pack's `steps`,
   otherwise 40.
@@ -285,7 +285,7 @@ its defaults from pack metadata (see `docs/packed-format-v1.md`).
   `steps=3|4|8|25|40`. `pack-metadata` refuses to write through an
   inconsistent header, writes in crash-safe stages, and can replace
   unreadable metadata. `verify-packed` now checks metadata as the loader
-  does. See `docs/packed-format-v1.md`.
+  does.
 - **Environment switches:** generation refuses `QI_PROFILE_SKIP`. It also
   refuses `QI_EXPERIMENT_NO_SHIFT_TERMINAL` when the pack states
   `shift_terminal=0.02`, and `QI_CACHE_DIT_WARMUP` values outside 1-4. Every
@@ -353,8 +353,7 @@ Inspect a shard, optionally filtering tensor names:
 - A C+ block-0 packed writer/reader with fixed little-endian metadata,
   256-byte tensor alignment, a page-aligned data section, source identity,
   per-tensor and payload checksums, exact source round-trip validation, and
-  atomic temp-file installation. The format is documented in
-  `docs/packed-format-v1.md`.
+  atomic temp-file installation.
 - An affine INT8/group-64 Metal linear kernel that consumes packed U8 weights,
   FP16 scales, and U8 zero points without materializing a dense weight matrix.
   It uses FP16 tiles with FP32 accumulation, matches its CPU oracle exactly,
@@ -386,8 +385,7 @@ Inspect a shard, optionally filtering tensor names:
   7,115,124,736-parameter, two-shard inventory; installs atomically only after
   structure, payload, per-tensor, and exact source round-trip checks; and
   produced a verified 14,230,327,296-byte artifact from the pinned snapshot.
-  The layout and scope compatibility rules are documented in
-  `docs/packed-format-v1.md`.
+  The loader validates layout and scope compatibility before use.
 - Native execution of all 32 blocks directly from one read-only, page-aligned
   no-copy QIPACK1 Metal buffer. Kernel selection comes from each tensor record,
   not a second hard-coded policy. Current v4 artifacts discover zero Q8
@@ -1540,7 +1538,7 @@ repeatable observed range is therefore about 38-39 seconds.
 - **VAE:** fell from 10.2 to 2.8 s after moving convolution to MPSGraph.
 - **Startup:** fell by about 4 s after replacing the pack mapping with a
   parallel `pread` copy.
-- **Fixed-cost pass (2026-09-23, from `fable-max-review.md`).** Same
+- **Fixed-cost pass (2026-09-23).** Same
   Viggle run, same machine, 5.8 GB swap in use:
 
   | Phase | Before | After | Change |

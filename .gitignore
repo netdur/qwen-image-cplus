@@ -5,6 +5,8 @@ __pycache__/
 /models/
 target/
 tests/fixtures/small/
+/bugs/
 /vendor
+/vendors/
 /plan.md
 /plan-*.md
