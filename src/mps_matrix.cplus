@@ -197,3 +197,87 @@ fn create(
         kernel: OwnedObjc::new(kernel_pointer),
     });
 }
+
+fn strided_descriptor(rows: usize, columns: usize, row_bytes: usize, data_type: u32)
+    -> option::Option[OwnedObjc] {
+    let class: *u8 = rt::get_class(#str_ptr("MPSMatrixDescriptor\0"));
+    if class.is_null() { return option::Option[OwnedObjc]::None; }
+    let value: *u8 = qi_msg_id_u64_u64_u64_u32(
+        class,
+        rt::sel(#str_ptr("matrixDescriptorWithRows:columns:rowBytes:dataType:\0")),
+        rows as u64,
+        columns as u64,
+        row_bytes as u64,
+        data_type,
+    );
+    if value.is_null() { return option::Option[OwnedObjc]::None; }
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(rt::retain(value)));
+}
+
+// One FP32 operand: `rows` x `columns` elements starting at `offset`, with
+// `row_bytes` between rows (a column slice of a wider matrix is allowed).
+struct Fp32Operand {
+    buffer: metal::Buffer,
+    offset: u64,
+    rows: usize,
+    columns: usize,
+    row_bytes: usize,
+}
+
+// FP32 C = alpha * op(A) * op(B), with optional transposes and strided
+// operands. Used where FP16 inputs would lose accuracy (the VAE).
+fn create_fp32(
+    device: metal::Device,
+    left: Fp32Operand,
+    right: Fp32Operand,
+    output: Fp32Operand,
+    transpose_left: bool,
+    transpose_right: bool,
+    inner: usize,
+    alpha: f64,
+) -> option::Option[Multiplication] {
+    guard let option::Option[OwnedObjc]::Some(left_descriptor) = strided_descriptor(
+        left.rows, left.columns, left.row_bytes, MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(right_descriptor) = strided_descriptor(
+        right.rows, right.columns, right.row_bytes, MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(output_descriptor) = strided_descriptor(
+        output.rows, output.columns, output.row_bytes, MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(left_matrix) = matrix(
+        left.buffer, left.offset, left_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(right_matrix) = matrix(
+        right.buffer, right.offset, right_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(output_matrix) = matrix(
+        output.buffer, output.offset, output_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    let class: *u8 = rt::get_class(#str_ptr("MPSMatrixMultiplication\0"));
+    if class.is_null() { return option::Option[Multiplication]::None; }
+    let allocated: *u8 = rt::msg_id(class, rt::sel(#str_ptr("alloc\0")));
+    if allocated.is_null() { return option::Option[Multiplication]::None; }
+    let kernel_pointer: *u8 = qi_msg_id_id_i8_i8_u64_u64_u64_f64_f64(
+        allocated,
+        rt::sel(#str_ptr("initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:\0")),
+        device.raw(),
+        if transpose_left { 1 as i8 } else { 0 as i8 },
+        if transpose_right { 1 as i8 } else { 0 as i8 },
+        output.rows as u64,
+        output.columns as u64,
+        inner as u64,
+        alpha,
+        0.0f64,
+    );
+    if kernel_pointer.is_null() { return option::Option[Multiplication]::None; }
+    return option::Option[Multiplication]::Some(Multiplication {
+        left_descriptor: left_descriptor,
+        right_descriptor: right_descriptor,
+        output_descriptor: output_descriptor,
+        left_matrix: left_matrix,
+        right_matrix: right_matrix,
+        output_matrix: output_matrix,
+        kernel: OwnedObjc::new(kernel_pointer),
+    });
+}

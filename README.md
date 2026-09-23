@@ -36,9 +36,11 @@ The 25-step experiment in this repository came from the
 not an official Qwen recommendation. That template explicitly says the
 official pipeline uses about 40-50 steps and that the template itself starts
 at 25. Consequently, 40 remains this runtime's compatibility, oracle, and
-default path; 25 is only a measured opt-in speed/quality tradeoff. It is not
-text-safe at 1024: on the `CASABLANCA` poster, 25 steps garbled or misspelled
-the word that 40 steps renders exactly (see the Viggle comparison below).
+default path for the base pack; 25 is only a measured opt-in speed/quality
+tradeoff. It is not text-safe at 1024: on the poster prompt, 25 steps chose
+to render CASABLANCA and misspelled it (see the Viggle comparison below).
+Pack metadata can set another default. The adopted Viggle distillation pack
+defaults to 4 steps with an unstretched schedule.
 
 ## Build and verify
 
@@ -97,7 +99,11 @@ cpc test
 ./target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
 ./target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
 ./target/debug/qwen-image-cplus generate-256-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
-./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
+./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25 none
+./target/debug/qwen-image-cplus generate-1024 viggle.qipack /path/to/model/snapshot output.png "your prompt" 1301
+./target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1301 40 cache-dit-0.16
+./target/debug/qwen-image-cplus pack-metadata transformer.qipack
+./target/debug/qwen-image-cplus pack-metadata transformer.qipack steps=40 cache=taylorseer
 ./target/debug/qwen-image-cplus generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
 ./target/debug/qwen-image-cplus generate-1024-taylorseer transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 1101 40
 ./target/debug/qwen-image-cplus generate-1024-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
@@ -259,8 +265,35 @@ finite execution. A production Q4 path must include the matching transform;
 these numbers answer only whether persistent expansion or destination-tile
 expansion is faster under the full real-weight workload.
 
-The five production generation commands accept `25` or `40` as their final
-optional argument. Omitting it preserves the canonical 40-step behavior. A
+The production generation commands accept `25` or `40` as an optional step
+argument. Omitting it preserves the canonical 40-step behavior, unless pack
+metadata sets `steps`.
+
+`generate-1024 PACK MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [CACHE]` reads
+its defaults from pack metadata (see `docs/packed-format-v1.md`).
+
+- **`STEPS`** accepts 3, 4, 8, 25, or 40. The default is the pack's `steps`,
+  otherwise 40.
+- **`CACHE`** accepts `none`, `taylorseer`, or `cache-dit-0.16`. The default
+  is the pack's `cache`, otherwise `none`.
+- **`shift_terminal=none`** in the pack selects the unstretched schedule
+  that few-step distills need.
+- **Refusals:** caching a `kind=distilled` pack, caching with fewer than 25
+  steps, invalid metadata, a `kind=distilled` pack in any fixed-step command
+  (`generate-256*`, `generate-1024-bottleneck`, the pipeline oracles), and a
+  pack `steps` value the command cannot run. Metadata accepts only
+  `steps=3|4|8|25|40`. `pack-metadata` refuses to write through an
+  inconsistent header, writes in crash-safe stages, and can replace
+  unreadable metadata. `verify-packed` now checks metadata as the loader
+  does. See `docs/packed-format-v1.md`.
+- **Environment switches:** generation refuses `QI_PROFILE_SKIP`. It also
+  refuses `QI_EXPERIMENT_NO_SHIFT_TERMINAL` when the pack states
+  `shift_terminal=0.02`, and `QI_CACHE_DIT_WARMUP` values outside 1-4. Every
+  run prints a `trajectory switches:` and a `VAE switches:` line.
+
+The local base pack carries `kind=base steps=40 shift_terminal=0.02
+cache=taylorseer`. The Viggle pack carries `kind=distilled steps=4
+shift_terminal=none`. Only its file name mentions Viggle. A
 25-step run constructs a fresh 25-step FlowMatch schedule; it does not truncate
 the first 25 points of the 40-step schedule. It reproduces a community ComfyUI
 template choice rather than Qwen's official recommendation. Both 256 and 1024
@@ -865,6 +898,18 @@ Inspect a shard, optionally filtering tensor names:
   are copied into a compact embedding buffer. This is deliberately streaming,
   not a persistent inference cache: every request still reads the weights it
   uses.
+- **Aligned, parallel layer reads (2026-09-23).** Every layer span began at
+  a page-unaligned shard offset (the Safetensors data bases are 49,800,
+  18,528, 18,560 and 5,208 bytes into the shards), so no `F_NOCACHE` read
+  took the direct path. Each span was also read by a single thread, at about
+  3 GB/s (116-133 ms per layer). Spans are now widened to whole 16 KiB pages
+  at 16 KiB-aligned slot offsets (385,908,736 bytes per layer, still inside
+  the 416 MiB slot). Each span is read by eight page-aligned jobs, like the
+  transformer pack copy. Layers now stream in 56-60 ms (about 6.6 GB/s). The
+  1024 text phase fell from 3,978 to 2,275 ms in `generate-1024`, and
+  `test-text-encoder` fell from about 3.1 s to 2,088 ms execution. The
+  bytes and output are unchanged: nRMSE is still 0.0361069, and the Viggle
+  quoted-text PNG SHA-256 is still `be8f75ea...2811`.
 - The latest pre-F3 text timing was 16,242 ms, including 7,208 ms inside the
   four whole-shard `MADV_WILLNEED` calls. A single-slot streaming prototype
   took 4,226 ms, and the accepted two-slot path took **3,145 ms** with the
@@ -976,7 +1021,10 @@ Inspect a shard, optionally filtering tensor names:
   `benchmarks/m1-max-plan4-review-256.json`.
 - Native prompt generation now has real 1024x1024 product paths, not a 256px
   decode followed by upscaling. `generate-1024` runs the reproducible cache-off
-  trajectory; `generate-1024-cache-dit` selects the explicit approximation.
+  trajectory when the pack has no `cache` key or the final argument is
+  `none`. (The local base pack now carries `cache=taylorseer`, so pass
+  `none` to reproduce these cache-off records with it.)
+  `generate-1024-cache-dit` selects the explicit approximation.
   Both derive a centered 64x64 latent grid, 4,096 target rows, prompt-sized
   metadata/RoPE and prefix caches, decode to `[1024,1024,4]`, and write a
   correctly dimensioned RGBA PNG. A one-step diagnostic completed the full
@@ -995,7 +1043,8 @@ Inspect a shard, optionally filtering tensor names:
   outside Git. Native input construction is exact: seeded-noise nRMSE is zero
   and dynamic-RoPE nRMSE is 2.46e-7. Native all-FP16-v4 latents pass the early
   checkpoints at **0.09597%** (step 1) and **0.14312%** (step 2), but diverge
-  to **13.211%** at step 40 against the official BF16 trajectory. This is a
+  to **13.211%** at step 40 against the official BF16 trajectory (13.1609%
+  after the 2026-09-23 timestep-rounding fix). This is a
   newly exposed long-horizon precision limitation; the old 256-only gate did
   not justify calling the 1024 path numerically equivalent.
 
@@ -1125,7 +1174,14 @@ Inspect a shard, optionally filtering tensor names:
     process wall, at a cost of 2.15 GB more peak footprint (7.76 GB).
   - **End to end.** The CASABLANCA 1024/40 Cache-DiT 0.16 run fell from
     145.18 s to **135.55 s**: 3.256 s text, 129.125 s transformer, 2.843 s
-    VAE, and 0.301 s PNG. All text stayed exact.
+    VAE, and 0.301 s PNG. All text stayed exact. A fresh AC-powered run after
+    the current fixed-cost work measured **126.69 s process wall** / 126.266 s
+    internal: 2.323 s text, 121.576 s transformer including a 118.736 s loop,
+    2.223 s VAE, and 0.120 s PNG. It again made 27 cached decisions and kept
+    all text exact. The PNG is not byte-identical to the old baseline because
+    the updated arithmetic paths produce small letter-edge and texture changes;
+    this current-worktree number is therefore a visual product check rather
+    than a bit-exact regression result.
 
   `QI_DISABLE_VAE_MPSGRAPH_CONV=1` restores the custom kernels.
   MPSGraph commit-and-continue fragments GPU timestamps, so wall time is
@@ -1192,14 +1248,28 @@ Inspect a shard, optionally filtering tensor names:
     giving 12 full steps. Result: 134.4 s; the extra C shrank to a stray
     stroke.
 
+  A current fixed-cost-worktree rerun of the original Taylor policy measured
+  **112.64 s process wall** with 11 full and 29 predicted passes, versus
+  126.69 s for the adjacent Cache-DiT 0.16 run. It still rendered
+  `CASABLANCCA`, while Cache-DiT rendered `CASABLANCA` exactly, so the faster
+  result does not change the rejection for this prompt.
+
   The letter count is fixed during early layout. Ordinary Cache-DiT 0.16
   already renders exact text with 13 full steps, so at most about one full
   step (about 7%) remains to win.
+
+  **Superseded judgment:** CASABLANCA was not quoted in that prompt. On the
+  quoted-text prompt, default TaylorSeer (0.24, 11 full steps) renders both
+  strings exactly in 115.1 s. It is the fastest base-model mode and is
+  available as the base pack's metadata default.
 - `QI_PROFILE_SKIP=attention|qkv|attnout|mlp|gate|down` is a profiling-only
   switch. It omits one kind of work from every block, so the change in
   step-2 wall time of `benchmark-transformer-trajectory-1024 ... 2` gives
   that part's cost inside the whole step. Output is meaningless while it is
-  set. On the 8.8-8.9 s cached 1024 step:
+  set, so every generation command refuses it; only the transformer-only
+  benchmarks accept it. Every trajectory prints a `trajectory switches:`
+  line with the state of each `QI_*` switch that can change its output, and
+  the VAE prints a `VAE switches:` line. On the 8.8-8.9 s cached 1024 step:
 
   | Part | Time per step | Share of step | % of peak |
   | --- | ---: | ---: | ---: |
@@ -1309,8 +1379,21 @@ Inspect a shard, optionally filtering tensor names:
   custom FP16-weight/FP32-input projection. Smaller resolutions retain that
   custom projection for their better numerical behavior.
 
+  **Prefill row split (2026-09-23).** The joint prefill layout is
+  `[text rows][4,096 image rows]`. The prefill now runs the MPS projection
+  on exactly the trusted 4,096-row shape: the left operand is offset by
+  `text_rows * 8192` bytes and the output by `text_rows * 16384` bytes. The
+  custom kernel handles only the 31-32 text rows. The split is finite. The
+  1024 two-step oracle is unchanged at 0.000959688 / 0.0014312 nRMSE, and the
+  Viggle quoted-text PNG is byte-identical. The earlier failure was
+  therefore tied to MPS on the ragged 4,127/4,128-row shape, not to
+  overflowing text-row activations. Across two ABBA pairs, step 1 fell from
+  9,537-9,552 ms to 8,897-8,901 ms (-0.65 s per image). Cached steps are
+  unchanged.
+
   The official 256 1-, 2-, and 40-step trajectory gates pass at 0.08727%,
-  0.12607%, and **1.07623%** nRMSE, respectively, under their unchanged limits;
+  0.12607%, and **1.07623%** nRMSE, respectively, under their unchanged limits
+  (the 40-step value is now 0.834196%; see "Timestep rounding" below);
   the 40-step loop measured 20.934 s wall. Cache-DiT 0.24 retained 27 cached
   steps and measured 7.494 s wall with 10.0293% approximation nRMSE. The full
   native prompt-to-PNG regression also passes with zero Q8 dispatches at
@@ -1402,9 +1485,12 @@ Inspect a shard, optionally filtering tensor names:
   unchanged `quantize-transformer` packed it after its single file was split
   into the base two-shard layout; the source round-trip passed. The pack
   header still names the base snapshot because the loader requires it, so
-  that pack is experiment-only. Running it needs two opt-in switches:
-  `generate-1024 ... 1301 4` and `QI_EXPERIMENT_NO_SHIFT_TERMINAL=1`, which
-  reproduces the checkpoint's `shift_terminal: null` schedule.
+  that pack is experiment-only. At the time, running it needed two opt-in
+  switches: `generate-1024 ... 1301 4` and
+  `QI_EXPERIMENT_NO_SHIFT_TERMINAL=1`, which reproduces the checkpoint's
+  `shift_terminal: null` schedule. Both are now pack metadata. The
+  environment switch applies only to packs that do not state
+  `shift_terminal`, and it is refused when a pack states `0.02`.
 - With the `CASABLANCA` prompt at seed 1301, on AC with the battery charging:
 
   | 1024 path | Full / cached steps | Loop | End to end | `CASABLANCA` |
@@ -1415,36 +1501,235 @@ Inspect a shard, optionally filtering tensor names:
   | Base, 40 + Cache-DiT 0.16 (earlier) | 13 / 27 | 122.601 s | 145.18 s | exact |
 
   Per-step cost is identical across checkpoints (about 9 s). The distill is
-  therefore 2.5x faster than the fastest exact-text path. It fails the text
-  gate the same way TaylorSeer and Cache-DiT 0.24 did: composition survives
-  while exact lettering breaks. At four steps, the VAE, transformer setup,
+  therefore 2.5x faster than the fastest exact-text path.
+
+  **Superseded judgment:** this prompt does not quote CASABLANCA, so its
+  absence was not a failure. On the quoted-text prompt, Viggle's HF Space and
+  this runtime both render every string exactly. The pack is now adopted and
+  identified by pack metadata, not by environment switches. See "Current
+  records" below. At four steps, the VAE, transformer setup,
   and text take 38% of the total. They become the next targets if a later
   distill passes. These are single-prompt, single-seed observations. Details
   and checksums are in `benchmarks/m1-max-viggle-turbo-4step-1024.json`.
 
 ## Remaining optimization phases
 
-**Current reference (2026-09-23).** The fastest 1024x1024 mode that renders
-the `CASABLANCA` poster text exactly is 40 steps with Cache-DiT 0.16. Its
-most recent run took **133.3 s end to end**, down from 145.18 s.
+**Current records (2026-09-23).** These are 1024x1024 end-to-end runs using
+the quoted-text test prompt `a travel poster with the headline "CASABLANCA"
+and the tagline "MEET ME AT SUNSET"` at seed 1301:
+
+| Pack / mode | Full steps | End to end | Text |
+| --- | ---: | ---: | --- |
+| **Viggle distill, 4 steps (adopted default model)** | 4 | **38.2 s** (48.7 s before the fixed-cost pass) | exact |
+| **Base, TaylorSeer** | 11 | **115.1 s** | exact |
+| Base, Cache-DiT 0.16 | 13 | 135.8 s | exact |
+| Base, Cache-DiT 0.24 | 13 | 169.8 s (thermally confounded) | exact |
+
+The base-pack runs had 5-7 GB of swap in use, which raised weight loading
+from about 2.4 s to about 5 s. With free memory they would be about 2.5 s
+faster. The Viggle record streams its block weights (see the fixed-cost pass
+below), so it no longer pays that penalty.
+
+A fresh-process AC-powered confirmation of the adopted Viggle path measured
+**39.32 s process wall** / 39.314 s internal: 2.288 s text, 34.672 s
+transformer including a 34.370-second four-step loop, 2.203 s VAE, and 0.126 s
+PNG. Its output is byte-identical to the 38.18-second record, keeps both quoted
+strings exact, uses no swap, and peaks at 7.04 GB process footprint. The
+repeatable observed range is therefore about 38-39 seconds.
 
 - **VAE:** fell from 10.2 to 2.8 s after moving convolution to MPSGraph.
 - **Startup:** fell by about 4 s after replacing the pack mapping with a
   parallel `pread` copy.
-- **Machine state:** that run happened under about 5 GB of swap pressure.
+- **Fixed-cost pass (2026-09-23, from `fable-max-review.md`).** Same
+  Viggle run, same machine, 5.8 GB swap in use:
 
-About 113 s of the remainder is the 13 full transformer steps. MPS GEMMs
-already run them at 76-88% of peak (see the 1024 step ablation profile).
-Attention runs at 62%, but the only faster-kernel candidate, Metal
-FlashAttention, was slower on this compiler.
+  | Phase | Before | After | Change |
+  | --- | ---: | ---: | --- |
+  | Text | 3,978 ms | 2,275-2,310 ms | page-aligned, 8-way parallel layer reads |
+  | Step 1 (prefill) | 9,537-9,552 ms | 8,897-8,901 ms | attention-output row split (ABBA, benchmark) |
+  | VAE | 2,752-3,038 ms | 2,133 ms | MPS FP32 attention; weights copied by parallel `pread` |
+  | PNG | 299-304 ms | 121-126 ms | table CRC-32, deferred Adler-32, bulk chunk copy |
+  | Pack setup | 2,018-4,743 ms | 169-205 ms | block-weight ring (below) |
+  | Cached steps | 8,704-8,742 ms | 8,169-8,183 ms | steel attention (below) |
+  | End to end | 48.46 s | **38.18-38.21 s** | two quiet-GPU runs |
+  | Process peak footprint | 15.73 GB | **7.04 GB** | ring, VAE upsample scratch |
 
-Every approach that ran fewer full steps has broken exact text so far:
+  The baseline's pack load was 4.74 s under swap, against a 2.0-2.3 s
+  swap-free copy, so about 2.5 s of the end-to-end gain is swap
+  variance. Full numbers, SHA-256s and gates are in
+  `benchmarks/m1-max-viggle-4step-1024-fixed-cost.json`. Text and PNG changes are byte-identical,
+  and so is the prefill split, whose PNG SHA-256 stayed
+  `be8f75ea...2811`. The VAE attention change moves 45 of 4,194,304 RGBA
+  bytes by one level (PSNR 96.6 dB); that image's SHA-256 is
+  `337c16d9...a8a0`. Steel attention changes the image slightly (PSNR
+  38.5 dB), and both quoted strings stay exact. The current reference PNG
+  SHA-256 is `b4c54100...0970`.
+  - **Review items not applied.**
+    - S3 graph precompilation: MPSGraph's first-use compile cannot be
+      separated from GPU time in this profile, so it is unmeasured.
+    - S6 early layer-0 read: layer 0 now reads in about 66 ms, so there
+      is little left to hide.
+    - S7 mask-free prefill: subsumed by the steel prefill. Its 34 MB mask
+      is still built (about 54 ms at startup) for the fallback path.
+    - S8 scalar final LayerNorm and per-step lookups: small, and the
+      LayerNorm change would alter reduction order. Per-block commits
+      under the ring now hide the lookups.
+    - S10 pack/text overlap: superseded by S1 and the ring.
+    - S11 resident mode: only helps batched prompts.
+    - M3: conflicts with the upsample scratch reuse.
+    - M4 activation aliasing: the transformer is no longer the peak phase.
+    - M5 transformer placeholders: never resident, so there is nothing to
+      free.
+    - M6 Q8-on-disk: superseded by the ring.
+    - B11 saturating FP16 stores: a clamp would turn a loud non-finite
+      abort into silently wrong values. No prompt has overflowed.
+    - B12 payload-bound metadata checksum: a format change. Instead,
+      every trajectory now prints a `trajectory pack:` line with the
+      pack's metadata.
+  - **Viggle schedule check.** Viggle's HF Space runs `steps=4` with
+    `sigmas=None`, `shift_terminal=None` and `true_cfg_scale=1.0`. That is
+    the default `linspace(1, 1/4)` with the resolution mu shift and no
+    terminal stretch, giving model timesteps 1000 / 857.19 / 666.76 /
+    400.10. This matches `src/scheduler.cplus` and its unit test, and
+    confirms that CFG stays off. Viggle has since published a 5-step
+    rank-256 LoRA (v0.2) whose card recommends explicit nodes
+    `[1.0, 0.875, 0.75, 0.5, 0.25]`. Running it would need a `sigmas=`
+    metadata key and a pack-time LoRA merge. It would be a quality
+    candidate, not a speed one.
+  - **Block-weight ring.** The all-FP16 pack stores the 272 MB of global
+    tensors first, then each block's nine tensors contiguously
+    (436,224,000 bytes per page-widened block). The production batched
+    loop now copies only that global prefix and streams each block into
+    one of three ring slots. It uses the same 8-way `F_NOCACHE` reads, two
+    blocks ahead of the GPU. Every block is its own command buffer, and a
+    slot is refilled only after the command buffer that last read it has
+    completed. The ring reads 14 GB per step at about 7 GB/s behind an
+    8.6 s GPU step. In two adjacent ABAB pairs of
+    `benchmark-transformer-trajectory-1024 viggle 4`, the loop measured
+    34,770/34,800 ms against 34,670/34,688 ms resident (+0.1 s), and pack
+    setup fell from 2,257/2,275 ms to 175/180 ms. The 1024 two-step oracle
+    is identical to every printed digit (0.000959688 / 0.0014312). Its
+    peak footprint fell from 15,685,742,208 to 3,119,712,944 bytes. The
+    Viggle PNG is byte-identical. Because the pack is no longer the
+    largest allocation, the 5-7 GB swap penalty on pack loading no longer
+    applies. The ring covers the cache-off batched 1024px path on all-FP16
+    packs, which is the adopted Viggle path. At 256px its cached step
+    measured about 1.9 s with the ring versus 0.58 s resident, so smaller
+    resolutions use the resident copy by default. `QI_ENABLE_WEIGHT_RING=1`
+    opts into streaming there to save memory. Cache-DiT/TaylorSeer, Q4,
+    profiling and per-block validation runs keep the resident copy.
+    `QI_DISABLE_WEIGHT_RING=1` restores it everywhere and overrides the
+    opt-in. The trajectory startup line reports the ring choice, slot size
+    and resident bytes. Per-step lines include ring read and slot wait times;
+    `gpu_ms` includes completed ring block command buffers.
+  - **Timestep rounding (precision fix).** The pinned pipeline casts the
+    scheduler timestep to the BF16 latent dtype and then divides by 1000
+    in BF16, so the model sees `bf16(bf16(t) / 1000)`. The runtime rounded
+    only once, `bf16(t / 1000)`. That is one BF16 ulp off on 15 of the 40
+    base-pack steps at 256 and 12 of 40 at 1024. The four Viggle timesteps
+    are unaffected, so its PNG is unchanged. With the pipeline's rounding,
+    the official 256 40-step oracle falls from 1.07623% to **0.834196%**
+    final-latent nRMSE (limit 1.1%); steps 1 and 2 are unchanged.
+  - **Steel attention for cached steps.** MLX's steel attention kernel
+    (`ml-explore/mlx` v0.32.2, MIT; flattened into
+    `kernels/mlx_steel_attention.metal`) uses only `simdgroup_matrix`
+    operations, so it compiles here, unlike Metal FlashAttention. At the
+    cached 1024 shape (4,096 queries x 4,127-4,128 keys, 32 heads, D 128,
+    FP16), MLX's own SDPA measured 36.4-40.8 ms per block against about
+    49.5 ms for MPSGraph. The runtime now runs the FP16/D128 instantiation
+    (BQ 32, BK 16, four simdgroups) on every cached step. It reads the
+    FP16 K/V the MPSGraph path already prepares. It writes FP16 output
+    straight into the attention-output GEMM's half input, which also
+    removes the FP32 round trip and conversion dispatch. The masked
+    prefill step keeps MPSGraph. The 1024 two-step oracle's step 2 measures
+    0.00143106 (MPSGraph 0.0014312; limit 0.0015). The Viggle quoted-text
+    image still renders both strings exactly (PSNR 38.5 dB against the
+    MPSGraph image). In two ABAB pairs of the 4-step benchmark, the loop
+    fell from 35,566/35,857 ms to 34,045/34,597 ms (about -1.4 s per
+    image; cached steps about -0.45 s each). `QI_DISABLE_STEEL_ATTENTION=1`
+    restores MPSGraph SDPA.
 
-| Approach | End to end | Text result |
-| --- | ---: | --- |
-| Viggle 4-step distill | 57.7 s | CASABLANCA missing |
-| TaylorSeer | 125.6 s | `CASABLANCCA` |
-| 25 steps with Cache-DiT | 116.1 s | `CASABLANCHA` |
+    The masked prefill splits into two unmasked problems. The 4,096 image
+    queries see every key, so they use the cached kernel. The 31-32 text
+    queries use a causal specialization over the text keys only, which is
+    exactly the prefill mask. The text rows' attention output is then FP16,
+    so it goes through its own small MPS multiplication instead of the
+    custom FP32-input kernel. The 1024 two-step oracle improves to
+    0.000954478 / 0.00142946 (previously 0.000959688 / 0.00143106).
+    **It is slower, so it is opt-in (`QI_STEEL_PREFILL=1`).** On a quiet
+    GPU (0% utilization between runs, 30 s pauses), the 4-step loop measured
+    41,097-44,013 ms with it and 33,483-40,629 ms without. Every later
+    cached step slowed as well, to 10.2-11 s against 8.18 s, although the
+    cached code path is identical. The mechanism is not understood. The
+    graph-based prefill stays the default.
+  - **MPS weight layout (rejected).** Every block GEMM binds weights as
+    `[out, in]` with `transposeRight = YES`. A throwaway spike timed the
+    production M = 4096 shapes with synthetic FP16 data against weights
+    stored `[in, out]` (`transposeRight = NO`), ten multiplications per
+    command buffer, in two ABBA passes. QKV/gate (N 12,288, K 4,096)
+    changed by -2.4% to +0.2%, and attention-out (4,096 x 4,096) by -0.6%
+    to -0.4%. The down projection (K 12,288) became 1.43-1.91x slower.
+    MPS's kernel selection does not favour the other layout, so rewriting
+    the pack is not worth it, and the spike was removed. The down
+    projection remains the least efficient shape (about 5.8 against
+    8.6 TFLOP/s).
+  - **Sustained load.** A 1024/40 base-pack oracle run with the ring
+    rose from 8.6 s to 12-13 s per step over 40 steps. This matches the
+    earlier sustained-load record (hot 25-step cached average 12.9 s) and
+    does not reach the 4-step path.
+  - **VAE attention.** The middle-block attention was one threadgroup per
+    query, with a 7-level barrier reduction for every key: 253.6 ms. It is
+    now scores = QK^T / sqrt(C) (FP32 MPS GEMM over strided column slices
+    of the qkv buffer), an in-place row softmax, then P V (FP32 MPS GEMM):
+    10.2 ms. The official 1024 VAE oracle improved from 2.25238e-07 to
+    2.19341e-07. The 256 oracle moved from 2.42725e-07 to 2.43162e-07
+    (limit 3e-06), and the small-fixture middle block measures 1.92e-07
+    (limit 1e-06). `QI_DISABLE_VAE_MPS_ATTENTION=1` restores the old
+    kernel. The score matrix adds 64 MiB of scratch at 1024.
+  - **VAE weights.** A no-copy mapping makes the first dispatch fault and
+    wire 1.26 GiB inside the decode. With warm pages the copy saves only
+    about 25 ms. After the transformer phase has evicted them, it saves
+    about 0.37 s (221 + 1,781 ms versus 1 + 2,373 ms).
+    `QI_DISABLE_VAE_PREAD=1` restores the mapping.
+  - **VAE memory.** The fused `resize -> conv2d -> bias` upsample graphs
+    made MPSGraph materialise every nearest-2x resize output (75.5 + 302
+    + 604 + 1,208 MB). A small `vae_nearest_upsample_2x` kernel now writes
+    that tensor into `buffer_c`, which is dead scratch at every upsampler,
+    and a plain conv graph runs at the doubled shape. The upsample
+    boundaries and the 1024 oracle are unchanged to every printed digit.
+    Timing is unchanged. The unused 81 MiB parity-packed upsample buffer is
+    no longer allocated on the MPSGraph path. VAE-phase peak footprint
+    (`test-vae-decoder ... trajectory-1024`) was 7,757,677,312 bytes at
+    HEAD and 9,176,844,016 bytes with the weight copy. It is now
+    **6,985,303,768 bytes**, 0.77 GB below HEAD. The review's `buffer_c`
+    narrowing (M3) conflicts with this reuse and was not applied.
+  - **VAE timing line.** `VAE timing:` splits the phase. Setup is under
+    0.1 s. The rest is one commit/wait of about 1.8 s. The per-dispatch
+    profile cannot separate MPSGraph's first-use compile from GPU time, so
+    the review's graph precompilation item remains unmeasured.
+
+A full 1024 transformer step costs about 8.8 s on either pack (about 8.2 s
+for cached steps with steel attention, below). MPS GEMMs run it at 76-88% of
+peak (see the 1024 step ablation profile). Attention ran at 62% with
+MPSGraph. Metal FlashAttention was slower on this compiler, but MLX's steel
+attention kernel is about 25% faster and now runs the cached steps. Further
+large gains still come from fewer full steps.
+
+**Test prompt correction.** Earlier today, text was judged with the old
+prompt: `A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET',
+bold geometric lettering.` That prompt quotes only `MEET ME AT SUNSET`, so
+leaving CASABLANCA out was not an error; only misspellings count.
+
+- **Re-judged on the new prompt:** Viggle and TaylorSeer both pass.
+- **Still invalid:** 25 steps with Cache-DiT misspelled CASABLANCA
+  (`CASABLANCHA`) after choosing to render it.
+- **Viggle step counts:** 3 steps (39.5 s) added a garbled extra text line.
+  8 steps (80.2 s) was clean but slower than 4.
+- **Caching the distill:** Cache-DiT cannot cache the 4-step distill. Its
+  consecutive steps differ by 0.28-0.32 relative L1, far above any usable
+  threshold. That measurement used `QI_CACHE_DIT_WARMUP=N`, which lowers
+  the four full warmup steps. It is read once per trajectory, printed in the
+  `trajectory switches:` line, and must be 1-4. Any other value is refused.
 
 The native-quality product target is now 2048x2048; 1024x1024 remains the
 practical performance mode and the largest completed runtime path. Before any
@@ -1505,17 +1790,18 @@ evidence:
    after every aliasing change so transformer, text, and VAE phases remain safe
    on the 32 GB M1 Max. The default MPSGraph convolution path raises the
    1024 VAE peak to 7,758,496,536 bytes, about 2.15 GB of internal graph
-   scratch. When MPSGraph is active, the 170 MiB parity-packed upsample
-   weight buffer is unused and could be skipped.
+   scratch. When MPSGraph is active, the 81 MiB (84,934,656-byte)
+   parity-packed upsample weight buffer is unused and could be skipped.
 5. **Shared startup and small-kernel work.** Text layer streaming has completed
    Plan-5 F3: the measured text working set is below 1 GB and standalone text
    time fell from 16,242 to 3,145 ms without changing output.
    - **Transformer setup, diagnosed 2026-09-23.** The former 6.5-7.5 s was
      almost entirely the first dispatch wiring the no-copy pack. The parallel
      `pread` copy reduces it to 2.3-2.6 s.
-   - **Next candidate.** Overlap that copy with the roughly 3 s text phase.
-     It shares SSD bandwidth with text streaming, so the realistic saving is
-     about 1 s. Whole-shard text
+   - **Text reads now run near SSD speed.** Aligned, parallel layer reads
+     cut the text phase to about 2.3 s. Overlapping the pack copy with it
+     would now compete for the same saturated SSD, so it is no longer a
+     candidate. Whole-shard text
    readahead is superseded; tensor-order `madvise`, broad text Q8, four-query
    attention at 256, and blanket 256-thread elementwise groups stay rejected
    unless new evidence changes their tradeoffs.

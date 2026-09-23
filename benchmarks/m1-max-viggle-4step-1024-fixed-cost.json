@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "machine": "Apple M1 Max, 32 GB unified memory, AC power, battery charged; 5.7-5.8 GB swap in use",
+  "model": "Qwen/Qwen-Image-2.1",
+  "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+  "scope": "Fixed-cost pass over the adopted 4-step path, from fable-max-review.md: generate-1024 on models/qwen-image-2.1-viggle-turbo-EXPERIMENT-fp16-v4.qipack (pack metadata kind=distilled steps=4 shift_terminal=none), cache off",
+  "input": {
+    "prompt": "a travel poster with the headline \"CASABLANCA\" and the tagline \"MEET ME AT SUNSET\"",
+    "seed": 1301,
+    "pixels": 1024,
+    "model_timesteps": [1000, 857.192, 666.756, 400.096]
+  },
+  "baseline": {
+    "description": "Working tree before the pass (HEAD 2c05154 plus metadata/CLI diff)",
+    "pipeline_ms": {"text": 3978, "pack_setup": 4743, "step_walls": [9578, 8706, 8704, 8742], "transformer_phase": 41112, "vae": 3038, "png": 304, "end_to_end": 48456},
+    "peak_memory_footprint_bytes": 15725964976,
+    "png_sha256": "be8f75eacfbff0564b47a88ea50b6ebefd457cb870c6397068981b18299e2811"
+  },
+  "after_ring": {
+    "description": "Aligned parallel text reads, prefill attention-output row split, VAE MPS attention and pread weights, VAE upsample scratch reuse, PNG writer, block-weight ring; MPSGraph SDPA",
+    "pipeline_ms": {"text": 2285, "pack_setup": 169, "step_walls": [8795, 8586, 8587, 8591], "transformer_phase": 34848, "vae": 2108, "png": 121, "end_to_end": 39387},
+    "process_wall_seconds": 39.39,
+    "peak_memory_footprint_bytes": 7233587000,
+    "png_sha256": "337c16d9fee463ac01c0548b40f4f16dcf17b81bc781de207fecdedd6145a8a0",
+    "png_vs_baseline": "45 of 4,194,304 RGBA bytes differ by one level (PSNR 96.6 dB), from the VAE attention change; everything else byte-identical",
+    "text_judgement": "both quoted strings exact"
+  },
+  "steel_attention_cached_steps": {
+    "description": "MLX steel attention (v0.32.2, MIT) replaces MPSGraph SDPA on cached steps",
+    "benchmark": "benchmark-transformer-trajectory-1024 viggle 4, ABAB",
+    "loop_ms_steel": [34045, 34597],
+    "loop_ms_mpsgraph": [35566, 35857],
+    "oracle_1024_two_step_nrmse": [0.000959688, 0.00143106],
+    "png_sha256": "b4c54100ffb995feae6a0b3aef7b9e07120b78daf84cfc82d07dbcf907230970",
+    "png_vs_mpsgraph_psnr_db": 38.54,
+    "text_judgement": "both quoted strings exact",
+    "caveat": "The machine was warm after a 1024/40 oracle run; the single end-to-end run measured 39.52 s with steps 3-4 at 8.5-8.9 s"
+  },
+  "final_default": {
+    "description": "All of the above plus steel attention on cached steps; prefill on MPSGraph. Quiet GPU, 30 s pause before each run",
+    "pipeline_ms": [
+      {"text": 2294, "step_walls": [8793, 8183, 8183, 8173], "transformer_phase": 33631, "vae": 2138, "png": 124, "end_to_end": 38212},
+      {"text": 2271, "step_walls": [8794, 8183, 8169, 8178], "transformer_phase": 33625, "vae": 2135, "png": 124, "end_to_end": 38179}
+    ],
+    "peak_memory_footprint_bytes": [7040681808, 7040747416],
+    "png_sha256": "b4c54100ffb995feae6a0b3aef7b9e07120b78daf84cfc82d07dbcf907230970",
+    "text_judgement": "both quoted strings exact"
+  },
+  "powered_confirmation": {
+    "description": "Fresh-process end-to-end confirmation after rebuilding the current worktree; AC power, battery charged at 100%",
+    "pipeline_ms": {
+      "text": 2288,
+      "transformer_startup": 302,
+      "step_walls": [8929, 8431, 8437, 8559],
+      "transformer_loop": 34370,
+      "transformer_phase": 34672,
+      "vae": 2203,
+      "png": 126,
+      "end_to_end": 39314
+    },
+    "process_wall_seconds": 39.32,
+    "maximum_resident_set_bytes": 1693237248,
+    "peak_memory_footprint_bytes": 7041337192,
+    "swaps": 0,
+    "png_sha256": "b4c54100ffb995feae6a0b3aef7b9e07120b78daf84cfc82d07dbcf907230970",
+    "png_vs_final_default": "byte-identical",
+    "text_judgement": "both quoted strings exact",
+    "interpretation": "1.14 seconds slower than the 38.18-second best run but confirms the same output and roughly 38-39-second operating range"
+  },
+  "steel_attention_prefill": {
+    "oracle_1024_two_step_nrmse": [0.000954478, 0.00142946],
+    "png_sha256": "f9bb1ab9f5f89c87c31c5f67894de01f322d64e5d78edd360dc9a59c85bcdc98",
+    "png_vs_cached_only_steel_psnr_db": 35.62,
+    "text_judgement": "both quoted strings exact",
+    "loop_ms_with_steel_prefill": [41097, 44013, 43656, 41797],
+    "loop_ms_without": [33483, 33483, 40629, 35142],
+    "verdict": "slower overall, and later cached steps slow to 10.2-11 s although their code path is unchanged; mechanism unknown; kept opt-in as QI_STEEL_PREFILL=1, off by default"
+  },
+  "gates": {
+    "text_encoder_nrmse": 0.0361069,
+    "vae_1024_oracle_nrmse": 2.19341e-07,
+    "vae_256_oracle_nrmse": 2.43162e-07,
+    "trajectory_256_nrmse_steps_1_2_40": [0.000872739, 0.00126067, 0.00834196],
+    "trajectory_1024_step_40_nrmse": 0.131609,
+    "note": "The 256/40 and 1024/40 values include the BF16 timestep double-rounding fix (previously 0.0107623 and 0.13211)"
+  }
+}

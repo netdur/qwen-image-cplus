@@ -201,6 +201,13 @@ struct MpsWorkspace {
     half_input: metal::Buffer,
     half_weight: metal::Buffer,
     direct_half_activations: bool,
+    // MLX steel attention for the 1024 cached (unmasked) shape; see
+    // create_steel_attention_pipeline.
+    steel_attention: metal::ComputePipelineState,
+    // Causal specialization for the prefill's text queries.
+    steel_causal_attention: metal::ComputePipelineState,
+    use_steel_attention: bool,
+    steel_key_rows: usize,
 }
 
 struct CacheDiffResult {
@@ -602,6 +609,7 @@ fn encode_mps_input_conversion(
     output: metal::Buffer,
     rows: usize,
     input_columns: usize,
+    output_offset: u64 = 0 as u64,
 ) {
     var params: LinearParams = LinearParams {
         rows: rows as u32,
@@ -611,7 +619,7 @@ fn encode_mps_input_conversion(
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(input, 0 as u64, 0 as u64);
-    encoder.set_buffer(output, 0 as u64, 1 as u64);
+    encoder.set_buffer(output, output_offset, 1 as u64);
     encoder.set_bytes(
         #addr_of(params) as *u8, #size_of::[LinearParams]() as u64, 2 as u64,
     );
@@ -1666,8 +1674,9 @@ fn read_packed_storage_buffer(
     device: metal::Device,
     path: str,
     file: packed::File,
+    prefix_length: usize = 0 as usize,
 ) -> option::Option[metal::Buffer] {
-    let length: usize = file.length();
+    let length: usize = if prefix_length > (0 as usize) { prefix_length } else { file.length() };
     guard let option::Option[metal::Buffer]::Some(buffer) = new_buffer(
         device, round_up(length, VM_PAGE_BYTES) as u64,
     ) else { return option::Option[metal::Buffer]::None; };
@@ -1704,6 +1713,301 @@ fn read_packed_storage_buffer(
     }
     if !ok { return option::Option[metal::Buffer]::None; }
     return option::Option[metal::Buffer]::Some(buffer);
+}
+
+// Block-weight ring. The all-FP16 pack stores the global tensors first and
+// then each block's nine tensors contiguously (about 436 MB per block). The
+// production batched loop keeps only the global prefix resident and streams
+// block b of every step into slot (global block index % WEIGHT_RING_SLOTS)
+// with the same parallel F_NOCACHE reads, one block ahead of the GPU. Each
+// block is its own command buffer; a slot is refilled only after the command
+// buffer that last read it has completed. Bytes and offsets within a block
+// are unchanged. The ring is the default at 1024px; smaller resolutions use
+// it only with QI_ENABLE_WEIGHT_RING=1. QI_DISABLE_WEIGHT_RING=1 wins over
+// that opt-in and restores the resident pack copy.
+const WEIGHT_RING_SLOTS: usize = 3;
+
+struct RingRegion {
+    file_begin: u64,
+    length: usize,
+    // Unaligned extent of the block's tensors, for layout checks.
+    tensor_begin: u64,
+    tensor_end: u64,
+}
+
+struct RingReadJob {
+    fd: i32,
+    opaque destination: *u8,
+    offset: u64,
+    length: usize,
+}
+
+impl RingReadJob: Send {}
+
+fn read_ring_region(take job: RingReadJob) -> i64 {
+    let chunk: usize = round_up(job.length / PACK_READ_THREADS +% (1 as usize), VM_PAGE_BYTES);
+    var handles: vec::Vec[thread::JoinHandle[i64]] =
+        vec::Vec[thread::JoinHandle[i64]]::with_capacity(PACK_READ_THREADS);
+    var ok: bool = true;
+    var start: usize = 0 as usize;
+    while start < job.length {
+        let count: usize = if job.length -% start < chunk { job.length -% start } else { chunk };
+        let handle: thread::JoinHandle[i64] = thread::spawn_with::[PackReadJob, i64](
+            PackReadJob {
+                fd: job.fd,
+                destination: job.destination + start,
+                offset: job.offset +% start as u64,
+                length: count,
+            },
+            read_pack_job,
+        );
+        if handles.append(handle) != status::Status::Ok {
+            ok = false;
+            break;
+        }
+        start = start +% count;
+    }
+    while handles.count() > (0 as usize) {
+        guard let option::Option[thread::JoinHandle[i64]]::Some(handle) = handles.remove_last() else {
+            return -1 as i64;
+        };
+        if handle.join() != (0 as i64) { ok = false; }
+    }
+    return if ok { 0 as i64 } else { -1 as i64 };
+}
+
+struct WeightRing {
+    reader: mapped::PositionalReader,
+    opaque slots: [*u8; 3],
+    opaque inflight: [*u8; 3],
+    regions: [RingRegion; 32],
+    reads: vec::Vec[thread::JoinHandle[i64]],
+    next_read: usize,
+    expected_next: usize,
+    total: usize,
+    ok: bool,
+    gpu_ms: f64,
+    acquire_wait_ms: i64,
+    retire_wait_ms: i64,
+}
+
+impl WeightRing {
+    fn slot(this, global_block: usize) -> metal::Buffer {
+        return metal::Buffer::from_raw(this.slots[global_block % WEIGHT_RING_SLOTS]);
+    }
+
+    fn region(this, global_block: usize) -> RingRegion {
+        return this.regions[global_block % (32 as usize)];
+    }
+
+    // Waits for the command buffer that last read `slot`, then releases it.
+    fn retire(ref this, slot: usize) {
+        if !this.inflight[slot].is_null() {
+            let start_ms: i64 = time::now_millis();
+            let command_buffer: metal::CommandBuffer = metal::CommandBuffer::from_raw(this.inflight[slot]);
+            command_buffer.wait_until_completed();
+            this.retire_wait_ms = this.retire_wait_ms +% time::now_millis() -% start_ms;
+            this.gpu_ms = this.gpu_ms +
+                (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64;
+            rt::release(this.inflight[slot]);
+            this.inflight[slot] = 0 as *u8;
+        }
+    }
+
+    // Issues reads in global block order until `limit` (exclusive).
+    fn issue_until(ref this, limit: usize) {
+        while this.next_read < limit && this.next_read < this.total {
+            let slot: usize = this.next_read % WEIGHT_RING_SLOTS;
+            this.retire(slot);
+            let region: RingRegion = this.region(this.next_read);
+            // Reserve before spawning so a failed allocation cannot drop a
+            // running read whose destination belongs to this ring.
+            if this.reads.reserve(1 as usize) != status::Status::Ok {
+                this.ok = false;
+                return;
+            }
+            let handle: thread::JoinHandle[i64] = thread::spawn_with::[RingReadJob, i64](
+                RingReadJob {
+                    fd: this.reader.descriptor(),
+                    destination: metal::Buffer::from_raw(this.slots[slot]).contents(),
+                    offset: region.file_begin,
+                    length: region.length,
+                },
+                read_ring_region,
+            );
+            if this.reads.append(handle) != status::Status::Ok {
+                this.ok = false;
+                return;
+            }
+            this.next_read = this.next_read +% (1 as usize);
+        }
+    }
+
+    // Returns once block `global_block`'s weights are in its slot. Blocks
+    // must be acquired in order.
+    fn acquire(ref this, global_block: usize) -> bool {
+        if global_block != this.expected_next { return false; }
+        this.issue_until(global_block +% (1 as usize));
+        guard let option::Option[thread::JoinHandle[i64]]::Some(handle) = this.reads.remove(0 as usize) else {
+            return false;
+        };
+        let start_ms: i64 = time::now_millis();
+        let read_ok: bool = handle.join() == (0 as i64);
+        this.acquire_wait_ms = this.acquire_wait_ms +% time::now_millis() -% start_ms;
+        if !this.ok || !read_ok { return false; }
+        this.expected_next = this.expected_next +% (1 as usize);
+        return true;
+    }
+
+    // Records the committed command buffer that reads `global_block`'s slot
+    // and starts the read that the ring can now fit.
+    fn committed(ref this, global_block: usize, command_buffer: metal::CommandBuffer) {
+        let slot: usize = global_block % WEIGHT_RING_SLOTS;
+        this.retire(slot);
+        this.inflight[slot] = rt::retain(command_buffer.raw());
+        this.issue_until(global_block +% WEIGHT_RING_SLOTS);
+    }
+
+    fn retire_all(ref this) {
+        var slot: usize = 0 as usize;
+        while slot < WEIGHT_RING_SLOTS {
+            this.retire(slot);
+            slot = slot +% (1 as usize);
+        }
+    }
+
+    fn take_gpu_ms(ref this) -> f64 {
+        let elapsed: f64 = this.gpu_ms;
+        this.gpu_ms = 0.0f64;
+        return elapsed;
+    }
+
+    fn take_acquire_wait_ms(ref this) -> i64 {
+        let elapsed: i64 = this.acquire_wait_ms;
+        this.acquire_wait_ms = 0 as i64;
+        return elapsed;
+    }
+
+    fn take_retire_wait_ms(ref this) -> i64 {
+        let elapsed: i64 = this.retire_wait_ms;
+        this.retire_wait_ms = 0 as i64;
+        return elapsed;
+    }
+
+    fn drop(ref this) {
+        while this.reads.count() > (0 as usize) {
+            guard let option::Option[thread::JoinHandle[i64]]::Some(handle) = this.reads.remove_last() else {
+                break;
+            };
+            let _status: i64 = handle.join();
+        }
+        var slot: usize = 0 as usize;
+        while slot < WEIGHT_RING_SLOTS {
+            this.retire(slot);
+            if !this.slots[slot].is_null() {
+                rt::release(this.slots[slot]);
+                this.slots[slot] = 0 as *u8;
+            }
+            slot = slot +% (1 as usize);
+        }
+    }
+}
+
+// The byte range [begin, end) covering block `block`'s nine tensors, widened
+// to whole pages. None when the pack does not have the contiguous layout.
+fn ring_block_region(file: packed::File, block: usize) -> option::Option[RingRegion] {
+    let prefix: text::Text = "transformer_blocks.${block}.";
+    var names: [text::Text; 9] = [
+        "${prefix}attn.norm_k.weight", "${prefix}attn.norm_q.weight",
+        "${prefix}attn.to_q.weight", "${prefix}attn.to_k.weight",
+        "${prefix}attn.to_v.weight", "${prefix}attn.to_out.0.weight",
+        "${prefix}img_mlp.gate_layer.weight", "${prefix}img_mlp.out.weight",
+        "${prefix}img_mlp.proj.weight",
+    ];
+    var begin: u64 = (0 as u64) -% (1 as u64);
+    var end: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < (9 as usize) {
+        guard let option::Option[packed::TensorData]::Some(tensor) = file.tensor(names[index].view()) else {
+            return option::Option[RingRegion]::None;
+        };
+        if tensor.scheme != PACKED_SCHEME_FP16 && tensor.input != (0 as u64) {
+            return option::Option[RingRegion]::None;
+        }
+        if tensor.weights_offset < begin { begin = tensor.weights_offset; }
+        let tensor_end: u64 = tensor.weights_offset +% tensor.weights_length;
+        if tensor_end > end { end = tensor_end; }
+        index = index +% (1 as usize);
+    }
+    let page: u64 = VM_PAGE_BYTES as u64;
+    let aligned_begin: u64 = begin / page *% page;
+    var aligned_end: u64 = round_up(end as usize, VM_PAGE_BYTES) as u64;
+    if aligned_end > file.length() as u64 { aligned_end = file.length() as u64; }
+    return option::Option[RingRegion]::Some(RingRegion {
+        file_begin: aligned_begin,
+        length: (aligned_end -% aligned_begin) as usize,
+        tensor_begin: begin,
+        tensor_end: end,
+    });
+}
+
+// Plans the ring: block tensors must be disjoint and ordered, and every
+// global tensor must end before block 0's first tensor. Page widening may
+// make neighbouring regions share an edge page; each slot holds its own copy.
+// Returns the page-rounded resident prefix length, or 0 to disable the ring.
+fn plan_weight_ring(file: packed::File, ref regions: [RingRegion; 32], ref slot_bytes: usize) -> usize {
+    var block: usize = 0 as usize;
+    var previous_end: u64 = 0 as u64;
+    slot_bytes = 0 as usize;
+    while block < (32 as usize) {
+        guard let option::Option[RingRegion]::Some(region) = ring_block_region(file, block) else {
+            return 0 as usize;
+        };
+        if block > (0 as usize) && region.tensor_begin < previous_end { return 0 as usize; }
+        regions[block] = region;
+        previous_end = region.tensor_end;
+        if region.length > slot_bytes { slot_bytes = region.length; }
+        block = block +% (1 as usize);
+    }
+    // Global tensors must all lie before block 0.
+    var global_names: [str; 9] = [
+        "img_in.weight", "modulation.1.weight", "norm_out.linear.weight", "proj_out.weight",
+        "time_text_embed.timestep_embedder.linear_1.weight",
+        "time_text_embed.timestep_embedder.linear_2.weight",
+        "txt_in.in_layer.weight", "txt_in.out_layer.weight", "txt_in.text_norm.weight",
+    ];
+    var global_end: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < (9 as usize) {
+        guard let option::Option[packed::TensorData]::Some(tensor) = file.tensor(global_names[index]) else {
+            return 0 as usize;
+        };
+        let tensor_end: u64 = tensor.weights_offset +% tensor.weights_length;
+        if tensor_end > regions[0].tensor_begin { return 0 as usize; }
+        if tensor_end > global_end { global_end = tensor_end; }
+        index = index +% (1 as usize);
+    }
+    return round_up(global_end as usize, VM_PAGE_BYTES);
+}
+
+fn ring_linear_weight(
+    file: packed::File,
+    slot: metal::Buffer,
+    region: RingRegion,
+    name: str,
+    output_columns: u64,
+    input_columns: u64,
+) -> option::Option[LinearWeight] {
+    guard let option::Option[LinearWeight]::Some(weight) = packed_linear_weight(
+        file, slot, name, output_columns, input_columns,
+    ) else { return option::Option[LinearWeight]::None; };
+    return option::Option[LinearWeight]::Some(LinearWeight {
+        storage: slot,
+        scheme: weight.scheme,
+        weights_offset: weight.weights_offset -% region.file_begin,
+        scales_offset: 0 as u64,
+        zeros_offset: 0 as u64,
+    });
 }
 
 fn packed_storage_buffer(
@@ -2739,9 +3043,174 @@ fn encode_post_attention(
     );
 }
 
+// MLX steel attention (kernels/mlx_steel_attention.metal, MIT, from
+// ml-explore/mlx v0.32.2): FP16 Q/K/V/O with FP32 softmax and accumulation,
+// BQ=32 BK=16 BD=128, four simdgroups per threadgroup. Used for the cached
+// 1024 step, whose image queries attend every key without a mask. It reads
+// the FP16 K/V that the MPSGraph path already prepares and writes FP16
+// output straight into the attention-output GEMM's half input.
+// QI_DISABLE_STEEL_ATTENTION=1 restores MPSGraph SDPA.
+#[repr(C)]
+struct SteelAttentionParams {
+    batch: i32,
+    heads: i32,
+    head_dimension: i32,
+    query_rows: i32,
+    key_rows: i32,
+    gqa_factor: i32,
+    scale: f32,
+    query_blocks: i32,
+    key_blocks: i32,
+    query_blocks_aligned: i32,
+    key_blocks_aligned: i32,
+    query_remainder: i32,
+    key_remainder: i32,
+    query_offset: i32,
+    query_strides: [i64; 3],
+    key_strides: [i64; 3],
+    value_strides: [i64; 3],
+    output_strides: [i64; 3],
+}
+
+const STEEL_BLOCK_QUERIES: usize = 32;
+const STEEL_BLOCK_KEYS: usize = 16;
+
+fn create_steel_attention_library(device: metal::Device) -> option::Option[OwnedObjc] {
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() { return option::Option[OwnedObjc]::None; }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        #include_str("../kernels/mlx_steel_attention.metal"), options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 = rt::msg_id(compile_error, rt::sel(#str_ptr("localizedDescription\0")));
+            io::eprintln("steel attention Metal compile: ${bridge::to_text(description)}");
+        }
+        return option::Option[OwnedObjc]::None;
+    };
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(library.raw()));
+}
+
+// Specializes the kernel for one (query rows, key rows, causal) shape.
+fn create_steel_attention_pipeline(
+    device: metal::Device,
+    library_pointer: *u8,
+    query_rows: usize,
+    key_rows: usize,
+    causal: bool,
+) -> option::Option[OwnedObjc] {
+    if library_pointer.is_null() { return option::Option[OwnedObjc]::None; }
+    let library: metal::Library = metal::Library::from_raw(library_pointer);
+    let values_pointer: *u8 = rt::alloc_init(#str_ptr("MTLFunctionConstantValues\0"));
+    if values_pointer.is_null() { return option::Option[OwnedObjc]::None; }
+    let values_owner: OwnedObjc = OwnedObjc::new(values_pointer);
+    let values: metal::FunctionConstantValues =
+        metal::FunctionConstantValues::from_raw(values_owner.raw());
+    var align_queries: bool = query_rows % STEEL_BLOCK_QUERIES == (0 as usize);
+    var align_keys: bool = key_rows % STEEL_BLOCK_KEYS == (0 as usize);
+    var disabled: bool = false;
+    var do_causal: bool = causal;
+    values.set_constant_value(#addr_of(align_queries) as *u8, metal::DataType::Bool, 200 as u64);
+    values.set_constant_value(#addr_of(align_keys) as *u8, metal::DataType::Bool, 201 as u64);
+    values.set_constant_value(#addr_of(disabled) as *u8, metal::DataType::Bool, 300 as u64);
+    values.set_constant_value(#addr_of(do_causal) as *u8, metal::DataType::Bool, 301 as u64);
+    values.set_constant_value(#addr_of(disabled) as *u8, metal::DataType::Bool, 302 as u64);
+    var function_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Function]::Some(function) = library.new_function_with_name_constant_values(
+        "steel_attention_float16_bq32_bk16_bd128_wm4_wn1_maskfloat16", values,
+        #addr_of(function_error) as *u8,
+    ) else {
+        io::eprintln("steel attention: could not specialize the kernel");
+        return option::Option[OwnedObjc]::None;
+    };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+    var pipeline_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::ComputePipelineState]::Some(state) =
+        device.new_compute_pipeline_state_with_function(function, #addr_of(pipeline_error) as *u8) else {
+        io::eprintln("steel attention: could not build the pipeline");
+        return option::Option[OwnedObjc]::None;
+    };
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(state.raw()));
+}
+
+// Converts all `total_rows` rows of Q (FP32 [rows, HEADS*HEAD_DIMENSION])
+// to FP16 above the output region of half_input. The output region is
+// half_input[0, total_rows) in the same row layout.
+fn encode_steel_query_conversion(
+    encoder: metal::ComputeCommandEncoder,
+    mps_workspace: MpsWorkspace,
+    query: metal::Buffer,
+    total_rows: usize,
+) {
+    encode_mps_input_conversion(
+        encoder, mps_workspace.input_pipeline, query, mps_workspace.half_input, total_rows, WIDTH,
+        (total_rows *% WIDTH *% (2 as usize)) as u64,
+    );
+}
+
+// Attention for query rows [query_start, query_start + query_rows) against
+// key rows [0, key_rows), writing FP16 output rows at the same positions.
+fn encode_steel_attention(
+    encoder: metal::ComputeCommandEncoder,
+    mps_workspace: MpsWorkspace,
+    pipeline: metal::ComputePipelineState,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    total_rows: usize,
+    query_start: usize,
+    query_rows: usize,
+    key_rows: usize,
+) {
+    let row_bytes: usize = WIDTH *% (2 as usize);
+    let query_base: u64 = (total_rows *% row_bytes) as u64;
+    let row_stride: i64 = WIDTH as i64;
+    let head_stride: i64 = HEAD_DIMENSION as i64;
+    var params: SteelAttentionParams = SteelAttentionParams {
+        batch: 1 as i32,
+        heads: HEADS as i32,
+        head_dimension: HEAD_DIMENSION as i32,
+        query_rows: query_rows as i32,
+        key_rows: key_rows as i32,
+        gqa_factor: 1 as i32,
+        scale: 0.08838834764831845f32,
+        query_blocks: ((query_rows +% STEEL_BLOCK_QUERIES -% (1 as usize)) / STEEL_BLOCK_QUERIES) as i32,
+        key_blocks: ((key_rows +% STEEL_BLOCK_KEYS -% (1 as usize)) / STEEL_BLOCK_KEYS) as i32,
+        query_blocks_aligned: (query_rows / STEEL_BLOCK_QUERIES) as i32,
+        key_blocks_aligned: (key_rows / STEEL_BLOCK_KEYS) as i32,
+        query_remainder: (query_rows % STEEL_BLOCK_QUERIES) as i32,
+        key_remainder: (key_rows % STEEL_BLOCK_KEYS) as i32,
+        query_offset: (key_rows as i32) - (query_rows as i32),
+        query_strides: [(query_rows as i64) * row_stride, head_stride, row_stride],
+        key_strides: [(key_rows as i64) * row_stride, head_stride, row_stride],
+        value_strides: [(key_rows as i64) * row_stride, head_stride, row_stride],
+        output_strides: [(query_rows as i64) * row_stride, head_stride, row_stride],
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(
+        mps_workspace.half_input, query_base +% (query_start *% row_bytes) as u64, 0 as u64,
+    );
+    encoder.set_buffer(key, 0 as u64, 1 as u64);
+    encoder.set_buffer(value, 0 as u64, 2 as u64);
+    encoder.set_buffer(mps_workspace.half_input, (query_start *% row_bytes) as u64, 3 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[SteelAttentionParams]() as u64, 4 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size {
+            width: ((query_rows +% STEEL_BLOCK_QUERIES -% (1 as usize)) / STEEL_BLOCK_QUERIES) as u64,
+            height: HEADS as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 32 as u64, height: 4 as u64, depth: 1 as u64 },
+    );
+}
+
 // Profiling-only ablation: QI_PROFILE_SKIP=attention|qkv|attnout|mlp|gate|
 // down omits that work from every block so the step-time delta measures its
-// integrated cost. Output is meaningless while it is set. (`proj` also exists,
+// integrated cost. Output is meaningless while it is set, so generation
+// refuses it (`run_trajectory_packed_impl`). (`proj` also exists,
 // but a stale projected buffer later feeds padded K/V and aborts non-finite.)
 fn profile_skips(kind: str) -> bool {
     return match env::var("QI_PROFILE_SKIP") {
@@ -2831,11 +3300,15 @@ fn encode_mps_mlp_runtime_block(
         input_offset: 0 as u32,
     };
     let matrix_bytes: u64 = (WIDTH *% WIDTH *% (2 as usize)) as u64;
-    // MPSMatrix produces partial non-finite output for the 4096-plus-prompt
-    // prefill shape on M1 Max. Select it only for the measured 4096-row cached
-    // shape; smaller resolutions keep the more accurate custom FP32-input GEMM.
+    // MPSMatrix produced partial non-finite output when it multiplied the whole
+    // 4096-plus-prompt prefill. At that shape MPS now covers only the 4096
+    // image rows (the joint layout is [text rows][image rows]) and the custom
+    // FP32-input GEMM covers the text rows. Smaller resolutions keep the more
+    // accurate custom GEMM for every row.
+    let attention_output_text_rows: usize = if use_graph_attention
+        && rows > (4096 as usize) { rows -% (4096 as usize) } else { 0 as usize };
     let mps_attention_output: bool = weights.attention_output.scheme == PACKED_SCHEME_FP16
-        && rows == (4096 as usize)
+        && (rows == (4096 as usize) || attention_output_text_rows > (0 as usize))
         && !env::has_var("QI_DISABLE_MPS_ATTENTION_OUTPUT");
     let mps_qkv: bool = weights.q.scheme == PACKED_SCHEME_FP16
         && weights.k.scheme == PACKED_SCHEME_FP16
@@ -2978,7 +3451,41 @@ fn encode_mps_mlp_runtime_block(
         metal::CommandEncoder::from_raw(attention_encoder.raw());
     attention_command_encoder.end_encoding();
 
-    if use_graph_attention && !profile_skips("attention") {
+    // 1024 steps can use steel attention, which writes FP16 output directly
+    // where the attention-output GEMMs read it. Cached steps: 4096 image
+    // queries against prefix + image keys. Prefill (opt-in QI_STEEL_PREFILL,
+    // measured slower overall): the same for the image queries (they see
+    // every key), plus causal text-only attention for the text queries,
+    // which is exactly the prefill mask.
+    let steel_attention: bool = use_graph_attention && mps_workspace.use_steel_attention
+        && (if cached { rows == (4096 as usize) } else { env::has_var("QI_STEEL_PREFILL") &&
+        rows > (4096 as usize) && rows -% (4096 as usize) == prefix_rows
+    });
+    if steel_attention && !profile_skips("attention") {
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(steel_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let steel_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(steel_encoder.raw()));
+        encode_steel_query_conversion(steel_encoder, mps_workspace, workspace.query_rope, rows);
+        encode_buffer_barrier(steel_encoder);
+        if cached {
+            encode_steel_attention(
+                steel_encoder, mps_workspace, mps_workspace.steel_attention, workspace.key,
+                workspace.projected, rows, 0 as usize, rows, mps_workspace.steel_key_rows,
+            );
+        } else {
+            encode_steel_attention(
+                steel_encoder, mps_workspace, mps_workspace.steel_attention, workspace.key,
+                workspace.projected, rows, prefix_rows, rows -% prefix_rows, rows,
+            );
+            encode_steel_attention(
+                steel_encoder, mps_workspace, mps_workspace.steel_causal_attention,
+                workspace.key, workspace.projected, rows, 0 as usize, prefix_rows, prefix_rows,
+            );
+        }
+        let steel_command_encoder: metal::CommandEncoder =
+            metal::CommandEncoder::from_raw(steel_encoder.raw());
+        steel_command_encoder.end_encoding();
+    } else if use_graph_attention && !profile_skips("attention") {
         let graph_ok: bool = if cached {
             graph_attention::encode(
                 graph_cached_attention, command_buffer, workspace.query_rope,
@@ -2996,21 +3503,44 @@ fn encode_mps_mlp_runtime_block(
     if mps_attention_output {
         guard let option::Option[mps::Multiplication]::Some(attention_output_operation) =
             mps::create(
-                mps_workspace.device, mps_workspace.half_input, 0 as u64,
+                mps_workspace.device, mps_workspace.half_input,
+            (attention_output_text_rows *% WIDTH *% (2 as usize)) as u64,
             weights.attention_output.storage, weights.attention_output.weights_offset,
-            workspace.attention_projected, 0 as u64, rows, WIDTH, WIDTH,
+            workspace.attention_projected,
+            (attention_output_text_rows *% WIDTH *% (4 as usize)) as u64,
+            rows -% attention_output_text_rows, WIDTH, WIDTH,
         ) else { return false; };
         guard let option::Option[metal::ComputeCommandEncoder]::Some(conversion_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
         let conversion_encoder_owner: OwnedObjc =
             OwnedObjc::new(rt::retain(conversion_encoder.raw()));
-        encode_mps_input_conversion(
-            conversion_encoder, mps_workspace.input_pipeline, workspace.attended,
-            mps_workspace.half_input, rows, WIDTH,
-        );
+        if !steel_attention {
+            encode_mps_input_conversion(
+                conversion_encoder, mps_workspace.input_pipeline, workspace.attended,
+                mps_workspace.half_input, rows, WIDTH,
+            );
+        }
+        if attention_output_text_rows > (0 as usize) && !steel_attention {
+            encode_weighted_linear(
+                conversion_encoder, pipelines, workspace.attended, weights.attention_output,
+                workspace.attention_projected, WIDTH, WIDTH, attention_output_text_rows,
+            );
+        }
         let conversion_command_encoder: metal::CommandEncoder =
             metal::CommandEncoder::from_raw(conversion_encoder.raw());
         conversion_command_encoder.end_encoding();
+        // With steel attention the text rows' attention output is FP16 too;
+        // project them with their own small MPS multiplication.
+        if attention_output_text_rows > (0 as usize) && steel_attention {
+            guard let option::Option[mps::Multiplication]::Some(text_output_operation) =
+                mps::create(
+                    mps_workspace.device, mps_workspace.half_input, 0 as u64,
+                weights.attention_output.storage, weights.attention_output.weights_offset,
+                workspace.attention_projected, 0 as u64, attention_output_text_rows,
+                WIDTH, WIDTH,
+            ) else { return false; };
+            if !profile_skips("attnout") { text_output_operation.encode(command_buffer); }
+        }
         if !profile_skips("attnout") { attention_output_operation.encode(command_buffer); }
         guard let option::Option[metal::ComputeCommandEncoder]::Some(epilogue_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
@@ -4727,11 +5257,30 @@ fn cache_dit_should_cache_with_cap(
     difference: f64,
     threshold: f64,
     continuous_cap: usize,
+    warmup_steps: usize = CACHE_DIT_DEFAULT_WARMUP,
 ) -> bool {
-    return step >= (4 as usize)
+    return step >= warmup_steps
         && have_residual
         && continuous_cached_steps < continuous_cap
         && difference < threshold;
+}
+
+const CACHE_DIT_DEFAULT_WARMUP: usize = 4;
+
+// Cache-DiT always runs the first four steps in full. QI_CACHE_DIT_WARMUP=N
+// (1-4) lowers that for few-step distillation experiments. Read once per
+// trajectory; any other value is refused (None).
+fn cache_dit_warmup_steps() -> option::Option[usize] {
+    return match env::var("QI_CACHE_DIT_WARMUP") {
+        option::Option[text::Text]::Some(value) => {
+            if value == "1" { option::Option[usize]::Some(1 as usize) }
+            else if value == "2" { option::Option[usize]::Some(2 as usize) }
+            else if value == "3" { option::Option[usize]::Some(3 as usize) }
+            else if value == "4" { option::Option[usize]::Some(4 as usize) }
+            else { option::Option[usize]::None }
+        }
+        option::Option[text::Text]::None => option::Option[usize]::Some(CACHE_DIT_DEFAULT_WARMUP),
+    };
 }
 
 fn taylor_first_derivative(previous: f32, current: f32, window: usize) -> f32 {
@@ -4951,11 +5500,11 @@ fn benchmark_trajectory_1024(
     requested_steps: str,
     fixture_root: str = "tests/fixtures/transformer_scale_fp32",
 ) -> i32 {
-    if !(requested_steps == "1" || requested_steps == "2"
+    if !(requested_steps == "1" || requested_steps == "2" || requested_steps == "3"
         || requested_steps == "4" || requested_steps == "8"
         || requested_steps == "13" || requested_steps == "25"
         || requested_steps == "40") {
-        io::eprintln("1024 trajectory benchmark: steps must be 1, 2, 4, 8, 13, 25, or 40");
+        io::eprintln("1024 trajectory benchmark: steps must be 1, 2, 3, 4, 8, 13, 25, or 40");
         return 2;
     }
     let text_path: text::Text = "${fixture_root}/1024/text_input.f32";
@@ -5420,6 +5969,95 @@ fn run_trajectory_bottleneck_packed(
     return 0;
 }
 
+// The pinned pipeline casts the scheduler timestep to the BF16 latent dtype
+// and then divides by 1000 in BF16, so the model sees bf16(bf16(t) / 1000).
+// Rounding only once differs by one BF16 ulp on 12 of the 40 1024 steps.
+fn model_timestep(timestep: f32) -> f32 {
+    let rounded: f32 = cpu::bf16_to_f32(cpu::f32_to_bf16(timestep));
+    return cpu::bf16_to_f32(cpu::f32_to_bf16(rounded / 1000.0f32));
+}
+
+#[test]
+fn model_timestep_rounds_like_the_bf16_pipeline() {
+    // 1024/40 step 6: single rounding gives 0.9296875, the pipeline 0.93359375.
+    assert model_timestep(931.3406372070312f32) != cpu::bf16_to_f32(cpu::f32_to_bf16(931.3406372070312f32 / 1000.0f32));
+    // The Viggle 4-step timesteps are unaffected.
+    assert model_timestep(857.19189453125f32) == cpu::bf16_to_f32(cpu::f32_to_bf16(857.19189453125f32 / 1000.0f32));
+    assert model_timestep(1000.0f32) == 1.0f32;
+}
+
+const PACK_SHIFT_TERMINAL_UNSET: u32 = 0;
+const PACK_SHIFT_TERMINAL_STRETCH: u32 = 1;
+const PACK_SHIFT_TERMINAL_NONE: u32 = 2;
+
+// A pack whose metadata says `shift_terminal=none` (for example a few-step
+// distillation) uses the unstretched FlowMatch schedule; `0.02` pins the
+// stretched one.
+fn pack_shift_terminal(packed_path: str) -> u32 {
+    return match packed::read_metadata(packed_path) {
+        packed::MetadataResult::Ok(metadata) => match metadata.get("shift_terminal") {
+            option::Option[str]::Some(value) => {
+                if value == "none" { PACK_SHIFT_TERMINAL_NONE }
+                else { PACK_SHIFT_TERMINAL_STRETCH }
+            }
+            option::Option[str]::None => PACK_SHIFT_TERMINAL_UNSET,
+        },
+        packed::MetadataResult::Err(_message) => PACK_SHIFT_TERMINAL_UNSET,
+    };
+}
+
+// One log line identifying the pack by its metadata, since the fixed header
+// names the base snapshot for every pack, fine-tunes included.
+fn print_pack_identity(packed_path: str) {
+    match packed::read_metadata(packed_path) {
+        packed::MetadataResult::Ok(metadata) => {
+            let block: text::Text = metadata.serialize();
+            let line: text::Text = block.replacing("\n", " ");
+            if line.view().count() == (0 as usize) {
+                io::println("trajectory pack: ${packed_path} metadata=none");
+            } else {
+                io::println("trajectory pack: ${packed_path} ${line}");
+            }
+        }
+        packed::MetadataResult::Err(message) => {
+            io::println("trajectory pack: ${packed_path} metadata=invalid (${message})");
+        }
+    }
+}
+
+fn env_switch(name: str) -> str {
+    return if env::has_var(name) { "on" } else { "off" };
+}
+
+// Every environment switch that can change a trajectory's output, resolved
+// once per run so the log records it and a stale export cannot hide.
+fn print_trajectory_switches(
+    shift_terminal_name: str,
+    shift_terminal_source: str,
+    profile_skip: str,
+    cache_dit_enabled: bool,
+    cache_dit_warmup: usize,
+) {
+    let warmup_name: text::Text = if cache_dit_enabled {
+        "${cache_dit_warmup}"
+    } else { text::from_str("n/a") };
+    let mps_attention_output: str = env_switch("QI_DISABLE_MPS_ATTENTION_OUTPUT");
+    let mpsgraph_attention: str = env_switch("QI_DISABLE_MPSGRAPH_ATTENTION");
+    let direct_fp16: str = env_switch("QI_DISABLE_DIRECT_FP16_ACTIVATIONS");
+    let pack_pread: str = env_switch("QI_DISABLE_PACK_PREAD");
+    let weight_ring: str = env_switch("QI_DISABLE_WEIGHT_RING");
+    let enable_weight_ring: str = env_switch("QI_ENABLE_WEIGHT_RING");
+    let steel: str = env_switch("QI_DISABLE_STEEL_ATTENTION");
+    let steel_prefill: str = env_switch("QI_STEEL_PREFILL");
+    let sigma_spacing: str = env_switch("QI_TAYLOR_SIGMA_SPACING");
+    let full_final_step: str = env_switch("QI_TAYLOR_FULL_FINAL_STEP");
+    let early_cap3: str = env_switch("QI_TAYLOR_EARLY_CAP3");
+    let cached_block: str = env_switch("QI_PROFILE_CACHED_BLOCK");
+    let validate_blocks: str = env_switch("QI_VALIDATE_TRAJECTORY_BLOCKS");
+    let validate_diff: str = env_switch("QI_VALIDATE_GPU_CACHE_DIFF");
+    io::println("trajectory switches: shift_terminal=${shift_terminal_name} shift_terminal_source=${shift_terminal_source} profile_skip=${profile_skip} disable_mps_attention_output=${mps_attention_output} disable_mpsgraph_attention=${mpsgraph_attention} disable_direct_fp16_activations=${direct_fp16} disable_pack_pread=${pack_pread} enable_weight_ring=${enable_weight_ring} disable_weight_ring=${weight_ring} disable_steel_attention=${steel} steel_prefill=${steel_prefill} cache_dit_warmup=${warmup_name} taylor_sigma_spacing=${sigma_spacing} taylor_full_final_step=${full_final_step} taylor_early_cap3=${early_cap3} profile_cached_block=${cached_block} validate_trajectory_blocks=${validate_blocks} validate_gpu_cache_diff=${validate_diff}");
+}
+
 fn run_trajectory_packed_impl(
     packed_path: str,
     requested_steps: str,
@@ -5453,6 +6091,8 @@ fn run_trajectory_packed_impl(
         step_limit = 1 as usize;
     } else if requested_steps == "2" {
         step_limit = 2 as usize;
+    } else if requested_steps == "3" {
+        step_limit = 3 as usize;
     } else if requested_steps == "4" {
         step_limit = 4 as usize;
     } else if requested_steps == "8" {
@@ -5464,7 +6104,7 @@ fn run_trajectory_packed_impl(
     } else if requested_steps == "40" {
         step_limit = 40 as usize;
     } else {
-        io::eprintln("trajectory: steps must be 1, 2, 4, 8, 13, 25, or 40");
+        io::eprintln("trajectory: steps must be 1, 2, 3, 4, 8, 13, 25, or 40");
         return 2;
     }
     let text_rows: usize = if native_inputs { native_text_rows } else { 22 as usize };
@@ -5481,6 +6121,41 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: reference checkpoints require the canonical 40-step schedule");
         return 2;
     }
+    // QI_PROFILE_SKIP drops transformer work from every block, so its output is
+    // meaningless; only transformer-only benchmarks (no final latent) take it.
+    let profile_skip: text::Text = match env::var("QI_PROFILE_SKIP") {
+        option::Option[text::Text]::Some(value) => value,
+        option::Option[text::Text]::None => text::from_str("none"),
+    };
+    if !final_latent.is_null() && env::has_var("QI_PROFILE_SKIP") {
+        io::eprintln("trajectory: QI_PROFILE_SKIP=${profile_skip} is a benchmark-only ablation that omits transformer work; unset it to generate");
+        return 2;
+    }
+    // Pack metadata owns the schedule. The environment override only applies
+    // to packs that do not state shift_terminal, and it is logged.
+    let pack_shift: u32 = pack_shift_terminal(packed_path);
+    let no_shift_override: bool = env::has_var("QI_EXPERIMENT_NO_SHIFT_TERMINAL");
+    if no_shift_override && pack_shift == PACK_SHIFT_TERMINAL_STRETCH {
+        io::eprintln("trajectory: QI_EXPERIMENT_NO_SHIFT_TERMINAL conflicts with the pack's shift_terminal=0.02; unset it or change the pack metadata");
+        return 2;
+    }
+    let stretch_terminal: bool = !no_shift_override && pack_shift != PACK_SHIFT_TERMINAL_NONE;
+    let shift_terminal_source: str = if pack_shift != PACK_SHIFT_TERMINAL_UNSET {
+        "pack"
+    } else if no_shift_override { "env" } else { "default" };
+    if pack_shift == PACK_SHIFT_TERMINAL_UNSET && no_shift_override {
+        io::eprintln("trajectory: QI_EXPERIMENT_NO_SHIFT_TERMINAL overrides the default shift_terminal=0.02");
+    }
+    let shift_terminal_name: str = if stretch_terminal { "0.02" } else { "none" };
+    guard let option::Option[usize]::Some(cache_dit_warmup) = cache_dit_warmup_steps() else {
+        io::eprintln("trajectory: QI_CACHE_DIT_WARMUP must be 1, 2, 3, or 4");
+        return 2;
+    };
+    print_pack_identity(packed_path);
+    print_trajectory_switches(
+        shift_terminal_name, shift_terminal_source, profile_skip.view(), cache_dit_enabled,
+        cache_dit_warmup,
+    );
     let latent_side: usize = pixels / (16 as usize);
     let target_rows: usize = latent_side *% latent_side;
     let rows: usize = text_rows +% target_rows;
@@ -5504,7 +6179,7 @@ fn run_trajectory_packed_impl(
             target_rows,
             #addr_of(sigmas[0]),
             #addr_of(timesteps[0]),
-            !env::has_var("QI_EXPERIMENT_NO_SHIFT_TERMINAL"),
+            stretch_terminal,
         )
     };
     if !schedule_ok {
@@ -5643,9 +6318,62 @@ fn run_trajectory_packed_impl(
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
 
     let storage_and_weights_start_ms: i64 = time::now_millis();
+    let ring_wanted: bool = (pixels == (1024 as usize) || env::has_var("QI_ENABLE_WEIGHT_RING"))
+        && weight_file.all_block_matrices_fp16()
+        && !cache_dit_enabled
+        && !env::has_var("QI_PROFILE_CACHED_BLOCK")
+        && !env::has_var("QI_VALIDATE_TRAJECTORY_BLOCKS")
+        && !env::has_var("QI_DISABLE_PACK_PREAD")
+        && !env::has_var("QI_DISABLE_WEIGHT_RING");
+    var ring_regions: [RingRegion; 32] =
+        [RingRegion {
+        file_begin: 0 as u64, length: 0 as usize,
+        tensor_begin: 0 as u64, tensor_end: 0 as u64,
+    }; 32];
+    var ring_slot_bytes: usize = 0 as usize;
+    let ring_prefix_bytes: usize = if ring_wanted {
+        plan_weight_ring(weight_file, ring_regions, ring_slot_bytes)
+    } else { 0 as usize };
+    let use_weight_ring: bool = ring_prefix_bytes > (0 as usize);
+    let weight_ring_reason: str = if use_weight_ring {
+        if pixels == (1024 as usize) { "1024-default" } else { "explicit-memory-saving" }
+    } else { "resident" };
+    if ring_wanted && !use_weight_ring {
+        io::eprintln("trajectory: pack layout does not allow the weight ring; keeping the resident copy");
+    }
+    let ring_reader: mapped::PositionalReader = if use_weight_ring {
+        guard let option::Option[mapped::PositionalReader]::Some(reader) =
+            mapped::open_positional_reader(packed_path) else { return 1; };
+        reader
+    } else { mapped::inactive_positional_reader() };
+    var weight_ring: WeightRing = WeightRing {
+        reader: ring_reader,
+        slots: [0 as *u8; 3],
+        inflight: [0 as *u8; 3],
+        regions: ring_regions,
+        reads: vec::Vec[thread::JoinHandle[i64]]::with_capacity(WEIGHT_RING_SLOTS),
+        next_read: 0 as usize,
+        expected_next: 0 as usize,
+        total: if use_weight_ring { step_limit *% (32 as usize) } else { 0 as usize },
+        ok: true,
+        gpu_ms: 0.0f64,
+        acquire_wait_ms: 0 as i64,
+        retire_wait_ms: 0 as i64,
+    };
+    if use_weight_ring {
+        var slot: usize = 0 as usize;
+        while slot < WEIGHT_RING_SLOTS {
+            guard let option::Option[metal::Buffer]::Some(slot_buffer) =
+                new_buffer(device, ring_slot_bytes as u64) else { return 1; };
+            weight_ring.slots[slot] = slot_buffer.raw();
+            slot = slot +% (1 as usize);
+        }
+        // Start the first blocks while the rest of setup runs.
+        weight_ring.issue_until(WEIGHT_RING_SLOTS -% (1 as usize));
+    }
     guard let option::Option[metal::Buffer]::Some(storage) =
         if !env::has_var("QI_DISABLE_PACK_PREAD") {
-        read_packed_storage_buffer(device, packed_path, weight_file)
+        read_packed_storage_buffer(device, packed_path, weight_file, ring_prefix_bytes)
     } else { packed_storage_buffer(device, weight_file) } else { return 1; };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
     let q4_model: bool = weight_file.int4_rotated();
@@ -5899,6 +6627,37 @@ fn run_trajectory_packed_impl(
         2 as u64
     } else { (MLP_WIDTH *% WIDTH *% (2 as usize)) as u64 };
     guard let option::Option[metal::Buffer]::Some(mps_half_weight) = new_buffer(device, mps_half_weight_bytes) else { return 1; }; let mps_half_weight_owner: OwnedObjc = OwnedObjc::new(mps_half_weight.raw());
+    // The steel kernel needs the MPS attention-output path (which reads its
+    // FP16 output) and the 4096-row cached shape.
+    let steel_wanted: bool = use_graph_attention && weight_file.all_block_matrices_fp16()
+        && !env::has_var("QI_DISABLE_STEEL_ATTENTION")
+        && !env::has_var("QI_DISABLE_MPS_ATTENTION_OUTPUT");
+    let steel_library_owner: OwnedObjc = if steel_wanted {
+        match create_steel_attention_library(device) {
+            option::Option[OwnedObjc]::Some(owner) => owner,
+            option::Option[OwnedObjc]::None => OwnedObjc::new(0 as *u8),
+        }
+    } else { OwnedObjc::new(0 as *u8) };
+    let steel_attention_owner: OwnedObjc = match create_steel_attention_pipeline(
+        device, steel_library_owner.raw(), target_rows, rows, false,
+    ) {
+        option::Option[OwnedObjc]::Some(owner) => owner,
+        option::Option[OwnedObjc]::None => OwnedObjc::new(0 as *u8),
+    };
+    let steel_prefill_wanted: bool = env::has_var("QI_STEEL_PREFILL");
+    let steel_causal_owner: OwnedObjc = if steel_prefill_wanted {
+        match create_steel_attention_pipeline(
+            device, steel_library_owner.raw(), text_rows, text_rows, true,
+        ) {
+            option::Option[OwnedObjc]::Some(owner) => owner,
+            option::Option[OwnedObjc]::None => OwnedObjc::new(0 as *u8),
+        }
+    } else { OwnedObjc::new(0 as *u8) };
+    let use_steel_attention: bool = !steel_attention_owner.raw().is_null()
+        && (!steel_prefill_wanted || !steel_causal_owner.raw().is_null());
+    if steel_wanted && !use_steel_attention {
+        io::eprintln("trajectory: steel attention unavailable; using MPSGraph SDPA");
+    }
     let mps_workspace: MpsWorkspace = MpsWorkspace {
         device: device,
         input_pipeline: mps_input_pipeline,
@@ -5909,6 +6668,10 @@ fn run_trajectory_packed_impl(
         half_input: mps_half_input,
         half_weight: mps_half_weight,
         direct_half_activations: direct_half_activations,
+        steel_attention: metal::ComputePipelineState::from_raw(steel_attention_owner.raw()),
+        steel_causal_attention: metal::ComputePipelineState::from_raw(steel_causal_owner.raw()),
+        use_steel_attention: use_steel_attention,
+        steel_key_rows: rows,
     };
     guard let option::Option[metal::Buffer]::Some(final_scale) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_owner: OwnedObjc = OwnedObjc::new(final_scale.raw());
     guard let option::Option[metal::Buffer]::Some(final_normalized) = new_buffer(device, activation_bytes) else { return 1; }; let final_normalized_owner: OwnedObjc = OwnedObjc::new(final_normalized.raw());
@@ -5948,21 +6711,22 @@ fn run_trajectory_packed_impl(
         && env::has_var("QI_TAYLOR_EARLY_CAP3");
     let buffers_and_prefix_wall_ms: i64 = time::now_millis() - buffers_and_prefix_start_ms;
     io::println("trajectory startup detail: inputs_ms=${startup_inputs_ms - buffers_and_prefix_start_ms} conditioning_buffers_ms=${startup_conditioning_buffers_ms - startup_inputs_ms} text_projection_ms=${startup_text_projection_ms - startup_conditioning_buffers_ms} masks_ms=${startup_masks_ms - startup_text_projection_ms} graphs_ms=${startup_graphs_ms - startup_masks_ms} workspaces_ms=${time::now_millis() - startup_graphs_ms}");
+    let if_ring_slots: usize = if use_weight_ring { WEIGHT_RING_SLOTS } else { 0 as usize };
+    let resident_pack_bytes: usize = if use_weight_ring { ring_prefix_bytes } else { weight_file.length() };
     let q4_mode_name: str = if q4_model {
         if eager_q4 { "eager-fp16" }
         else if direct_q4 { "direct-packed" }
         else { "destination-expand" }
     } else { "none" };
     io::println(
-        "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} q4_mode=${q4_mode_name} q4_expand_gpu_ms=${eager_expand_gpu_ms} q4_repack_gpu_ms=${direct_repack_gpu_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms} direct_fp16_activations=${direct_half_activations} fp32_activation_scratch_bytes=${(2 as u64) *% fp32_norm_scratch_bytes +% fp32_swiglu_scratch_bytes}",
+        "trajectory startup: packed_validation_ms=${packed_load_wall_ms} metal_pipeline_ms=${metal_pipeline_wall_ms} storage_and_weights_ms=${storage_and_weights_wall_ms} q4_mode=${q4_mode_name} q4_expand_gpu_ms=${eager_expand_gpu_ms} q4_repack_gpu_ms=${direct_repack_gpu_ms} buffers_and_prefix_ms=${buffers_and_prefix_wall_ms} direct_fp16_activations=${direct_half_activations} steel_attention=${use_steel_attention} weight_ring=${use_weight_ring} weight_ring_reason=${weight_ring_reason} ring_slots=${if_ring_slots} ring_slot_bytes=${ring_slot_bytes} resident_pack_bytes=${resident_pack_bytes} fp32_activation_scratch_bytes=${(2 as u64) *% fp32_norm_scratch_bytes +% fp32_swiglu_scratch_bytes}",
     );
     let trajectory_wall_start_ms: i64 = time::now_millis();
     let timestep_values: *f32 = timestep.contents() as *f32;
     var conditioning_step: usize = 0 as usize;
     while conditioning_step < step_limit {
-        timestep_values[conditioning_step *% (2 as usize)] = cpu::bf16_to_f32(
-            cpu::f32_to_bf16(timesteps[conditioning_step] / 1000.0f32),
-        );
+        timestep_values[conditioning_step *% (2 as usize)] =
+            model_timestep(timesteps[conditioning_step]);
         timestep_values[conditioning_step *% (2 as usize) +% (1 as usize)] = 0.0f32;
         conditioning_step = conditioning_step +% (1 as usize);
     }
@@ -6082,13 +6846,20 @@ fn run_trajectory_packed_impl(
             guard let option::Option[metal::Buffer]::Some(norm_k) = packed_vector_buffer(device, weight_file, norm_k_name.view(), HEAD_DIMENSION as u64) else { return 1; }; let norm_k_owner: OwnedObjc = OwnedObjc::new(norm_k.raw());
             let q_name: text::Text = "${prefix}attn.to_q.weight"; let k_name: text::Text = "${prefix}attn.to_k.weight"; let v_name: text::Text = "${prefix}attn.to_v.weight";
             let attention_output_name: text::Text = "${prefix}attn.to_out.0.weight"; let gate_name: text::Text = "${prefix}img_mlp.gate_layer.weight"; let projected_name: text::Text = "${prefix}img_mlp.proj.weight"; let mlp_output_name: text::Text = "${prefix}img_mlp.out.weight";
-            guard let option::Option[LinearWeight]::Some(q) = runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, q_name.view(), WIDTH as u64, WIDTH as u64) else { return 1; };
-            guard let option::Option[LinearWeight]::Some(k) = runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, k_name.view(), WIDTH as u64, WIDTH as u64) else { return 1; };
-            guard let option::Option[LinearWeight]::Some(v) = runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, v_name.view(), WIDTH as u64, WIDTH as u64) else { return 1; };
-            guard let option::Option[LinearWeight]::Some(attention_output) = runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, attention_output_name.view(), WIDTH as u64, WIDTH as u64) else { return 1; };
-            guard let option::Option[LinearWeight]::Some(gate_weight) = runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, gate_name.view(), MLP_WIDTH as u64, WIDTH as u64) else { return 1; };
-            guard let option::Option[LinearWeight]::Some(projected_weight) = runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, projected_name.view(), MLP_WIDTH as u64, WIDTH as u64) else { return 1; };
-            guard let option::Option[LinearWeight]::Some(mlp_output) = runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, mlp_output_name.view(), WIDTH as u64, MLP_WIDTH as u64) else { return 1; };
+            let global_block: usize = step *% (32 as usize) +% block;
+            if use_weight_ring && !weight_ring.acquire(global_block) {
+                io::eprintln("trajectory: could not stream block ${block} weights");
+                return 1;
+            }
+            let ring_slot: metal::Buffer = if use_weight_ring { weight_ring.slot(global_block) } else { storage };
+            let ring_region: RingRegion = weight_ring.region(global_block);
+            guard let option::Option[LinearWeight]::Some(q) = if use_weight_ring { ring_linear_weight(weight_file, ring_slot, ring_region, q_name.view(), WIDTH as u64, WIDTH as u64) } else { runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, q_name.view(), WIDTH as u64, WIDTH as u64) } else { return 1; };
+            guard let option::Option[LinearWeight]::Some(k) = if use_weight_ring { ring_linear_weight(weight_file, ring_slot, ring_region, k_name.view(), WIDTH as u64, WIDTH as u64) } else { runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, k_name.view(), WIDTH as u64, WIDTH as u64) } else { return 1; };
+            guard let option::Option[LinearWeight]::Some(v) = if use_weight_ring { ring_linear_weight(weight_file, ring_slot, ring_region, v_name.view(), WIDTH as u64, WIDTH as u64) } else { runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, v_name.view(), WIDTH as u64, WIDTH as u64) } else { return 1; };
+            guard let option::Option[LinearWeight]::Some(attention_output) = if use_weight_ring { ring_linear_weight(weight_file, ring_slot, ring_region, attention_output_name.view(), WIDTH as u64, WIDTH as u64) } else { runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, attention_output_name.view(), WIDTH as u64, WIDTH as u64) } else { return 1; };
+            guard let option::Option[LinearWeight]::Some(gate_weight) = if use_weight_ring { ring_linear_weight(weight_file, ring_slot, ring_region, gate_name.view(), MLP_WIDTH as u64, WIDTH as u64) } else { runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, gate_name.view(), MLP_WIDTH as u64, WIDTH as u64) } else { return 1; };
+            guard let option::Option[LinearWeight]::Some(projected_weight) = if use_weight_ring { ring_linear_weight(weight_file, ring_slot, ring_region, projected_name.view(), MLP_WIDTH as u64, WIDTH as u64) } else { runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, projected_name.view(), MLP_WIDTH as u64, WIDTH as u64) } else { return 1; };
+            guard let option::Option[LinearWeight]::Some(mlp_output) = if use_weight_ring { ring_linear_weight(weight_file, ring_slot, ring_region, mlp_output_name.view(), WIDTH as u64, MLP_WIDTH as u64) } else { runtime_linear_weight(weight_file, storage, eager_storage, direct_storage, eager_q4, direct_q4, mlp_output_name.view(), WIDTH as u64, MLP_WIDTH as u64) } else { return 1; };
             step_quantized_matrices = step_quantized_matrices +%
                 (if q.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +%
                 (if k.scheme == PACKED_SCHEME_INT8_AFFINE { 1 as usize } else { 0 as usize }) +%
@@ -6102,7 +6873,28 @@ fn run_trajectory_packed_impl(
             let block_metadata_wall_ms: i64 = time::now_millis() - block_metadata_start_ms;
             let batch_transformer_block: bool = batch_transformer_step
                 || (cache_dit_enabled && !profile_cached_block && block > (0 as usize));
-            if batch_transformer_block {
+            if use_weight_ring {
+                guard let option::Option[metal::CommandBuffer]::Some(block_base_command_buffer) =
+                    queue.command_buffer() else { return 1; };
+                let block_command_buffer_owner: OwnedObjc =
+                    OwnedObjc::new(rt::retain(block_base_command_buffer.raw()));
+                guard let option::Option[graph_attention::CommandBufferContext]::Some(
+                    block_command_context,
+                ) = graph_attention::wrap_command_buffer(
+                    block_base_command_buffer, use_graph_attention,
+                ) else { return 1; };
+                let block_command_buffer: metal::CommandBuffer = block_command_context.metal();
+                if !encode_mps_mlp_runtime_block(
+                    block_command_buffer, pipelines, mps_workspace, block_weights,
+                    active_workspace, current, next, active_rows, cache_mode,
+                    cache_copy_pipeline, cache_key_arena, cache_value_arena, cache_offset,
+                    text_rows,
+                    use_graph_attention, #addr_of(graph_prefill_attention),
+                    #addr_of(graph_cached_attention), graph_mask,
+                ) { return 1; }
+                block_command_buffer.commit();
+                weight_ring.committed(global_block, block_command_buffer);
+            } else if batch_transformer_block {
                 if !encode_mps_mlp_runtime_block(
                     transformer_command_buffer, pipelines, mps_workspace, block_weights,
                     active_workspace, current, next, active_rows, cache_mode,
@@ -6161,7 +6953,7 @@ fn run_trajectory_packed_impl(
                 } else {
                     3 as usize
                 };
-                let forced_full: bool = step < (4 as usize)
+                let forced_full: bool = step < cache_dit_warmup
                     || !have_cache_residual
                     || continuous_cached_steps >= continuous_cache_cap
                     || (taylor_full_final_step && step +% (1 as usize) == step_limit);
@@ -6194,6 +6986,7 @@ fn run_trajectory_packed_impl(
                     cache_dit_diff,
                     cache_dit_threshold_value,
                     continuous_cache_cap,
+                    cache_dit_warmup,
                 );
                 if cache_dit_cached_step {
                     params.slot = 0 as u32;
@@ -6254,6 +7047,12 @@ fn run_trajectory_packed_impl(
                 (transformer_command_buffer.g_p_u_end_time()
                     - transformer_command_buffer.g_p_u_start_time()) * 1000.0f64;
         }
+        if use_weight_ring {
+            weight_ring.retire_all();
+            step_ms = step_ms + weight_ring.take_gpu_ms();
+        }
+        let ring_acquire_wait_ms: i64 = weight_ring.take_acquire_wait_ms();
+        let ring_retire_wait_ms: i64 = weight_ring.take_retire_wait_ms();
         let expected_step_quantized: usize = if cache_dit_cached_step {
             0 as usize
         } else {
@@ -6360,17 +7159,17 @@ fn run_trajectory_packed_impl(
                 0.011f64
             };
             if cache_dit_enabled && completed_step == (40 as usize) {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps} latent_nRMSE=${error} validation=measured-only");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} ring_acquire_wait_ms=${ring_acquire_wait_ms} ring_retire_wait_ms=${ring_retire_wait_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps} latent_nRMSE=${error} validation=measured-only");
                 all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
             } else {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} latent_nRMSE=${error} limit=${error_limit}");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} ring_acquire_wait_ms=${ring_acquire_wait_ms} ring_retire_wait_ms=${ring_retire_wait_ms} latent_nRMSE=${error} limit=${error_limit}");
                 all_ok = error <= error_limit && finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
             }
         } else {
             if cache_dit_enabled {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps}");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} ring_acquire_wait_ms=${ring_acquire_wait_ms} ring_retire_wait_ms=${ring_retire_wait_ms} cache_diff=${cache_dit_diff} cache_steps=${total_cached_steps}");
             } else {
-                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms}");
+                io::println("trajectory step ${completed_step}: mode=${cache_mode_name} timestep=${timesteps[step]} sigma=${sigmas[step]} gpu_ms=${step_ms} gpu_timing_fragmented=${use_graph_attention} wall_ms=${step_wall_ms} ring_acquire_wait_ms=${ring_acquire_wait_ms} ring_retire_wait_ms=${ring_retire_wait_ms}");
             }
             all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         }
@@ -6385,7 +7184,7 @@ fn run_trajectory_packed_impl(
         }
     }
     let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
-    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} taylorseer=${taylorseer_enabled} bottleneck_shift=${bottleneck_shift} bottleneck_strength=${bottleneck_strength} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
+    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} taylorseer=${taylorseer_enabled} bottleneck_shift=${bottleneck_shift} bottleneck_strength=${bottleneck_strength} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} shift_terminal=${shift_terminal_name} profile_skip=${profile_skip} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
         if taylorseer_enabled {
             io::println("Qwen-Image-2.1 TaylorSeer trajectory: complete; quality requires measured acceptance");

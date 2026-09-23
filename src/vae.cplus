@@ -1,6 +1,7 @@
 import "./mmap_macos" as mapped;
 import "./mps_graph_attention" as graph_attention;
 import "./mps_graph_conv" as graph_conv;
+import "./mps_matrix" as mps;
 import "./safetensors" as safetensors;
 import "metal/metal" as metal;
 import "objc/bridge" as bridge;
@@ -9,10 +10,15 @@ import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/thread" as thread;
 import "stdlib/text" as text;
+import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 
 extern fn MTLCreateSystemDefaultDevice() -> *u8;
+#[link_name = "memcpy"]
+extern fn qi_memcpy(destination: *u8, source: *u8, count: usize) -> *u8;
 
 const REDUCTION_THREADS: usize = 128;
 const VM_PAGE_BYTES: usize = 16384;
@@ -134,6 +140,8 @@ struct Pipelines {
     denormalize: metal::ComputePipelineState,
     dup: metal::ComputePipelineState,
     attention: metal::ComputePipelineState,
+    softmax: metal::ComputePipelineState,
+    nearest_upsample: metal::ComputePipelineState,
     clamp: metal::ComputePipelineState,
     // Non-null selects the MPSGraph FP32 convolution path.
     opaque graph_convs: *graph_conv::Cache,
@@ -196,6 +204,77 @@ fn mapped_storage_buffer(
         return option::Option[metal::Buffer]::None;
     }
     return option::Option[metal::Buffer]::Some(metal::Buffer::from_raw(object));
+}
+
+// The no-copy mapping makes the first decode dispatch fault and wire the
+// 1.26 GiB weight file inside the timed decode. Copying it into an ordinary
+// shared buffer with parallel F_NOCACHE positional reads (as the transformer
+// pack does) keeps identical bytes at identical offsets.
+// QI_DISABLE_VAE_PREAD=1 restores the no-copy mapping.
+const VAE_READ_THREADS: usize = 8;
+
+struct VaeReadJob {
+    fd: i32,
+    opaque destination: *u8,
+    offset: u64,
+    length: usize,
+}
+
+impl VaeReadJob: Send {}
+
+fn read_vae_job(take job: VaeReadJob) -> i64 {
+    return if mapped::read_at_descriptor(job.fd, job.destination, job.length, job.offset) {
+        0 as i64
+    } else { -1 as i64 };
+}
+
+fn read_storage_buffer(
+    device: metal::Device,
+    path: str,
+    length: usize,
+) -> option::Option[metal::Buffer] {
+    guard let option::Option[metal::Buffer]::Some(buffer) = new_buffer(
+        device, round_up(length, VM_PAGE_BYTES) as u64,
+    ) else { return option::Option[metal::Buffer]::None; };
+    guard let option::Option[mapped::PositionalReader]::Some(reader) =
+        mapped::open_positional_reader(path) else {
+        rt::release(buffer.raw());
+        return option::Option[metal::Buffer]::None;
+    };
+    let chunk: usize = round_up(length / VAE_READ_THREADS +% (1 as usize), VM_PAGE_BYTES);
+    var handles: vec::Vec[thread::JoinHandle[i64]] =
+        vec::Vec[thread::JoinHandle[i64]]::with_capacity(VAE_READ_THREADS);
+    var ok: bool = true;
+    var start: usize = 0 as usize;
+    while start < length {
+        let count: usize = if length -% start < chunk { length -% start } else { chunk };
+        let handle: thread::JoinHandle[i64] = thread::spawn_with::[VaeReadJob, i64](
+            VaeReadJob {
+                fd: reader.descriptor(),
+                destination: buffer.contents() + start,
+                offset: start as u64,
+                length: count,
+            },
+            read_vae_job,
+        );
+        if handles.append(handle) != status::Status::Ok {
+            ok = false;
+            break;
+        }
+        start = start +% count;
+    }
+    while handles.count() > (0 as usize) {
+        guard let option::Option[thread::JoinHandle[i64]]::Some(handle) = handles.remove_last() else {
+            ok = false;
+            break;
+        };
+        if handle.join() != (0 as i64) { ok = false; }
+    }
+    if !ok {
+        rt::release(buffer.raw());
+        return option::Option[metal::Buffer]::None;
+    }
+    return option::Option[metal::Buffer]::Some(buffer);
 }
 
 fn fixture_buffer(
@@ -633,6 +712,106 @@ fn dispatch_attention(
     return option::Option[f64]::Some(finish_dispatch(command_buffer, encoder, !deferred.is_null()));
 }
 
+// Middle-block single-head attention as scores = QK^T / sqrt(C) (FP32 MPS
+// GEMM over strided column slices of the [pixels, 3C] qkv buffer), an
+// in-place row softmax, and output = P V (FP32 MPS GEMM). Replaces one
+// threadgroup per query with a barrier reduction per key (about 250 ms at
+// 1024). QI_DISABLE_VAE_MPS_ATTENTION=1 restores the streaming kernel.
+fn dispatch_attention_mps(
+    queue: metal::CommandQueue,
+    device: metal::Device,
+    softmax_pipeline: metal::ComputePipelineState,
+    qkv: metal::Buffer,
+    scores: metal::Buffer,
+    output: metal::Buffer,
+    pixels: usize,
+    deferred: *u8 = 0 as *u8,
+) -> option::Option[f64] {
+    let channels: usize = 1152 as usize;
+    let qkv_row_bytes: usize = (3 as usize) *% channels *% #size_of::[f32]();
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[mps::Multiplication]::Some(score_operation) = mps::create_fp32(
+        device,
+        mps::Fp32Operand { buffer: qkv, offset: 0 as u64, rows: pixels, columns: channels, row_bytes: qkv_row_bytes },
+        mps::Fp32Operand { buffer: qkv, offset: (channels *% #size_of::[f32]()) as u64, rows: pixels, columns: channels, row_bytes: qkv_row_bytes },
+        mps::Fp32Operand { buffer: scores, offset: 0 as u64, rows: pixels, columns: pixels, row_bytes: pixels *% #size_of::[f32]() },
+        false, true, channels, 1.0f64 / (channels as f64).sqrt(),
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[mps::Multiplication]::Some(value_operation) = mps::create_fp32(
+        device,
+        mps::Fp32Operand { buffer: scores, offset: 0 as u64, rows: pixels, columns: pixels, row_bytes: pixels *% #size_of::[f32]() },
+        mps::Fp32Operand { buffer: qkv, offset: ((2 as usize) *% channels *% #size_of::[f32]()) as u64, rows: pixels, columns: channels, row_bytes: qkv_row_bytes },
+        mps::Fp32Operand { buffer: output, offset: 0 as u64, rows: pixels, columns: channels, row_bytes: channels *% #size_of::[f32]() },
+        false, false, pixels, 1.0f64,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    score_operation.encode(command_buffer);
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: ElementParams = ElementParams { elements: pixels as u32, channels: channels as u32 };
+    encoder.set_compute_pipeline_state(softmax_pipeline);
+    encoder.set_buffer(scores, 0 as u64, 0 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[ElementParams]() as u64, 1 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size { width: pixels as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: REDUCTION_THREADS as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    let command_encoder: metal::CommandEncoder = metal::CommandEncoder::from_raw(encoder.raw());
+    command_encoder.end_encoding();
+    value_operation.encode(command_buffer);
+    if !deferred.is_null() { return option::Option[f64]::Some(0.0f64); }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+// Writes the nearest-2x upsampled input into dead scratch, then runs a plain
+// 3x3 convolution graph at the doubled shape. The fused resize-plus-conv
+// graph made MPSGraph materialise every resize output internally, about
+// 2.1 GB of graph scratch at 1024.
+fn dispatch_graph_upsample_conv(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    storage: metal::Buffer,
+    weight: ConvWeight,
+    input: metal::Buffer,
+    upsampled: metal::Buffer,
+    output: metal::Buffer,
+    height: usize,
+    width: usize,
+    channels: usize,
+    deferred: *u8,
+) -> option::Option[f64] {
+    let elements: usize = height *% width *% (4 as usize) *% channels;
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = dispatch_command_buffer(queue, deferred) else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: ElementParams = ElementParams { elements: width as u32, channels: channels as u32 };
+    encoder.set_compute_pipeline_state(pipelines.nearest_upsample);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(upsampled, 0 as u64, 1 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[ElementParams]() as u64, 2 as u64);
+    encoder.dispatch_threads(
+        metal::Size { width: elements as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: pipelines.nearest_upsample.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+    );
+    let upsample_ms: f64 = finish_dispatch(command_buffer, encoder, !deferred.is_null());
+    guard let option::Option[f64]::Some(conv_ms) = dispatch_conv(
+        queue, pipelines, storage, weight, upsampled, output,
+        height *% (2 as usize), width *% (2 as usize), channels, channels, 3, 1, false, deferred,
+    ) else { return option::Option[f64]::None; };
+    return option::Option[f64]::Some(upsample_ms + conv_ms);
+}
+
 fn execute_residual(
     queue: metal::CommandQueue,
     pipelines: Pipelines,
@@ -876,6 +1055,7 @@ fn run_impl(
         return 2;
     }
     let input_width: usize = input_height;
+    let timing_start_ms: i64 = time::now_millis();
     let fixture_directory_text: text::Text = "${fixture_root}/${case_directory}";
     let fixture_directory: str = fixture_directory_text.view();
     let model_path: text::Text = "${model_root}/vae/diffusion_pytorch_model.safetensors";
@@ -884,6 +1064,7 @@ fn run_impl(
         return 1;
     };
 
+    let timing_header_ms: i64 = time::now_millis();
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return 1; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
@@ -918,12 +1099,23 @@ fn run_impl(
     guard let option::Option[OwnedObjc]::Some(dup_owner) = pipeline(device, library, "vae_dup_up_shortcut") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "vae_single_head_attention") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(clamp_owner) = pipeline(device, library, "vae_clamp") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(softmax_owner) = pipeline(device, library, "vae_row_softmax") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(nearest_upsample_owner) = pipeline(device, library, "vae_nearest_upsample_2x") else { return 1; };
     // Every convolution, including nearest-2x upsample convolutions, runs
     // through MPSGraph's FP32 convolution: about 6.9 s faster at 1024 and more
     // accurate against the official oracle. QI_DISABLE_VAE_MPSGRAPH_CONV=1
     // restores the custom cooperative-matrix kernels for A/B testing.
-    let use_graph_conv: bool = !env::has_var("QI_DISABLE_VAE_MPSGRAPH_CONV")
-        && graph_attention::load_frameworks();
+    let disable_graph_conv: bool = env::has_var("QI_DISABLE_VAE_MPSGRAPH_CONV");
+    let use_graph_conv: bool = !disable_graph_conv && graph_attention::load_frameworks();
+    let disable_graph_conv_name: str = if disable_graph_conv { "on" } else { "off" };
+    let use_pread: bool = !env::has_var("QI_DISABLE_VAE_PREAD");
+    let disable_pread_name: str = if use_pread { "off" } else { "on" };
+    let use_mps_attention: bool = !env::has_var("QI_DISABLE_VAE_MPS_ATTENTION")
+        && mps::load_framework();
+    let disable_mps_attention_name: str = if env::has_var("QI_DISABLE_VAE_MPS_ATTENTION") {
+        "on"
+    } else { "off" };
+    io::println("VAE switches: disable_vae_mpsgraph_conv=${disable_graph_conv_name} graph_conv=${use_graph_conv} disable_vae_pread=${disable_pread_name} disable_vae_mps_attention=${disable_mps_attention_name} mps_attention=${use_mps_attention}");
     var graph_convs: graph_conv::Cache = graph_conv::new_cache();
     let pipelines: Pipelines = Pipelines {
         conv: metal::ComputePipelineState::from_raw(conv_owner.raw()),
@@ -934,12 +1126,17 @@ fn run_impl(
         denormalize: metal::ComputePipelineState::from_raw(denormalize_owner.raw()),
         dup: metal::ComputePipelineState::from_raw(dup_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
+        softmax: metal::ComputePipelineState::from_raw(softmax_owner.raw()),
+        nearest_upsample: metal::ComputePipelineState::from_raw(nearest_upsample_owner.raw()),
         clamp: metal::ComputePipelineState::from_raw(clamp_owner.raw()),
         graph_convs: if use_graph_conv { #addr_of(graph_convs) } else { 0 as *graph_conv::Cache },
     };
 
-    guard let option::Option[metal::Buffer]::Some(storage) = mapped_storage_buffer(device, file) else {
-        io::eprintln("VAE: could not create no-copy weight buffer");
+    let timing_pipelines_ms: i64 = time::now_millis();
+    guard let option::Option[metal::Buffer]::Some(storage) = if use_pread {
+        read_storage_buffer(device, model_path.view(), file.mapping_length())
+    } else { mapped_storage_buffer(device, file) } else {
+        io::eprintln("VAE: could not create the weight buffer");
         return 1;
     };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
@@ -968,8 +1165,10 @@ fn run_impl(
     let wide_activation_bytes: u64 = (wide_activation_elements *% #size_of::[f32]()) as u64;
     let narrow_activation_bytes: u64 = (narrow_activation_elements *% #size_of::[f32]()) as u64;
     let qkv_bytes: u64 = (input_height *% input_width *% (3456 as usize) *% #size_of::[f32]()) as u64;
-    let upsample_weight_bytes: u64 = ((16 as usize) *% (1152 as usize)
-        *% (1152 as usize) *% #size_of::[f32]()) as u64;
+    // Only the custom upsample kernels read the parity-packed weights.
+    let upsample_weight_bytes: u64 = if use_graph_conv { 4 as u64 } else {
+        ((16 as usize) *% (1152 as usize) *% (1152 as usize) *% #size_of::[f32]()) as u64
+    };
     guard let option::Option[metal::Buffer]::Some(buffer_a) = new_buffer(device, narrow_activation_bytes) else { return 1; }; let buffer_a_owner: OwnedObjc = OwnedObjc::new(buffer_a.raw());
     guard let option::Option[metal::Buffer]::Some(buffer_b) = new_buffer(device, wide_activation_bytes) else { return 1; }; let buffer_b_owner: OwnedObjc = OwnedObjc::new(buffer_b.raw());
     guard let option::Option[metal::Buffer]::Some(buffer_c) = new_buffer(device, wide_activation_bytes) else { return 1; }; let buffer_c_owner: OwnedObjc = OwnedObjc::new(buffer_c.raw());
@@ -977,7 +1176,13 @@ fn run_impl(
     guard let option::Option[metal::Buffer]::Some(shortcut) = new_buffer(device, narrow_activation_bytes) else { return 1; }; let shortcut_owner: OwnedObjc = OwnedObjc::new(shortcut.raw());
     guard let option::Option[metal::Buffer]::Some(block_shortcut) = new_buffer(device, wide_activation_bytes) else { return 1; }; let block_shortcut_owner: OwnedObjc = OwnedObjc::new(block_shortcut.raw());
     guard let option::Option[metal::Buffer]::Some(qkv) = new_buffer(device, qkv_bytes) else { return 1; }; let qkv_owner: OwnedObjc = OwnedObjc::new(qkv.raw());
+    let attention_pixels: usize = input_height *% input_width;
+    let scores_bytes: u64 = if use_mps_attention {
+        (attention_pixels *% attention_pixels *% #size_of::[f32]()) as u64
+    } else { 4 as u64 };
+    guard let option::Option[metal::Buffer]::Some(scores) = new_buffer(device, scores_bytes) else { return 1; }; let scores_owner: OwnedObjc = OwnedObjc::new(scores.raw());
     guard let option::Option[metal::Buffer]::Some(packed_upsample_weight) = new_buffer(device, upsample_weight_bytes) else { return 1; }; let packed_upsample_weight_owner: OwnedObjc = OwnedObjc::new(packed_upsample_weight.raw());
+    let timing_buffers_ms: i64 = time::now_millis();
     guard let option::Option[metal::CommandBuffer]::Some(base_decode_command_buffer) =
         queue.command_buffer() else { return 1; };
     let base_decode_command_buffer_owner: OwnedObjc =
@@ -1022,7 +1227,11 @@ fn run_impl(
     guard let option::Option[ConvWeight]::Some(qkv_weight) = conv_weight(file, "decoder.mid_block.attentions.0.to_qkv", 3456, 1152, 1) else { return 1; };
     guard let option::Option[f64]::Some(qkv_ms) = dispatch_conv(queue, pipelines, storage, qkv_weight, buffer_c, qkv, input_height, input_width, 1152, 3456, 1, 0, false, deferred) else { return 1; };
     total_ms = total_ms + qkv_ms;
-    guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(queue, pipelines.attention, qkv, buffer_d, input_height *% input_width, deferred) else { return 1; };
+    guard let option::Option[f64]::Some(attention_ms) = if use_mps_attention {
+        dispatch_attention_mps(queue, device, pipelines.softmax, qkv, scores, buffer_d, attention_pixels, deferred)
+    } else {
+        dispatch_attention(queue, pipelines.attention, qkv, buffer_d, attention_pixels, deferred)
+    } else { return 1; };
     total_ms = total_ms + attention_ms;
     guard let option::Option[ConvWeight]::Some(attention_projection) = conv_weight(file, "decoder.mid_block.attentions.0.proj", 1152, 1152, 1) else { return 1; };
     guard let option::Option[f64]::Some(attention_projection_ms) = dispatch_conv(queue, pipelines, storage, attention_projection, buffer_d, buffer_a, input_height, input_width, 1152, 1152, 1, 0, false, deferred) else { return 1; };
@@ -1090,9 +1299,9 @@ fn run_impl(
                     width, output_channels, deferred,
                 )
             } else {
-                dispatch_conv(
-                    queue, pipelines, storage, upsample_weight, buffer_a, buffer_b, height,
-                    width, output_channels, output_channels, 3, 1, true, deferred,
+                dispatch_graph_upsample_conv(
+                    queue, pipelines, storage, upsample_weight, buffer_a, buffer_c, buffer_b,
+                    height, width, output_channels, deferred,
                 )
             };
             guard let option::Option[f64]::Some(upsample_ms) = upsample_result else { return 1; };
@@ -1137,6 +1346,7 @@ fn run_impl(
     if profile_dispatches {
         io::println("VAE profile: stage=output norm_silu_ms=${final_norm_silu_ms} conv_out_ms=${conv_out_ms} clamp_ms=${clamp_ms}");
     }
+    let timing_encoded_ms: i64 = time::now_millis();
     if !deferred.is_null() {
         decode_command_buffer.commit();
         decode_command_buffer.wait_until_completed();
@@ -1162,20 +1372,20 @@ fn run_impl(
         };
         all_ok = output_error <= output_limit && all_ok;
     }
+    let timing_completed_ms: i64 = time::now_millis();
     all_ok = finite(buffer_a, output_count) && all_ok;
     if !decoded_destination.is_null() {
-        let decoded_values: *f32 = buffer_a.contents() as *f32;
         let decoded_count: usize = height *% width *% (4 as usize);
-        var decoded_index: usize = 0 as usize;
-        while decoded_index < decoded_count {
-            decoded_destination[decoded_index] = decoded_values[decoded_index];
-            decoded_index = decoded_index +% (1 as usize);
-        }
+        let _copied: *u8 = qi_memcpy(
+            decoded_destination as *u8, buffer_a.contents(),
+            decoded_count *% #size_of::[f32](),
+        );
     }
+    io::println("VAE timing: header_ms=${timing_header_ms - timing_start_ms} device_library_pipelines_ms=${timing_pipelines_ms - timing_header_ms} storage_and_buffers_ms=${timing_buffers_ms - timing_pipelines_ms} encode_ms=${timing_encoded_ms - timing_buffers_ms} commit_wait_ms=${timing_completed_ms - timing_encoded_ms} finite_and_readback_ms=${time::now_millis() - timing_completed_ms}");
     if validate_reference {
-        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(3 as u64) *% wide_activation_bytes + (3 as u64) *% narrow_activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(3 as u64) *% wide_activation_bytes + (3 as u64) *% narrow_activation_bytes + qkv_bytes + upsample_weight_bytes + scores_bytes} gpu_ms=${total_ms} output_nRMSE=${output_error} limit=${output_limit}");
     } else {
-        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(3 as u64) *% wide_activation_bytes + (3 as u64) *% narrow_activation_bytes + qkv_bytes + upsample_weight_bytes} gpu_ms=${total_ms}");
+        io::println("VAE decode: case=${requested_case} input=${input_height}x${input_width} output=${height}x${width} mapped_weight_bytes=${round_up(file.mapping_length(), VM_PAGE_BYTES)} scratch_bytes=${(3 as u64) *% wide_activation_bytes + (3 as u64) *% narrow_activation_bytes + qkv_bytes + upsample_weight_bytes + scores_bytes} gpu_ms=${total_ms}");
     }
     if all_ok {
         if validate_reference {

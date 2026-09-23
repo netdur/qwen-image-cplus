@@ -16,6 +16,8 @@ extern fn qi_pack_open(path: *u8, flags: i32, mode: i32) -> i32;
 extern fn qi_pack_write(fd: i32, bytes: *u8, count: usize) -> isize;
 #[link_name = "lseek"]
 extern fn qi_pack_lseek(fd: i32, offset: i64, whence: i32) -> i64;
+#[link_name = "pwrite"]
+extern fn qi_pack_pwrite(fd: i32, bytes: *u8, count: usize, offset: i64) -> isize;
 #[link_name = "fsync"]
 extern fn qi_pack_fsync(fd: i32) -> i32;
 #[link_name = "fchmod"]
@@ -42,6 +44,7 @@ const TRANSFORMER_BLOCK_COUNT: usize = 32;
 const SCOPE_BLOCK0: u32 = 1;
 const SCOPE_TRANSFORMER: u32 = 2;
 const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
 const O_CREAT: i32 = 0x0200;
 const O_TRUNC: i32 = 0x0400;
 const SEEK_SET: i32 = 0;
@@ -80,7 +83,13 @@ struct PackedHeader {
     model_snapshot: [u8; 40],
     diffusers_commit: [u8; 40],
     policy: [u8; 32],
-    reserved: [u8; 88],
+    // Optional key/value metadata block (see docs/packed-format-v1.md).
+    // All zero means the pack carries no metadata.
+    metadata_offset: u64,
+    metadata_bytes: u32,
+    metadata_version: u32,
+    metadata_checksum: u64,
+    reserved: [u8; 64],
 }
 
 #[repr(C)]
@@ -844,6 +853,14 @@ fn convert_tensor_to_fp16(tensor: safetensors::TensorData) -> option::Option[Own
 }
 
 fn verify_full_packed(file: mapped::MappedFile, quiet: bool) -> i32 {
+    // The loader rejects invalid metadata, so the verifier must too.
+    match mapped_metadata(file.pointer(), file.length()) {
+        MetadataResult::Ok(_metadata) => {}
+        MetadataResult::Err(message) => {
+            if !quiet { io::eprintln("packed model: invalid metadata: ${message}"); }
+            return 1;
+        }
+    }
     let header: *PackedHeader = file.pointer() as *PackedHeader;
     let all_matrix_policy: bool = fixed_matches(
         #addr_of((*header).policy[0]), 32 as usize, FULL_POLICY,
@@ -1289,6 +1306,13 @@ fn verify_packed(path: str, quiet: bool = false) -> i32 {
         if !quiet { io::eprintln("packed model: invalid header or model identity"); }
         return 1;
     }
+    match mapped_metadata(file.pointer(), file.length()) {
+        MetadataResult::Ok(_metadata) => {}
+        MetadataResult::Err(message) => {
+            if !quiet { io::eprintln("packed model: invalid metadata: ${message}"); }
+            return 1;
+        }
+    }
     let payload_length: usize = file.length() -% (*header).data_offset as usize;
     let payload_hash: u64 = hash_update(
         FNV_OFFSET,
@@ -1411,6 +1435,13 @@ fn load(path: str, verify_hashes: bool = false) -> LoadResult {
     if magic_matches(header) && (*header).scope == SCOPE_TRANSFORMER {
         if verify_full_runtime_structure(mapping, true) != (0 as i32) {
             return LoadResult::Err;
+        }
+        match mapped_metadata(mapping.pointer(), mapping.length()) {
+            MetadataResult::Ok(_metadata) => {}
+            MetadataResult::Err(message) => {
+                io::eprintln("packed model: invalid metadata in ${path}: ${message}");
+                return LoadResult::Err;
+            }
         }
         let checksum_requested: bool =
             verify_hashes || env::has_var("QI_VERIFY_PACKED_CHECKSUMS");
@@ -1766,7 +1797,11 @@ fn quantize_block0(model_directory: str, output_path: str) -> i32 {
         model_snapshot: [0 as u8; 40],
         diffusers_commit: [0 as u8; 40],
         policy: [0 as u8; 32],
-        reserved: [0 as u8; 88],
+        metadata_offset: 0 as u64,
+        metadata_bytes: 0 as u32,
+        metadata_version: 0 as u32,
+        metadata_checksum: 0 as u64,
+        reserved: [0 as u8; 64],
     };
     let _snapshot_ok: bool = fixed_text(#addr_of(header.model_snapshot[0]), 40 as usize, SNAPSHOT);
     let _commit_ok: bool = fixed_text(#addr_of(header.diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT);
@@ -1964,7 +1999,11 @@ fn quantize_transformer_impl(
         model_snapshot: [0 as u8; 40],
         diffusers_commit: [0 as u8; 40],
         policy: [0 as u8; 32],
-        reserved: [0 as u8; 88],
+        metadata_offset: 0 as u64,
+        metadata_bytes: 0 as u32,
+        metadata_version: 0 as u32,
+        metadata_checksum: 0 as u64,
+        reserved: [0 as u8; 64],
     };
     let _snapshot_ok: bool = fixed_text(#addr_of(header.model_snapshot[0]), 40 as usize, SNAPSHOT);
     let _commit_ok: bool = fixed_text(#addr_of(header.diffusers_commit[0]), 40 as usize, DIFFUSERS_COMMIT);
@@ -2149,6 +2188,579 @@ fn quantize_transformer(model_directory: str, output_path: str) -> i32 {
 
 fn quantize_transformer_int4_rotated(model_directory: str, output_path: str) -> i32 {
     return quantize_transformer_impl(model_directory, output_path, true);
+}
+
+// MARK: - Key/value metadata
+
+// Metadata is a UTF-8 block of `key=value` lines stored in the unused padding
+// between the tensor directory and the page-aligned data section. That space
+// is outside the payload checksum, so metadata can be added to an existing
+// pack in place. Keys use [a-z0-9._-]; values are single-line. Unknown keys
+// are preserved and ignored; the known keys below are validated on load.
+const METADATA_VERSION: u32 = 1;
+const METADATA_BASE_PREFIX: str = "Qwen/Qwen-Image-2.1@";
+
+struct MetadataEntry {
+    key: text::Text,
+    value: text::Text,
+}
+
+struct Metadata {
+    entries: vec::Vec[MetadataEntry],
+}
+
+enum MetadataResult {
+    Ok(Metadata),
+    Err(text::Text),
+}
+
+impl Metadata {
+    // The returned view borrows this Metadata and must not outlive it.
+    fn get(this, key: str) -> option::Option[str] {
+        var index: usize = 0 as usize;
+        while index < this.entries.count() {
+            guard let option::Option[*MetadataEntry]::Some(entry) = this.entries.at_ptr(index) else {
+                return option::Option[str]::None;
+            };
+            if (*entry).key.view() == key {
+                return option::Option[str]::Some((*entry).value.view());
+            }
+            index = index +% (1 as usize);
+        }
+        return option::Option[str]::None;
+    }
+
+    // An empty value removes the key.
+    fn set(ref this, key: str, value: str) -> status::Status {
+        var index: usize = 0 as usize;
+        while index < this.entries.count() {
+            guard let option::Option[*MetadataEntry]::Some(entry) = this.entries.at_ptr(index) else {
+                return status::Status::OutOfBounds;
+            };
+            if (*entry).key.view() == key {
+                if value.count() == (0 as usize) {
+                    let _removed: option::Option[MetadataEntry] = this.entries.remove(index);
+                    return status::Status::Ok;
+                }
+                (*entry).value = text::from_str(value);
+                return status::Status::Ok;
+            }
+            index = index +% (1 as usize);
+        }
+        if value.count() == (0 as usize) { return status::Status::Ok; }
+        return this.entries.append(MetadataEntry {
+            key: text::from_str(key),
+            value: text::from_str(value),
+        });
+    }
+
+    fn serialize(this) -> text::Text {
+        var output: text::Text = text::new();
+        var index: usize = 0 as usize;
+        while index < this.entries.count() {
+            guard let option::Option[*MetadataEntry]::Some(entry) = this.entries.at_ptr(index) else {
+                return output;
+            };
+            let _key: status::Status = output.append((*entry).key.view());
+            let _equals: status::Status = output.append("=");
+            let _value: status::Status = output.append((*entry).value.view());
+            let _newline: status::Status = output.append("\n");
+            index = index +% (1 as usize);
+        }
+        return output;
+    }
+}
+
+fn empty_metadata() -> Metadata {
+    return Metadata { entries: vec::Vec[MetadataEntry]::with_capacity(8 as usize) };
+}
+
+fn metadata_key_valid(key: str) -> bool {
+    if key.count() == (0 as usize) || key.count() > (64 as usize) { return false; }
+    var index: usize = 0 as usize;
+    while index < key.count() {
+        guard let option::Option[u8]::Some(byte) = key.byte_at(index) else { return false; };
+        let ok: bool = (byte >= (97 as u8) && byte <= (122 as u8))
+            || (byte >= (48 as u8) && byte <= (57 as u8))
+            || byte == (46 as u8) || byte == (95 as u8) || byte == (45 as u8);
+        if !ok { return false; }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn metadata_value_valid(value: str) -> bool {
+    if value.count() == (0 as usize) || value.count() > (512 as usize) { return false; }
+    var index: usize = 0 as usize;
+    while index < value.count() {
+        guard let option::Option[u8]::Some(byte) = value.byte_at(index) else { return false; };
+        if byte < (32 as u8) || byte == (127 as u8) { return false; }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn parse_decimal_usize(value: str) -> option::Option[usize] {
+    if value.count() == (0 as usize) || value.count() > (6 as usize) {
+        return option::Option[usize]::None;
+    }
+    var result: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < value.count() {
+        guard let option::Option[u8]::Some(byte) = value.byte_at(index) else {
+            return option::Option[usize]::None;
+        };
+        if byte < (48 as u8) || byte > (57 as u8) { return option::Option[usize]::None; }
+        result = result *% (10 as usize) +% (byte -% (48 as u8)) as usize;
+        index = index +% (1 as usize);
+    }
+    return option::Option[usize]::Some(result);
+}
+
+// Returns an error message for an invalid known key, or an empty Text.
+fn validate_known_metadata(metadata: Metadata) -> text::Text {
+    match metadata.get("base") {
+        option::Option[str]::Some(value) => {
+            let expected: text::Text = "${METADATA_BASE_PREFIX}${SNAPSHOT}";
+            if value != expected.view() {
+                return "base must be ${expected}, got ${value}";
+            }
+        }
+        option::Option[str]::None => {}
+    }
+    match metadata.get("kind") {
+        option::Option[str]::Some(value) => {
+            if value != "base" && value != "distilled" {
+                return "kind must be base or distilled, got ${value}";
+            }
+        }
+        option::Option[str]::None => {}
+    }
+    match metadata.get("steps") {
+        option::Option[str]::Some(value) => {
+            guard let option::Option[usize]::Some(steps) = parse_decimal_usize(value) else {
+                return "steps must be a whole number, got ${value}";
+            };
+            // Only the counts generate-1024 can run; anything else would be
+            // refused at generation time.
+            if !(steps == (3 as usize) || steps == (4 as usize) || steps == (8 as usize)
+                || steps == (25 as usize) || steps == (40 as usize)) {
+                return "steps must be 3, 4, 8, 25, or 40, got ${value}";
+            }
+        }
+        option::Option[str]::None => {}
+    }
+    match metadata.get("shift_terminal") {
+        option::Option[str]::Some(value) => {
+            if value != "0.02" && value != "none" {
+                return "shift_terminal must be 0.02 or none, got ${value}";
+            }
+        }
+        option::Option[str]::None => {}
+    }
+    match metadata.get("cache") {
+        option::Option[str]::Some(value) => {
+            if value != "none" && value != "taylorseer" && value != "cache-dit-0.16" {
+                return "cache must be none, taylorseer, or cache-dit-0.16, got ${value}";
+            }
+            if value != "none" && metadata_is_distilled(metadata) {
+                return "cache=${value} is invalid for kind=distilled; few-step distills have no steps to cache";
+            }
+        }
+        option::Option[str]::None => {}
+    }
+    return text::new();
+}
+
+fn metadata_is_distilled(metadata: Metadata) -> bool {
+    return match metadata.get("kind") {
+        option::Option[str]::Some(value) => value == "distilled",
+        option::Option[str]::None => false,
+    };
+}
+
+fn parse_metadata(source: str) -> MetadataResult {
+    var metadata: Metadata = empty_metadata();
+    var line_start: usize = 0 as usize;
+    while line_start < source.count() {
+        var line_end: usize = line_start;
+        while line_end < source.count() {
+            guard let option::Option[u8]::Some(byte) = source.byte_at(line_end) else {
+                return MetadataResult::Err("metadata is not readable");
+            };
+            if byte == (10 as u8) { break; }
+            line_end = line_end +% (1 as usize);
+        }
+        if line_end == source.count() {
+            return MetadataResult::Err("metadata must end with a newline");
+        }
+        guard let option::Option[str]::Some(line) = source.slice(line_start, line_end) else {
+            return MetadataResult::Err("metadata line is not valid UTF-8");
+        };
+        guard let option::Option[usize]::Some(equals) = line.find("=") else {
+            return MetadataResult::Err("metadata line has no '=': ${line}");
+        };
+        guard let option::Option[str]::Some(key) = line.slice(0 as usize, equals) else {
+            return MetadataResult::Err("metadata key is not readable");
+        };
+        guard let option::Option[str]::Some(value) = line.slice(equals +% (1 as usize), line.count()) else {
+            return MetadataResult::Err("metadata value is not readable");
+        };
+        if !metadata_key_valid(key) {
+            return MetadataResult::Err("invalid metadata key: ${key}");
+        }
+        if !metadata_value_valid(value) {
+            return MetadataResult::Err("invalid metadata value for ${key}");
+        }
+        match metadata.get(key) {
+            option::Option[str]::Some(_existing) => {
+                return MetadataResult::Err("duplicate metadata key: ${key}");
+            }
+            option::Option[str]::None => {}
+        }
+        if metadata.set(key, value) != status::Status::Ok {
+            return MetadataResult::Err("could not store metadata");
+        }
+        line_start = line_end +% (1 as usize);
+    }
+    let known_error: text::Text = validate_known_metadata(metadata);
+    if known_error.view().count() > (0 as usize) {
+        return MetadataResult::Err(known_error);
+    }
+    return MetadataResult::Ok(metadata);
+}
+
+fn directory_end(header: *PackedHeader) -> u64 {
+    return (*header).directory_offset +% RECORD_BYTES *% (*header).tensor_count as u64;
+}
+
+// Reads and validates the metadata block of a mapped pack. A pack without
+// metadata yields an empty Metadata.
+fn mapped_metadata(pointer: *u8, length: usize) -> MetadataResult {
+    if length < HEADER_BYTES as usize {
+        return MetadataResult::Err("file is too small for a header");
+    }
+    let header: *PackedHeader = pointer as *PackedHeader;
+    if !magic_matches(header) {
+        return MetadataResult::Err("not a QIPACK1 file");
+    }
+    if (*header).metadata_offset == (0 as u64) && (*header).metadata_bytes == (0 as u32)
+        && (*header).metadata_version == (0 as u32)
+        && (*header).metadata_checksum == (0 as u64) {
+        return MetadataResult::Ok(empty_metadata());
+    }
+    if (*header).metadata_version != METADATA_VERSION {
+        return MetadataResult::Err("unsupported metadata version ${(*header).metadata_version}");
+    }
+    let start: u64 = (*header).metadata_offset;
+    let directory: u64 = (*header).directory_offset;
+    let count: u64 = (*header).tensor_count as u64;
+    let data: u64 = (*header).data_offset;
+    // Check each bound before adding an offset or forming a mapped pointer.
+    if directory < HEADER_BYTES || directory > data
+        || count > (data -% directory) / RECORD_BYTES
+        || data > length as u64
+        || start < directory +% count *% RECORD_BYTES || start > data
+        || (*header).metadata_bytes as u64 > data -% start {
+        return MetadataResult::Err("metadata block is outside the directory padding");
+    }
+    let bytes: *u8 = pointer + start as usize;
+    if hash_update(FNV_OFFSET, bytes, (*header).metadata_bytes as usize)
+        != (*header).metadata_checksum {
+        return MetadataResult::Err("metadata checksum mismatch");
+    }
+    return parse_metadata(#str_from_raw_parts(bytes, (*header).metadata_bytes as usize));
+}
+
+fn read_metadata(path: str) -> MetadataResult {
+    guard let mapped::MapResult::Ok(file) = mapped::map_readonly(path) else {
+        return MetadataResult::Err("could not map ${path}");
+    };
+    return mapped_metadata(file.pointer(), file.length());
+}
+
+fn pwrite_all(fd: i32, bytes: *u8, count: usize, offset: u64) -> bool {
+    var written: usize = 0 as usize;
+    while written < count {
+        let result: isize = qi_pack_pwrite(
+            fd, bytes + written, count -% written, (offset +% written as u64) as i64,
+        );
+        if result <= (0 as isize) { return false; }
+        written = written +% result as usize;
+    }
+    return true;
+}
+
+// Replaces the metadata block in place, in three fsync'd stages so a crash or
+// a full disk never leaves a pack that neither the loader nor this tool
+// accepts: (1) the header's metadata descriptor is cleared, which reads as
+// "no metadata"; (2) the padding is cleared and the new block written;
+// (3) the header points at the new block.
+fn write_metadata(path: str, metadata: Metadata) -> i32 {
+    let known_error: text::Text = validate_known_metadata(metadata);
+    if known_error.view().count() > (0 as usize) {
+        io::eprintln("pack metadata: ${known_error}");
+        return 2;
+    }
+    var header: PackedHeader = PackedHeader {
+        magic: [0 as u8; 8], version: 0 as u32, header_bytes: 0 as u32,
+        tensor_count: 0 as u32, scope: 0 as u32, directory_offset: 0 as u64,
+        data_offset: 0 as u64, file_bytes: 0 as u64, payload_checksum: 0 as u64,
+        model_snapshot: [0 as u8; 40], diffusers_commit: [0 as u8; 40],
+        policy: [0 as u8; 32], metadata_offset: 0 as u64, metadata_bytes: 0 as u32,
+        metadata_version: 0 as u32, metadata_checksum: 0 as u64, reserved: [0 as u8; 64],
+    };
+    {
+        guard let mapped::MapResult::Ok(file) = mapped::map_readonly(path) else {
+            io::eprintln("pack metadata: could not map ${path}");
+            return 1;
+        };
+        if file.length() < HEADER_BYTES as usize || !magic_matches(file.pointer() as *PackedHeader) {
+            io::eprintln("pack metadata: ${path} is not a QIPACK1 file");
+            return 1;
+        }
+        header = *(file.pointer() as *PackedHeader);
+        // Never derive a write range from a damaged header.
+        if header.version != VERSION || header.header_bytes != HEADER_BYTES as u32
+            || header.directory_offset != HEADER_BYTES
+            || header.file_bytes != file.length() as u64
+            || header.data_offset < directory_end(#addr_of(header))
+            || header.data_offset > file.length() as u64
+            || header.data_offset -% directory_end(#addr_of(header)) > DATA_ALIGNMENT {
+            io::eprintln("pack metadata: ${path} has an inconsistent header; refusing to write");
+            return 1;
+        }
+    }
+    let block: text::Text = metadata.serialize();
+    let start: u64 = directory_end(#addr_of(header));
+    let capacity: u64 = header.data_offset -% start;
+    if block.view().count() as u64 > capacity {
+        io::eprintln("pack metadata: ${block.view().count()} bytes exceed the ${capacity}-byte directory padding");
+        return 2;
+    }
+    let path_owner: text::Text = text::from_str(path);
+    guard let option::Option[text::CString]::Some(c_path) = path_owner.c_str() else { return 1; };
+    let fd: i32 = qi_pack_open(c_path.as_ptr(), O_RDWR, 0 as i32);
+    if fd < (0 as i32) {
+        io::eprintln("pack metadata: could not open ${path} for writing");
+        return 1;
+    }
+    // Stage 1: detach the old block.
+    var detached: PackedHeader = header;
+    detached.metadata_offset = 0 as u64;
+    detached.metadata_bytes = 0 as u32;
+    detached.metadata_version = 0 as u32;
+    detached.metadata_checksum = 0 as u64;
+    var ok: bool = pwrite_all(fd, #addr_of(detached) as *u8, HEADER_BYTES as usize, 0 as u64);
+    if ok { ok = qi_pack_fsync(fd) == (0 as i32); }
+    // Stage 2: clear the whole padding, then write the block at its start.
+    var zeroes: [u8; 256] = [0 as u8; 256];
+    var cleared: u64 = 0 as u64;
+    while ok && cleared < capacity {
+        let amount: u64 = if capacity -% cleared < (256 as u64) { capacity -% cleared } else { 256 as u64 };
+        ok = pwrite_all(fd, #addr_of(zeroes[0]), amount as usize, start +% cleared);
+        cleared = cleared +% amount;
+    }
+    let block_bytes: usize = block.view().count();
+    if ok && block_bytes > (0 as usize) {
+        ok = pwrite_all(fd, #str_ptr(block.view()), block_bytes, start);
+    }
+    if ok { ok = qi_pack_fsync(fd) == (0 as i32); }
+    if block_bytes == (0 as usize) {
+        header.metadata_offset = 0 as u64;
+        header.metadata_bytes = 0 as u32;
+        header.metadata_version = 0 as u32;
+        header.metadata_checksum = 0 as u64;
+    } else {
+        header.metadata_offset = start;
+        header.metadata_bytes = block_bytes as u32;
+        header.metadata_version = METADATA_VERSION;
+        header.metadata_checksum = hash_update(FNV_OFFSET, #str_ptr(block.view()), block_bytes);
+    }
+    if ok { ok = pwrite_all(fd, #addr_of(header) as *u8, HEADER_BYTES as usize, 0 as u64); }
+    if ok { ok = qi_pack_fsync(fd) == (0 as i32); }
+    let _closed: i32 = qi_pack_close(fd);
+    if !ok {
+        io::eprintln("pack metadata: write failed for ${path}");
+        return 1;
+    }
+    return 0;
+}
+
+// `pack-metadata FILE [key=value ...]`: show metadata, or set/remove keys
+// (an empty value removes) and show the result.
+fn pack_metadata_command(path: str, assignments: vec::Vec[text::Text]) -> i32 {
+    var metadata: Metadata = empty_metadata();
+    match read_metadata(path) {
+        MetadataResult::Ok(found) => { metadata = found; }
+        MetadataResult::Err(message) => {
+            // Unreadable metadata can be replaced, never silently shown.
+            if assignments.count() == (0 as usize) {
+                io::eprintln("pack metadata: ${message}");
+                return 1;
+            }
+            io::eprintln("pack metadata: ${message}; replacing it with only the given keys");
+        }
+    }
+    if assignments.count() > (0 as usize) {
+        var index: usize = 0 as usize;
+        while index < assignments.count() {
+            guard let option::Option[*text::Text]::Some(assignment) = assignments.at_ptr(index) else {
+                return 1;
+            };
+            let view: str = (*assignment).view();
+            guard let option::Option[usize]::Some(equals) = view.find("=") else {
+                io::eprintln("pack metadata: expected key=value, got ${view}");
+                return 2;
+            };
+            guard let option::Option[str]::Some(key) = view.slice(0 as usize, equals) else { return 2; };
+            guard let option::Option[str]::Some(value) = view.slice(equals +% (1 as usize), view.count()) else { return 2; };
+            if !metadata_key_valid(key)
+                || (value.count() > (0 as usize) && !metadata_value_valid(value)) {
+                io::eprintln("pack metadata: invalid key or value in ${view}");
+                return 2;
+            }
+            if metadata.set(key, value) != status::Status::Ok { return 1; }
+            index = index +% (1 as usize);
+        }
+        let written: i32 = write_metadata(path, metadata);
+        if written != (0 as i32) { return written; }
+        match read_metadata(path) {
+            MetadataResult::Ok(found) => { metadata = found; }
+            MetadataResult::Err(message) => {
+                io::eprintln("pack metadata: reread failed: ${message}");
+                return 1;
+            }
+        }
+    }
+    if metadata.entries.count() == (0 as usize) {
+        io::println("${path}: no metadata");
+        return 0;
+    }
+    io::println("${path}:");
+    io::print(metadata.serialize().view());
+    return 0;
+}
+
+#[test]
+fn metadata_round_trips_and_validates_known_keys() {
+    let source: str = "base=Qwen/Qwen-Image-2.1@b3179ad355be050328e483a9dfdd9e60cd62adfa\nkind=distilled\nsteps=4\nshift_terminal=none\nnote.custom=kept as is\n";
+    match parse_metadata(source) {
+        MetadataResult::Ok(metadata) => {
+            assert metadata.entries.count() == (5 as usize);
+            match metadata.get("steps") {
+                option::Option[str]::Some(value) => { assert value == "4"; }
+                option::Option[str]::None => { assert false; }
+            }
+            match metadata.get("note.custom") {
+                option::Option[str]::Some(value) => { assert value == "kept as is"; }
+                option::Option[str]::None => { assert false; }
+            }
+            assert metadata.serialize().view() == source;
+        }
+        MetadataResult::Err(_message) => { assert false; }
+    }
+}
+
+#[test]
+fn metadata_rejects_invalid_blocks() {
+    match parse_metadata("kind=turbo\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("steps=0\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    // Only step counts generate-1024 can run are accepted.
+    match parse_metadata("steps=6\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("steps=4\n") {
+        MetadataResult::Ok(_m) => {}
+        MetadataResult::Err(_message) => { assert false; }
+    }
+    match parse_metadata("shift_terminal=0.5\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("kind=distilled\ncache=taylorseer\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("cache=fast\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("base=Other/Model@abc\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("Kind=base\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("kind=base\nkind=base\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("kind=base") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+}
+
+#[test]
+fn metadata_set_replaces_and_removes() {
+    var metadata: Metadata = empty_metadata();
+    assert metadata.set("steps", "40") == status::Status::Ok;
+    assert metadata.set("steps", "4") == status::Status::Ok;
+    assert metadata.entries.count() == (1 as usize);
+    assert metadata.set("steps", "") == status::Status::Ok;
+    assert metadata.entries.count() == (0 as usize);
+}
+
+#[test]
+fn mapped_metadata_checks_ranges_before_reading() {
+    var raw: [u64; 512] = [0 as u64; 512];
+    let pointer: *u8 = #addr_of(raw[0]) as *u8;
+    let header: *PackedHeader = pointer as *PackedHeader;
+    (*header).magic = [81 as u8, 73 as u8, 80 as u8, 65 as u8,
+        67 as u8, 75 as u8, 49 as u8, 0 as u8];
+    (*header).directory_offset = HEADER_BYTES;
+    (*header).data_offset = 4096 as u64;
+    (*header).metadata_version = METADATA_VERSION;
+    (*header).metadata_checksum = FNV_OFFSET;
+
+    // An empty block at the data boundary is valid.
+    (*header).metadata_offset = 4096 as u64;
+    match mapped_metadata(pointer, 4096 as usize) {
+        MetadataResult::Ok(metadata) => { assert metadata.entries.count() == (0 as usize); }
+        MetadataResult::Err(_message) => { assert false; }
+    }
+
+    // A truncated block and an offset that wraps on addition are rejected.
+    (*header).metadata_bytes = 1 as u32;
+    match mapped_metadata(pointer, 4096 as usize) {
+        MetadataResult::Ok(_metadata) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    (*header).metadata_offset = (0 as u64) -% (1 as u64) -% ((1 as u64) << (31 as u64));
+    (*header).metadata_bytes = ((1 as u64) << (31 as u64)) as u32 +% (2 as u32);
+    match mapped_metadata(pointer, 4096 as usize) {
+        MetadataResult::Ok(_metadata) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+
+    // A directory claiming records beyond the data boundary is rejected.
+    (*header).metadata_offset = 4096 as u64;
+    (*header).metadata_bytes = 0 as u32;
+    (*header).tensor_count = 16 as u32;
+    match mapped_metadata(pointer, 4096 as usize) {
+        MetadataResult::Ok(_metadata) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
 }
 
 #[test]

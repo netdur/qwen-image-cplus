@@ -433,6 +433,65 @@ kernel void vae_single_head_attention(
     }
 }
 
+// Nearest-exact 2x upsample of an NHWC FP32 tensor: output pixel (2y or 2y+1,
+// 2x or 2x+1) copies input pixel (y, x). params.elements is the input width.
+kernel void vae_nearest_upsample_2x(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant ElementParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint channels = params.channels;
+    const uint output_width = params.elements * 2;
+    const uint channel = index % channels;
+    const uint pixel = index / channels;
+    const uint output_y = pixel / output_width;
+    const uint output_x = pixel % output_width;
+    output[index] = input[((output_y / 2) * params.elements + (output_x / 2)) * channels + channel];
+}
+
+// In-place softmax over each row of an FP32 [rows, elements] score matrix.
+// The row maximum is subtracted before exp, as in the streaming kernel.
+kernel void vae_row_softmax(
+    device float *scores [[buffer(0)]],
+    constant ElementParams &params [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float reduction[VAE_REDUCTION_THREADS];
+    device float *values = scores + ulong(row) * params.elements;
+    float local_max = -INFINITY;
+    for (uint index = lane; index < params.elements; index += VAE_REDUCTION_THREADS) {
+        local_max = max(local_max, values[index]);
+    }
+    reduction[lane] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = VAE_REDUCTION_THREADS / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            reduction[lane] = max(reduction[lane], reduction[lane + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float row_max = reduction[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = 0.0f;
+    for (uint index = lane; index < params.elements; index += VAE_REDUCTION_THREADS) {
+        const float weight = exp(values[index] - row_max);
+        values[index] = weight;
+        local_sum += weight;
+    }
+    reduction[lane] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = VAE_REDUCTION_THREADS / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            reduction[lane] += reduction[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float row_sum = reduction[0];
+    for (uint index = lane; index < params.elements; index += VAE_REDUCTION_THREADS) {
+        values[index] = values[index] / row_sum;
+    }
+}
+
 kernel void vae_clamp(
     device const float *input [[buffer(0)]],
     device float *output [[buffer(1)]],

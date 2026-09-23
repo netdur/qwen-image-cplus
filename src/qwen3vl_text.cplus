@@ -7,6 +7,7 @@ import "objc/runtime" as rt;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
+import "stdlib/status" as status;
 import "stdlib/text" as text;
 import "stdlib/thread" as thread;
 import "stdlib/time" as time;
@@ -25,7 +26,13 @@ const VOCABULARY: usize = 151936;
 const SYSTEM_PREFIX_TOKENS: usize = 14;
 const TILE: usize = 16;
 const LAYER_STREAM_BYTES: usize = 416 * 1024 * 1024;
-const STREAM_ALIGNMENT: usize = 256;
+// F_NOCACHE reads take the direct path only when the file offset, the
+// destination and the length are page-aligned. Every layer span starts at an
+// unaligned offset in the shards, so spans are widened to whole 16 KiB pages
+// and placed at page-aligned destinations. Each span is then read by
+// STREAM_READ_THREADS page-aligned jobs, like the transformer pack copy.
+const STREAM_ALIGNMENT: usize = 16384;
+const STREAM_READ_THREADS: usize = 8;
 
 struct OwnedObjc {
     opaque pointer: *u8,
@@ -205,18 +212,17 @@ fn include_source(
     else { span_3.include(source.tensor); }
 }
 
+// Widens a non-empty span to whole pages, clamped to the shard's end.
+fn align_span(ref span: ShardSpan, file_length: u64) {
+    if span.length() == (0 as u64) { return; }
+    span.begin = span.begin / STREAM_ALIGNMENT as u64 *% STREAM_ALIGNMENT as u64;
+    let aligned_end: u64 = round_up(span.end as usize, STREAM_ALIGNMENT) as u64;
+    span.end = if aligned_end < file_length { aligned_end } else { file_length };
+}
+
 fn place_span(ref span: ShardSpan, destination: u64) -> u64 {
     span.destination = destination;
     return round_up((destination +% span.length()) as usize, STREAM_ALIGNMENT) as u64;
-}
-
-fn stream_span(
-    reader: mapped::PositionalReader,
-    destination: *u8,
-    span: ShardSpan,
-) -> bool {
-    if span.length() == (0 as u64) { return true; }
-    return reader.read_at(destination + span.destination as usize, span.length() as usize, span.begin);
 }
 
 fn stream_source_range(
@@ -295,6 +301,10 @@ fn layer_span_layout(
     include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, gate_weight);
     include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, up_weight);
     include_source(layout.span_0, layout.span_1, layout.span_2, layout.span_3, down_weight);
+    align_span(layout.span_0, file_0.mapping_length() as u64);
+    align_span(layout.span_1, file_1.mapping_length() as u64);
+    align_span(layout.span_2, file_2.mapping_length() as u64);
+    align_span(layout.span_3, file_3.mapping_length() as u64);
     layout.bytes = place_span(layout.span_0, 0 as u64);
     layout.bytes = place_span(layout.span_1, layout.bytes);
     layout.bytes = place_span(layout.span_2, layout.bytes);
@@ -306,12 +316,63 @@ fn layer_span_layout(
     return option::Option[LayerSpanLayout]::Some(layout);
 }
 
+struct SpanChunkJob {
+    fd: i32,
+    opaque destination: *u8,
+    offset: u64,
+    length: usize,
+}
+
+impl SpanChunkJob: Send {}
+
+fn read_span_chunk(take job: SpanChunkJob) -> i64 {
+    return if mapped::read_at_descriptor(job.fd, job.destination, job.length, job.offset) {
+        0 as i64
+    } else { -1 as i64 };
+}
+
+// Reads one span with up to STREAM_READ_THREADS page-aligned jobs. Every job
+// is joined before returning, including on failure.
+fn read_span_parallel(fd: i32, base: *u8, span: ShardSpan) -> bool {
+    let length: usize = span.length() as usize;
+    if length == (0 as usize) { return true; }
+    let chunk: usize = round_up(length / STREAM_READ_THREADS +% (1 as usize), STREAM_ALIGNMENT);
+    var handles: vec::Vec[thread::JoinHandle[i64]] =
+        vec::Vec[thread::JoinHandle[i64]]::with_capacity(STREAM_READ_THREADS);
+    var ok: bool = true;
+    var start: usize = 0 as usize;
+    while start < length {
+        let count: usize = if length -% start < chunk { length -% start } else { chunk };
+        let handle: thread::JoinHandle[i64] = thread::spawn_with::[SpanChunkJob, i64](
+            SpanChunkJob {
+                fd: fd,
+                destination: base + span.destination as usize + start,
+                offset: span.begin +% start as u64,
+                length: count,
+            },
+            read_span_chunk,
+        );
+        if handles.append(handle) != status::Status::Ok {
+            ok = false;
+            break;
+        }
+        start = start +% count;
+    }
+    while handles.count() > (0 as usize) {
+        guard let option::Option[thread::JoinHandle[i64]]::Some(handle) = handles.remove_last() else {
+            return false;
+        };
+        if handle.join() != (0 as i64) { ok = false; }
+    }
+    return ok;
+}
+
 fn read_layer_job(take job: LayerReadJob) -> i64 {
     let started_ms: i64 = time::now_millis();
-    if !mapped::read_at_descriptor(job.fd_0, job.destination + job.layout.span_0.destination as usize, job.layout.span_0.length() as usize, job.layout.span_0.begin)
-        || !mapped::read_at_descriptor(job.fd_1, job.destination + job.layout.span_1.destination as usize, job.layout.span_1.length() as usize, job.layout.span_1.begin)
-        || !mapped::read_at_descriptor(job.fd_2, job.destination + job.layout.span_2.destination as usize, job.layout.span_2.length() as usize, job.layout.span_2.begin)
-        || !mapped::read_at_descriptor(job.fd_3, job.destination + job.layout.span_3.destination as usize, job.layout.span_3.length() as usize, job.layout.span_3.begin) {
+    if !read_span_parallel(job.fd_0, job.destination, job.layout.span_0)
+        || !read_span_parallel(job.fd_1, job.destination, job.layout.span_1)
+        || !read_span_parallel(job.fd_2, job.destination, job.layout.span_2)
+        || !read_span_parallel(job.fd_3, job.destination, job.layout.span_3) {
         return -1 as i64;
     }
     return time::now_millis() - started_ms;
@@ -675,10 +736,10 @@ fn run_impl(
         if layer == (0 as usize) {
             let layer_stream_start_ms: i64 = time::now_millis();
             let layer_destination: *u8 = layer_storage.contents();
-            if !stream_span(reader_0, layer_destination, span_0)
-                || !stream_span(reader_1, layer_destination, span_1)
-                || !stream_span(reader_2, layer_destination, span_2)
-                || !stream_span(reader_3, layer_destination, span_3) {
+            if !read_span_parallel(reader_0.descriptor(), layer_destination, span_0)
+                || !read_span_parallel(reader_1.descriptor(), layer_destination, span_1)
+                || !read_span_parallel(reader_2.descriptor(), layer_destination, span_2)
+                || !read_span_parallel(reader_3.descriptor(), layer_destination, span_3) {
                 io::eprintln("text encoder: could not stream layer ${layer}");
                 return 1;
             }
@@ -690,6 +751,8 @@ fn run_impl(
             next_layout = found_next_layout;
         }
         let next_storage: metal::Buffer = if layer % (2 as usize) == (0 as usize) { layer_storage_1 } else { layer_storage_0 };
+        // Every exit below joins this worker first: it writes into a slot that
+        // this function owns and releases on return.
         let prefetch_handle: thread::JoinHandle[i64] = thread::spawn_with::[LayerReadJob, i64](
             LayerReadJob {
                 fd_0: reader_0.descriptor(),
@@ -713,24 +776,24 @@ fn run_impl(
         let up_weight: Weight = streamed_weight(layer_storage, up_weight_source, span_0, span_1, span_2, span_3);
         let down_weight: Weight = streamed_weight(layer_storage, down_weight_source, span_0, span_1, span_2, span_3);
 
-        guard let option::Option[f64]::Some(norm_ms) = dispatch_element(queue, pipelines.rms_norm, hidden_a, input_norm.storage, norm, #addr_of(params), rows, 0 as u64, input_norm.offset) else { return 1; }; total_ms = total_ms + norm_ms;
-        guard let option::Option[f64]::Some(q_ms) = dispatch_linear(queue, pipelines.linear, norm, q_weight, query, rows, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + q_ms;
-        guard let option::Option[f64]::Some(k_ms) = dispatch_linear(queue, pipelines.linear, norm, k_weight, key, rows, KV_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + k_ms;
-        guard let option::Option[f64]::Some(v_ms) = dispatch_linear(queue, pipelines.linear, norm, v_weight, value, rows, KV_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + v_ms;
+        guard let option::Option[f64]::Some(norm_ms) = dispatch_element(queue, pipelines.rms_norm, hidden_a, input_norm.storage, norm, #addr_of(params), rows, 0 as u64, input_norm.offset) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + norm_ms;
+        guard let option::Option[f64]::Some(q_ms) = dispatch_linear(queue, pipelines.linear, norm, q_weight, query, rows, WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + q_ms;
+        guard let option::Option[f64]::Some(k_ms) = dispatch_linear(queue, pipelines.linear, norm, k_weight, key, rows, KV_WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + k_ms;
+        guard let option::Option[f64]::Some(v_ms) = dispatch_linear(queue, pipelines.linear, norm, v_weight, value, rows, KV_WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + v_ms;
         params.heads = HEADS as u32;
-        guard let option::Option[f64]::Some(q_rope_ms) = dispatch_element(queue, pipelines.qk_norm_rope, query, q_norm.storage, query_rope, #addr_of(params), rows *% HEADS, 0 as u64, q_norm.offset) else { return 1; }; total_ms = total_ms + q_rope_ms;
+        guard let option::Option[f64]::Some(q_rope_ms) = dispatch_element(queue, pipelines.qk_norm_rope, query, q_norm.storage, query_rope, #addr_of(params), rows *% HEADS, 0 as u64, q_norm.offset) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + q_rope_ms;
         params.heads = KV_HEADS as u32;
-        guard let option::Option[f64]::Some(k_rope_ms) = dispatch_element(queue, pipelines.qk_norm_rope, key, k_norm.storage, key_rope, #addr_of(params), rows *% KV_HEADS, 0 as u64, k_norm.offset) else { return 1; }; total_ms = total_ms + k_rope_ms;
+        guard let option::Option[f64]::Some(k_rope_ms) = dispatch_element(queue, pipelines.qk_norm_rope, key, k_norm.storage, key_rope, #addr_of(params), rows *% KV_HEADS, 0 as u64, k_norm.offset) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + k_rope_ms;
         params.heads = HEADS as u32;
-        guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(queue, pipelines.attention, query_rope, key_rope, attended, value, #addr_of(params)) else { return 1; }; total_ms = total_ms + attention_ms;
-        guard let option::Option[f64]::Some(o_ms) = dispatch_linear(queue, pipelines.linear, attended, o_weight, branch, rows, WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + o_ms;
-        guard let option::Option[f64]::Some(add_attention_ms) = dispatch_element(queue, pipelines.add, hidden_a, branch, hidden_b, #addr_of(params), rows *% WIDTH) else { return 1; }; total_ms = total_ms + add_attention_ms;
-        guard let option::Option[f64]::Some(post_norm_ms) = dispatch_element(queue, pipelines.rms_norm, hidden_b, post_norm.storage, norm, #addr_of(params), rows, 0 as u64, post_norm.offset) else { return 1; }; total_ms = total_ms + post_norm_ms;
-        guard let option::Option[f64]::Some(gate_ms) = dispatch_linear(queue, pipelines.linear, norm, gate_weight, gate, rows, INTERMEDIATE_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + gate_ms;
-        guard let option::Option[f64]::Some(up_ms) = dispatch_linear(queue, pipelines.linear, norm, up_weight, up, rows, INTERMEDIATE_WIDTH, WIDTH) else { return 1; }; total_ms = total_ms + up_ms;
-        guard let option::Option[f64]::Some(swiglu_ms) = dispatch_element(queue, pipelines.swiglu, gate, up, activated, #addr_of(params), rows *% INTERMEDIATE_WIDTH) else { return 1; }; total_ms = total_ms + swiglu_ms;
-        guard let option::Option[f64]::Some(down_ms) = dispatch_linear(queue, pipelines.linear, activated, down_weight, branch, rows, WIDTH, INTERMEDIATE_WIDTH) else { return 1; }; total_ms = total_ms + down_ms;
-        guard let option::Option[f64]::Some(add_mlp_ms) = dispatch_element(queue, pipelines.add, hidden_b, branch, hidden_a, #addr_of(params), rows *% WIDTH) else { return 1; }; total_ms = total_ms + add_mlp_ms;
+        guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(queue, pipelines.attention, query_rope, key_rope, attended, value, #addr_of(params)) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + attention_ms;
+        guard let option::Option[f64]::Some(o_ms) = dispatch_linear(queue, pipelines.linear, attended, o_weight, branch, rows, WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + o_ms;
+        guard let option::Option[f64]::Some(add_attention_ms) = dispatch_element(queue, pipelines.add, hidden_a, branch, hidden_b, #addr_of(params), rows *% WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + add_attention_ms;
+        guard let option::Option[f64]::Some(post_norm_ms) = dispatch_element(queue, pipelines.rms_norm, hidden_b, post_norm.storage, norm, #addr_of(params), rows, 0 as u64, post_norm.offset) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + post_norm_ms;
+        guard let option::Option[f64]::Some(gate_ms) = dispatch_linear(queue, pipelines.linear, norm, gate_weight, gate, rows, INTERMEDIATE_WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + gate_ms;
+        guard let option::Option[f64]::Some(up_ms) = dispatch_linear(queue, pipelines.linear, norm, up_weight, up, rows, INTERMEDIATE_WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + up_ms;
+        guard let option::Option[f64]::Some(swiglu_ms) = dispatch_element(queue, pipelines.swiglu, gate, up, activated, #addr_of(params), rows *% INTERMEDIATE_WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + swiglu_ms;
+        guard let option::Option[f64]::Some(down_ms) = dispatch_linear(queue, pipelines.linear, activated, down_weight, branch, rows, WIDTH, INTERMEDIATE_WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + down_ms;
+        guard let option::Option[f64]::Some(add_mlp_ms) = dispatch_element(queue, pipelines.add, hidden_b, branch, hidden_a, #addr_of(params), rows *% WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + add_mlp_ms;
         let prefetch_wait_start_ms: i64 = time::now_millis();
         prefetched_stream_wall_ms = prefetch_handle.join();
         let prefetch_wait_wall_ms: i64 = time::now_millis() - prefetch_wait_start_ms;

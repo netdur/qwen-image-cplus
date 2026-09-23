@@ -183,6 +183,25 @@
         "loop_ms": 112823,
         "png_sha256": "e299e681e46438581f7627987c92d01c77da00e63ae654653c659df3dfca3552",
         "text": "Approximately CASABLANICA: the duplicated C collapsed to a residual stroke between N and C"
+      },
+      {
+        "variant": "original, current fixed-cost worktree",
+        "source_state": "Uncommitted working tree based on 2c05154",
+        "full_steps": 11,
+        "cached_steps": 29,
+        "process_wall_ms": 112640,
+        "end_to_end_ms": 112637,
+        "text_ms": 2291,
+        "transformer_startup_ms": 2779,
+        "loop_ms": 105189,
+        "transformer_phase_ms": 107968,
+        "vae_ms": 2223,
+        "png_ms": 131,
+        "peak_memory_footprint_bytes": 15986732720,
+        "swaps": 0,
+        "png_sha256": "fe29551a4dc84d6798533a6c872bcd8656a4160e4334efb0c096952eb47674e6",
+        "text": "CASABLANCCA; the historical spelling regression remains",
+        "comparison": "14.05 seconds faster than the adjacent 126.69-second Cache-DiT 0.16 current-worktree run, but not an acceptable replacement for this prompt"
       }
     ],
     "power_state": "AC Power; battery 100%; charged; GPU idle before each run",

@@ -18,7 +18,9 @@ import "./cpu_ops" as cpu_ops;
 import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/option" as option;
+import "stdlib/status" as status;
 import "stdlib/text" as text;
+import "stdlib/vec" as vec;
 
 fn parse_u64_decimal(value: str) -> option::Option[u64] {
     if value.count() == (0 as usize) { return option::Option[u64]::None; }
@@ -108,10 +110,71 @@ fn cache_dit_threshold_parser_accepts_calibration_candidates() {
     }
 }
 
+// Step count a pack's metadata asks for, limited to the counts this command
+// supports. Packs without a `steps` key keep the canonical 40. A step count
+// the command cannot run is refused (None) rather than replaced, because
+// silently running 40 steps of a few-step distill produces a wrong image.
+fn pack_default_steps(packed_path: str, allowed: [str; 5]) -> option::Option[str] {
+    match packed_model::read_metadata(packed_path) {
+        packed_model::MetadataResult::Ok(metadata) => {
+            match metadata.get("steps") {
+                option::Option[str]::Some(value) => {
+                    var index: usize = 0 as usize;
+                    while index < (5 as usize) {
+                        if allowed[index] == value { return option::Option[str]::Some(allowed[index]); }
+                        index = index +% (1 as usize);
+                    }
+                    io::eprintln("pack metadata: steps=${value} is not supported by this command; pass an explicit step count");
+                    return option::Option[str]::None;
+                }
+                option::Option[str]::None => {}
+            }
+        }
+        packed_model::MetadataResult::Err(_message) => {}
+    }
+    return option::Option[str]::Some("40");
+}
+
+// Commands that fix their own step count and schedule. A kind=distilled pack
+// defines both through its metadata, which only generate-1024 honours.
+fn command_ignores_pack_steps(command: str) -> bool {
+    return command == "generate-256" || command == "generate-256-cache-dit"
+        || command == "generate-256-bottleneck" || command == "generate-1024-bottleneck"
+        || command == "test-pipeline-256" || command == "test-pipeline-cache-dit-256"
+        || command == "test-native-pipeline-256" || command == "test-pipeline-1024-oracle"
+        || command == "test-pipeline-cache-dit-1024-oracle"
+        || command == "benchmark-process-reuse-256";
+}
+
+// Cache policy for generate-1024: an explicit argument wins, otherwise the
+// pack's `cache` key, otherwise none.
+fn pack_cache_policy(packed_path: str) -> str {
+    match packed_model::read_metadata(packed_path) {
+        packed_model::MetadataResult::Ok(metadata) => {
+            match metadata.get("cache") {
+                option::Option[str]::Some(value) => {
+                    if value == "taylorseer" { return "taylorseer"; }
+                    if value == "cache-dit-0.16" { return "cache-dit-0.16"; }
+                }
+                option::Option[str]::None => {}
+            }
+        }
+        packed_model::MetadataResult::Err(_message) => {}
+    }
+    return "none";
+}
+
+fn pack_is_distilled(packed_path: str) -> bool {
+    return match packed_model::read_metadata(packed_path) {
+        packed_model::MetadataResult::Ok(metadata) => packed_model::metadata_is_distilled(metadata),
+        packed_model::MetadataResult::Err(_message) => false,
+    };
+}
+
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -120,6 +183,29 @@ fn main() -> i32 {
         io::eprintln("missing command");
         return 2;
     };
+
+    // QI_PROFILE_SKIP omits transformer work, so it is only meaningful for the
+    // transformer-only benchmarks. Refuse it before any image-producing command
+    // spends time on the text encoder (the trajectory refuses it again).
+    let command_name: str = command.view();
+    if env::has_var("QI_PROFILE_SKIP") && (command_name.has_prefix("generate-")
+        || command_name.contains("pipeline") || command_name.has_prefix("benchmark-q4-")
+        || command_name.has_prefix("benchmark-process-reuse")) {
+        io::eprintln("${command}: QI_PROFILE_SKIP is a benchmark-only ablation that omits transformer work; unset it to generate");
+        return 2;
+    }
+
+    if command_ignores_pack_steps(command_name) {
+        match env::arg(2 as usize) {
+            option::Option[text::Text]::Some(packed_path) => {
+                if pack_is_distilled(packed_path.view()) {
+                    io::eprintln("${command}: kind=distilled packs define their own steps and schedule; use generate-1024");
+                    return 2;
+                }
+            }
+            option::Option[text::Text]::None => {}
+        }
+    }
 
     if command == "probe" {
         return metal_probe::run();
@@ -193,11 +279,11 @@ fn main() -> i32 {
     }
     if command == "benchmark-transformer-trajectory-1024" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2|4|8|13|25|40 [FIXTURE_ROOT]");
+            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT]");
             return 2;
         };
         guard let option::Option[text::Text]::Some(steps) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2|4|8|13|25|40 [FIXTURE_ROOT]");
+            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT]");
             return 2;
         };
         match env::arg(4 as usize) {
@@ -674,19 +760,19 @@ fn main() -> i32 {
         || command == "benchmark-q4-inference-1024"
         || command == "benchmark-q4-direct-1024" {
         guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
+            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
             return 2;
         };
         guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
+            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
             return 2;
         };
         guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
+            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
             return 2;
         };
         guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
+            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
             return 2;
         };
         var seed: u64 = 1101 as u64;
@@ -700,19 +786,26 @@ fn main() -> i32 {
             }
             option::Option[text::Text]::None => {}
         }
-        var requested_steps: str = "40";
+        guard let option::Option[str]::Some(pack_steps) = if command == "generate-1024" {
+            pack_default_steps(packed_path.view(), ["3", "4", "8", "25", "40"])
+        } else { option::Option[str]::Some("40") } else { return 2; };
+        var requested_steps: str = pack_steps;
         match env::arg(7 as usize) {
             option::Option[text::Text]::Some(steps_text) => {
                 if steps_text == "1" && command != "generate-1024" {
                     requested_steps = "1";
-                } else if steps_text == "4" && command == "generate-1024" {
-                    // Viggle distillation experiment; pair with
-                    // QI_EXPERIMENT_NO_SHIFT_TERMINAL=1.
-                    requested_steps = "4";
+                } else if (steps_text == "3" || steps_text == "4" || steps_text == "8")
+                    && command == "generate-1024" {
+                    // Few-step distillation; the pack's shift_terminal
+                    // metadata selects its schedule.
+                    requested_steps = if steps_text == "3" { "3" }
+                    else if steps_text == "4" { "4" } else { "8" };
                 } else if steps_text == "25" {
                     requested_steps = "25";
-                } else if steps_text != "40" {
-                    io::eprintln("generate-1024: steps must be 25 or 40 (Q4 benchmarks also accept 1)");
+                } else if steps_text == "40" {
+                    requested_steps = "40";
+                } else {
+                    io::eprintln("${command}: steps must be 3, 4, 8, 25, or 40 (Q4 benchmarks: 1, 25, or 40)");
                     return 2;
                 }
             }
@@ -736,6 +829,56 @@ fn main() -> i32 {
                 false, true, seed, requested_steps,
             );
         }
+        var cache_policy: str = pack_cache_policy(packed_path.view());
+        let cache_from_pack: bool = cache_policy != "none";
+        var cache_explicit: bool = false;
+        match env::arg(8 as usize) {
+            option::Option[text::Text]::Some(cache_text) => {
+                cache_explicit = true;
+                if cache_text == "none" {
+                    cache_policy = "none";
+                } else if cache_text == "taylorseer" {
+                    cache_policy = "taylorseer";
+                } else if cache_text == "cache-dit-0.16" {
+                    cache_policy = "cache-dit-0.16";
+                } else {
+                    io::eprintln("generate-1024: cache must be none, taylorseer, or cache-dit-0.16");
+                    return 2;
+                }
+            }
+            option::Option[text::Text]::None => {}
+        }
+        if cache_policy != "none" {
+            if pack_is_distilled(packed_path.view()) {
+                io::eprintln("generate-1024: kind=distilled packs cannot use cache=${cache_policy}");
+                return 2;
+            }
+            if requested_steps != "25" && requested_steps != "40" {
+                io::eprintln("generate-1024: cache=${cache_policy} needs 25 or 40 steps");
+                return 2;
+            }
+            // A pack's cache default is calibrated for its own step count;
+            // other step counts must name the cache policy explicitly.
+            if cache_from_pack && !cache_explicit && requested_steps != pack_steps {
+                io::eprintln("generate-1024: the pack's cache=${cache_policy} is set for ${pack_steps} steps; pass none or ${cache_policy} explicitly to run ${requested_steps}");
+                return 2;
+            }
+            io::println("generate-1024: cache=${cache_policy} steps=${requested_steps}");
+            if cache_policy == "taylorseer" {
+                return pipeline::generate_1024_taylorseer(
+                    packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+                    seed, 0.24f64, requested_steps,
+                );
+            }
+            return pipeline::generate_1024_cache_dit(
+                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+                seed, 0.16f64, requested_steps,
+            );
+        }
+        if pack_is_distilled(packed_path.view()) && requested_steps != pack_steps {
+            io::println("generate-1024: pack kind=distilled steps=${pack_steps}; running the requested ${requested_steps} steps");
+        }
+        io::println("generate-1024: cache=none steps=${requested_steps}");
         return pipeline::generate_1024(
             packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
             requested_steps,
@@ -798,6 +941,10 @@ fn main() -> i32 {
             io::eprintln("generate-1024-cache-dit: threshold must be 0.12, 0.14, 0.16, or 0.24");
             return 2;
         };
+        if pack_is_distilled(packed_path.view()) && !env::has_var("QI_CACHE_DIT_WARMUP") {
+            io::eprintln("${command}: kind=distilled packs have no steps to cache; use generate-1024");
+            return 2;
+        }
         var seed: u64 = 1101 as u64;
         match env::arg(7 as usize) {
             option::Option[text::Text]::Some(seed_text) => {
@@ -809,29 +956,38 @@ fn main() -> i32 {
             }
             option::Option[text::Text]::None => {}
         }
-        var use_25_steps: bool = false;
+        guard let option::Option[str]::Some(cache_pack_steps) = pack_default_steps(
+            packed_path.view(), ["4", "25", "40", "40", "40"],
+        ) else { return 2; };
+        var cache_steps: str = cache_pack_steps;
         match env::arg(8 as usize) {
             option::Option[text::Text]::Some(steps_text) => {
                 if steps_text == "25" {
-                    use_25_steps = true;
-                } else if steps_text != "40" {
-                    io::eprintln("generate-1024-cache-dit: steps must be 25 or 40");
+                    cache_steps = "25";
+                } else if steps_text == "4" {
+                    // Viggle distillation experiment.
+                    cache_steps = "4";
+                } else if steps_text == "40" {
+                    cache_steps = "40";
+                } else {
+                    io::eprintln("generate-1024-cache-dit: steps must be 4, 25, or 40");
                     return 2;
                 }
             }
             option::Option[text::Text]::None => {}
         }
+        io::println("${command}: steps=${cache_steps}");
         if command == "generate-1024-taylorseer" {
             return pipeline::generate_1024_taylorseer(
                 packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
                 threshold,
-                if use_25_steps { "25" } else { "40" },
+                cache_steps,
             );
         }
         return pipeline::generate_1024_cache_dit(
             packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
             threshold,
-            if use_25_steps { "25" } else { "40" },
+            cache_steps,
         );
     }
     if command == "benchmark-process-reuse-256" {
@@ -981,6 +1137,20 @@ fn main() -> i32 {
         return packed_model::quantize_transformer_int4_rotated(
             model_path.view(), output_path.view(),
         );
+    }
+    if command == "pack-metadata" {
+        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus pack-metadata FILE [key=value ...]  (empty value removes a key)");
+            return 2;
+        };
+        var assignments: vec::Vec[text::Text] = vec::Vec[text::Text]::with_capacity(8 as usize);
+        var index: usize = 3 as usize;
+        while true {
+            guard let option::Option[text::Text]::Some(assignment) = env::arg(index) else { break; };
+            if assignments.append(assignment) != status::Status::Ok { return 1; }
+            index = index +% (1 as usize);
+        }
+        return packed_model::pack_metadata_command(path.view(), assignments);
     }
     if command == "verify-packed" {
         guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {

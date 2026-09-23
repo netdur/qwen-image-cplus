@@ -5,6 +5,11 @@
   "model": "Qwen/Qwen-Image-2.1",
   "snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
   "scope": "Parked experiment: Viggle's 4-step DMD distillation of Qwen-Image-2.1 versus the base model at 25 steps with and without Cache-DiT 0.16, all through the unchanged fresh-process native 1024x1024 prompt-to-PNG path",
+  "superseded": {
+    "date": "2026-09-23",
+    "note": "The parked verdict was judged on a prompt that did not quote CASABLANCA. On the quoted-text prompt the pack renders both strings exactly and is the adopted model. Its steps and schedule now come from pack metadata (kind=distilled steps=4 shift_terminal=none); the environment switches below are no longer needed. The 9.8 s VAE and 57.7 s total predate MPSGraph convolution and the fixed-cost pass.",
+    "current_record": "benchmarks/m1-max-viggle-4step-1024-fixed-cost.json"
+  },
   "distilled_checkpoint": {
     "repository": "Viggle/Qwen-Image-2.1-viggle-turbo",
     "revision": "bafc91e4cc934f5fb1406b22496a0bed9b99c548",

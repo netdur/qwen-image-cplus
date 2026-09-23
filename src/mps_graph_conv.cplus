@@ -96,8 +96,9 @@ struct Conv {
     opaque output_tensor: graph::OwnedObjc,
 }
 
-// One compiled graph per distinct layer shape; the 1024 decoder has about a
-// dozen. MPSGraph additionally caches its executable after the first encode.
+// One compiled graph per distinct layer shape (about twenty at 1024; the
+// upsample convolutions now run at the doubled shape and share the next
+// block's 3x3 graphs). MPSGraph caches its executable after the first encode.
 struct Cache {
     entries: vec::Vec[Conv],
 }

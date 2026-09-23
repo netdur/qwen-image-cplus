@@ -49,6 +49,10 @@ struct PositionalReader {
     opaque _fd: i32,
 }
 
+fn inactive_positional_reader() -> PositionalReader {
+    return PositionalReader { _fd: -1 as i32 };
+}
+
 impl PositionalReader {
     fn descriptor(this) -> i32 {
         return this._fd;
