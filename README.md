@@ -16,11 +16,15 @@ Homebrew downloads a prebuilt ARM64 CLI and C ABI; it does not install the C+
 compiler or build this project on the user's machine.
 
 Because this repository contains both the product and its formula rather than
-using a separate `homebrew-*` repository, tap it with its explicit URL:
+using a separate `homebrew-*` repository, tap it with its explicit URL.
+Homebrew 7 also requires explicit trust for formulae from repositories that do
+not use the `homebrew-*` naming convention. Trust only this formula rather than
+the whole tap:
 
 ```sh
 brew tap netdur/qwen-image-cplus https://github.com/netdur/qwen-image-cplus.git
-brew install qwen-image-cplus
+brew trust --formula netdur/qwen-image-cplus/qwen-image-cplus
+brew install netdur/qwen-image-cplus/qwen-image-cplus
 ```
 
 The installation contains:
