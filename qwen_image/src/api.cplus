@@ -48,7 +48,7 @@ fn _dimensions_supported(width: usize, height: usize) -> bool {
     return width >= (256 as usize) && height >= (256 as usize)
         && width % (32 as usize) == (0 as usize)
         && height % (32 as usize) == (0 as usize)
-        && (width / (16 as usize)) *% (height / (16 as usize)) <= (4096 as usize);
+        && (width / (16 as usize)) *% (height / (16 as usize)) <= (16384 as usize);
 }
 
 fn _step_name(steps: usize) -> option::Option[str] {
@@ -248,4 +248,34 @@ fn public_generation_request_validation_is_typed() {
         height: 768 as usize,
     };
     assert _validate(rectangle) == GenerateStatus::Ok;
+
+    let native_2048: GenerateRequest = GenerateRequest {
+        packed_path: valid.packed_path,
+        model_root: valid.model_root,
+        output_path: valid.output_path,
+        prompt: valid.prompt,
+        pixels: 0 as usize,
+        steps: 4 as usize,
+        seed: valid.seed,
+        cache: CacheMode::None,
+        cache_threshold: 0.0f64,
+        width: 2048 as usize,
+        height: 2048 as usize,
+    };
+    assert _validate(native_2048) == GenerateStatus::Ok;
+
+    let too_large: GenerateRequest = GenerateRequest {
+        packed_path: valid.packed_path,
+        model_root: valid.model_root,
+        output_path: valid.output_path,
+        prompt: valid.prompt,
+        pixels: 0 as usize,
+        steps: 4 as usize,
+        seed: valid.seed,
+        cache: CacheMode::None,
+        cache_threshold: 0.0f64,
+        width: 2080 as usize,
+        height: 2048 as usize,
+    };
+    assert _validate(too_large) == GenerateStatus::InvalidArgument;
 }

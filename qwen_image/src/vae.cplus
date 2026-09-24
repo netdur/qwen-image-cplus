@@ -946,6 +946,20 @@ fn run(
             requested_case == "1024-profile",
         );
     }
+    if requested_case == "2048" {
+        let latent_side: usize = 128 as usize;
+        let latent_values: usize = latent_side *% latent_side *% (64 as usize);
+        var latent: vec::Vec[f32] = vec::Vec[f32]::with_capacity(latent_values);
+        var index: usize = 0 as usize;
+        while index < latent_values {
+            latent.append(0.0f32);
+            index = index +% (1 as usize);
+        }
+        return run_impl(
+            model_root, "sized", "", #slice_ptr(latent.as_slice()), 0 as *f32,
+            false, false, false, latent_side, latent_side,
+        );
+    }
     if requested_case == "trajectory-1024" {
         return run_impl(
             model_root,

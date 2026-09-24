@@ -198,6 +198,54 @@ fn create(
     });
 }
 
+// Encodes a large row-major FP16 x FP16 -> FP32 multiplication in bounded
+// row slices. MPSMatrix can produce partial non-finite output for very tall
+// matrices on Apple Silicon; 4096 rows is the already verified production
+// shape. Weight rows are shared by every slice, while input/output offsets
+// advance through their contiguous row-major buffers.
+fn encode_row_tiled(
+    device: metal::Device,
+    command_buffer: metal::CommandBuffer,
+    left_buffer: metal::Buffer,
+    left_offset: u64,
+    right_buffer: metal::Buffer,
+    right_offset: u64,
+    output_buffer: metal::Buffer,
+    output_offset: u64,
+    rows: usize,
+    columns: usize,
+    inner: usize,
+    tile_rows: usize = 4096 as usize,
+) -> bool {
+    if rows == (0 as usize) || columns == (0 as usize)
+        || inner == (0 as usize) || tile_rows == (0 as usize) {
+        return false;
+    }
+    // Preserve the existing single operation at established production
+    // shapes. Only native-resolution matrices need slicing.
+    let bounded_rows: usize = if rows <= (8192 as usize) { rows } else { tile_rows };
+    var row: usize = 0 as usize;
+    while row < rows {
+        let remaining: usize = rows -% row;
+        let count: usize = if remaining < bounded_rows { remaining } else { bounded_rows };
+        guard let option::Option[Multiplication]::Some(operation) = create(
+            device,
+            left_buffer,
+            left_offset +% (row *% inner *% (2 as usize)) as u64,
+            right_buffer,
+            right_offset,
+            output_buffer,
+            output_offset +% (row *% columns *% (4 as usize)) as u64,
+            count,
+            columns,
+            inner,
+        ) else { return false; };
+        operation.encode(command_buffer);
+        row = row +% count;
+    }
+    return true;
+}
+
 fn strided_descriptor(rows: usize, columns: usize, row_bytes: usize, data_type: u32)
     -> option::Option[OwnedObjc] {
     let class: *u8 = rt::get_class(#str_ptr("MPSMatrixDescriptor\0"));

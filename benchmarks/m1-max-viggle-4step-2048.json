@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-24",
+  "machine": "Apple M1 Max, 32 GB unified memory, macOS 26.6.2",
+  "model": "Viggle/Qwen-Image-2.1-viggle-turbo",
+  "scope": "Native 2048x2048 feasibility and end-to-end acceptance through the cache-off four-step distilled FP16 path",
+  "input": {
+    "prompt": "A simple red circle on a white background",
+    "seed": 1301,
+    "width": 2048,
+    "height": 2048,
+    "steps": 4
+  },
+  "gates": {
+    "transformer_one_step": {
+      "result": "finite",
+      "latent_tokens": 16384,
+      "gpu_ms": 29594,
+      "process_wall_seconds": 67.85
+    },
+    "vae_zero_latent": {
+      "result": "finite",
+      "process_wall_seconds": 9.83,
+      "peak_memory_footprint_bytes": 24481007344,
+      "scratch_bytes": 23043506180
+    }
+  },
+  "end_to_end": {
+    "result": "finite 2048x2048 PNG",
+    "timing_wall_ms": {
+      "text": 2219,
+      "transformer_phase": 295868,
+      "denoising_loop": 295486,
+      "step_walls": [69238, 64054, 76351, 85830],
+      "vae": 11459,
+      "png_output": 85,
+      "end_to_end": 309664
+    },
+    "step_gpu_ms": [30371.0, 30216.5, 34519.7, 38292.2],
+    "process_wall_seconds": 309.71,
+    "peak_memory_footprint_bytes": 24571627440,
+    "maximum_rss_bytes": 2218049536,
+    "swaps": 0,
+    "output": "/private/tmp/qwen-image-native-2048.png"
+  },
+  "correctness_fixes": [
+    "Use the actual text-prefix row count when separating text and image rows for attention-output projection.",
+    "Encode MPS matrix multiplication above 8192 rows in verified 4096-row slices after a single tall operation produced non-finite rows."
+  ],
+  "quality_note": "The output was coherent but interpreted the simple circle prompt as a red no-entry road sign in a forest; this was a finite-output and shape acceptance run, not a prompt-adherence calibration.",
+  "result": "native 2048 generation accepted as a capacity mode"
+}

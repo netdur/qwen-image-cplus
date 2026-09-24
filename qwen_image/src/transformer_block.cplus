@@ -3273,22 +3273,6 @@ fn encode_mps_mlp_runtime_block(
     } else {
         0 as u64
     };
-    guard let option::Option[mps::Multiplication]::Some(gate_operation) = mps::create(
-        mps_workspace.device, mps_workspace.half_input, 0 as u64,
-        gate_weight_buffer, gate_weight_offset, workspace.gate, 0 as u64,
-        rows, MLP_WIDTH, WIDTH,
-    ) else { return false; };
-    guard let option::Option[mps::Multiplication]::Some(projected_operation) = mps::create(
-        mps_workspace.device, mps_workspace.half_input, 0 as u64,
-        projected_weight_buffer, projected_weight_offset, workspace.projected, 0 as u64,
-        rows, MLP_WIDTH, WIDTH,
-    ) else { return false; };
-    guard let option::Option[mps::Multiplication]::Some(output_operation) = mps::create(
-        mps_workspace.device, mps_workspace.half_input, 0 as u64,
-        output_weight_buffer, output_weight_offset, workspace.mlp_projected, 0 as u64,
-        rows, WIDTH, MLP_WIDTH,
-    ) else { return false; };
-
     var params: BlockParams = BlockParams {
         rows: rows as u32,
         width: WIDTH as u32,
@@ -3301,14 +3285,16 @@ fn encode_mps_mlp_runtime_block(
     };
     let matrix_bytes: u64 = (WIDTH *% WIDTH *% (2 as usize)) as u64;
     // MPSMatrix produced partial non-finite output when it multiplied the whole
-    // 4096-plus-prompt prefill. At that shape MPS now covers only the 4096
-    // image rows (the joint layout is [text rows][image rows]) and the custom
-    // FP32-input GEMM covers the text rows. Smaller resolutions keep the more
-    // accurate custom GEMM for every row.
-    let attention_output_text_rows: usize = if use_graph_attention
-        && rows > (4096 as usize) { rows -% (4096 as usize) } else { 0 as usize };
+    // image-plus-prompt prefill. MPS therefore covers only the image rows (the
+    // joint layout is [text rows][image rows]) and the custom FP32-input GEMM
+    // covers the text prefix. Use the actual prefix rather than assuming the
+    // old 4096-token 1024 shape.
+    let cached: bool = cache_mode == (2 as u32);
+    let attention_output_text_rows: usize = if use_graph_attention && !cached {
+        prefix_rows
+    } else { 0 as usize };
     let mps_attention_output: bool = weights.attention_output.scheme == PACKED_SCHEME_FP16
-        && (rows == (4096 as usize) || attention_output_text_rows > (0 as usize))
+        && use_graph_attention
         && !env::has_var("QI_DISABLE_MPS_ATTENTION_OUTPUT");
     let mps_qkv: bool = weights.q.scheme == PACKED_SCHEME_FP16
         && weights.k.scheme == PACKED_SCHEME_FP16
@@ -3316,11 +3302,6 @@ fn encode_mps_mlp_runtime_block(
         && weights.k.weights_offset == weights.q.weights_offset + matrix_bytes
         && weights.v.weights_offset == weights.k.weights_offset + matrix_bytes;
     if mps_qkv {
-        guard let option::Option[mps::Multiplication]::Some(qkv_operation) = mps::create(
-            mps_workspace.device, mps_workspace.half_input, 0 as u64,
-            weights.q.storage, weights.q.weights_offset, workspace.gate, 0 as u64,
-            rows, MLP_WIDTH, WIDTH,
-        ) else { return false; };
         guard let option::Option[metal::ComputeCommandEncoder]::Some(norm_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
         let norm_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(norm_encoder.raw()));
@@ -3351,7 +3332,13 @@ fn encode_mps_mlp_runtime_block(
                 metal::CommandEncoder::from_raw(conversion_encoder.raw());
             conversion_command_encoder.end_encoding();
         }
-        if !profile_skips("qkv") { qkv_operation.encode(command_buffer); }
+        if !profile_skips("qkv") && !mps::encode_row_tiled(
+            mps_workspace.device, command_buffer,
+            mps_workspace.half_input, 0 as u64,
+            weights.q.storage, weights.q.weights_offset,
+            workspace.gate, 0 as u64,
+            rows, MLP_WIDTH, WIDTH,
+        ) { return false; }
     }
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(attention_encoder) =
@@ -3397,7 +3384,6 @@ fn encode_mps_mlp_runtime_block(
         workspace.rope, workspace.dummy, workspace.dummy, #addr_of(params), rows *% HEADS,
     );
     encode_buffer_barrier(attention_encoder);
-    let cached: bool = cache_mode == (2 as u32);
     if pipelines.attention_threads == (128 as usize) {
         encode_flash_prepare_kv(
             attention_encoder, cache_copy_pipeline, workspace.key_rope,
@@ -3451,7 +3437,7 @@ fn encode_mps_mlp_runtime_block(
         metal::CommandEncoder::from_raw(attention_encoder.raw());
     attention_command_encoder.end_encoding();
 
-    // 1024 steps can use steel attention, which writes FP16 output directly
+    // Large shapes can use steel attention, which writes FP16 output directly
     // where the attention-output GEMMs read it. Cached steps: 4096 image
     // queries against prefix + image keys. Prefill (opt-in QI_STEEL_PREFILL,
     // measured slower overall): the same for the image queries (they see
@@ -3501,15 +3487,6 @@ fn encode_mps_mlp_runtime_block(
     }
 
     if mps_attention_output {
-        guard let option::Option[mps::Multiplication]::Some(attention_output_operation) =
-            mps::create(
-                mps_workspace.device, mps_workspace.half_input,
-            (attention_output_text_rows *% WIDTH *% (2 as usize)) as u64,
-            weights.attention_output.storage, weights.attention_output.weights_offset,
-            workspace.attention_projected,
-            (attention_output_text_rows *% WIDTH *% (4 as usize)) as u64,
-            rows -% attention_output_text_rows, WIDTH, WIDTH,
-        ) else { return false; };
         guard let option::Option[metal::ComputeCommandEncoder]::Some(conversion_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
         let conversion_encoder_owner: OwnedObjc =
@@ -3532,16 +3509,23 @@ fn encode_mps_mlp_runtime_block(
         // With steel attention the text rows' attention output is FP16 too;
         // project them with their own small MPS multiplication.
         if attention_output_text_rows > (0 as usize) && steel_attention {
-            guard let option::Option[mps::Multiplication]::Some(text_output_operation) =
-                mps::create(
-                    mps_workspace.device, mps_workspace.half_input, 0 as u64,
+            if !profile_skips("attnout") && !mps::encode_row_tiled(
+                mps_workspace.device, command_buffer,
+                mps_workspace.half_input, 0 as u64,
                 weights.attention_output.storage, weights.attention_output.weights_offset,
-                workspace.attention_projected, 0 as u64, attention_output_text_rows,
-                WIDTH, WIDTH,
-            ) else { return false; };
-            if !profile_skips("attnout") { text_output_operation.encode(command_buffer); }
+                workspace.attention_projected, 0 as u64,
+                attention_output_text_rows, WIDTH, WIDTH,
+            ) { return false; }
         }
-        if !profile_skips("attnout") { attention_output_operation.encode(command_buffer); }
+        if !profile_skips("attnout") && !mps::encode_row_tiled(
+            mps_workspace.device, command_buffer,
+            mps_workspace.half_input,
+            (attention_output_text_rows *% WIDTH *% (2 as usize)) as u64,
+            weights.attention_output.storage, weights.attention_output.weights_offset,
+            workspace.attention_projected,
+            (attention_output_text_rows *% WIDTH *% (4 as usize)) as u64,
+            rows -% attention_output_text_rows, WIDTH, WIDTH,
+        ) { return false; }
         guard let option::Option[metal::ComputeCommandEncoder]::Some(epilogue_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
         let epilogue_encoder_owner: OwnedObjc =
@@ -3624,7 +3608,13 @@ fn encode_mps_mlp_runtime_block(
         gate_conversion_command_encoder.end_encoding();
     }
     let skip_mlp: bool = profile_skips("mlp");
-    if !skip_mlp && !profile_skips("gate") { gate_operation.encode(command_buffer); }
+    if !skip_mlp && !profile_skips("gate") && !mps::encode_row_tiled(
+        mps_workspace.device, command_buffer,
+        mps_workspace.half_input, 0 as u64,
+        gate_weight_buffer, gate_weight_offset,
+        workspace.gate, 0 as u64,
+        rows, MLP_WIDTH, WIDTH,
+    ) { return false; }
 
     if weights.projected.scheme != PACKED_SCHEME_FP16 {
         guard let option::Option[metal::ComputeCommandEncoder]::Some(
@@ -3639,7 +3629,13 @@ fn encode_mps_mlp_runtime_block(
             metal::CommandEncoder::from_raw(projected_conversion_encoder.raw());
         projected_conversion_command_encoder.end_encoding();
     }
-    if !skip_mlp && !profile_skips("proj") { projected_operation.encode(command_buffer); }
+    if !skip_mlp && !profile_skips("proj") && !mps::encode_row_tiled(
+        mps_workspace.device, command_buffer,
+        mps_workspace.half_input, 0 as u64,
+        projected_weight_buffer, projected_weight_offset,
+        workspace.projected, 0 as u64,
+        rows, MLP_WIDTH, WIDTH,
+    ) { return false; }
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(swiglu_encoder) =
         command_buffer.compute_command_encoder() else { return false; };
@@ -3669,7 +3665,13 @@ fn encode_mps_mlp_runtime_block(
     let swiglu_command_encoder: metal::CommandEncoder =
         metal::CommandEncoder::from_raw(swiglu_encoder.raw());
     swiglu_command_encoder.end_encoding();
-    if !skip_mlp && !profile_skips("down") { output_operation.encode(command_buffer); }
+    if !skip_mlp && !profile_skips("down") && !mps::encode_row_tiled(
+        mps_workspace.device, command_buffer,
+        mps_workspace.half_input, 0 as u64,
+        output_weight_buffer, output_weight_offset,
+        workspace.mlp_projected, 0 as u64,
+        rows, WIDTH, MLP_WIDTH,
+    ) { return false; }
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(residual_encoder) =
         command_buffer.compute_command_encoder() else { return false; };
@@ -5537,6 +5539,49 @@ fn benchmark_trajectory_1024(
     );
 }
 
+// Memory/feasibility gate for the model's native 2048x2048 shape. This runs
+// one transformer step from the existing 31-row text fixture and deliberately
+// omits the VAE and PNG phases. A null final-latent destination marks it as a
+// benchmark-only path, independently of VAE and PNG work.
+fn benchmark_trajectory_2048(
+    packed_path: str,
+    fixture_root: str = "tests/fixtures/transformer_scale_fp32",
+) -> i32 {
+    let text_path: text::Text = "${fixture_root}/1024/text_input.f32";
+    guard let mapped::MapResult::Ok(text_mapping) = mapped::map_readonly(text_path.view()) else {
+        io::eprintln("2048 trajectory benchmark: could not map ${text_path}");
+        return 1;
+    };
+    let text_rows: usize = 31 as usize;
+    let expected_bytes: usize = text_rows *% WIDTH *% #size_of::[f32]();
+    if text_mapping.length() != expected_bytes {
+        io::eprintln("2048 trajectory benchmark: text fixture has ${text_mapping.length()} bytes, expected ${expected_bytes}");
+        return 1;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        "1",
+        "",
+        0 as *f32,
+        text_mapping.pointer() as *f32,
+        text_rows,
+        1301 as u64,
+        true,
+        false,
+        false,
+        0.0f64,
+        2048 as usize,
+        false,
+        0 as *f32,
+        0.0f32,
+        1.0f32,
+        false,
+        false,
+        2048 as usize,
+        2048 as usize,
+    );
+}
+
 fn cache_dit_threshold(value: str) -> option::Option[f64] {
     if value == "0.12" { return option::Option[f64]::Some(0.12f64); }
     if value == "0.14" { return option::Option[f64]::Some(0.14f64); }
@@ -6212,8 +6257,9 @@ fn run_trajectory_packed_impl(
     let latent_height: usize = output_height / (16 as usize);
     let latent_width: usize = output_width / (16 as usize);
     let target_rows: usize = latent_height *% latent_width;
-    if target_rows > (4096 as usize) {
-        io::eprintln("trajectory: output exceeds the verified 4096-token memory ceiling");
+    let maximum_target_rows: usize = 16384 as usize;
+    if target_rows > maximum_target_rows {
+        io::eprintln("trajectory: output exceeds the ${maximum_target_rows}-token limit for this path");
         return 2;
     }
     let rows: usize = text_rows +% target_rows;
@@ -6290,8 +6336,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(q4_repack_owner) = pipeline(device, library, "qi_q4_repack_direct") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
-    let flash_attention: bool = target_rows == (256 as usize) || target_rows == (4096 as usize);
-    let use_graph_attention: bool = target_rows == (4096 as usize)
+    let flash_attention: bool = target_rows == (256 as usize) || target_rows >= (4096 as usize);
+    let use_graph_attention: bool = target_rows >= (4096 as usize)
         && !env::has_var("QI_DISABLE_MPSGRAPH_ATTENTION");
     let attention_kernel_name: str = if flash_attention {
         "qi_block_attention_flash128"
@@ -6376,11 +6422,10 @@ fn run_trajectory_packed_impl(
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
 
     let storage_and_weights_start_ms: i64 = time::now_millis();
-    let ring_wanted: bool = (target_rows == (4096 as usize) || env::has_var("QI_ENABLE_WEIGHT_RING"))
+    let ring_wanted: bool = (target_rows >= (4096 as usize) || env::has_var("QI_ENABLE_WEIGHT_RING"))
         && weight_file.all_block_matrices_fp16()
         && !cache_dit_enabled
         && !env::has_var("QI_PROFILE_CACHED_BLOCK")
-        && !env::has_var("QI_VALIDATE_TRAJECTORY_BLOCKS")
         && !env::has_var("QI_DISABLE_PACK_PREAD")
         && !env::has_var("QI_DISABLE_WEIGHT_RING");
     var ring_regions: [RingRegion; 32] =
@@ -6394,7 +6439,7 @@ fn run_trajectory_packed_impl(
     } else { 0 as usize };
     let use_weight_ring: bool = ring_prefix_bytes > (0 as usize);
     let weight_ring_reason: str = if use_weight_ring {
-        if target_rows == (4096 as usize) { "4096-token-default" } else { "explicit-memory-saving" }
+        if target_rows >= (4096 as usize) { "large-shape-default" } else { "explicit-memory-saving" }
     } else { "resident" };
     if ring_wanted && !use_weight_ring {
         io::eprintln("trajectory: pack layout does not allow the weight ring; keeping the resident copy");
@@ -6952,6 +6997,16 @@ fn run_trajectory_packed_impl(
                 ) { return 1; }
                 block_command_buffer.commit();
                 weight_ring.committed(global_block, block_command_buffer);
+                if validate_trajectory_blocks {
+                    block_command_buffer.wait_until_completed();
+                    if !finite(
+                        "trajectory step ${step +% (1 as usize)} block ${block}",
+                        next,
+                        active_rows *% WIDTH,
+                    ) {
+                        return 1;
+                    }
+                }
             } else if batch_transformer_block {
                 if !encode_mps_mlp_runtime_block(
                     transformer_command_buffer, pipelines, mps_workspace, block_weights,

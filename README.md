@@ -70,11 +70,11 @@ aspect ratios. The Diffusers implementation and Qwen's vLLM/SGLang examples
 also accept 1024x1024, so 1024 is a supported and useful lower-resolution mode,
 but it is not the model's native quality target. The runtime accepts independent
 width and height values that are at least 256, divisible by 32, and no more
-than 4,096 latent tokens in total (equivalently, at most 1,048,576 output
-pixels). That includes 256x256, 512x512, 1024x1024, and practical rectangular
-shapes such as 1344x768 or 768x1344. The ceiling is deliberate: it preserves
-the completed 1024 memory envelope. Full 2048x2048 support needs 16,384 latent
-tokens and remains behind a separate memory gate.
+than 16,384 latent tokens in total (equivalently, at most 4,194,304 output
+pixels). That includes 256x256, 512x512, 1024x1024, native 2048x2048, and
+rectangular shapes within the same pixel budget. The 2048 path is functional,
+but its measured 24.57 GB peak on a 32 GB M1 Max makes it a capacity mode, not
+the practical performance default.
 
 Rectangular generation carries the shape through latent allocation, the two
 independent spatial RoPE coordinates, transformer scheduling, VAE decode, and
@@ -87,6 +87,16 @@ The first end-to-end rectangular acceptance run used the Viggle 4-step pack at
 2.334 s text, 11.813 s transformer, 0.649 s VAE, and 4 ms PNG output. This is a
 functional acceptance measurement on the M1 Max, not a claim that every aspect
 ratio has the same throughput or quality calibration.
+
+The native 2048 acceptance used the same distilled FP16 pack, four steps, and
+seed 1301. It produced a finite 2048x2048 PNG in **309.664 s**: 2.219 s text,
+295.868 s transformer phase, 11.459 s VAE, and 85 ms PNG output. Peak memory
+footprint was 24,571,627,440 bytes with no swap. The first attempt found two
+shape-dependent correctness bugs: attention projection had assumed exactly
+4,096 image rows, and a single very tall `MPSMatrixMultiplication` produced
+non-finite rows. Projection now uses the actual text-prefix length and matrix
+work above 8,192 rows is encoded in verified 4,096-row slices. The benchmark
+record is `benchmarks/m1-max-viggle-4step-2048.json`.
 
 The authoritative Qwen and Diffusers sampling default is **40 Euler steps**.
 The 25-step experiment in this repository came from the
@@ -200,6 +210,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 1
 ./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 2
 ./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 13
+./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-2048 transformer.qipack
 ./cli/target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
 ./cli/target/debug/qwen-image-cplus quantize-transformer /path/to/model/snapshot transformer.qipack
@@ -226,6 +237,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024-profile
+./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 2048
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot trajectory-1024 /path/to/vae_oracle_1024
 ./cli/target/debug/qwen-image-cplus test-image-output reference.png
 ./cli/target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
@@ -235,6 +247,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-native-inputs
 ./cli/target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./cli/target/debug/qwen-image-cplus generate transformer.qipack /path/to/model/snapshot output.png "your prompt" 1344 768 1101 40
+./cli/target/debug/qwen-image-cplus generate transformer.qipack /path/to/model/snapshot output.png "your prompt" 2048 2048 1301 4
 ./cli/target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
 ./cli/target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
 ./cli/target/debug/qwen-image-cplus generate-256-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
@@ -1868,22 +1881,15 @@ leaving CASABLANCA out was not an error; only misspellings count.
   the four full warmup steps. It is read once per trajectory, printed in the
   `trajectory switches:` line, and must be 1-4. Any other value is refused.
 
-The native-quality product target is now 2048x2048; 1024x1024 remains the
-practical performance mode and the largest completed runtime path. Before any
-full 2048 generation, add a 16,384-token one-step transformer smoke, measure
-peak memory, and establish whether VAE arena reuse or tiled decoding is needed.
-Until those gates pass, work is still measured at the 4,096-token 1024 shape;
-an optimization that only helps the 256x256 benchmark is no longer sufficient
-evidence:
+The native-quality product target is 2048x2048; 1024x1024 remains the practical
+performance mode. Native 2048 feasibility is complete: the 16,384-token
+one-step transformer smoke, standalone VAE, and four-step end-to-end generation
+all produced finite output. The full run took 309.664 s and peaked at 24.57 GB
+without swap, so future 2048 work must continue to record memory as well as
+time. An optimization that only helps the 256x256 benchmark is no longer
+sufficient evidence:
 
-1. **Native 2048 feasibility.** The runtime shape path is now rectangular and
-   dynamic up to 4,096 latent tokens. Raise that explicit ceiling to a 128x128
-   latent grid only for a one-step transformer smoke while recording allocation
-   and resident-memory peaks. Separately size or tile the 2048 VAE decode. Do
-   not start a full 40-step image until both phases fit safely on the 32 GB M1
-   Max. If they pass, the first resolution-scheduling candidate is
-   2048→1024→2048 rather than 1024→512→1024.
-2. **1024 precision follow-up.** The official 40-step transformer and VAE
+1. **1024 precision follow-up.** The official 40-step transformer and VAE
    oracles are complete. Cache-off is visually close but reaches 13.211%
    final-latent nRMSE against official BF16; determine whether a bounded
    higher-precision accumulation or operand path can reduce that long-horizon
@@ -1891,7 +1897,7 @@ evidence:
    gate merely because this poster remains readable. Cache-DiT calibration is
    also complete: use 0.12 for the conservative quality tradeoff, use 0.16 for
    the measured speed-biased tradeoff, and reject 0.24 at 1024/40.
-3. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
+2. **1024 transformer tail.** MPSGraph SDPA, the all-FP16 v4 pack, and direct
    FP16 normalization/SwiGLU output have completed Plan-5 F1, F2, and F4.
    First-order TaylorSeer F8 is also complete: its predictor passed the 256
    numerical calibration, but the faster cap-four policy failed the controlled
@@ -1899,8 +1905,8 @@ evidence:
    Bottleneck Sampling F9's sub-native spike is complete: both the literal FLUX
    policy and a Qwen terminal-sigma adaptation failed the 256 visual gate. A
    1024→512→1024 sweep remains closed, but 2048→1024→2048 is a materially
-   different native-resolution proposal and can be reopened after 2048 memory
-   feasibility is established. The
+   different native-resolution proposal that can now be reconsidered because
+   2048 memory feasibility is established. The
    direct FP16 K/V preparation is now also closed. A K-only prototype that
    preserved FP32 QKV projection output and rounded normalized/rotated K at its
    final store was numerically identical to the established two-step oracle,
@@ -1919,7 +1925,7 @@ evidence:
    results close the obvious exact-arithmetic kernel levers. Any further
    large gain needs fewer full transformer evaluations while exact text
    survives. The candidates are a future distilled checkpoint and MeanCache.
-4. **1024 working memory.** Shape-specific VAE arena sizing already removed
+3. **1024 working memory.** Shape-specific VAE arena sizing already removed
    1.6875 GiB, and F5 measured a 5,603,394,208-byte peak footprint with
    5,577,375,744 bytes of explicit scratch. Further reduction requires a real
    liveness/aliasing schedule rather than smaller fixed capacities: block 4
@@ -1930,7 +1936,7 @@ evidence:
    1024 VAE peak to 7,758,496,536 bytes, about 2.15 GB of internal graph
    scratch. When MPSGraph is active, the 81 MiB (84,934,656-byte)
    parity-packed upsample weight buffer is unused and could be skipped.
-5. **Shared startup and small-kernel work.** Text layer streaming has completed
+4. **Shared startup and small-kernel work.** Text layer streaming has completed
    Plan-5 F3: the measured text working set is below 1 GB and standalone text
    time fell from 16,242 to 3,145 ms without changing output.
    - **Transformer setup, diagnosed 2026-09-23.** The former 6.5-7.5 s was
