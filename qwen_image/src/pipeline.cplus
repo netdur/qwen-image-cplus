@@ -320,6 +320,17 @@ fn run_native_impl(
     );
 }
 
+// The public output-size rule: both sides at least 256 and divisible by 32
+// (two 16-pixel latent patches), within the trajectory's latent-token limit.
+// The API validates requests with this same function.
+fn output_dimensions_supported(width: usize, height: usize) -> bool {
+    return width >= (256 as usize) && height >= (256 as usize)
+        && width % (32 as usize) == (0 as usize)
+        && height % (32 as usize) == (0 as usize)
+        && (width / (16 as usize)) *% (height / (16 as usize))
+            <= transformer::max_target_tokens();
+}
+
 fn run_native_tokens_impl(
     packed_path: str,
     model_root: str,
@@ -342,10 +353,7 @@ fn run_native_tokens_impl(
 ) -> i32 {
     let image_width: usize = if output_width == (0 as usize) { pixels } else { output_width };
     let image_height: usize = if output_height == (0 as usize) { pixels } else { output_height };
-    if image_width < (256 as usize) || image_height < (256 as usize)
-        || image_width % (32 as usize) != (0 as usize)
-        || image_height % (32 as usize) != (0 as usize)
-        || (image_width / (16 as usize)) *% (image_height / (16 as usize)) > (16384 as usize) {
+    if !output_dimensions_supported(image_width, image_height) {
         io::eprintln("pipeline: width and height must be at least 256, divisible by 32, and no more than 16384 latent tokens total");
         return 2;
     }
@@ -404,6 +412,8 @@ fn run_native_tokens_impl(
     }
     io::println("pipeline: phase=transformer-scheduler output=${image_width}x${image_height} text_rows=${text_rows} seed=${seed}");
     let transformer_wall_start_ms: i64 = time::now_millis();
+    // Cache-off 1024x1024 takes the sized path below; it passes the same
+    // trajectory arguments as the dedicated 1024 wrapper.
     let transformer_status: i32 = if image_width == (1024 as usize)
         && image_height == (1024 as usize) && (bottleneck || taylorseer || cache_dit) {
         if bottleneck {
@@ -424,7 +434,7 @@ fn run_native_tokens_impl(
                 cache_dit_threshold,
                 steps,
             )
-        } else if cache_dit {
+        } else {
             transformer::run_prompt_trajectory_cache_dit_1024_to_host(
                 packed_path,
                 #slice_ptr(text_embeddings.as_slice()),
@@ -433,17 +443,6 @@ fn run_native_tokens_impl(
                 #slice_ptr(latent.as_slice()),
                 cache_dit_threshold,
                 steps,
-            )
-        } else {
-            transformer::run_prompt_trajectory_1024_to_host(
-                packed_path,
-                #slice_ptr(text_embeddings.as_slice()),
-                text_rows,
-                seed,
-                #slice_ptr(latent.as_slice()),
-                steps,
-                q4_eager_expand,
-                q4_direct_packed,
             )
         }
     } else if image_width == (256 as usize) && image_height == (256 as usize) && bottleneck {

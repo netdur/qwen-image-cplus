@@ -198,3 +198,51 @@ kernel void qv_attention(
     }
     if (active) output[query_start + lane] = qv_round_bf16(accumulator / state[1]);
 }
+
+// Row softmax over [rows, rows] FP32 attention scores already scaled by
+// 1/sqrt(head_dimension). One threadgroup per row; the row length is
+// params.rows.
+kernel void qv_row_softmax(
+    device float *scores [[buffer(0)]],
+    constant VisionParams &params [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float reduction[256];
+    device float *values = scores + ulong(row) * params.rows;
+    float local_max = -INFINITY;
+    for (uint index = lane; index < params.rows; index += 256) {
+        local_max = max(local_max, values[index]);
+    }
+    reduction[lane] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float row_max = reduction[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = 0.0f;
+    for (uint index = lane; index < params.rows; index += 256) {
+        const float weight = exp(values[index] - row_max);
+        values[index] = weight;
+        local_sum += weight;
+    }
+    reduction[lane] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse_sum = 1.0f / reduction[0];
+    for (uint index = lane; index < params.rows; index += 256) {
+        values[index] *= inverse_sum;
+    }
+}
+
+// Rounds the attention output to BF16, as qv_attention does per element.
+kernel void qv_round_bf16_inplace(
+    device float *values [[buffer(0)]],
+    constant VisionParams &params [[buffer(1)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < params.rows * params.width) values[index] = qv_round_bf16(values[index]);
+}

@@ -5,12 +5,15 @@
 // for the VAE and also provides RGB composited over white for Qwen3-VL, which
 // is the split used by the pinned official pipeline.
 
+import "./host_buffers" as host_buffers;
 import "./image_conditioning" as conditioning;
 import "./image_output" as image_output;
 import "objc/runtime" as rt;
 import "stdlib/io" as io;
+import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/status" as status;
+import "stdlib/text" as text;
 import "stdlib/vec" as vec;
 
 extern fn CFURLCreateFromFileSystemRepresentation(
@@ -39,6 +42,17 @@ extern fn CGBitmapContextCreate(
 ) -> *u8;
 extern fn CGContextSetInterpolationQuality(context: *u8, quality: i32);
 extern fn CGContextDrawImage(context: *u8, rect: rt::Rect, image: *u8);
+extern fn CGContextTranslateCTM(context: *u8, x: f64, y: f64);
+extern fn CGContextRotateCTM(context: *u8, angle: f64);
+extern fn CGContextScaleCTM(context: *u8, x: f64, y: f64);
+extern fn CGImageSourceCopyPropertiesAtIndex(
+    source: *u8,
+    index: usize,
+    options: *u8,
+) -> *u8;
+extern fn CFStringCreateWithCString(allocator: *u8, bytes: *u8, encoding: u32) -> *u8;
+extern fn CFDictionaryGetValue(dictionary: *u8, key: *u8) -> *u8;
+extern fn CFNumberGetValue(number: *u8, number_type: isize, value: *u8) -> bool;
 extern fn CFRelease(value: *u8);
 
 const CHANNELS: usize = 3;
@@ -46,6 +60,9 @@ const RGBA_CHANNELS: usize = 4;
 const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 const BYTE_ORDER_32_BIG: u32 = 4 << 12;
 const INTERPOLATION_HIGH: i32 = 3;
+const CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+const CF_NUMBER_SINT32: isize = 3;
+const HALF_PI: f64 = 1.5707963267948966;
 
 struct OwnedCf {
     pointer: *u8,
@@ -66,16 +83,61 @@ struct Image {
     vae_pixels: vec::Vec[f32],
 }
 
-fn zero_bytes(count: usize) -> option::Option[vec::Vec[u8]] {
-    var bytes: vec::Vec[u8] = vec::Vec[u8]::with_capacity(count);
-    var index: usize = 0 as usize;
-    while index < count {
-        if bytes.append(0 as u8) != status::Status::Ok {
-            return option::Option[vec::Vec[u8]]::None;
-        }
-        index = index +% (1 as usize);
+// EXIF/TIFF orientation (1-8) of the first image, or 1 when absent. The
+// reference loader (diffusers `load_image`) applies `exif_transpose`, so a
+// phone photo stored sideways must be upright before resizing.
+fn source_orientation(source: *u8) -> i32 {
+    let properties: *u8 = CGImageSourceCopyPropertiesAtIndex(source, 0 as usize, 0 as *u8);
+    if properties.is_null() { return 1 as i32; }
+    let properties_owner: OwnedCf = OwnedCf::new(properties);
+    // kCGImagePropertyOrientation is the CFString "Orientation".
+    let key: *u8 = CFStringCreateWithCString(
+        0 as *u8, #str_ptr("Orientation\0"), CF_STRING_ENCODING_UTF8,
+    );
+    if key.is_null() { return 1 as i32; }
+    let key_owner: OwnedCf = OwnedCf::new(key);
+    let number: *u8 = CFDictionaryGetValue(properties, key);
+    if number.is_null() { return 1 as i32; }
+    var orientation: i32 = 1 as i32;
+    if !CFNumberGetValue(number, CF_NUMBER_SINT32, #addr_of(orientation) as *u8) {
+        return 1 as i32;
     }
-    return option::Option[vec::Vec[u8]]::Some(bytes);
+    if orientation < (1 as i32) || orientation > (8 as i32) { return 1 as i32; }
+    return orientation;
+}
+
+// Orientations 5-8 swap the stored width and height.
+fn orientation_transposes(orientation: i32) -> bool {
+    return orientation >= (5 as i32);
+}
+
+// Maps the stored image, drawn into (0, 0, stored width, stored height), onto
+// the upright width x height surface. Core Graphics is y-up here, and a later
+// CTM call applies to user coordinates first.
+fn apply_orientation(context: *u8, orientation: i32, width: f64, height: f64) {
+    if orientation == (2 as i32) {
+        CGContextTranslateCTM(context, width, 0.0f64);
+        CGContextScaleCTM(context, -1.0f64, 1.0f64);
+    } else if orientation == (3 as i32) {
+        CGContextTranslateCTM(context, width, height);
+        CGContextScaleCTM(context, -1.0f64, -1.0f64);
+    } else if orientation == (4 as i32) {
+        CGContextTranslateCTM(context, 0.0f64, height);
+        CGContextScaleCTM(context, 1.0f64, -1.0f64);
+    } else if orientation == (5 as i32) {
+        CGContextTranslateCTM(context, width, height);
+        CGContextRotateCTM(context, HALF_PI);
+        CGContextScaleCTM(context, -1.0f64, 1.0f64);
+    } else if orientation == (6 as i32) {
+        CGContextTranslateCTM(context, 0.0f64, height);
+        CGContextRotateCTM(context, 0.0f64 - HALF_PI);
+    } else if orientation == (7 as i32) {
+        CGContextRotateCTM(context, HALF_PI);
+        CGContextScaleCTM(context, 1.0f64, -1.0f64);
+    } else if orientation == (8 as i32) {
+        CGContextTranslateCTM(context, width, 0.0f64);
+        CGContextRotateCTM(context, HALF_PI);
+    }
 }
 
 fn load_resized(
@@ -97,14 +159,18 @@ fn load_resized(
     if image_pointer.is_null() { return option::Option[Image]::None; }
     let image_owner: OwnedCf = OwnedCf::new(image_pointer);
 
-    let source_width: usize = CGImageGetWidth(image_pointer);
-    let source_height: usize = CGImageGetHeight(image_pointer);
+    let orientation: i32 = source_orientation(source_pointer);
+    let transposed: bool = orientation_transposes(orientation);
+    let stored_width: usize = CGImageGetWidth(image_pointer);
+    let stored_height: usize = CGImageGetHeight(image_pointer);
+    let source_width: usize = if transposed { stored_height } else { stored_width };
+    let source_height: usize = if transposed { stored_width } else { stored_height };
     guard let option::Option[conditioning::Shape]::Some(shape) =
         conditioning::calculate_shape(
             source_width, source_height, output_resolution,
     ) else { return option::Option[Image]::None; };
     let rgba_count: usize = shape.width *% shape.height *% RGBA_CHANNELS;
-    guard let option::Option[vec::Vec[u8]]::Some(rgba) = zero_bytes(rgba_count)
+    guard let option::Option[vec::Vec[u8]]::Some(rgba) = host_buffers::zeroed_u8(rgba_count)
         else { return option::Option[Image]::None; };
     let color_space_pointer: *u8 = CGColorSpaceCreateDeviceRGB();
     if color_space_pointer.is_null() { return option::Option[Image]::None; }
@@ -122,15 +188,19 @@ fn load_resized(
     let context_owner: OwnedCf = OwnedCf::new(context_pointer);
     CGContextSetInterpolationQuality(context_pointer, INTERPOLATION_HIGH);
     // CGImage drawing into this explicit bitmap layout leaves the first
-    // memory row at the visual top. Keep the coordinates untransformed; a
-    // Core Graphics y-flip here would invert the image processor input.
+    // memory row at the visual top. Only the EXIF orientation transforms the
+    // coordinates; an extra Core Graphics y-flip here would invert the image
+    // processor input.
+    apply_orientation(
+        context_pointer, orientation, shape.width as f64, shape.height as f64,
+    );
     CGContextDrawImage(
         context_pointer,
         rt::Rect {
             x: 0.0f64,
             y: 0.0f64,
-            w: shape.width as f64,
-            h: shape.height as f64,
+            w: if transposed { shape.height as f64 } else { shape.width as f64 },
+            h: if transposed { shape.width as f64 } else { shape.height as f64 },
         },
         image_pointer,
     );
@@ -261,5 +331,57 @@ fn run_reference(source_path: str) -> i32 {
     io::println(
         "reference image input: source=64x32 resized=736x352 output_resolution=512 vision_tokens=253 latent_tokens=1012 RGBA/vision-white/top-down=verified",
     );
+    return 0;
+}
+
+// Loads orientation_1.jpg through orientation_8.jpg from `directory`. Each file
+// stores the same upright picture under a different EXIF orientation, so
+// every decode must match orientation 1 in shape and in pixels.
+fn run_orientation(directory: str) -> i32 {
+    let reference_path: text::Text = "${directory}/orientation_1.jpg";
+    guard let option::Option[Image]::Some(reference) = load_resized(
+        reference_path.view(), 512 as usize,
+    ) else {
+        io::eprintln("image orientation: could not decode ${reference_path}");
+        return 1;
+    };
+    let reference_values: *f32 = #slice_ptr(reference.vision_pixels.as_slice());
+    var all_ok: bool = true;
+    var orientation: usize = 2 as usize;
+    while orientation <= (8 as usize) {
+        let path: text::Text = "${directory}/orientation_${orientation}.jpg";
+        guard let option::Option[Image]::Some(decoded) = load_resized(
+            path.view(), 512 as usize,
+        ) else {
+            io::eprintln("image orientation: could not decode ${path}");
+            return 1;
+        };
+        if decoded.shape.width != reference.shape.width
+            || decoded.shape.height != reference.shape.height {
+            io::eprintln(
+                "image orientation ${orientation}: shape ${decoded.shape.width}x${decoded.shape.height} expected ${reference.shape.width}x${reference.shape.height}",
+            );
+            all_ok = false;
+        } else {
+            let values: *f32 = #slice_ptr(decoded.vision_pixels.as_slice());
+            var absolute_sum: f64 = 0.0f64;
+            var index: usize = 0 as usize;
+            while index < decoded.vision_pixels.count() {
+                absolute_sum = absolute_sum
+                    + (values[index] as f64 - reference_values[index] as f64).abs();
+                index = index +% (1 as usize);
+            }
+            let mean_error: f64 = absolute_sum / decoded.vision_pixels.count() as f64;
+            io::println(
+                "image orientation ${orientation}: shape=${decoded.shape.width}x${decoded.shape.height} mean_abs_error=${mean_error}",
+            );
+            // JPEG re-encoding of the rotated storage differs slightly; a
+            // wrong orientation moves whole colour blocks and is far larger.
+            if mean_error > 0.02f64 { all_ok = false; }
+        }
+        orientation = orientation +% (1 as usize);
+    }
+    if !all_ok { return 1; }
+    io::println("reference image EXIF orientations 1-8: verified");
     return 0;
 }

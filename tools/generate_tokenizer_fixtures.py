@@ -29,6 +29,8 @@ PROMPTS = (
     ("special_tokens", "Show <|im_end|> and <think> literally."),
     ("nfc_decomposed", "Cafe\u0301"),
 )
+MULTI_IMAGE_PROMPT = "Place Picture 1 beside Picture 2."
+MULTI_IMAGE_COUNTS = (3, 2, 4)
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,6 +122,28 @@ def main() -> None:
             "input_ids": left_padding,
             "attention_mask": attention_mask,
         },
+    }
+    # Image-conditioned template, built the way QwenImage21Pipeline builds it
+    # and with each `<|image_pad|>` expanded as the processor expands it. The
+    # native test supplies the same per-image counts, so full IDs compare.
+    image_labels = "".join(
+        ("" if index == 0 else " ")
+        + f"<image{index + 1}><|vision_start|>"
+        + "<|image_pad|>" * count
+        + "<|vision_end|>"
+        for index, count in enumerate(MULTI_IMAGE_COUNTS)
+    )
+    multi_image_ids = tokenizer(
+        template.format(image_labels + MULTI_IMAGE_PROMPT), add_special_tokens=True
+    ).input_ids
+    multi_image_values = np.asarray(multi_image_ids, dtype="<i4")
+    (args.output / "multi_image_three.i32").write_bytes(multi_image_values.tobytes())
+    metadata["multi_image"] = {
+        "file": "multi_image_three.i32",
+        "prompt": MULTI_IMAGE_PROMPT,
+        "image_token_counts": list(MULTI_IMAGE_COUNTS),
+        "full_token_count": len(multi_image_ids),
+        "sha256": hashlib.sha256(multi_image_values.tobytes()).hexdigest(),
     }
     (args.output / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n"

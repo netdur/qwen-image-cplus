@@ -7,10 +7,12 @@
 
 import "./cpu_ops" as cpu;
 import "./mmap_macos" as mapped;
+import "./mps_matrix" as mps;
 import "./safetensors" as safetensors;
 import "metal/metal" as metal;
 import "objc/bridge" as bridge;
 import "objc/runtime" as rt;
+import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
@@ -76,6 +78,8 @@ struct Pipelines {
     gelu: metal::ComputePipelineState,
     split_rope: metal::ComputePipelineState,
     attention: metal::ComputePipelineState,
+    softmax: metal::ComputePipelineState,
+    round_bf16: metal::ComputePipelineState,
 }
 
 fn round_up(value: usize, alignment: usize) -> usize {
@@ -423,6 +427,99 @@ fn dispatch_attention(
     return option::Option[f64]::Some(finish(command_buffer, encoder));
 }
 
+// Bidirectional attention as matrix work: per head, QK^T (scaled) with MPS,
+// a row softmax, then PV written into that head's 72 output columns. Q, K, V
+// and the output are [rows, heads, head_dimension] FP32, so each head is a
+// strided view. The per-key kernel above did the same arithmetic one key at a
+// time; at 4,096 patches it took 27 of the tower's 30 seconds.
+fn dispatch_attention_mps(
+    queue: metal::CommandQueue,
+    device: metal::Device,
+    pipelines: Pipelines,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    scores: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    let row_bytes: usize = WIDTH *% #size_of::[f32]();
+    let score_row_bytes: usize = rows *% #size_of::[f32]();
+    var params: VisionParams = VisionParams {
+        rows: rows as u32, width: WIDTH as u32,
+        output_width: WIDTH as u32, input_width: WIDTH as u32,
+        heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32, rope_theta: 10000.0f32,
+    };
+    var head: usize = 0 as usize;
+    while head < HEADS {
+        let head_offset: u64 = (head *% HEAD_DIMENSION *% #size_of::[f32]()) as u64;
+        guard let option::Option[mps::Multiplication]::Some(score_operation) = mps::create_fp32(
+            device,
+            mps::Fp32Operand { buffer: query, offset: head_offset, rows: rows, columns: HEAD_DIMENSION, row_bytes: row_bytes },
+            mps::Fp32Operand { buffer: key, offset: head_offset, rows: rows, columns: HEAD_DIMENSION, row_bytes: row_bytes },
+            mps::Fp32Operand { buffer: scores, offset: 0 as u64, rows: rows, columns: rows, row_bytes: score_row_bytes },
+            false, true, HEAD_DIMENSION, 1.0f64 / (HEAD_DIMENSION as f64).sqrt(),
+        ) else { return option::Option[f64]::None; };
+        guard let option::Option[mps::Multiplication]::Some(value_operation) = mps::create_fp32(
+            device,
+            mps::Fp32Operand { buffer: scores, offset: 0 as u64, rows: rows, columns: rows, row_bytes: score_row_bytes },
+            mps::Fp32Operand { buffer: value, offset: head_offset, rows: rows, columns: HEAD_DIMENSION, row_bytes: row_bytes },
+            mps::Fp32Operand { buffer: output, offset: head_offset, rows: rows, columns: HEAD_DIMENSION, row_bytes: row_bytes },
+            false, false, rows, 1.0f64,
+        ) else { return option::Option[f64]::None; };
+        score_operation.encode(command_buffer);
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+            command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+        let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+        encoder.set_compute_pipeline_state(pipelines.softmax);
+        encoder.set_buffer(scores, 0 as u64, 0 as u64);
+        encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 1 as u64);
+        encoder.dispatch_threadgroups(
+            metal::Size { width: rows as u64, height: 1 as u64, depth: 1 as u64 },
+            metal::Size { width: 256 as u64, height: 1 as u64, depth: 1 as u64 },
+        );
+        metal::CommandEncoder::from_raw(encoder.raw()).end_encoding();
+        value_operation.encode(command_buffer);
+        head = head +% (1 as usize);
+    }
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(round_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let round_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(round_encoder.raw()));
+    round_encoder.set_compute_pipeline_state(pipelines.round_bf16);
+    round_encoder.set_buffer(output, 0 as u64, 0 as u64);
+    round_encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 1 as u64);
+    let width: u64 = pipelines.round_bf16.thread_execution_width();
+    round_encoder.dispatch_threads(
+        metal::Size { width: (rows *% WIDTH) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: width, height: 1 as u64, depth: 1 as u64 },
+    );
+    return option::Option[f64]::Some(finish(command_buffer, round_encoder));
+}
+
+// Normalized RMS difference of `actual` against `expected`, both FP32.
+fn buffer_nrmse(actual: metal::Buffer, expected: metal::Buffer, count: usize) -> f64 {
+    let actual_values: *f32 = actual.contents() as *f32;
+    let expected_values: *f32 = expected.contents() as *f32;
+    var error: f64 = 0.0f64;
+    var reference: f64 = 0.0f64;
+    var index: usize = 0 as usize;
+    while index < count {
+        let difference: f64 = actual_values[index] as f64 - expected_values[index] as f64;
+        error = error + difference * difference;
+        reference = reference + expected_values[index] as f64 * expected_values[index] as f64;
+        index = index +% (1 as usize);
+    }
+    if reference == 0.0f64 { return error.sqrt(); }
+    return (error / reference).sqrt();
+}
+
 fn patchify(
     pixels: *f32,
     width: usize,
@@ -692,6 +789,23 @@ fn execute_merger(
 // Encodes one already-resized white-composited RGB image in HWC [0, 1].
 // `output` has vision_tokens x 4096 floats. `deepstack` has three consecutive
 // tensors of the same shape, corresponding to visual blocks 8, 16, and 24.
+// One image for `encode_batch_to_host`. DeepStack features are written as
+// [layer, token, channel]; `deepstack_layer_stride` is the value distance
+// between layers, so a caller can place several images' tokens in one
+// layer-major array without repacking.
+struct Input {
+    opaque rgb_pixels: *f32,
+    width: usize,
+    height: usize,
+    opaque output: *f32,
+    opaque deepstack: *f32,
+    deepstack_layer_stride: usize,
+}
+
+fn merged_tokens(width: usize, height: usize) -> usize {
+    return (width / PATCH_SIZE) *% (height / PATCH_SIZE) / (MERGE_SIZE *% MERGE_SIZE);
+}
+
 fn encode_sized_to_host(
     model_root: str,
     rgb_pixels: *f32,
@@ -701,12 +815,42 @@ fn encode_sized_to_host(
     deepstack: *f32,
     fixture_directory: str = "",
 ) -> i32 {
-    if rgb_pixels.is_null() || output.is_null() || deepstack.is_null()
-        || width == (0 as usize) || height == (0 as usize)
-        || width % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize)
-        || height % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize) {
-        io::eprintln("vision encoder: invalid buffers or dimensions");
+    var inputs: [Input; 1] = [Input {
+        rgb_pixels: rgb_pixels,
+        width: width,
+        height: height,
+        output: output,
+        deepstack: deepstack,
+        deepstack_layer_stride: merged_tokens(width, height) *% OUTPUT_WIDTH,
+    }];
+    return encode_batch_to_host(model_root, #addr_of(inputs[0]), 1 as usize, fixture_directory);
+}
+
+// Encodes several reference images with one weight read, one Metal library
+// compile, and one set of pipelines. Only activations are per image.
+fn encode_batch_to_host(
+    model_root: str,
+    inputs: *Input,
+    count: usize,
+    fixture_directory: str = "",
+) -> i32 {
+    if inputs.is_null() || count == (0 as usize) {
+        io::eprintln("vision encoder: no images");
         return 2;
+    }
+    var input_index: usize = 0 as usize;
+    while input_index < count {
+        let input: Input = inputs[input_index];
+        if input.rgb_pixels.is_null() || input.output.is_null() || input.deepstack.is_null()
+            || input.width == (0 as usize) || input.height == (0 as usize)
+            || input.width % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize)
+            || input.height % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize)
+            || input.deepstack_layer_stride
+                < merged_tokens(input.width, input.height) *% OUTPUT_WIDTH {
+            io::eprintln("vision encoder: invalid buffers or dimensions");
+            return 2;
+        }
+        input_index = input_index +% (1 as usize);
     }
     let started_ms: i64 = time::now_millis();
     let shard_path: text::Text = "${model_root}/text_encoder/model-00001-of-00004.safetensors";
@@ -771,6 +915,15 @@ fn encode_sized_to_host(
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(
         device, library, "qv_attention",
     ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(softmax_owner) = pipeline(
+        device, library, "qv_row_softmax",
+    ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(round_owner) = pipeline(
+        device, library, "qv_round_bf16_inplace",
+    ) else { return 1; };
+    let use_mps_attention: bool = !env::has_var("QI_DISABLE_VISION_MPS_ATTENTION")
+        && mps::load_framework();
+    let validate_attention: bool = env::has_var("QI_VALIDATE_VISION_ATTENTION");
     let pipelines: Pipelines = Pipelines {
         linear: metal::ComputePipelineState::from_raw(linear_owner.raw()),
         norm: metal::ComputePipelineState::from_raw(norm_owner.raw()),
@@ -778,6 +931,8 @@ fn encode_sized_to_host(
         gelu: metal::ComputePipelineState::from_raw(gelu_owner.raw()),
         split_rope: metal::ComputePipelineState::from_raw(split_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
+        softmax: metal::ComputePipelineState::from_raw(softmax_owner.raw()),
+        round_bf16: metal::ComputePipelineState::from_raw(round_owner.raw()),
     };
 
     guard let option::Option[metal::Buffer]::Some(storage) = new_buffer(
@@ -795,6 +950,41 @@ fn encode_sized_to_host(
     }
     let weights_ready_ms: i64 = time::now_millis();
 
+    input_index = 0 as usize;
+    while input_index < count {
+        let status: i32 = encode_loaded(
+            file, storage, region_begin, region_bytes, device, queue, pipelines,
+            use_mps_attention, validate_attention,
+            inputs[input_index], fixture_directory,
+            if input_index == (0 as usize) { weights_ready_ms - started_ms } else { 0 as i64 },
+        );
+        if status != (0 as i32) { return status; }
+        input_index = input_index +% (1 as usize);
+    }
+    return 0;
+}
+
+// Runs the tower for one image on an already loaded session.
+fn encode_loaded(
+    file: safetensors::File,
+    storage: metal::Buffer,
+    region_begin: u64,
+    region_bytes: usize,
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    use_mps_attention: bool,
+    validate_attention: bool,
+    input: Input,
+    fixture_directory: str,
+    weight_read_ms: i64,
+) -> i32 {
+    let started_ms: i64 = time::now_millis();
+    let rgb_pixels: *f32 = input.rgb_pixels;
+    let width: usize = input.width;
+    let height: usize = input.height;
+    let output: *f32 = input.output;
+    let deepstack: *f32 = input.deepstack;
     let grid_width: usize = width / PATCH_SIZE;
     let grid_height: usize = height / PATCH_SIZE;
     let patch_rows: usize = grid_width *% grid_height;
@@ -889,6 +1079,13 @@ fn encode_sized_to_host(
         device, merged_output_bytes,
     ) else { return 1; };
     let merged_output_owner: OwnedObjc = OwnedObjc::new(merged_output.raw());
+    guard let option::Option[metal::Buffer]::Some(scores) = new_buffer(
+        device,
+        if use_mps_attention {
+            (patch_rows *% patch_rows *% #size_of::[f32]()) as u64
+        } else { #size_of::[f32]() as u64 },
+    ) else { return 1; };
+    let scores_owner: OwnedObjc = OwnedObjc::new(scores.raw());
 
     guard let option::Option[Weight]::Some(patch_weight) = tensor_weight(
         file, storage, region_begin, "model.visual.patch_embed.proj.weight",
@@ -913,6 +1110,8 @@ fn encode_sized_to_host(
     var other: metal::Buffer = hidden_a;
 
     var total_gpu_ms: f64 = 0.0f64;
+    var attention_gpu_ms: f64 = 0.0f64;
+    var linear_gpu_ms: f64 = 0.0f64;
     var layer: usize = 0 as usize;
     while layer < LAYERS {
         let prefix: text::Text = "model.visual.blocks.${layer}";
@@ -971,9 +1170,25 @@ fn encode_sized_to_host(
             queue, pipelines.split_rope, qkv, query, key, value,
             position_buffer, patch_rows,
         ) else { return 1; };
-        guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(
-            queue, pipelines.attention, query, key, value, attended, patch_rows,
-        ) else { return 1; };
+        guard let option::Option[f64]::Some(attention_ms) = if use_mps_attention {
+            dispatch_attention_mps(
+                queue, device, pipelines, query, key, value, scores, attended, patch_rows,
+            )
+        } else {
+            dispatch_attention(
+                queue, pipelines.attention, query, key, value, attended, patch_rows,
+            )
+        } else { return 1; };
+        // Checks the matrix path against the per-key kernel on real inputs;
+        // `branch` is free until the output projection below.
+        if validate_attention && use_mps_attention && layer == (0 as usize) {
+            guard let option::Option[f64]::Some(_reference_ms) = dispatch_attention(
+                queue, pipelines.attention, query, key, value, branch, patch_rows,
+            ) else { return 1; };
+            io::println(
+                "vision attention validation: layer=0 rows=${patch_rows} nRMSE=${buffer_nrmse(attended, branch, patch_rows *% WIDTH)}",
+            );
+        }
         guard let option::Option[f64]::Some(proj_ms) = dispatch_linear(
             queue, pipelines.linear, attended, proj_weight, proj_bias, branch,
             patch_rows, WIDTH, WIDTH,
@@ -1006,6 +1221,8 @@ fn encode_sized_to_host(
         let swapped_mlp: metal::Buffer = current;
         current = other;
         other = swapped_mlp;
+        attention_gpu_ms = attention_gpu_ms + attention_ms;
+        linear_gpu_ms = linear_gpu_ms + qkv_ms + proj_ms + fc1_ms + fc2_ms;
         total_gpu_ms = total_gpu_ms + norm1_ms + qkv_ms + rope_ms + attention_ms
             + proj_ms + attention_add_ms + norm2_ms + fc1_ms + gelu_ms
             + fc2_ms + mlp_add_ms;
@@ -1019,10 +1236,10 @@ fn encode_sized_to_host(
                 queue, pipelines, file, storage, region_begin,
                 merger_prefix.view(), true, current, norm, merged_a, merged_b,
                 merged_output, patch_rows,
-                deepstack + deep_index *% merged_rows *% OUTPUT_WIDTH,
+                deepstack + deep_index *% input.deepstack_layer_stride,
             ) { return 1; }
             if !report_fixture(
-                deepstack + deep_index *% merged_rows *% OUTPUT_WIDTH,
+                deepstack + deep_index *% input.deepstack_layer_stride,
                 fixture_directory, "deepstack_${deep_index}",
                 merged_rows *% OUTPUT_WIDTH,
             ) { return 1; }
@@ -1045,7 +1262,7 @@ fn encode_sized_to_host(
         output, fixture_directory, "output", merged_rows *% OUTPUT_WIDTH,
     ) { return 1; }
     io::println(
-        "Qwen3-VL vision encoder: image=${width}x${height} patches=${patch_rows} tokens=${merged_rows} weight_region_bytes=${region_bytes} weight_read_ms=${weights_ready_ms - started_ms} block_gpu_ms=${total_gpu_ms} total_wall_ms=${time::now_millis() - started_ms} finite=verified",
+        "Qwen3-VL vision encoder: image=${width}x${height} patches=${patch_rows} tokens=${merged_rows} weight_region_bytes=${region_bytes} weight_read_ms=${weight_read_ms} block_gpu_ms=${total_gpu_ms} mps_attention=${use_mps_attention} attention_gpu_ms=${attention_gpu_ms} linear_gpu_ms=${linear_gpu_ms} total_wall_ms=${time::now_millis() - started_ms} finite=verified",
     );
     return 0;
 }

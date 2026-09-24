@@ -233,3 +233,61 @@ kernel void qt_swiglu(
         output[index] = qt_round_bf16((value / (1.0f + exp(-value))) * up[index]);
     }
 }
+
+// Expands one BF16 weight matrix to FP32 for the MPS linear path. The values
+// are exact: BF16 is the upper half of an FP32 word.
+kernel void qt_bf16_to_f32(
+    device const ushort *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) output[index] = qt_bf16(input[index]);
+}
+
+// Rounds an MPS linear output to BF16, as qt_linear_16x16 does per element.
+kernel void qt_round_bf16_inplace(
+    device float *values [[buffer(0)]],
+    constant uint &count [[buffer(1)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) values[index] = qt_round_bf16(values[index]);
+}
+
+// Causal row softmax over [rows, rows] FP32 scores already scaled by
+// 1/sqrt(head_dimension): row i keeps keys 0..i and zeroes the rest.
+kernel void qt_causal_row_softmax(
+    device float *scores [[buffer(0)]],
+    constant uint &rows [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float reduction[256];
+    device float *values = scores + ulong(row) * rows;
+    const uint valid = row + 1;
+    float local_max = -INFINITY;
+    for (uint index = lane; index < valid; index += 256) {
+        local_max = max(local_max, values[index]);
+    }
+    reduction[lane] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float row_max = reduction[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = 0.0f;
+    for (uint index = lane; index < valid; index += 256) {
+        const float weight = exp(values[index] - row_max);
+        values[index] = weight;
+        local_sum += weight;
+    }
+    reduction[lane] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse_sum = 1.0f / reduction[0];
+    for (uint index = lane; index < rows; index += 256) {
+        values[index] = index < valid ? values[index] * inverse_sum : 0.0f;
+    }
+}

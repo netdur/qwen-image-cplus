@@ -6,6 +6,7 @@
 
 import "./image_conditioning" as conditioning;
 import "./image_input" as image_input;
+import "./host_buffers" as host_buffers;
 import "./image_output" as image_output;
 import "./qwen3vl_text" as text_encoder;
 import "./qwen3vl_vision" as vision_encoder;
@@ -35,35 +36,14 @@ struct Encoded {
     shapes: vec::Vec[conditioning::Shape],
 }
 
-fn zero_f32(count: usize) -> option::Option[vec::Vec[f32]] {
-    var values: vec::Vec[f32] = vec::Vec[f32]::with_capacity(count);
-    var index: usize = 0 as usize;
-    while index < count {
-        if values.append(0.0f32) != status::Status::Ok {
-            return option::Option[vec::Vec[f32]]::None;
-        }
-        index = index +% (1 as usize);
-    }
-    return option::Option[vec::Vec[f32]]::Some(values);
-}
-
-fn zero_u32(count: usize) -> option::Option[vec::Vec[u32]] {
-    var values: vec::Vec[u32] = vec::Vec[u32]::with_capacity(count);
-    var index: usize = 0 as usize;
-    while index < count {
-        if values.append(0 as u32) != status::Status::Ok {
-            return option::Option[vec::Vec[u32]]::None;
-        }
-        index = index +% (1 as usize);
-    }
-    return option::Option[vec::Vec[u32]]::Some(values);
-}
-
-fn encode_images_512(
+// References are resized to the output area, as the reference pipeline's
+// `output_resolution` does for both the vision tower and the VAE.
+fn encode_images(
     model_root: str,
     prompt: str,
     image_paths: *str,
     image_count: usize,
+    output_resolution: usize = 512 as usize,
 ) -> option::Option[Encoded] {
     if !conditioning::reference_count_supported(image_count) {
         io::eprintln("multimodal conditioning: reference image count must be 1 through 10");
@@ -79,15 +59,16 @@ fn encode_images_512(
     var vision_rows: usize = 0 as usize;
     var condition_rows: usize = 0 as usize;
 
-    // Discover every resized shape before allocating the combined outputs.
-    // Image input is intentionally reloaded for the encoder pass below. The
-    // extra native decode is milliseconds and avoids retaining up to ten RGBA
-    // and RGB float images simultaneously.
+    // Decode every reference once. Ten 512-area images hold about 75 MB of
+    // float pixels (300 MB at 1024), far less than reloading both encoders
+    // per image costs.
+    var images: vec::Vec[image_input::Image] =
+        vec::Vec[image_input::Image]::with_capacity(image_count);
     var image_index: usize = 0 as usize;
     while image_index < image_count {
         let input_start_ms: i64 = time::now_millis();
         guard let option::Option[image_input::Image]::Some(image) =
-            image_input::load_resized(image_paths[image_index], 512 as usize) else {
+            image_input::load_resized(image_paths[image_index], output_resolution) else {
             io::eprintln(
                 "multimodal conditioning: could not load ${image_paths[image_index]}",
             );
@@ -96,7 +77,8 @@ fn encode_images_512(
         input_ms = input_ms + (time::now_millis() - input_start_ms);
         let shape: conditioning::Shape = image.shape;
         if shapes.append(shape) != status::Status::Ok
-            || image_token_counts.append(shape.vision_tokens) != status::Status::Ok {
+            || image_token_counts.append(shape.vision_tokens) != status::Status::Ok
+            || images.append(image) != status::Status::Ok {
             return option::Option[Encoded]::None;
         }
         vision_rows = vision_rows +% shape.vision_tokens;
@@ -104,82 +86,64 @@ fn encode_images_512(
         image_index = image_index +% (1 as usize);
     }
 
-    guard let option::Option[vec::Vec[f32]]::Some(vision) = zero_f32(
+    guard let option::Option[vec::Vec[f32]]::Some(vision) = host_buffers::zeroed_f32(
         vision_rows *% WIDTH,
     ) else { return option::Option[Encoded]::None; };
-    guard let option::Option[vec::Vec[f32]]::Some(deepstack) = zero_f32(
+    guard let option::Option[vec::Vec[f32]]::Some(deepstack) = host_buffers::zeroed_f32(
         DEEPSTACK_LAYERS *% vision_rows *% WIDTH,
     ) else { return option::Option[Encoded]::None; };
-    guard let option::Option[vec::Vec[f32]]::Some(condition_latents) = zero_f32(
+    guard let option::Option[vec::Vec[f32]]::Some(condition_latents) = host_buffers::zeroed_f32(
         condition_rows *% LATENT_CHANNELS,
     ) else { return option::Option[Encoded]::None; };
 
     let shape_values: *conditioning::Shape = #slice_ptr(shapes.as_slice());
+    let image_values: *image_input::Image = #slice_ptr(images.as_slice());
     let vision_values: *f32 = #slice_ptr(vision.as_slice());
     let deep_values: *f32 = #slice_ptr(deepstack.as_slice());
     let latent_values: *f32 = #slice_ptr(condition_latents.as_slice());
+    // Each image writes its rows at its offset in the combined arrays. The
+    // DeepStack stride spans all images' tokens, which is the language
+    // model's [layer, all images' tokens, channel] order.
+    var vision_inputs: vec::Vec[vision_encoder::Input] =
+        vec::Vec[vision_encoder::Input]::with_capacity(image_count);
+    var vae_inputs: vec::Vec[vae::EncodeInput] =
+        vec::Vec[vae::EncodeInput]::with_capacity(image_count);
     var vision_row_offset: usize = 0 as usize;
     var latent_row_offset: usize = 0 as usize;
     image_index = 0 as usize;
     while image_index < image_count {
         let shape: conditioning::Shape = shape_values[image_index];
-        let input_start_ms: i64 = time::now_millis();
-        guard let option::Option[image_input::Image]::Some(image) =
-            image_input::load_resized(image_paths[image_index], 512 as usize) else {
-            io::eprintln(
-                "multimodal conditioning: could not reload ${image_paths[image_index]}",
-            );
+        if vision_inputs.append(vision_encoder::Input {
+            rgb_pixels: #slice_ptr(image_values[image_index].vision_pixels.as_slice()),
+            width: shape.width,
+            height: shape.height,
+            output: vision_values + vision_row_offset *% WIDTH,
+            deepstack: deep_values + vision_row_offset *% WIDTH,
+            deepstack_layer_stride: vision_rows *% WIDTH,
+        }) != status::Status::Ok
+            || vae_inputs.append(vae::EncodeInput {
+            rgba_source: #slice_ptr(image_values[image_index].vae_pixels.as_slice()),
+            width: shape.width,
+            height: shape.height,
+            normalized_destination: latent_values
+                    + latent_row_offset *% LATENT_CHANNELS,
+        }) != status::Status::Ok {
             return option::Option[Encoded]::None;
-        };
-        input_ms = input_ms + (time::now_millis() - input_start_ms);
-
-        let local_deep_values: usize =
-            DEEPSTACK_LAYERS *% shape.vision_tokens *% WIDTH;
-        guard let option::Option[vec::Vec[f32]]::Some(local_deep) = zero_f32(
-            local_deep_values,
-        ) else { return option::Option[Encoded]::None; };
-        let vision_start_ms: i64 = time::now_millis();
-        if vision_encoder::encode_sized_to_host(
-            model_root,
-            #slice_ptr(image.vision_pixels.as_slice()),
-            shape.width,
-            shape.height,
-            vision_values + vision_row_offset *% WIDTH,
-            #slice_ptr(local_deep.as_slice()),
-        ) != (0 as i32) { return option::Option[Encoded]::None; }
-        vision_ms = vision_ms + (time::now_millis() - vision_start_ms);
-
-        // Each image returns [layer, local token, channel]. Repack it into
-        // [layer, all images' tokens, channel] for the language model.
-        let local_deep_pointer: *f32 = #slice_ptr(local_deep.as_slice());
-        var layer: usize = 0 as usize;
-        while layer < DEEPSTACK_LAYERS {
-            var local: usize = 0 as usize;
-            while local < shape.vision_tokens *% WIDTH {
-                deep_values[
-                    layer *% vision_rows *% WIDTH
-                        +% vision_row_offset *% WIDTH +% local
-                ] = local_deep_pointer[
-                    layer *% shape.vision_tokens *% WIDTH +% local
-                ];
-                local = local +% (1 as usize);
-            }
-            layer = layer +% (1 as usize);
         }
-
-        let vae_start_ms: i64 = time::now_millis();
-        if vae::encode_sized_from_host(
-            model_root,
-            #slice_ptr(image.vae_pixels.as_slice()),
-            shape.width,
-            shape.height,
-            latent_values + latent_row_offset *% LATENT_CHANNELS,
-        ) != (0 as i32) { return option::Option[Encoded]::None; }
-        vae_ms = vae_ms + (time::now_millis() - vae_start_ms);
         vision_row_offset = vision_row_offset +% shape.vision_tokens;
         latent_row_offset = latent_row_offset +% shape.latent_tokens;
         image_index = image_index +% (1 as usize);
     }
+    let vision_start_ms: i64 = time::now_millis();
+    if vision_encoder::encode_batch_to_host(
+        model_root, #slice_ptr(vision_inputs.as_slice()), image_count,
+    ) != (0 as i32) { return option::Option[Encoded]::None; }
+    vision_ms = time::now_millis() - vision_start_ms;
+    let vae_start_ms: i64 = time::now_millis();
+    if vae::encode_batch_from_host(
+        model_root, #slice_ptr(vae_inputs.as_slice()), image_count,
+    ) != (0 as i32) { return option::Option[Encoded]::None; }
+    vae_ms = time::now_millis() - vae_start_ms;
 
     let text_start_ms: i64 = time::now_millis();
     guard let option::Option[vec::Vec[u32]]::Some(tokens) =
@@ -189,7 +153,7 @@ fn encode_images_512(
         io::eprintln("multimodal conditioning: could not tokenize prompt");
         return option::Option[Encoded]::None;
     };
-    guard let option::Option[vec::Vec[u32]]::Some(positions) = zero_u32(
+    guard let option::Option[vec::Vec[u32]]::Some(positions) = host_buffers::zeroed_u32(
         tokens.count() *% (3 as usize),
     ) else { return option::Option[Encoded]::None; };
     if !conditioning::fill_language_positions(
@@ -200,7 +164,7 @@ fn encode_images_512(
         return option::Option[Encoded]::None;
     }
     let prompt_rows: usize = tokens.count() -% SYSTEM_PREFIX_TOKENS;
-    guard let option::Option[vec::Vec[f32]]::Some(prompt_embeddings) = zero_f32(
+    guard let option::Option[vec::Vec[f32]]::Some(prompt_embeddings) = host_buffers::zeroed_f32(
         prompt_rows *% WIDTH,
     ) else { return option::Option[Encoded]::None; };
     var encoded_rows: usize = 0 as usize;
@@ -233,7 +197,7 @@ fn encode_images_512(
     let text_ms: i64 = time::now_millis() - text_start_ms;
 
     io::println(
-        "multi-image conditioning: images=${image_count} output_resolution=512 vision_rows=${vision_rows} prompt_rows=${prompt_rows} condition_rows=${condition_rows} input_ms=${input_ms} vision_ms=${vision_ms} text_ms=${text_ms} vae_ms=${vae_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        "multi-image conditioning: images=${image_count} output_resolution=${output_resolution} vision_rows=${vision_rows} prompt_rows=${prompt_rows} condition_rows=${condition_rows} input_ms=${input_ms} vision_ms=${vision_ms} text_ms=${text_ms} vae_ms=${vae_ms} total_wall_ms=${time::now_millis() - started_ms}",
     );
     return option::Option[Encoded]::Some(Encoded {
         prompt_embeddings: prompt_embeddings,
@@ -252,7 +216,7 @@ fn encode_two_images_512(
     second_path: str,
 ) -> option::Option[Encoded] {
     var image_paths: [str; 2] = [first_path, second_path];
-    return encode_images_512(model_root, prompt, #addr_of(image_paths[0]), 2 as usize);
+    return encode_images(model_root, prompt, #addr_of(image_paths[0]), 2 as usize);
 }
 
 fn finite_nonzero(values: *f32, count: usize) -> bool {
@@ -316,11 +280,13 @@ fn run_two_image_512(
     return 0;
 }
 
-// Full native handoff through a short 512x512 transformer smoke or the complete
-// 40-step trajectory. Two steps prove that target-only decoding can reuse the
-// interleaved prefix K/V cache; an output path also performs native VAE decode
-// and PNG output.
-fn run_multi_image_transformer_512(
+// Full native handoff through a short transformer smoke or a complete
+// trajectory. One and two steps are truncated prefixes of the 40-step schedule:
+// two prove that target-only decoding can reuse the interleaved prefix K/V
+// cache, but their latent is still mostly noise, so they never write a PNG.
+// Complete trajectories (3, 4, 8, 25, or 40 steps; the pack's shift_terminal
+// metadata selects the schedule) also run native VAE decode and PNG output.
+fn run_multi_image_transformer(
     packed_path: str,
     model_root: str,
     image_paths: *str,
@@ -329,14 +295,25 @@ fn run_multi_image_transformer_512(
     requested_steps: str = "1",
     output_path: str = "",
     seed: u64 = 1301 as u64,
+    output_resolution: usize = 512 as usize,
 ) -> i32 {
-    if !(requested_steps == "1" || requested_steps == "2" || requested_steps == "40") {
-        io::eprintln("multi-image transformer: steps must be 1, 2, or 40");
+    if output_resolution != (512 as usize) && output_resolution != (1024 as usize) {
+        io::eprintln("multi-image transformer: output resolution must be 512 or 1024");
+        return 2;
+    }
+    let smoke_steps: bool = requested_steps == "1" || requested_steps == "2";
+    if !(smoke_steps || requested_steps == "3" || requested_steps == "4"
+        || requested_steps == "8" || requested_steps == "25" || requested_steps == "40") {
+        io::eprintln("multi-image transformer: steps must be 1, 2, 3, 4, 8, 25, or 40");
+        return 2;
+    }
+    if smoke_steps && output_path.count() > (0 as usize) {
+        io::eprintln("multi-image transformer: ${requested_steps} steps is a truncated smoke trajectory; generating a PNG needs 3, 4, 8, 25, or 40");
         return 2;
     }
     let started_ms: i64 = time::now_millis();
-    guard let option::Option[Encoded]::Some(encoded) = encode_images_512(
-        model_root, prompt, image_paths, image_count,
+    guard let option::Option[Encoded]::Some(encoded) = encode_images(
+        model_root, prompt, image_paths, image_count, output_resolution,
     ) else { return 1; };
     var shapes: vec::Vec[transformer::LatentShape] =
         vec::Vec[transformer::LatentShape]::with_capacity(image_count);
@@ -349,9 +326,9 @@ fn run_multi_image_transformer_512(
         }) != status::Status::Ok { return 1; }
         shape_index = shape_index +% (1 as usize);
     }
-    let target_rows: usize = (512 as usize) / (16 as usize)
-        *% ((512 as usize) / (16 as usize));
-    guard let option::Option[vec::Vec[f32]]::Some(target) = zero_f32(
+    let latent_side: usize = output_resolution / (16 as usize);
+    let target_rows: usize = latent_side *% latent_side;
+    guard let option::Option[vec::Vec[f32]]::Some(target) = host_buffers::zeroed_f32(
         target_rows *% LATENT_CHANNELS,
     ) else { return 1; };
     let transformer_start_ms: i64 = time::now_millis();
@@ -366,8 +343,8 @@ fn run_multi_image_transformer_512(
         image_count,
         seed,
         #slice_ptr(target.as_slice()),
-        512 as usize,
-        512 as usize,
+        output_resolution,
+        output_resolution,
         requested_steps,
     );
     let transformer_ms: i64 = time::now_millis() - transformer_start_ms;
@@ -378,33 +355,41 @@ fn run_multi_image_transformer_512(
         return 1;
     }
     if output_path.count() > (0 as usize) {
-        guard let option::Option[vec::Vec[f32]]::Some(decoded) = zero_f32(
-            (512 as usize) *% (512 as usize) *% (4 as usize),
+        guard let option::Option[vec::Vec[f32]]::Some(decoded) = host_buffers::zeroed_f32(
+            output_resolution *% output_resolution *% (4 as usize),
         ) else { return 1; };
         let vae_start_ms: i64 = time::now_millis();
-        if vae::decode_sized_from_host(
-            model_root,
-            #slice_ptr(target.as_slice()),
-            #slice_ptr(decoded.as_slice()),
-            32 as usize,
-            32 as usize,
-        ) != (0 as i32) {
+        // 1024 uses the same decoder entry as text-to-image 1024.
+        let decode_status: i32 = if output_resolution == (1024 as usize) {
+            vae::decode_1024_from_host(
+                model_root, #slice_ptr(target.as_slice()), #slice_ptr(decoded.as_slice()),
+            )
+        } else {
+            vae::decode_sized_from_host(
+                model_root,
+                #slice_ptr(target.as_slice()),
+                #slice_ptr(decoded.as_slice()),
+                latent_side,
+                latent_side,
+            )
+        };
+        if decode_status != (0 as i32) {
             return 1;
         }
         let vae_ms: i64 = time::now_millis() - vae_start_ms;
         let output_start_ms: i64 = time::now_millis();
         if !image_output::write_png_sized(
-            #slice_ptr(decoded.as_slice()), output_path, 512 as usize, 512 as usize,
+            #slice_ptr(decoded.as_slice()), output_path, output_resolution, output_resolution,
         ) {
             return 1;
         }
         io::println(
-            "Qwen-Image-2.1 multi-image generation: images=${image_count} output=${output_path} pixels=512x512 steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
+            "Qwen-Image-2.1 multi-image generation: images=${image_count} output=${output_path} pixels=${output_resolution}x${output_resolution} steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
         );
         return 0;
     }
     io::println(
-        "Qwen-Image-2.1 multi-image transformer: verified images=${image_count} output=512x512 steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        "Qwen-Image-2.1 multi-image transformer: verified images=${image_count} output=${output_resolution}x${output_resolution} steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",
     );
     return 0;
 }
@@ -420,7 +405,7 @@ fn run_two_image_transformer_512(
     seed: u64 = 1301 as u64,
 ) -> i32 {
     var image_paths: [str; 2] = [first_path, second_path];
-    return run_multi_image_transformer_512(
+    return run_multi_image_transformer(
         packed_path,
         model_root,
         #addr_of(image_paths[0]),

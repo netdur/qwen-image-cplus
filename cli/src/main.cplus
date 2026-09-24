@@ -215,7 +215,7 @@ fn pack_is_distilled(packed_path: str) -> bool {
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | generate-multi-image-512 PACKED MODEL_DIR OUTPUT PROMPT SEED 1|2|40 IMAGE [IMAGE ... up to 10] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-image-input SOURCE_OUTPUT | test-vae-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-multi-image-prompt MODEL_DIR | test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | generate-multi-image-512|generate-multi-image-1024 PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|8|25|40 IMAGE [IMAGE ... up to 10] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-image-input SOURCE_OUTPUT | test-image-orientation DIRECTORY | test-vae-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-multi-image-prompt MODEL_DIR | test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -1297,38 +1297,49 @@ fn main() -> i32 {
             }
         };
     }
-    if command == "generate-multi-image-512" {
-        let usage: str = "usage: qwen-image-cplus generate-multi-image-512 PACKED MODEL_DIR OUTPUT PROMPT SEED 1|2|40 IMAGE [IMAGE ... up to 10]";
+    if command == "generate-multi-image-512" || command == "generate-multi-image-1024" {
+        let output_resolution: usize = if command == "generate-multi-image-1024" {
+            1024 as usize
+        } else { 512 as usize };
+        let usage: text::Text = "usage: qwen-image-cplus ${command} PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|8|25|40 IMAGE [IMAGE ... up to 10]";
         guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln(usage); return 2;
+            io::eprintln(usage.view()); return 2;
         };
         guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln(usage); return 2;
+            io::eprintln(usage.view()); return 2;
         };
         guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln(usage); return 2;
+            io::eprintln(usage.view()); return 2;
         };
         guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln(usage); return 2;
+            io::eprintln(usage.view()); return 2;
         };
         guard let option::Option[text::Text]::Some(seed_text) = env::arg(6 as usize) else {
-            io::eprintln(usage); return 2;
+            io::eprintln(usage.view()); return 2;
         };
         guard let option::Option[u64]::Some(seed) = parse_u64_decimal(seed_text.view()) else {
-            io::eprintln("generate-multi-image-512: seed must be an unsigned decimal integer");
+            io::eprintln("${command}: seed must be an unsigned decimal integer");
             return 2;
         };
         guard let option::Option[text::Text]::Some(steps_text) = env::arg(7 as usize) else {
-            io::eprintln(usage); return 2;
+            io::eprintln(usage.view()); return 2;
         };
-        let steps: str = steps_text.view();
-        if !(steps == "1" || steps == "2" || steps == "40") {
-            io::eprintln("generate-multi-image-512: steps must be 1, 2, or 40");
+        // `pack` takes the step count from the pack metadata, as generate
+        // does when its step argument is omitted.
+        guard let option::Option[str]::Some(pack_steps) = pack_default_steps(
+            packed_path.view(), ["3", "4", "8", "25", "40"],
+        ) else { return 2; };
+        let steps: str = if steps_text == "pack" { pack_steps } else { steps_text.view() };
+        if !(steps == "3" || steps == "4" || steps == "8" || steps == "25" || steps == "40") {
+            io::eprintln("${command}: steps must be pack, 3, 4, 8, 25, or 40");
             return 2;
+        }
+        if pack_is_distilled(packed_path.view()) && steps != pack_steps {
+            io::println("${command}: pack kind=distilled steps=${pack_steps}; running the requested ${steps} steps");
         }
         let image_count: usize = env::argc() -% (8 as usize);
         if image_count < (1 as usize) || image_count > (10 as usize) {
-            io::eprintln("generate-multi-image-512: provide 1 through 10 image paths");
+            io::eprintln("${command}: provide 1 through 10 image paths");
             return 2;
         }
         var path_owners: vec::Vec[text::Text] =
@@ -1337,7 +1348,7 @@ fn main() -> i32 {
         while image_index < image_count {
             guard let option::Option[text::Text]::Some(image_path) =
                 env::arg((8 as usize) +% image_index) else {
-                io::eprintln(usage); return 2;
+                io::eprintln(usage.view()); return 2;
             };
             if path_owners.append(image_path) != status::Status::Ok { return 1; }
             image_index = image_index +% (1 as usize);
@@ -1354,21 +1365,28 @@ fn main() -> i32 {
         };
         let request: qwen_image::MultiImageGenerateRequest =
             qwen_image::MultiImageGenerateRequest {
-                packed_path: packed_path.view(),
-                model_root: model_path.view(),
-                output_path: output_path.view(),
-                prompt: prompt.view(),
-                image_paths: #addr_of(image_paths[0]),
-                image_count: image_count,
-                pixels: 512 as usize,
-                steps: step_count as usize,
-                seed: seed,
-            };
+            packed_path: packed_path.view(),
+            model_root: model_path.view(),
+            output_path: output_path.view(),
+            prompt: prompt.view(),
+            image_paths: #addr_of(image_paths[0]),
+            image_count: image_count,
+            pixels: output_resolution,
+            steps: step_count as usize,
+            seed: seed,
+        };
         return match qwen_image::generate_multi_image_to_png(request) {
             qwen_image::GenerateStatus::Ok => 0,
             qwen_image::GenerateStatus::InvalidArgument => 2,
             qwen_image::GenerateStatus::Failed => 1,
         };
+    }
+    if command == "test-image-orientation" {
+        guard let option::Option[text::Text]::Some(directory) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-image-orientation DIRECTORY");
+            return 2;
+        };
+        return image_input::run_orientation(directory.view());
     }
     if command == "test-image-input" {
         guard let option::Option[text::Text]::Some(source_path) = env::arg(2 as usize) else {

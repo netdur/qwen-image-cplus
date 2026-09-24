@@ -72,7 +72,9 @@ but it is not the model's native quality target. The runtime accepts independent
 width and height values that are at least 256, divisible by 32, and no more
 than 16,384 latent tokens in total (equivalently, at most 4,194,304 output
 pixels). That includes 256x256, 512x512, 1024x1024, native 2048x2048, and
-rectangular shapes within the same pixel budget. The 2048 path is functional,
+rectangular shapes within the same pixel budget. The rule lives in one place,
+`pipeline::output_dimensions_supported`, which the public API also calls, and
+its token cap comes from the trajectory's `max_target_tokens`. The 2048 path is functional,
 but its measured 24.57 GB peak on a 32 GB M1 Max makes it a capacity mode, not
 the practical performance default.
 
@@ -98,6 +100,34 @@ non-finite rows. Projection now uses the actual text-prefix length and matrix
 work above 8,192 rows is encoded in verified 4,096-row slices. The benchmark
 record is `benchmarks/m1-max-viggle-4step-2048.json`.
 
+Below that threshold a single MPS operation is measured clean, not assumed.
+With the Viggle pack, the CASABLANCA poster prompt, and seed 1301, 1536x1024
+(about 6,170 prefill rows in one operation) completed in **65.4 s** end to
+end with a 10.0 GB peak footprint, and 1984x1024 (about 7,970 rows, the tallest
+unsliced shape) in **87.8 s** with 12.5 GB. Every step was finite and both
+images rendered both quoted strings exactly. Lowering the threshold to 4,096
+would also slice the 1024 prefill GEMMs (about 4,130 rows) and change MPS
+kernel selection on the production path, so the threshold stays at 8,192.
+
+Every output shape now uses the flash attention kernel with an FP16 K/V
+prefix cache. Previously only the 256-token and >=4096-token shapes did, and
+everything else (512x512, rectangles below 4096 tokens, and every conditioned
+prefix) fell back to the per-key FP32 kernel with an FP32 prefix cache. The
+flash kernel already bounds query tails and padded keys and applies the same
+image-block mask, so the gate only reflected which shapes had been calibrated.
+`QI_DISABLE_FLASH_ATTENTION=1` restores the old selection. A/B runs with the
+Viggle pack and seed 1301 measured:
+
+| Shape | Per-key FP32 | Flash FP16 K/V | Image PSNR (A vs B) |
+| --- | ---: | ---: | ---: |
+| Two-image conditioned 512 (4 steps) | 62.4 s, step 1 24.4 s, cache 2.16 GB | **34.5 s**, step 1 7.3 s, cache 1.08 GB | 48.6 dB |
+| Text-only 512x512 (4 steps) | 18.9 s | **14.2 s** | 38.3 dB |
+| 1344x768 poster (4 steps) | 173.0 s | **61.8 s** | 38.5 dB |
+
+Both 1344x768 images render CASABLANCA and MEET ME AT SUNSET exactly. The
+1024x1024 path already used flash and is unchanged: the Viggle poster PNG is
+byte-identical to the previous build (SHA-256 `5f2501d2…`).
+
 The authoritative Qwen and Diffusers sampling default is **40 Euler steps**.
 The 25-step experiment in this repository came from the
 [Comfy-Org workflow template](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_qwen_image_2_1_t2i.json),
@@ -113,10 +143,11 @@ defaults to 4 steps with an unstretched schedule.
 ## Multi-image conditioning status
 
 The official Qwen-Image-2.1 pipeline accepts **one to ten reference images**.
-Native image-conditioned generation is available through a provisional CLI;
-it is not exposed through the public C+/C generation APIs yet. Integration
-tests use a 512x512 output budget so correctness work does not spend 1024 or
-2048 generation time.
+Native image-conditioned generation is available through the CLI and the
+public C+/C generation APIs (see Package and API layout). Output is square,
+512x512 or 1024x1024. As in the reference pipeline's `output_resolution`,
+references are resized to the output area. Integration tests use the 512
+budget so correctness work does not spend 1024 or 2048 generation time.
 
 The first completed checkpoint reproduces the pinned Diffusers/Qwen3-VL input
 contract: aspect-preserving area resize rounded to multiples of 32, one vision
@@ -128,14 +159,31 @@ that is 256 vision tokens and 1,024 VAE latent tokens per image. Together they
 produce 512 language-vision tokens and a 2,048-token VAE condition prefix; the
 512px output itself is another 1,024 latent tokens.
 
-The shape and MRoPE unit tests pass, the two-image tokenizer smoke produces the
-expected 512 placeholders, and the existing text-only encoder oracle remains
-unchanged at 0.0361069 output nRMSE. Native ImageIO/Core Graphics input now
+The shape and MRoPE unit tests pass, and the existing text-only encoder oracle
+remains unchanged at 0.0361069 output nRMSE. Text-only prompts still embed a
+literal `<|image_pad|>` as an ordinary token, as the reference encoder does
+without pixel values. The first multimodal encoder briefly rejected such a
+prompt with "image placeholder has no vision feature"; a 512x512 Viggle run of
+`a flat app icon labelled <|image_pad|>` now completes again. `test-multi-image-prompt` compares
+every token of a three-image template against IDs from the pinned HF tokenizer
+(`tests/fixtures/tokenizer/multi_image_three.i32`). That exact comparison caught
+a label-spacing bug the earlier count-only smoke missed: the reference
+tokenizes `" <image2>"` as one pre-token run (`" <"`, `image`, `2`, `>`), while
+the native builder had encoded a separate `" "` and `"<image2>"`, adding one
+token and shifting every later position for each image after the first. Native ImageIO/Core Graphics input now
 decodes and resizes without Python or a GUI framework. It preserves straight
 RGBA FP32 for the VAE while separately compositing RGB over white for Qwen3-VL,
 matching the official split. Its asymmetric 64x32 smoke verifies alpha and
 channel handling, top-down row orientation, and the official 512-area result
-of 736x352 (253 vision tokens and 1,012 VAE latent tokens).
+of 736x352 (253 vision tokens and 1,012 VAE latent tokens). Input also honours
+the EXIF/TIFF orientation tag the way Diffusers' `load_image`
+(`ImageOps.exif_transpose`) does. Without it a phone photo stored sideways
+was encoded rotated, with width and height swapped. The orientation is applied
+as a Core Graphics transform in the same single resample.
+`test-image-orientation tests/fixtures/image_orientation` decodes one picture
+stored under all eight orientations
+(`tools/generate_orientation_fixtures.py`) and requires every decode to match
+orientation 1. Each one does, with a mean absolute error of at most 2.2e-7.
 
 The native VAE condition encoder is also structurally complete. It implements
 the five down blocks, four 2x spatial reductions, middle attention, posterior
@@ -159,6 +207,30 @@ case resizes the asymmetric input to 736x352, processes 1,012 patches into 253
 merged tokens, and completes the tower in **2.653 s** wall time on the M1 Max.
 This phase streams one contiguous 1.153 GB vision-weight region and keeps every
 operation on Metal after native input preparation.
+
+Vision attention runs as matrix work. For each of the 16 heads, QK^T (scaled by
+1/sqrt(72)) is an MPS FP32 multiplication over a strided view of the
+`[patches, heads, 72]` buffers. A row softmax and the PV product follow, written
+straight into that head's output columns, with the output rounded to BF16 as
+before. The original kernel walked the keys one at a time with four
+threadgroup barriers per key: on a 1024x1024 reference (4,096 patches) it
+spent **27.5 of the tower's 31.2 s** in attention, about 76 GFLOP/s. The
+matrix path takes **1.41 s** (tower 5.9 s), and 155 ms instead of 1,504 ms at
+512. `QI_VALIDATE_VISION_ATTENTION=1` also runs the old kernel on layer 0 and
+reports the difference: nRMSE 5.8e-5 at 1,024 patches and 1.0e-4 at 4,096.
+`QI_DISABLE_VISION_MPS_ATTENTION=1` restores the old kernel.
+
+Multi-image conditioning runs both reference encoders as one batch each
+(`vision_encoder::encode_batch_to_host`, `vae::encode_batch_from_host`). The
+weight read, Metal library compile, pipelines, and the VAE's MPSGraph
+convolution cache are set up once, and only activations are per image. Vision
+output and DeepStack features are written directly at each image's offset in
+the layer-major arrays, so there is no repack. Before this, every reference
+reloaded both encoders. On two references the generated PNG is byte-identical
+(SHA-256 `b1b7a08f…`). With six 512-area references, alternating runs against
+the previous build measured the VAE phase at **2.57 → 1.09 s** and the vision
+phase at 17.1 → 15.1-16.7 s (about 12% background GPU load; vision time is
+dominated by per-image GPU work, not setup).
 
 The transformer condition-prefix assembly now works across the same one-to-ten
 image contract. Qwen-Image 2.1 does not simply prepend all condition latents:
@@ -208,11 +280,57 @@ the official one-to-ten image range, and the native orchestration/CLI now do as
 well. One-image and three-image one-step boundary smokes complete in **21.153
 s** and **57.904 s** end to end respectively. Their prefix caches are **1.087
 GB** and **3.234 GB**, showing the approximately linear memory cost per 512-area
-reference. Ten images are accepted by the model contract and implementation,
-but were not forced through this 32 GB M1 Max: the estimated **10.7 GB** prefix
-cache plus the **14.23 GB** resident transformer and working memory leaves too
-little responsible headroom. The practical image-count ceiling is therefore
-unified-memory dependent. The public C+/C exposure is described below.
+reference. Those caches were FP32. With flash attention on every shape the prefix cache
+is FP16 and exactly half the size (two images: 2.157 → 1.078 GB), so one and
+three images now need about 0.54 and 1.62 GB, and ten about **5.4 GB** instead
+of the earlier 10.7 GB estimate. Ten images are accepted by the model contract
+and implementation but have not been run on this 32 GB M1 Max. The cache plus
+the **14.23 GB** resident transformer and working memory should now fit, but
+the practical image-count ceiling still depends on unified memory. The public C+/C exposure is described below.
+
+### 1024x1024 text and one-image timings
+
+Measured on 2026-09-24 on the M1 Max, seed 1301, with the CASABLANCA poster
+prompt for text. The image runs use one 1024x1024 reference (the Viggle poster)
+and the prompt `Change the headline to "MARRAKECH" and keep everything else
+the same.` The conditioned trajectory has no Cache-DiT, so the base image run
+uses the official 40 uncached steps.
+
+| Pack and mode | Conditioning | Trajectory | End to end | Peak footprint |
+| --- | ---: | ---: | ---: | ---: |
+| Viggle 4-step, text | 2.2 s text | 34.6 s | **39.0 s** | 7.0 GB |
+| Viggle 4-step, 1 image | 47.5 s (vision 30.3, text 16.4, VAE 0.8) | 60.4 s | 110.4 s | 7.2 GB |
+| Viggle 4-step, 1 image, MPS vision attention | 23.1 s (vision 6.2, text 16.1, VAE 0.8) | 61.1 s | 86.6 s | 7.2 GB |
+| Viggle 4-step, 1 image, + MPS text linears and attention | 10.6 s (vision 5.5, text 4.3, VAE 0.8) | 59.7 s | **72.5 s** | 7.2 GB |
+| Base 40 steps Cache-DiT 0.16, text | 2.2 s text | 119.4 s | **123.8 s** | 16.0 GB |
+| Base 40 steps uncached, text | 2.2 s text | 435.2 s | **440.6 s** | 7.0 GB |
+| Base 40 steps uncached, 1 image | 59.7 s (vision 36.5, text 22.3, VAE 0.8) | 683.8 s | **746.4 s** | 7.2 GB |
+
+One 1024 reference adds 4,096 condition-latent rows and 1,024 vision tokens
+(1,055-row prompt). The prefix K/V cache is 2.16 GB, and cached steps rise from
+about 8.4 s to 11.4 s (Viggle) or about 16 s (base). The vision tower's 4,096
+patches cost about 30 s, almost all of it in a per-key attention kernel. The
+MPS attention path above reduces that to about 6 s; the base image run was
+measured before it and would drop by about the same 25 s. The text encoder
+had the same problem at 1,069 rows. Its scalar 16x16 BF16 linear kernel ran at
+about 1.1 TFLOP/s (about 13.5 of 16 s), and its causal attention walked keys
+one at a time (2.8 s). Prompts of 256 rows or more now run each linear as
+three steps in one command buffer: BF16 weights expanded exactly to FP32
+scratch, an MPS FP32 multiplication, and BF16 rounding of the output.
+Attention runs per head as MPS QK^T, a causal row softmax, and PV, with query
+head h reading KV head h/4. The encoder drops from **16.1 s to 4.3 s**
+(attention 2.77 s to 0.23 s). Forced onto the 22-row oracle
+(`QI_FORCE_TEXT_MPS_LINEAR=1`), the new path lands closer to PyTorch: output
+nRMSE 0.0324 against 0.0361. Shorter prompts keep the original kernels, where
+the weight reads dominate; the 1024 Viggle text-only PNG is byte-identical.
+`QI_DISABLE_TEXT_MPS_LINEAR` and `QI_DISABLE_TEXT_MPS_ATTENTION` restore the
+old kernels. With both encoders fixed, one 1024 reference adds about 33 s to
+the distilled run (39.0 to 72.5 s), almost all of it in denoising: step 1
+covers about 9.2k rows (26 s against 9 s), and each cached step attends to
+4,096 extra keys (about 11.4 s against 8.4 s). The Viggle image run performed
+the edit (MARRAKECH, scene and tagline kept). The base run reproduced the
+reference but kept CASABLANCA, over-saturated; that quality difference is not
+yet explained.
 
 ## Package and API layout
 
@@ -244,9 +362,22 @@ extension, not something callers should infer from the current surface.
 Image-conditioned generation is exposed by the same engine as
 `MultiImageGenerateRequest`/`generate_multi_image_to_png` for C+ and by
 `QiMultiImageGenerateRequest`/`qi_generate_multi_image_to_png` for C. The
-current public image-conditioned surface deliberately pins output to 512x512,
-accepts 1-10 borrowed image paths, and permits 1, 2, or 40 steps. The short
-counts are integration smokes; 40 is the official production trajectory.
+current public image-conditioned surface produces square output (`pixels`
+512 or 1024), accepts 1-10 borrowed image paths, and takes the same step counts as
+text-to-image generation: 3, 4, 8, 25, or 40. The pack's `shift_terminal`
+metadata selects the schedule, so a distilled pack runs its own few-step
+schedule. The CLI accepts `pack` in place of a step count to use the pack's
+`steps` metadata. One and two steps are truncated prefixes of the 40-step
+schedule; they remain available to `test-multi-image-transformer` as K/V-cache
+smokes, but the engine refuses to write a PNG from them because the latent is
+still mostly noise.
+
+With the adopted Viggle 4-step pack (`pack` steps), two 512-area references
+(a red circle and a yellow/green block layout) and seed 1301 produced a
+correctly composed 512x512 PNG in **63.9 s end to end**: 15.2 s conditioning,
+41.5 s trajectory (first step 21.2 s, cached-prefix steps about 6.75 s), 0.8 s
+VAE, and a 17.5 GB peak footprint. Flash attention for every shape (below)
+brings the same request to **34.5 s**.
 
 The C ABI is versioned and self-describing. Callers set both `abi_version` and
 `struct_size`, pass strings as pointer-length pairs, and receive a typed
@@ -380,6 +511,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot trajectory-1024 /path/to/vae_oracle_1024
 ./cli/target/debug/qwen-image-cplus test-image-output reference.png
 ./cli/target/debug/qwen-image-cplus test-image-input /tmp/reference-input.png
+./cli/target/debug/qwen-image-cplus test-image-orientation tests/fixtures/image_orientation
 ./cli/target/debug/qwen-image-cplus test-vae-encoder /path/to/model/snapshot /path/to/reference.png 512
 ./cli/target/debug/qwen-image-cplus test-vision-encoder /path/to/model/snapshot /path/to/reference.png 512
 ./cli/target/debug/qwen-image-cplus test-vision-encoder-oracle /path/to/model/snapshot /path/to/vision_fixture
@@ -411,6 +543,8 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-multi-image-conditioning /path/to/model/snapshot first.png second.png "Combine both references"
 ./cli/target/debug/qwen-image-cplus test-multi-image-transformer transformer.qipack /path/to/model/snapshot first.png second.png "Combine both references" 2
 ./cli/target/debug/qwen-image-cplus generate-multi-image-512 transformer.qipack /path/to/model/snapshot output.png "Combine the references" 1301 40 first.png second.png [more.png ...]
+./cli/target/debug/qwen-image-cplus generate-multi-image-512 viggle.qipack /path/to/model/snapshot output.png "Combine the references" 1301 pack first.png second.png
+./cli/target/debug/qwen-image-cplus generate-multi-image-1024 viggle.qipack /path/to/model/snapshot output.png "Change the headline" 1301 pack reference.png
 ./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
@@ -2167,3 +2301,41 @@ the exact two-slot layer streamer rather than the rejected affine-Q8 candidates.
 The current VAE path intentionally implements the pinned one-frame first-chunk
 semantics; temporal continuation and tiled decode remain outside its verified
 scope.
+
+## Native GUI structure
+
+The macOS GUI in `gui/` is currently an editable input shell, not a generation client.
+`src/app.cplus` only registers the Generation and Settings windows and starts
+the app; neither window uses navigation routes. Each window has its own screen
+under `gui/src/screens/`. The generation screen composes the prompt, reference
+image, output-option, and preview components from `gui/src/components/`.
+Those components build retained `@ui` trees and implement `core::IntoNode` via
+`component::child`, so the screen can place them directly in its layout.
+Both windows use Facet's `Bar::Blended`. The Generation window follows the
+local llama model manager's shell pattern: a full-height split with safe-area
+opt-out, a left header that places native `window_buttons()` and supplies a
+drag region, and a draggable right header. The compose and preview panes paint
+their own backgrounds to the top edge. The compose scroll viewport reaches the
+split edge; its content, rather than the viewport, supplies left padding and a
+right-side gutter so cards do not sit underneath the overlay scrollbar.
+The Settings window remains a simpler standalone screen with the default
+safe-area inset.
+
+The prompt is an editable text area with no placeholder. The disabled Create
+icon sits beside the Create heading until generation is connected. Width and
+height are text fields with live guidance for the current minimum and
+multiple-of-32 rule; seed accepts the engine's full unsigned 64-bit decimal
+range. Steps use a native picker containing the supported 3, 4, 8, 25, and
+40-step choices. The compact + button sits beside the reference-image count;
+the thumbnail strip is hidden when empty. A new image appears first and the
+strip returns to the left so it is immediately visible. Each local-file
+thumbnail fills its card, with a white × on a dark circular backing at the
+top-left. The backing provides contrast against pale images, where a shadow
+alone was insufficient. At ten images the + button is disabled. These are
+local window inputs only: no model loads or inference runs, and the preview
+remains empty. The Settings window opens from the native menu and remains a
+placeholder. Preference storage is unwired.
+When inference is connected, expensive work must run in a background service:
+stage worker results separately, then apply them on the UI thread. A
+window-lifetime component should not own an inference job that must survive
+closing that window.

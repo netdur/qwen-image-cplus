@@ -6407,6 +6407,7 @@ fn print_trajectory_switches(
     let weight_ring: str = env_switch("QI_DISABLE_WEIGHT_RING");
     let enable_weight_ring: str = env_switch("QI_ENABLE_WEIGHT_RING");
     let steel: str = env_switch("QI_DISABLE_STEEL_ATTENTION");
+    let flash: str = env_switch("QI_DISABLE_FLASH_ATTENTION");
     let steel_prefill: str = env_switch("QI_STEEL_PREFILL");
     let sigma_spacing: str = env_switch("QI_TAYLOR_SIGMA_SPACING");
     let full_final_step: str = env_switch("QI_TAYLOR_FULL_FINAL_STEP");
@@ -6414,7 +6415,13 @@ fn print_trajectory_switches(
     let cached_block: str = env_switch("QI_PROFILE_CACHED_BLOCK");
     let validate_blocks: str = env_switch("QI_VALIDATE_TRAJECTORY_BLOCKS");
     let validate_diff: str = env_switch("QI_VALIDATE_GPU_CACHE_DIFF");
-    io::println("trajectory switches: shift_terminal=${shift_terminal_name} shift_terminal_source=${shift_terminal_source} profile_skip=${profile_skip} disable_mps_attention_output=${mps_attention_output} disable_mpsgraph_attention=${mpsgraph_attention} disable_direct_fp16_activations=${direct_fp16} disable_pack_pread=${pack_pread} enable_weight_ring=${enable_weight_ring} disable_weight_ring=${weight_ring} disable_steel_attention=${steel} steel_prefill=${steel_prefill} cache_dit_warmup=${warmup_name} taylor_sigma_spacing=${sigma_spacing} taylor_full_final_step=${full_final_step} taylor_early_cap3=${early_cap3} profile_cached_block=${cached_block} validate_trajectory_blocks=${validate_blocks} validate_gpu_cache_diff=${validate_diff}");
+    io::println("trajectory switches: shift_terminal=${shift_terminal_name} shift_terminal_source=${shift_terminal_source} profile_skip=${profile_skip} disable_mps_attention_output=${mps_attention_output} disable_mpsgraph_attention=${mpsgraph_attention} disable_direct_fp16_activations=${direct_fp16} disable_pack_pread=${pack_pread} enable_weight_ring=${enable_weight_ring} disable_weight_ring=${weight_ring} disable_steel_attention=${steel} disable_flash_attention=${flash} steel_prefill=${steel_prefill} cache_dit_warmup=${warmup_name} taylor_sigma_spacing=${sigma_spacing} taylor_full_final_step=${full_final_step} taylor_early_cap3=${early_cap3} profile_cached_block=${cached_block} validate_trajectory_blocks=${validate_blocks} validate_gpu_cache_diff=${validate_diff}");
+}
+
+// Largest target latent grid (2048x2048 pixels) the trajectory allocates
+// for. The public size rule in pipeline::output_dimensions_supported uses it.
+fn max_target_tokens() -> usize {
+    return 16384 as usize;
 }
 
 fn run_trajectory_packed_impl(
@@ -6534,7 +6541,7 @@ fn run_trajectory_packed_impl(
     let latent_height: usize = output_height / (16 as usize);
     let latent_width: usize = output_width / (16 as usize);
     let target_rows: usize = latent_height *% latent_width;
-    let maximum_target_rows: usize = 16384 as usize;
+    let maximum_target_rows: usize = max_target_tokens();
     if target_rows > maximum_target_rows {
         io::eprintln("trajectory: output exceeds the ${maximum_target_rows}-token limit for this path");
         return 2;
@@ -6631,7 +6638,12 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(q4_repack_owner) = pipeline(device, library, "qi_q4_repack_direct") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
-    let flash_attention: bool = target_rows == (256 as usize) || target_rows >= (4096 as usize);
+    // The flash kernel bounds query tails and padded keys and applies the same
+    // image-block mask, so every shape uses it with a half-size FP16 K/V
+    // prefix cache. QI_DISABLE_FLASH_ATTENTION restores the per-key FP32
+    // kernel for shapes other than the 256 and >=4096-token calibrations.
+    let flash_attention: bool = target_rows == (256 as usize) || target_rows >= (4096 as usize)
+        || !env::has_var("QI_DISABLE_FLASH_ATTENTION");
     let use_graph_attention: bool = target_rows >= (4096 as usize)
         && !env::has_var("QI_DISABLE_MPSGRAPH_ATTENTION");
     let attention_kernel_name: str = if flash_attention {

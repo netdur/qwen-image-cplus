@@ -391,10 +391,12 @@ fn encode_full_prompt_with_images(
 
     var image: usize = 0 as usize;
     while image < image_count {
-        if image > (0 as usize) && !encode_ordinary(tokenizer, " ", full) {
-            return option::Option[vec::Vec[u32]]::None;
-        }
-        let label: text::Text = "<image${image +% (1 as usize)}>";
+        // Later labels keep their leading space in the same pre-token run:
+        // the reference tokenizes " <image2>" as " <", "image", "2", ">",
+        // not as a separate " " followed by "<".
+        let label: text::Text = if image == (0 as usize) {
+            "<image${image +% (1 as usize)}>"
+        } else { " <image${image +% (1 as usize)}>" };
         if !encode_ordinary(tokenizer, label.view(), full) {
             return option::Option[vec::Vec[u32]]::None;
         }
@@ -473,40 +475,55 @@ fn tokenize_full_prompt_with_images(
     );
 }
 
-fn test_multi_image_prompt(model_root: str) -> i32 {
-    var counts: [usize; 2] = [256 as usize, 256 as usize];
+// Compares the complete image-conditioned template against the pinned HF
+// tokenizer, so label spacing and placeholder order are pinned, not just the
+// special-token counts.
+fn test_multi_image_prompt(
+    model_root: str,
+    fixture_directory: str = "tests/fixtures/tokenizer",
+) -> i32 {
+    var counts: [usize; 3] = [3 as usize, 2 as usize, 4 as usize];
     guard let option::Option[vec::Vec[u32]]::Some(tokens) =
         tokenize_full_prompt_with_images(
             model_root,
-        "Place Picture 1 and Picture 2 side by side.",
+        "Place Picture 1 beside Picture 2.",
         #addr_of(counts[0]),
-        2 as usize,
+        3 as usize,
     ) else {
         io::eprintln("multi-image tokenizer: could not build prompt");
         return 1;
     };
-    var image_pads: usize = 0 as usize;
-    var vision_starts: usize = 0 as usize;
-    var vision_ends: usize = 0 as usize;
-    var index: usize = 0 as usize;
-    while index < tokens.count() {
-        guard let option::Option[u32]::Some(token) = tokens.at(index) else { return 1; };
-        if token == IMAGE_PAD { image_pads = image_pads +% (1 as usize); }
-        if token == VISION_START { vision_starts = vision_starts +% (1 as usize); }
-        if token == VISION_END { vision_ends = vision_ends +% (1 as usize); }
-        index = index +% (1 as usize);
-    }
-    io::println(
-        "multi-image prompt: images=2 output_resolution=512 vision_tokens=512 full_tokens=${tokens.count()}",
-    );
-    if image_pads != (512 as usize) || vision_starts != (2 as usize)
-        || vision_ends != (2 as usize) {
+    let path: text::Text = "${fixture_directory}/multi_image_three.i32";
+    guard let mapped::MapResult::Ok(expected) = mapped::map_readonly(path.view()) else {
+        io::eprintln("multi-image tokenizer: missing ${path}");
+        return 1;
+    };
+    if expected.length() != tokens.count() *% #size_of::[u32]() {
         io::eprintln(
-            "multi-image tokenizer: pads=${image_pads} starts=${vision_starts} ends=${vision_ends}",
+            "multi-image tokenizer: token count mismatch actual=${tokens.count()} expected=${expected.length() / #size_of::[u32]()}",
         );
         return 1;
     }
-    io::println("Qwen3-VL two-image prompt layout: verified");
+    let expected_ids: *u32 = expected.pointer() as *u32;
+    var mismatches: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < tokens.count() {
+        guard let option::Option[u32]::Some(token) = tokens.at(index) else { return 1; };
+        if token != expected_ids[index] {
+            if mismatches == (0 as usize) {
+                io::eprintln(
+                    "multi-image tokenizer: first mismatch at ${index} actual=${token} expected=${expected_ids[index]}",
+                );
+            }
+            mismatches = mismatches +% (1 as usize);
+        }
+        index = index +% (1 as usize);
+    }
+    io::println(
+        "multi-image prompt: images=3 vision_tokens=9 full_tokens=${tokens.count()} mismatches=${mismatches}",
+    );
+    if mismatches != (0 as usize) { return 1; }
+    io::println("Qwen3-VL three-image prompt template: verified");
     return 0;
 }
 

@@ -1,0 +1,56 @@
+// Zero-filled host vectors for encoder inputs and outputs. Each returns None
+// when allocation fails. (Typed rather than generic: a generic fill value
+// would have to be moved on every append.)
+
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/vec" as vec;
+
+fn zeroed_f32(count: usize) -> option::Option[vec::Vec[f32]] {
+    var values: vec::Vec[f32] = vec::Vec[f32]::with_capacity(count);
+    var index: usize = 0 as usize;
+    while index < count {
+        if values.append(0.0f32) != status::Status::Ok {
+            return option::Option[vec::Vec[f32]]::None;
+        }
+        index = index +% (1 as usize);
+    }
+    return option::Option[vec::Vec[f32]]::Some(values);
+}
+
+fn zeroed_u32(count: usize) -> option::Option[vec::Vec[u32]] {
+    var values: vec::Vec[u32] = vec::Vec[u32]::with_capacity(count);
+    var index: usize = 0 as usize;
+    while index < count {
+        if values.append(0 as u32) != status::Status::Ok {
+            return option::Option[vec::Vec[u32]]::None;
+        }
+        index = index +% (1 as usize);
+    }
+    return option::Option[vec::Vec[u32]]::Some(values);
+}
+
+fn zeroed_u8(count: usize) -> option::Option[vec::Vec[u8]] {
+    var values: vec::Vec[u8] = vec::Vec[u8]::with_capacity(count);
+    var index: usize = 0 as usize;
+    while index < count {
+        if values.append(0 as u8) != status::Status::Ok {
+            return option::Option[vec::Vec[u8]]::None;
+        }
+        index = index +% (1 as usize);
+    }
+    return option::Option[vec::Vec[u8]]::Some(values);
+}
+
+#[test]
+fn zeroed_vectors_have_the_requested_length() {
+    guard let option::Option[vec::Vec[u32]]::Some(values) = zeroed_u32(3 as usize) else {
+        assert false;
+        return;
+    };
+    assert values.count() == (3 as usize);
+    match values.at(2 as usize) {
+        option::Option[u32]::Some(value) => { assert value == (0 as u32); }
+        option::Option[u32]::None => { assert false; }
+    }
+}

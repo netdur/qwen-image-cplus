@@ -1569,6 +1569,15 @@ fn run_impl(
 // [0, 1]; output is interleaved HWC with 64 normalized latent channels. The
 // still-image path follows the first temporal chunk, so its four spatial
 // downsampling stages reduce each side by exactly 16.
+// One reference image for `encode_batch_from_host`: straight RGBA in [0, 1]
+// and the destination for its normalized 64-channel latent rows.
+struct EncodeInput {
+    opaque rgba_source: *f32,
+    width: usize,
+    height: usize,
+    opaque normalized_destination: *f32,
+}
+
 fn encode_sized_from_host(
     model_root: str,
     rgba_source: *f32,
@@ -1576,12 +1585,38 @@ fn encode_sized_from_host(
     input_height: usize,
     normalized_destination: *f32,
 ) -> i32 {
-    if rgba_source.is_null() || normalized_destination.is_null()
-        || input_width == (0 as usize) || input_height == (0 as usize)
-        || input_width % (16 as usize) != (0 as usize)
-        || input_height % (16 as usize) != (0 as usize) {
-        io::eprintln("VAE encode: invalid host buffers or dimensions");
+    var inputs: [EncodeInput; 1] = [EncodeInput {
+        rgba_source: rgba_source,
+        width: input_width,
+        height: input_height,
+        normalized_destination: normalized_destination,
+    }];
+    return encode_batch_from_host(model_root, #addr_of(inputs[0]), 1 as usize);
+}
+
+// Encodes several reference images with one weight read, one Metal library
+// compile, and one MPSGraph convolution cache, so repeated shapes reuse their
+// compiled graphs. Only activations are per image.
+fn encode_batch_from_host(
+    model_root: str,
+    inputs: *EncodeInput,
+    count: usize,
+) -> i32 {
+    if inputs.is_null() || count == (0 as usize) {
+        io::eprintln("VAE encode: no images");
         return 2;
+    }
+    var input_index: usize = 0 as usize;
+    while input_index < count {
+        let input: EncodeInput = inputs[input_index];
+        if input.rgba_source.is_null() || input.normalized_destination.is_null()
+            || input.width == (0 as usize) || input.height == (0 as usize)
+            || input.width % (16 as usize) != (0 as usize)
+            || input.height % (16 as usize) != (0 as usize) {
+            io::eprintln("VAE encode: invalid host buffers or dimensions");
+            return 2;
+        }
+        input_index = input_index +% (1 as usize);
     }
     let started_ms: i64 = time::now_millis();
     let model_path: text::Text = "${model_root}/vae/diffusion_pytorch_model.safetensors";
@@ -1689,6 +1724,38 @@ fn encode_sized_from_host(
         device, model_path.view(), file.mapping_length(),
     ) else { return 1; };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
+    let setup_ms: i64 = time::now_millis() - started_ms;
+
+    input_index = 0 as usize;
+    while input_index < count {
+        let status: i32 = encode_loaded(
+            file, storage, device, queue, pipelines, use_graph_conv, use_mps_attention,
+            inputs[input_index],
+            if input_index == (0 as usize) { setup_ms } else { 0 as i64 },
+        );
+        if status != (0 as i32) { return status; }
+        input_index = input_index +% (1 as usize);
+    }
+    return 0;
+}
+
+// Runs the encoder for one image on an already loaded session.
+fn encode_loaded(
+    file: safetensors::File,
+    storage: metal::Buffer,
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    use_graph_conv: bool,
+    use_mps_attention: bool,
+    input: EncodeInput,
+    setup_ms: i64,
+) -> i32 {
+    let started_ms: i64 = time::now_millis();
+    let rgba_source: *f32 = input.rgba_source;
+    let input_width: usize = input.width;
+    let input_height: usize = input.height;
+    let normalized_destination: *f32 = input.normalized_destination;
 
     let input_values: usize = input_width *% input_height *% (4 as usize);
     var normalized_input: vec::Vec[f32] = vec::Vec[f32]::with_capacity(input_values);
@@ -1944,7 +2011,7 @@ fn encode_sized_from_host(
         pixel = pixel +% (1 as usize);
     }
     io::println(
-        "VAE encode: input=${input_width}x${input_height} latent=${latent_width}x${latent_height} tokens=${latent_pixels} graph_conv=${use_graph_conv} mps_attention=${use_mps_attention} command_wait_ms=${command_wait_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        "VAE encode: input=${input_width}x${input_height} latent=${latent_width}x${latent_height} tokens=${latent_pixels} graph_conv=${use_graph_conv} mps_attention=${use_mps_attention} setup_ms=${setup_ms} command_wait_ms=${command_wait_ms} total_wall_ms=${time::now_millis() - started_ms}",
     );
     return 0;
 }

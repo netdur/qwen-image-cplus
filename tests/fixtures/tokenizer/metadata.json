@@ -649,5 +649,16 @@
         1
       ]
     ]
+  },
+  "multi_image": {
+    "file": "multi_image_three.i32",
+    "prompt": "Place Picture 1 beside Picture 2.",
+    "image_token_counts": [
+      3,
+      2,
+      4
+    ],
+    "full_token_count": 58,
+    "sha256": "0b02726edfd0186f0003226f4ba8dce62a0e3ee2732a02516e5c4e417338c611"
   }
 }
