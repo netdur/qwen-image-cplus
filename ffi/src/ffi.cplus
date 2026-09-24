@@ -64,12 +64,38 @@ export struct QiGenerateRequest {
     height: u32,
 }
 
+// Independent additive request type: introducing image conditioning does not
+// change the frozen QiGenerateRequest ABI-v1 prefix.
+#[repr(C)]
+export struct QiMultiImageGenerateRequest {
+    abi_version: u32,
+    struct_size: u32,
+    opaque packed_path: *u8,
+    packed_path_length: usize,
+    opaque model_root: *u8,
+    model_root_length: usize,
+    opaque output_path: *u8,
+    output_path_length: usize,
+    opaque prompt: *u8,
+    prompt_length: usize,
+    opaque image_paths: **u8,
+    opaque image_path_lengths: *usize,
+    image_count: usize,
+    pixels: u32,
+    steps: u32,
+    seed: u64,
+}
+
 export extern fn qi_abi_version() -> u32 {
     return ABI_VERSION;
 }
 
 export extern fn qi_generate_request_size() -> u32 {
     return #size_of::[QiGenerateRequest]() as u32;
+}
+
+export extern fn qi_multi_image_generate_request_size() -> u32 {
+    return #size_of::[QiMultiImageGenerateRequest]() as u32;
 }
 
 export extern fn qi_generate_to_png(request: *QiGenerateRequest) -> QiStatus {
@@ -122,10 +148,62 @@ export extern fn qi_generate_to_png(request: *QiGenerateRequest) -> QiStatus {
     };
 }
 
+export extern fn qi_generate_multi_image_to_png(
+    request: *QiMultiImageGenerateRequest,
+) -> QiStatus {
+    if request.is_null() { return QiStatus::InvalidArgument; }
+    let value: QiMultiImageGenerateRequest = { *request };
+    if value.abi_version != ABI_VERSION
+        || value.struct_size < (#size_of::[QiMultiImageGenerateRequest]() as u32)
+        || value.packed_path.is_null() || value.packed_path_length == (0 as usize)
+        || value.model_root.is_null() || value.model_root_length == (0 as usize)
+        || value.output_path.is_null() || value.output_path_length == (0 as usize)
+        || value.prompt.is_null() || value.prompt_length == (0 as usize)
+        || value.image_paths.is_null() || value.image_path_lengths.is_null()
+        || value.image_count < (1 as usize) || value.image_count > (10 as usize) {
+        return QiStatus::InvalidArgument;
+    }
+
+    var image_path_views: [str; 10] = ["", "", "", "", "", "", "", "", "", ""];
+    var image_index: usize = 0 as usize;
+    while image_index < value.image_count {
+        let path_pointer: *u8 = value.image_paths[image_index];
+        let path_length: usize = value.image_path_lengths[image_index];
+        if path_pointer.is_null() || path_length == (0 as usize) {
+            return QiStatus::InvalidArgument;
+        }
+        image_path_views[image_index] = {
+            #str_from_raw_parts(path_pointer, path_length)
+        };
+        image_index = image_index +% (1 as usize);
+    }
+
+    let native: api::MultiImageGenerateRequest = api::MultiImageGenerateRequest {
+        packed_path: { #str_from_raw_parts(value.packed_path, value.packed_path_length) },
+        model_root: { #str_from_raw_parts(value.model_root, value.model_root_length) },
+        output_path: { #str_from_raw_parts(value.output_path, value.output_path_length) },
+        prompt: { #str_from_raw_parts(value.prompt, value.prompt_length) },
+        image_paths: #addr_of(image_path_views[0]),
+        image_count: value.image_count,
+        pixels: value.pixels as usize,
+        steps: value.steps as usize,
+        seed: value.seed,
+    };
+    return match api::generate_multi_image_to_png(native) {
+        api::GenerateStatus::Ok => QiStatus::Ok,
+        api::GenerateStatus::InvalidArgument => QiStatus::InvalidArgument,
+        api::GenerateStatus::Failed => QiStatus::GenerationFailed,
+    };
+}
+
 #[test]
 fn ffi_version_and_request_size_are_self_describing() {
     assert qi_abi_version() == (1 as u32);
     assert qi_generate_request_size() == (#size_of::[QiGenerateRequest]() as u32);
     assert #size_of::[QiGenerateRequestV1]() < #size_of::[QiGenerateRequest]();
     assert qi_generate_to_png(0 as *QiGenerateRequest) == QiStatus::InvalidArgument;
+    assert qi_multi_image_generate_request_size()
+        == (#size_of::[QiMultiImageGenerateRequest]() as u32);
+    assert qi_generate_multi_image_to_png(0 as *QiMultiImageGenerateRequest)
+        == QiStatus::InvalidArgument;
 }

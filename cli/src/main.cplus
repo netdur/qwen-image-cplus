@@ -1349,10 +1349,26 @@ fn main() -> i32 {
             image_paths[image_index] = owner_values[image_index].view();
             image_index = image_index +% (1 as usize);
         }
-        return multimodal_conditioning::run_multi_image_transformer_512(
-            packed_path.view(), model_path.view(), #addr_of(image_paths[0]),
-            image_count, prompt.view(), steps, output_path.view(), seed,
-        );
+        guard let option::Option[u64]::Some(step_count) = parse_u64_decimal(steps) else {
+            return 2;
+        };
+        let request: qwen_image::MultiImageGenerateRequest =
+            qwen_image::MultiImageGenerateRequest {
+                packed_path: packed_path.view(),
+                model_root: model_path.view(),
+                output_path: output_path.view(),
+                prompt: prompt.view(),
+                image_paths: #addr_of(image_paths[0]),
+                image_count: image_count,
+                pixels: 512 as usize,
+                steps: step_count as usize,
+                seed: seed,
+            };
+        return match qwen_image::generate_multi_image_to_png(request) {
+            qwen_image::GenerateStatus::Ok => 0,
+            qwen_image::GenerateStatus::InvalidArgument => 2,
+            qwen_image::GenerateStatus::Failed => 1,
+        };
     }
     if command == "test-image-input" {
         guard let option::Option[text::Text]::Some(source_path) = env::arg(2 as usize) else {

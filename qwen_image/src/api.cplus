@@ -6,6 +6,7 @@
 // added behind this module later without changing the C ABI entry module.
 
 import "./pipeline" as pipeline;
+import "./multimodal_conditioning" as multimodal_conditioning;
 import "stdlib/option" as option;
 
 enum CacheMode {
@@ -36,6 +37,20 @@ struct GenerateRequest {
     height: usize,
 }
 
+// Image-conditioned generation currently uses the 512x512 integration path.
+// `image_paths` is borrowed for the synchronous duration of the call.
+struct MultiImageGenerateRequest {
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    opaque image_paths: *str,
+    image_count: usize,
+    pixels: usize,
+    steps: usize,
+    seed: u64,
+}
+
 fn _request_width(request: GenerateRequest) -> usize {
     return if request.width == (0 as usize) { request.pixels } else { request.width };
 }
@@ -63,6 +78,38 @@ fn _step_name(steps: usize) -> option::Option[str] {
 fn _threshold_supported(value: f64) -> bool {
     return value == 0.12f64 || value == 0.14f64
         || value == 0.16f64 || value == 0.24f64;
+}
+
+fn _multi_image_step_name(steps: usize) -> option::Option[str] {
+    if steps == (1 as usize) { return option::Option[str]::Some("1"); }
+    if steps == (2 as usize) { return option::Option[str]::Some("2"); }
+    if steps == (40 as usize) { return option::Option[str]::Some("40"); }
+    return option::Option[str]::None;
+}
+
+fn _validate_multi_image(request: MultiImageGenerateRequest) -> GenerateStatus {
+    if request.packed_path.count() == (0 as usize)
+        || request.model_root.count() == (0 as usize)
+        || request.output_path.count() == (0 as usize)
+        || request.prompt.count() == (0 as usize)
+        || request.image_paths.is_null()
+        || request.image_count < (1 as usize)
+        || request.image_count > (10 as usize)
+        || request.pixels != (512 as usize) {
+        return GenerateStatus::InvalidArgument;
+    }
+    match _multi_image_step_name(request.steps) {
+        option::Option::Some(_) => {}
+        option::Option::None => { return GenerateStatus::InvalidArgument; }
+    }
+    var image_index: usize = 0 as usize;
+    while image_index < request.image_count {
+        if request.image_paths[image_index].count() == (0 as usize) {
+            return GenerateStatus::InvalidArgument;
+        }
+        image_index = image_index +% (1 as usize);
+    }
+    return GenerateStatus::Ok;
 }
 
 fn _validate(request: GenerateRequest) -> GenerateStatus {
@@ -187,6 +234,26 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
     return _from_pipeline_status(status);
 }
 
+fn generate_multi_image_to_png(request: MultiImageGenerateRequest) -> GenerateStatus {
+    let validation: GenerateStatus = _validate_multi_image(request);
+    if validation != GenerateStatus::Ok { return validation; }
+    guard let option::Option[str]::Some(steps) = _multi_image_step_name(request.steps) else {
+        return GenerateStatus::InvalidArgument;
+    };
+    return _from_pipeline_status(
+        multimodal_conditioning::run_multi_image_transformer_512(
+            request.packed_path,
+            request.model_root,
+            request.image_paths,
+            request.image_count,
+            request.prompt,
+            steps,
+            request.output_path,
+            request.seed,
+        ),
+    );
+}
+
 #[test]
 fn public_generation_request_validation_is_typed() {
     let valid: GenerateRequest = GenerateRequest {
@@ -278,4 +345,47 @@ fn public_generation_request_validation_is_typed() {
         height: 2048 as usize,
     };
     assert _validate(too_large) == GenerateStatus::InvalidArgument;
+}
+
+#[test]
+fn public_multi_image_request_enforces_count_resolution_and_steps() {
+    var paths: [str; 2] = ["first.png", "second.png"];
+    let valid: MultiImageGenerateRequest = MultiImageGenerateRequest {
+        packed_path: "model.qipack",
+        model_root: "models/qwen",
+        output_path: "output.png",
+        prompt: "Combine both references",
+        image_paths: #addr_of(paths[0]),
+        image_count: 2 as usize,
+        pixels: 512 as usize,
+        steps: 40 as usize,
+        seed: 1301 as u64,
+    };
+    assert _validate_multi_image(valid) == GenerateStatus::Ok;
+
+    let empty: MultiImageGenerateRequest = MultiImageGenerateRequest {
+        packed_path: valid.packed_path,
+        model_root: valid.model_root,
+        output_path: valid.output_path,
+        prompt: valid.prompt,
+        image_paths: valid.image_paths,
+        image_count: 0 as usize,
+        pixels: valid.pixels,
+        steps: valid.steps,
+        seed: valid.seed,
+    };
+    assert _validate_multi_image(empty) == GenerateStatus::InvalidArgument;
+
+    let wrong_resolution: MultiImageGenerateRequest = MultiImageGenerateRequest {
+        packed_path: valid.packed_path,
+        model_root: valid.model_root,
+        output_path: valid.output_path,
+        prompt: valid.prompt,
+        image_paths: valid.image_paths,
+        image_count: valid.image_count,
+        pixels: 1024 as usize,
+        steps: valid.steps,
+        seed: valid.seed,
+    };
+    assert _validate_multi_image(wrong_resolution) == GenerateStatus::InvalidArgument;
 }

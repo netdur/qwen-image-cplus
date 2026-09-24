@@ -212,7 +212,7 @@ reference. Ten images are accepted by the model contract and implementation,
 but were not forced through this 32 GB M1 Max: the estimated **10.7 GB** prefix
 cache plus the **14.23 GB** resident transformer and working memory leaves too
 little responsible headroom. The practical image-count ceiling is therefore
-unified-memory dependent. Public C+/C API exposure remains.
+unified-memory dependent. The public C+/C exposure is described below.
 
 ## Package and API layout
 
@@ -241,6 +241,13 @@ the runtime's current phase-scoped memory behavior. It is not yet a resident
 engine/session API; adding a reusable loaded-model handle is a later API
 extension, not something callers should infer from the current surface.
 
+Image-conditioned generation is exposed by the same engine as
+`MultiImageGenerateRequest`/`generate_multi_image_to_png` for C+ and by
+`QiMultiImageGenerateRequest`/`qi_generate_multi_image_to_png` for C. The
+current public image-conditioned surface deliberately pins output to 512x512,
+accepts 1-10 borrowed image paths, and permits 1, 2, or 40 steps. The short
+counts are integration smokes; 40 is the official production trajectory.
+
 The C ABI is versioned and self-describing. Callers set both `abi_version` and
 `struct_size`, pass strings as pointer-length pairs, and receive a typed
 `QiStatus`. String storage only has to remain alive for the synchronous call.
@@ -266,6 +273,34 @@ request.seed = 1301;
 request.cache_mode = QiCacheMode_None;
 
 QiStatus status = qi_generate_to_png(&request);
+```
+
+For image conditioning, paths and lengths are parallel borrowed arrays and
+must remain alive until the synchronous call returns:
+
+```c
+uint8_t *images[] = {(uint8_t *)first_path, (uint8_t *)second_path};
+size_t image_lengths[] = {first_path_length, second_path_length};
+
+QiMultiImageGenerateRequest request = {0};
+request.abi_version = qi_abi_version();
+request.struct_size = qi_multi_image_generate_request_size();
+request.packed_path = (uint8_t *)packed;
+request.packed_path_length = packed_length;
+request.model_root = (uint8_t *)model_root;
+request.model_root_length = model_root_length;
+request.output_path = (uint8_t *)output_path;
+request.output_path_length = output_path_length;
+request.prompt = (uint8_t *)prompt;
+request.prompt_length = prompt_length;
+request.image_paths = images;
+request.image_path_lengths = image_lengths;
+request.image_count = 2;
+request.pixels = 512;
+request.steps = 40;
+request.seed = 1301;
+
+QiStatus status = qi_generate_multi_image_to_png(&request);
 ```
 
 `width` and `height` were appended without changing ABI version 1. The library
