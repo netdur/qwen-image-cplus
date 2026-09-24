@@ -1,0 +1,1100 @@
+// Native Qwen3-VL vision tower for Qwen-Image-2.1 reference images.
+//
+// This follows the Transformers 4.57.1 layout pinned by the model snapshot:
+// duplicated temporal image patches, 48x48 learned-position interpolation,
+// 27 bidirectional transformer blocks, DeepStack taps at 8/16/24, and 2x2
+// patch mergers into the language model's 4096-wide representation.
+
+import "./cpu_ops" as cpu;
+import "./mmap_macos" as mapped;
+import "./safetensors" as safetensors;
+import "metal/metal" as metal;
+import "objc/bridge" as bridge;
+import "objc/runtime" as rt;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
+import "stdlib/vec" as vec;
+
+extern fn MTLCreateSystemDefaultDevice() -> *u8;
+#[link_name = "memcpy"]
+extern fn qi_memcpy(destination: *u8, source: *u8, count: usize) -> *u8;
+
+const WIDTH: usize = 1152;
+const INTERMEDIATE_WIDTH: usize = 4304;
+const OUTPUT_WIDTH: usize = 4096;
+const HEADS: usize = 16;
+const HEAD_DIMENSION: usize = 72;
+const LAYERS: usize = 27;
+const PATCH_SIZE: usize = 16;
+const TEMPORAL_PATCH_SIZE: usize = 2;
+const MERGE_SIZE: usize = 2;
+const PATCH_VALUES: usize = 3 * TEMPORAL_PATCH_SIZE * PATCH_SIZE * PATCH_SIZE;
+const MERGED_WIDTH: usize = WIDTH * MERGE_SIZE * MERGE_SIZE;
+const POSITION_SIDE: usize = 48;
+const STREAM_ALIGNMENT: usize = 16384;
+
+struct OwnedObjc {
+    opaque pointer: *u8,
+}
+
+impl OwnedObjc {
+    fn new(pointer: *u8) -> OwnedObjc { return OwnedObjc { pointer: pointer }; }
+    fn raw(this) -> *u8 { return this.pointer; }
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            rt::release(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+#[repr(C)]
+struct VisionParams {
+    rows: u32,
+    width: u32,
+    output_width: u32,
+    input_width: u32,
+    heads: u32,
+    head_dimension: u32,
+    epsilon: f32,
+    rope_theta: f32,
+}
+
+struct Weight {
+    storage: metal::Buffer,
+    offset: u64,
+}
+
+struct Pipelines {
+    linear: metal::ComputePipelineState,
+    norm: metal::ComputePipelineState,
+    add: metal::ComputePipelineState,
+    gelu: metal::ComputePipelineState,
+    split_rope: metal::ComputePipelineState,
+    attention: metal::ComputePipelineState,
+}
+
+fn round_up(value: usize, alignment: usize) -> usize {
+    return (value +% alignment -% (1 as usize)) / alignment *% alignment;
+}
+
+fn new_buffer(device: metal::Device, bytes: u64) -> option::Option[metal::Buffer] {
+    return device.new_buffer_with_length(
+        bytes, metal::resource_options_m_t_l_resource_storage_mode_shared,
+    );
+}
+
+fn pipeline(
+    device: metal::Device,
+    library: metal::Library,
+    name: str,
+) -> option::Option[OwnedObjc] {
+    guard let option::Option[metal::Function]::Some(function) =
+        library.new_function_with_name(name) else {
+        io::eprintln("vision encoder: missing Metal function ${name}");
+        return option::Option[OwnedObjc]::None;
+    };
+    let function_owner: OwnedObjc = OwnedObjc::new(function.raw());
+    var error: *u8 = 0 as *u8;
+    guard let option::Option[metal::ComputePipelineState]::Some(state) =
+        device.new_compute_pipeline_state_with_function(
+            function, #addr_of(error) as *u8,
+    ) else {
+        io::eprintln("vision encoder: could not build Metal pipeline ${name}");
+        return option::Option[OwnedObjc]::None;
+    };
+    return option::Option[OwnedObjc]::Some(OwnedObjc::new(state.raw()));
+}
+
+fn include_tensor(
+    file: safetensors::File,
+    name: str,
+    ref begin: u64,
+    ref end: u64,
+) -> bool {
+    guard let option::Option[safetensors::TensorData]::Some(tensor) = file.tensor(name)
+        else {
+        io::eprintln("vision encoder: missing tensor ${name}");
+        return false;
+    };
+    if tensor.dtype.name() != "BF16" {
+        io::eprintln("vision encoder: tensor ${name} is not BF16");
+        return false;
+    }
+    if tensor.file_offset < begin { begin = tensor.file_offset; }
+    let tensor_end: u64 = tensor.file_offset +% tensor.byte_length;
+    if tensor_end > end { end = tensor_end; }
+    return true;
+}
+
+fn include_merger(
+    file: safetensors::File,
+    prefix: str,
+    ref begin: u64,
+    ref end: u64,
+) -> bool {
+    return include_tensor(file, "${prefix}.norm.weight", begin, end)
+        && include_tensor(file, "${prefix}.norm.bias", begin, end)
+        && include_tensor(file, "${prefix}.linear_fc1.weight", begin, end)
+        && include_tensor(file, "${prefix}.linear_fc1.bias", begin, end)
+        && include_tensor(file, "${prefix}.linear_fc2.weight", begin, end)
+        && include_tensor(file, "${prefix}.linear_fc2.bias", begin, end);
+}
+
+fn vision_region(file: safetensors::File) -> option::Option[[u64; 2]] {
+    var begin: u64 = (0 as u64) -% (1 as u64);
+    var end: u64 = 0 as u64;
+    if !include_tensor(file, "model.visual.patch_embed.proj.weight", begin, end)
+        || !include_tensor(file, "model.visual.patch_embed.proj.bias", begin, end)
+        || !include_tensor(file, "model.visual.pos_embed.weight", begin, end) {
+        return option::Option[[u64; 2]]::None;
+    }
+    var layer: usize = 0 as usize;
+    while layer < LAYERS {
+        let prefix: text::Text = "model.visual.blocks.${layer}";
+        if !include_tensor(file, "${prefix}.norm1.weight", begin, end)
+            || !include_tensor(file, "${prefix}.norm1.bias", begin, end)
+            || !include_tensor(file, "${prefix}.attn.qkv.weight", begin, end)
+            || !include_tensor(file, "${prefix}.attn.qkv.bias", begin, end)
+            || !include_tensor(file, "${prefix}.attn.proj.weight", begin, end)
+            || !include_tensor(file, "${prefix}.attn.proj.bias", begin, end)
+            || !include_tensor(file, "${prefix}.norm2.weight", begin, end)
+            || !include_tensor(file, "${prefix}.norm2.bias", begin, end)
+            || !include_tensor(file, "${prefix}.mlp.linear_fc1.weight", begin, end)
+            || !include_tensor(file, "${prefix}.mlp.linear_fc1.bias", begin, end)
+            || !include_tensor(file, "${prefix}.mlp.linear_fc2.weight", begin, end)
+            || !include_tensor(file, "${prefix}.mlp.linear_fc2.bias", begin, end) {
+            return option::Option[[u64; 2]]::None;
+        }
+        layer = layer +% (1 as usize);
+    }
+    if !include_merger(file, "model.visual.merger", begin, end) {
+        return option::Option[[u64; 2]]::None;
+    }
+    var deep: usize = 0 as usize;
+    while deep < (3 as usize) {
+        let prefix: text::Text = "model.visual.deepstack_merger_list.${deep}";
+        if !include_merger(file, prefix.view(), begin, end) {
+            return option::Option[[u64; 2]]::None;
+        }
+        deep = deep +% (1 as usize);
+    }
+    let aligned_begin: u64 = begin / STREAM_ALIGNMENT as u64 *% STREAM_ALIGNMENT as u64;
+    let aligned_end: u64 = round_up(end as usize, STREAM_ALIGNMENT) as u64;
+    return option::Option[[u64; 2]]::Some([aligned_begin, aligned_end]);
+}
+
+fn tensor_weight(
+    file: safetensors::File,
+    storage: metal::Buffer,
+    region_begin: u64,
+    name: str,
+    expected_elements: u64,
+) -> option::Option[Weight] {
+    guard let option::Option[safetensors::TensorData]::Some(tensor) = file.tensor(name)
+        else { return option::Option[Weight]::None; };
+    if tensor.dtype.name() != "BF16" || tensor.elements != expected_elements
+        || tensor.file_offset < region_begin {
+        io::eprintln("vision encoder: invalid tensor metadata for ${name}");
+        return option::Option[Weight]::None;
+    }
+    return option::Option[Weight]::Some(Weight {
+        storage: storage,
+        offset: tensor.file_offset -% region_begin,
+    });
+}
+
+fn finish(
+    command_buffer: metal::CommandBuffer,
+    encoder: metal::ComputeCommandEncoder,
+) -> f64 {
+    metal::CommandEncoder::from_raw(encoder.raw()).end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time())
+        * 1000.0f64;
+}
+
+fn dispatch_linear(
+    queue: metal::CommandQueue,
+    pipeline_state: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weight: Weight,
+    bias: Weight,
+    output: metal::Buffer,
+    rows: usize,
+    output_width: usize,
+    input_width: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: VisionParams = VisionParams {
+        rows: rows as u32, width: input_width as u32,
+        output_width: output_width as u32, input_width: input_width as u32,
+        heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32, rope_theta: 10000.0f32,
+    };
+    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weight.storage, weight.offset, 1 as u64);
+    encoder.set_buffer(bias.storage, bias.offset, 2 as u64);
+    encoder.set_buffer(output, 0 as u64, 3 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 4 as u64);
+    encoder.dispatch_threads(
+        metal::Size {
+            width: round_up(output_width, 16 as usize) as u64,
+            height: round_up(rows, 16 as usize) as u64,
+            depth: 1 as u64,
+        },
+        metal::Size { width: 16 as u64, height: 16 as u64, depth: 1 as u64 },
+    );
+    return option::Option[f64]::Some(finish(command_buffer, encoder));
+}
+
+fn dispatch_norm(
+    queue: metal::CommandQueue,
+    pipeline_state: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weight: Weight,
+    bias: Weight,
+    output: metal::Buffer,
+    rows: usize,
+    width: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: VisionParams = VisionParams {
+        rows: rows as u32, width: width as u32,
+        output_width: width as u32, input_width: width as u32,
+        heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32, rope_theta: 10000.0f32,
+    };
+    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weight.storage, weight.offset, 1 as u64);
+    encoder.set_buffer(bias.storage, bias.offset, 2 as u64);
+    encoder.set_buffer(output, 0 as u64, 3 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 4 as u64);
+    encoder.dispatch_threads(
+        metal::Size { width: rows as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size {
+            width: pipeline_state.thread_execution_width(),
+            height: 1 as u64, depth: 1 as u64,
+        },
+    );
+    return option::Option[f64]::Some(finish(command_buffer, encoder));
+}
+
+fn dispatch_element(
+    queue: metal::CommandQueue,
+    pipeline_state: metal::ComputePipelineState,
+    input_0: metal::Buffer,
+    input_1: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+    width: usize,
+    add: bool,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: VisionParams = VisionParams {
+        rows: rows as u32, width: width as u32,
+        output_width: width as u32, input_width: width as u32,
+        heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32, rope_theta: 10000.0f32,
+    };
+    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_buffer(input_0, 0 as u64, 0 as u64);
+    if add {
+        encoder.set_buffer(input_1, 0 as u64, 1 as u64);
+        encoder.set_buffer(output, 0 as u64, 2 as u64);
+        encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 3 as u64);
+    } else {
+        encoder.set_buffer(output, 0 as u64, 1 as u64);
+        encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 2 as u64);
+    }
+    let threads: u64 = pipeline_state.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: (rows *% width) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: threads, height: 1 as u64, depth: 1 as u64 },
+    );
+    return option::Option[f64]::Some(finish(command_buffer, encoder));
+}
+
+fn dispatch_rope(
+    queue: metal::CommandQueue,
+    pipeline_state: metal::ComputePipelineState,
+    qkv: metal::Buffer,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    positions: metal::Buffer,
+    rows: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: VisionParams = VisionParams {
+        rows: rows as u32, width: WIDTH as u32,
+        output_width: WIDTH as u32, input_width: WIDTH as u32,
+        heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32, rope_theta: 10000.0f32,
+    };
+    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_buffer(qkv, 0 as u64, 0 as u64);
+    encoder.set_buffer(query, 0 as u64, 1 as u64);
+    encoder.set_buffer(key, 0 as u64, 2 as u64);
+    encoder.set_buffer(value, 0 as u64, 3 as u64);
+    encoder.set_buffer(positions, 0 as u64, 4 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 5 as u64);
+    let threads: u64 = pipeline_state.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: (rows *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: threads, height: 1 as u64, depth: 1 as u64 },
+    );
+    return option::Option[f64]::Some(finish(command_buffer, encoder));
+}
+
+fn dispatch_attention(
+    queue: metal::CommandQueue,
+    pipeline_state: metal::ComputePipelineState,
+    query: metal::Buffer,
+    key: metal::Buffer,
+    value: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    var params: VisionParams = VisionParams {
+        rows: rows as u32, width: WIDTH as u32,
+        output_width: WIDTH as u32, input_width: WIDTH as u32,
+        heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32, rope_theta: 10000.0f32,
+    };
+    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_buffer(query, 0 as u64, 0 as u64);
+    encoder.set_buffer(key, 0 as u64, 1 as u64);
+    encoder.set_buffer(value, 0 as u64, 2 as u64);
+    encoder.set_buffer(output, 0 as u64, 3 as u64);
+    encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 4 as u64);
+    encoder.dispatch_threadgroups(
+        metal::Size { width: (rows *% HEADS) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: 128 as u64, height: 1 as u64, depth: 1 as u64 },
+    );
+    return option::Option[f64]::Some(finish(command_buffer, encoder));
+}
+
+fn patchify(
+    pixels: *f32,
+    width: usize,
+    height: usize,
+) -> option::Option[vec::Vec[f32]] {
+    if pixels.is_null() || width % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize)
+        || height % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize) {
+        return option::Option[vec::Vec[f32]]::None;
+    }
+    let grid_width: usize = width / PATCH_SIZE;
+    let grid_height: usize = height / PATCH_SIZE;
+    var patches: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
+        grid_width *% grid_height *% PATCH_VALUES,
+    );
+    var block_y: usize = 0 as usize;
+    while block_y < grid_height / MERGE_SIZE {
+        var block_x: usize = 0 as usize;
+        while block_x < grid_width / MERGE_SIZE {
+            var merge_y: usize = 0 as usize;
+            while merge_y < MERGE_SIZE {
+                var merge_x: usize = 0 as usize;
+                while merge_x < MERGE_SIZE {
+                    var channel: usize = 0 as usize;
+                    while channel < (3 as usize) {
+                        var temporal: usize = 0 as usize;
+                        while temporal < TEMPORAL_PATCH_SIZE {
+                            var patch_y: usize = 0 as usize;
+                            while patch_y < PATCH_SIZE {
+                                var patch_x: usize = 0 as usize;
+                                while patch_x < PATCH_SIZE {
+                                    let source_y: usize = (block_y *% MERGE_SIZE +% merge_y)
+                                        *% PATCH_SIZE +% patch_y;
+                                    let source_x: usize = (block_x *% MERGE_SIZE +% merge_x)
+                                        *% PATCH_SIZE +% patch_x;
+                                    let value: f32 = pixels[
+                                        (source_y *% width +% source_x) *% (3 as usize) +% channel
+                                    ] * 2.0f32 - 1.0f32;
+                                    if patches.append(cpu::bf16_to_f32(cpu::f32_to_bf16(value)))
+                                        != status::Status::Ok {
+                                        return option::Option[vec::Vec[f32]]::None;
+                                    }
+                                    patch_x = patch_x +% (1 as usize);
+                                }
+                                patch_y = patch_y +% (1 as usize);
+                            }
+                            temporal = temporal +% (1 as usize);
+                        }
+                        channel = channel +% (1 as usize);
+                    }
+                    merge_x = merge_x +% (1 as usize);
+                }
+                merge_y = merge_y +% (1 as usize);
+            }
+            block_x = block_x +% (1 as usize);
+        }
+        block_y = block_y +% (1 as usize);
+    }
+    return option::Option[vec::Vec[f32]]::Some(patches);
+}
+
+fn positions(width: usize, height: usize) -> option::Option[vec::Vec[u32]] {
+    let grid_width: usize = width / PATCH_SIZE;
+    let grid_height: usize = height / PATCH_SIZE;
+    var result: vec::Vec[u32] = vec::Vec[u32]::with_capacity(
+        grid_width *% grid_height *% (2 as usize),
+    );
+    var block_y: usize = 0 as usize;
+    while block_y < grid_height / MERGE_SIZE {
+        var block_x: usize = 0 as usize;
+        while block_x < grid_width / MERGE_SIZE {
+            var merge_y: usize = 0 as usize;
+            while merge_y < MERGE_SIZE {
+                var merge_x: usize = 0 as usize;
+                while merge_x < MERGE_SIZE {
+                    if result.append((block_y *% MERGE_SIZE +% merge_y) as u32)
+                        != status::Status::Ok
+                        || result.append((block_x *% MERGE_SIZE +% merge_x) as u32)
+                            != status::Status::Ok {
+                        return option::Option[vec::Vec[u32]]::None;
+                    }
+                    merge_x = merge_x +% (1 as usize);
+                }
+                merge_y = merge_y +% (1 as usize);
+            }
+            block_x = block_x +% (1 as usize);
+        }
+        block_y = block_y +% (1 as usize);
+    }
+    return option::Option[vec::Vec[u32]]::Some(result);
+}
+
+fn interpolated_positions(
+    storage: metal::Buffer,
+    position_weight: Weight,
+    patch_positions: *u32,
+    rows: usize,
+    grid_width: usize,
+    grid_height: usize,
+) -> option::Option[vec::Vec[f32]] {
+    let source: *u16 = (storage.contents() + position_weight.offset as usize) as *u16;
+    var output: vec::Vec[f32] = vec::Vec[f32]::with_capacity(rows *% WIDTH);
+    var row: usize = 0 as usize;
+    while row < rows {
+        let h: usize = patch_positions[row *% (2 as usize)] as usize;
+        let w: usize = patch_positions[row *% (2 as usize) +% (1 as usize)] as usize;
+        let source_h: f32 = if grid_height == (1 as usize) { 0.0f32 } else {
+            h as f32 * (POSITION_SIDE -% (1 as usize)) as f32
+                / (grid_height -% (1 as usize)) as f32
+        };
+        let source_w: f32 = if grid_width == (1 as usize) { 0.0f32 } else {
+            w as f32 * (POSITION_SIDE -% (1 as usize)) as f32
+                / (grid_width -% (1 as usize)) as f32
+        };
+        let h0: usize = source_h.floor() as usize;
+        let w0: usize = source_w.floor() as usize;
+        let h1: usize = if h0 +% (1 as usize) < POSITION_SIDE {
+            h0 +% (1 as usize)
+        } else { POSITION_SIDE -% (1 as usize) };
+        let w1: usize = if w0 +% (1 as usize) < POSITION_SIDE {
+            w0 +% (1 as usize)
+        } else { POSITION_SIDE -% (1 as usize) };
+        let dh: f32 = source_h - h0 as f32;
+        let dw: f32 = source_w - w0 as f32;
+        var column: usize = 0 as usize;
+        while column < WIDTH {
+            let p00: f32 = cpu::bf16_to_f32(source[(h0 *% POSITION_SIDE +% w0) *% WIDTH +% column]);
+            let p01: f32 = cpu::bf16_to_f32(source[(h0 *% POSITION_SIDE +% w1) *% WIDTH +% column]);
+            let p10: f32 = cpu::bf16_to_f32(source[(h1 *% POSITION_SIDE +% w0) *% WIDTH +% column]);
+            let p11: f32 = cpu::bf16_to_f32(source[(h1 *% POSITION_SIDE +% w1) *% WIDTH +% column]);
+            let value: f32 = p00 * (1.0f32 - dh) * (1.0f32 - dw)
+                + p01 * (1.0f32 - dh) * dw
+                + p10 * dh * (1.0f32 - dw) + p11 * dh * dw;
+            if output.append(value) != status::Status::Ok {
+                return option::Option[vec::Vec[f32]]::None;
+            }
+            column = column +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    return option::Option[vec::Vec[f32]]::Some(output);
+}
+
+fn finite(buffer: metal::Buffer, count: usize) -> bool {
+    let values: *f32 = buffer.contents() as *f32;
+    var index: usize = 0 as usize;
+    while index < count {
+        let bits: u32 = #bitcast::[u32](values[index]);
+        if (bits & (0x7F800000 as u32)) == (0x7F800000 as u32) {
+            io::eprintln("vision encoder: non-finite value at ${index}");
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn fixture_error(
+    actual: *f32,
+    fixture_directory: str,
+    name: str,
+    count: usize,
+) -> option::Option[f64] {
+    let path: text::Text = "${fixture_directory}/${name}.f32";
+    guard let mapped::MapResult::Ok(expected) = mapped::map_readonly(path.view()) else {
+        io::eprintln("vision encoder: missing fixture ${path}");
+        return option::Option[f64]::None;
+    };
+    if expected.length() != count *% #size_of::[f32]() {
+        io::eprintln(
+            "vision encoder: fixture ${name} has ${expected.length()} bytes, expected ${count *% #size_of::[f32]()}"
+        );
+        return option::Option[f64]::None;
+    }
+    let reference: *f32 = expected.pointer() as *f32;
+    var squared_error: f64 = 0.0f64;
+    var squared_reference: f64 = 0.0f64;
+    var index: usize = 0 as usize;
+    while index < count {
+        let expected_value: f64 = reference[index] as f64;
+        let difference: f64 = actual[index] as f64 - expected_value;
+        squared_error = squared_error + difference * difference;
+        squared_reference = squared_reference + expected_value * expected_value;
+        index = index +% (1 as usize);
+    }
+    return option::Option[f64]::Some(
+        (squared_error / squared_reference.max(0.000000000001f64)).sqrt(),
+    );
+}
+
+fn report_fixture(
+    actual: *f32,
+    fixture_directory: str,
+    name: str,
+    count: usize,
+) -> bool {
+    if fixture_directory.count() == (0 as usize) { return true; }
+    guard let option::Option[f64]::Some(error) = fixture_error(
+        actual, fixture_directory, name, count,
+    ) else { return false; };
+    io::println("vision encoder ${name}: nRMSE=${error}");
+    return error <= 0.06f64;
+}
+
+fn execute_merger(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    file: safetensors::File,
+    storage: metal::Buffer,
+    region_begin: u64,
+    prefix: str,
+    postshuffle_norm: bool,
+    hidden: metal::Buffer,
+    norm: metal::Buffer,
+    wide_a: metal::Buffer,
+    wide_b: metal::Buffer,
+    output: metal::Buffer,
+    patch_rows: usize,
+    destination: *f32,
+) -> bool {
+    let merged_rows: usize = patch_rows / (MERGE_SIZE *% MERGE_SIZE);
+    let norm_width: usize = if postshuffle_norm { MERGED_WIDTH } else { WIDTH };
+    let norm_rows: usize = if postshuffle_norm { merged_rows } else { patch_rows };
+    guard let option::Option[Weight]::Some(norm_weight) = tensor_weight(
+        file, storage, region_begin, "${prefix}.norm.weight", norm_width as u64,
+    ) else { return false; };
+    guard let option::Option[Weight]::Some(norm_bias) = tensor_weight(
+        file, storage, region_begin, "${prefix}.norm.bias", norm_width as u64,
+    ) else { return false; };
+    guard let option::Option[Weight]::Some(fc1_weight) = tensor_weight(
+        file, storage, region_begin, "${prefix}.linear_fc1.weight",
+        (MERGED_WIDTH *% MERGED_WIDTH) as u64,
+    ) else { return false; };
+    guard let option::Option[Weight]::Some(fc1_bias) = tensor_weight(
+        file, storage, region_begin, "${prefix}.linear_fc1.bias", MERGED_WIDTH as u64,
+    ) else { return false; };
+    guard let option::Option[Weight]::Some(fc2_weight) = tensor_weight(
+        file, storage, region_begin, "${prefix}.linear_fc2.weight",
+        (OUTPUT_WIDTH *% MERGED_WIDTH) as u64,
+    ) else { return false; };
+    guard let option::Option[Weight]::Some(fc2_bias) = tensor_weight(
+        file, storage, region_begin, "${prefix}.linear_fc2.bias", OUTPUT_WIDTH as u64,
+    ) else { return false; };
+    guard let option::Option[f64]::Some(_norm_ms) = dispatch_norm(
+        queue, pipelines.norm, hidden, norm_weight, norm_bias, norm,
+        norm_rows, norm_width,
+    ) else { return false; };
+    guard let option::Option[f64]::Some(_fc1_ms) = dispatch_linear(
+        queue, pipelines.linear, norm, fc1_weight, fc1_bias, wide_a,
+        merged_rows, MERGED_WIDTH, MERGED_WIDTH,
+    ) else { return false; };
+    guard let option::Option[f64]::Some(_gelu_ms) = dispatch_element(
+        queue, pipelines.gelu, wide_a, wide_a, wide_b,
+        merged_rows, MERGED_WIDTH, false,
+    ) else { return false; };
+    guard let option::Option[f64]::Some(_fc2_ms) = dispatch_linear(
+        queue, pipelines.linear, wide_b, fc2_weight, fc2_bias, output,
+        merged_rows, OUTPUT_WIDTH, MERGED_WIDTH,
+    ) else { return false; };
+    if !finite(output, merged_rows *% OUTPUT_WIDTH) { return false; }
+    let _copied: *u8 = qi_memcpy(
+        destination as *u8, output.contents(),
+        merged_rows *% OUTPUT_WIDTH *% #size_of::[f32](),
+    );
+    return true;
+}
+
+// Encodes one already-resized white-composited RGB image in HWC [0, 1].
+// `output` has vision_tokens x 4096 floats. `deepstack` has three consecutive
+// tensors of the same shape, corresponding to visual blocks 8, 16, and 24.
+fn encode_sized_to_host(
+    model_root: str,
+    rgb_pixels: *f32,
+    width: usize,
+    height: usize,
+    output: *f32,
+    deepstack: *f32,
+    fixture_directory: str = "",
+) -> i32 {
+    if rgb_pixels.is_null() || output.is_null() || deepstack.is_null()
+        || width == (0 as usize) || height == (0 as usize)
+        || width % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize)
+        || height % (PATCH_SIZE *% MERGE_SIZE) != (0 as usize) {
+        io::eprintln("vision encoder: invalid buffers or dimensions");
+        return 2;
+    }
+    let started_ms: i64 = time::now_millis();
+    let shard_path: text::Text = "${model_root}/text_encoder/model-00001-of-00004.safetensors";
+    guard let safetensors::LoadResult::Ok(file) = safetensors::load(shard_path.view())
+        else {
+        io::eprintln("vision encoder: could not load ${shard_path}");
+        return 1;
+    };
+    guard let option::Option[[u64; 2]]::Some(region) = vision_region(file)
+        else { return 1; };
+    let region_begin: u64 = region[0];
+    let region_end: u64 = if region[1] < file.mapping_length() as u64 {
+        region[1]
+    } else { file.mapping_length() as u64 };
+    let region_bytes: usize = (region_end -% region_begin) as usize;
+
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return 1; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
+    if device_pointer.is_null() { return 1; }
+    let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
+    let device: metal::Device = metal::Device::from_raw(device_owner.raw());
+    guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue()
+        else { return 1; };
+    let queue_owner: OwnedObjc = OwnedObjc::new(queue.raw());
+    let options_pointer: *u8 = rt::alloc_init(#str_ptr("MTLCompileOptions\0"));
+    if options_pointer.is_null() { return 1; }
+    let options_owner: OwnedObjc = OwnedObjc::new(options_pointer);
+    let options: metal::CompileOptions = metal::CompileOptions::from_raw(options_owner.raw());
+    options.set_fast_math_enabled(false);
+    var compile_error: *u8 = 0 as *u8;
+    guard let option::Option[metal::Library]::Some(library) = device.new_library_with_source(
+        // Included at compile time so the distribution remains self-contained.
+        #include_str("../kernels/vision_encoder.metal"), options,
+        #addr_of(compile_error) as *u8,
+    ) else {
+        if !compile_error.is_null() {
+            let description: *u8 = rt::msg_id(
+                compile_error, rt::sel(#str_ptr("localizedDescription\0")),
+            );
+            io::eprintln("vision encoder Metal compile: ${bridge::to_text(description)}");
+        }
+        return 1;
+    };
+    let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
+    guard let option::Option[OwnedObjc]::Some(linear_owner) = pipeline(
+        device, library, "qv_linear_bf16_bias_16x16",
+    ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(
+        device, library, "qv_layer_norm",
+    ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(add_owner) = pipeline(
+        device, library, "qv_add",
+    ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(gelu_owner) = pipeline(
+        device, library, "qv_gelu_tanh",
+    ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(split_owner) = pipeline(
+        device, library, "qv_split_qkv_rope",
+    ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(
+        device, library, "qv_attention",
+    ) else { return 1; };
+    let pipelines: Pipelines = Pipelines {
+        linear: metal::ComputePipelineState::from_raw(linear_owner.raw()),
+        norm: metal::ComputePipelineState::from_raw(norm_owner.raw()),
+        add: metal::ComputePipelineState::from_raw(add_owner.raw()),
+        gelu: metal::ComputePipelineState::from_raw(gelu_owner.raw()),
+        split_rope: metal::ComputePipelineState::from_raw(split_owner.raw()),
+        attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
+    };
+
+    guard let option::Option[metal::Buffer]::Some(storage) = new_buffer(
+        device, region_bytes as u64,
+    ) else {
+        io::eprintln("vision encoder: could not allocate ${region_bytes} weight bytes");
+        return 1;
+    };
+    let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
+    guard let option::Option[mapped::PositionalReader]::Some(reader) =
+        mapped::open_positional_reader(shard_path.view()) else { return 1; };
+    if !reader.read_at(storage.contents(), region_bytes, region_begin) {
+        io::eprintln("vision encoder: could not read ${region_bytes} weight bytes");
+        return 1;
+    }
+    let weights_ready_ms: i64 = time::now_millis();
+
+    let grid_width: usize = width / PATCH_SIZE;
+    let grid_height: usize = height / PATCH_SIZE;
+    let patch_rows: usize = grid_width *% grid_height;
+    let merged_rows: usize = patch_rows / (MERGE_SIZE *% MERGE_SIZE);
+    guard let option::Option[vec::Vec[f32]]::Some(patch_values) = patchify(
+        rgb_pixels, width, height,
+    ) else { return 1; };
+    guard let option::Option[vec::Vec[u32]]::Some(position_values) = positions(
+        width, height,
+    ) else { return 1; };
+    guard let option::Option[Weight]::Some(position_weight) = tensor_weight(
+        file, storage, region_begin, "model.visual.pos_embed.weight",
+        (POSITION_SIDE *% POSITION_SIDE *% WIDTH) as u64,
+    ) else { return 1; };
+    guard let option::Option[vec::Vec[f32]]::Some(position_embeddings) =
+        interpolated_positions(
+            storage, position_weight, #slice_ptr(position_values.as_slice()),
+        patch_rows, grid_width, grid_height,
+    ) else { return 1; };
+
+    guard let option::Option[metal::Buffer]::Some(patches) = device.new_buffer_with_bytes(
+        #slice_ptr(patch_values.as_slice()) as *u8,
+        (patch_rows *% PATCH_VALUES *% #size_of::[f32]()) as u64,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    ) else { return 1; };
+    let patches_owner: OwnedObjc = OwnedObjc::new(patches.raw());
+    guard let option::Option[metal::Buffer]::Some(position_buffer) = device.new_buffer_with_bytes(
+        #slice_ptr(position_values.as_slice()) as *u8,
+        (patch_rows *% (2 as usize) *% #size_of::[u32]()) as u64,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    ) else { return 1; };
+    let position_buffer_owner: OwnedObjc = OwnedObjc::new(position_buffer.raw());
+    guard let option::Option[metal::Buffer]::Some(learned_positions) = device.new_buffer_with_bytes(
+        #slice_ptr(position_embeddings.as_slice()) as *u8,
+        (patch_rows *% WIDTH *% #size_of::[f32]()) as u64,
+        metal::resource_options_m_t_l_resource_storage_mode_shared,
+    ) else { return 1; };
+    let learned_positions_owner: OwnedObjc = OwnedObjc::new(learned_positions.raw());
+
+    let hidden_bytes: u64 = (patch_rows *% WIDTH *% #size_of::[f32]()) as u64;
+    let qkv_bytes: u64 = (patch_rows *% WIDTH *% (3 as usize) *% #size_of::[f32]()) as u64;
+    let intermediate_bytes: u64 =
+        (patch_rows *% INTERMEDIATE_WIDTH *% #size_of::[f32]()) as u64;
+    let merged_wide_bytes: u64 =
+        (merged_rows *% MERGED_WIDTH *% #size_of::[f32]()) as u64;
+    let merged_output_bytes: u64 =
+        (merged_rows *% OUTPUT_WIDTH *% #size_of::[f32]()) as u64;
+    guard let option::Option[metal::Buffer]::Some(hidden_a) = new_buffer(device, hidden_bytes)
+        else { return 1; };
+    let hidden_a_owner: OwnedObjc = OwnedObjc::new(hidden_a.raw());
+    guard let option::Option[metal::Buffer]::Some(hidden_b) = new_buffer(device, hidden_bytes)
+        else { return 1; };
+    let hidden_b_owner: OwnedObjc = OwnedObjc::new(hidden_b.raw());
+    guard let option::Option[metal::Buffer]::Some(norm) = new_buffer(device, merged_wide_bytes)
+        else { return 1; };
+    let norm_owner_buffer: OwnedObjc = OwnedObjc::new(norm.raw());
+    guard let option::Option[metal::Buffer]::Some(qkv) = new_buffer(device, qkv_bytes)
+        else { return 1; };
+    let qkv_owner: OwnedObjc = OwnedObjc::new(qkv.raw());
+    guard let option::Option[metal::Buffer]::Some(query) = new_buffer(device, hidden_bytes)
+        else { return 1; };
+    let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
+    guard let option::Option[metal::Buffer]::Some(key) = new_buffer(device, hidden_bytes)
+        else { return 1; };
+    let key_owner: OwnedObjc = OwnedObjc::new(key.raw());
+    guard let option::Option[metal::Buffer]::Some(value) = new_buffer(device, hidden_bytes)
+        else { return 1; };
+    let value_owner: OwnedObjc = OwnedObjc::new(value.raw());
+    guard let option::Option[metal::Buffer]::Some(attended) = new_buffer(device, hidden_bytes)
+        else { return 1; };
+    let attended_owner: OwnedObjc = OwnedObjc::new(attended.raw());
+    guard let option::Option[metal::Buffer]::Some(branch) = new_buffer(device, hidden_bytes)
+        else { return 1; };
+    let branch_owner: OwnedObjc = OwnedObjc::new(branch.raw());
+    guard let option::Option[metal::Buffer]::Some(intermediate_a) = new_buffer(
+        device, intermediate_bytes,
+    ) else { return 1; };
+    let intermediate_a_owner: OwnedObjc = OwnedObjc::new(intermediate_a.raw());
+    guard let option::Option[metal::Buffer]::Some(intermediate_b) = new_buffer(
+        device, intermediate_bytes,
+    ) else { return 1; };
+    let intermediate_b_owner: OwnedObjc = OwnedObjc::new(intermediate_b.raw());
+    guard let option::Option[metal::Buffer]::Some(merged_a) = new_buffer(
+        device, merged_wide_bytes,
+    ) else { return 1; };
+    let merged_a_owner: OwnedObjc = OwnedObjc::new(merged_a.raw());
+    guard let option::Option[metal::Buffer]::Some(merged_b) = new_buffer(
+        device, merged_wide_bytes,
+    ) else { return 1; };
+    let merged_b_owner: OwnedObjc = OwnedObjc::new(merged_b.raw());
+    guard let option::Option[metal::Buffer]::Some(merged_output) = new_buffer(
+        device, merged_output_bytes,
+    ) else { return 1; };
+    let merged_output_owner: OwnedObjc = OwnedObjc::new(merged_output.raw());
+
+    guard let option::Option[Weight]::Some(patch_weight) = tensor_weight(
+        file, storage, region_begin, "model.visual.patch_embed.proj.weight",
+        (WIDTH *% PATCH_VALUES) as u64,
+    ) else { return 1; };
+    guard let option::Option[Weight]::Some(patch_bias) = tensor_weight(
+        file, storage, region_begin, "model.visual.patch_embed.proj.bias", WIDTH as u64,
+    ) else { return 1; };
+    guard let option::Option[f64]::Some(_patch_ms) = dispatch_linear(
+        queue, pipelines.linear, patches, patch_weight, patch_bias, hidden_a,
+        patch_rows, WIDTH, PATCH_VALUES,
+    ) else { return 1; };
+    guard let option::Option[f64]::Some(_position_ms) = dispatch_element(
+        queue, pipelines.add, hidden_a, learned_positions, hidden_b,
+        patch_rows, WIDTH, true,
+    ) else { return 1; };
+    if !report_fixture(
+        hidden_b.contents() as *f32, fixture_directory, "patch_embed",
+        patch_rows *% WIDTH,
+    ) { return 1; }
+    var current: metal::Buffer = hidden_b;
+    var other: metal::Buffer = hidden_a;
+
+    var total_gpu_ms: f64 = 0.0f64;
+    var layer: usize = 0 as usize;
+    while layer < LAYERS {
+        let prefix: text::Text = "model.visual.blocks.${layer}";
+        guard let option::Option[Weight]::Some(norm1_weight) = tensor_weight(
+            file, storage, region_begin, "${prefix}.norm1.weight", WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(norm1_bias) = tensor_weight(
+            file, storage, region_begin, "${prefix}.norm1.bias", WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(qkv_weight) = tensor_weight(
+            file, storage, region_begin, "${prefix}.attn.qkv.weight",
+            ((3 as usize) *% WIDTH *% WIDTH) as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(qkv_bias) = tensor_weight(
+            file, storage, region_begin, "${prefix}.attn.qkv.bias",
+            ((3 as usize) *% WIDTH) as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(proj_weight) = tensor_weight(
+            file, storage, region_begin, "${prefix}.attn.proj.weight",
+            (WIDTH *% WIDTH) as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(proj_bias) = tensor_weight(
+            file, storage, region_begin, "${prefix}.attn.proj.bias", WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(norm2_weight) = tensor_weight(
+            file, storage, region_begin, "${prefix}.norm2.weight", WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(norm2_bias) = tensor_weight(
+            file, storage, region_begin, "${prefix}.norm2.bias", WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(fc1_weight) = tensor_weight(
+            file, storage, region_begin, "${prefix}.mlp.linear_fc1.weight",
+            (INTERMEDIATE_WIDTH *% WIDTH) as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(fc1_bias) = tensor_weight(
+            file, storage, region_begin, "${prefix}.mlp.linear_fc1.bias",
+            INTERMEDIATE_WIDTH as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(fc2_weight) = tensor_weight(
+            file, storage, region_begin, "${prefix}.mlp.linear_fc2.weight",
+            (WIDTH *% INTERMEDIATE_WIDTH) as u64,
+        ) else { return 1; };
+        guard let option::Option[Weight]::Some(fc2_bias) = tensor_weight(
+            file, storage, region_begin, "${prefix}.mlp.linear_fc2.bias", WIDTH as u64,
+        ) else { return 1; };
+
+        guard let option::Option[f64]::Some(norm1_ms) = dispatch_norm(
+            queue, pipelines.norm, current, norm1_weight, norm1_bias, norm,
+            patch_rows, WIDTH,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(qkv_ms) = dispatch_linear(
+            queue, pipelines.linear, norm, qkv_weight, qkv_bias, qkv,
+            patch_rows, (3 as usize) *% WIDTH, WIDTH,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(rope_ms) = dispatch_rope(
+            queue, pipelines.split_rope, qkv, query, key, value,
+            position_buffer, patch_rows,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(
+            queue, pipelines.attention, query, key, value, attended, patch_rows,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(proj_ms) = dispatch_linear(
+            queue, pipelines.linear, attended, proj_weight, proj_bias, branch,
+            patch_rows, WIDTH, WIDTH,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(attention_add_ms) = dispatch_element(
+            queue, pipelines.add, current, branch, other, patch_rows, WIDTH, true,
+        ) else { return 1; };
+        let swapped_attention: metal::Buffer = current;
+        current = other;
+        other = swapped_attention;
+        guard let option::Option[f64]::Some(norm2_ms) = dispatch_norm(
+            queue, pipelines.norm, current, norm2_weight, norm2_bias, norm,
+            patch_rows, WIDTH,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(fc1_ms) = dispatch_linear(
+            queue, pipelines.linear, norm, fc1_weight, fc1_bias, intermediate_a,
+            patch_rows, INTERMEDIATE_WIDTH, WIDTH,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(gelu_ms) = dispatch_element(
+            queue, pipelines.gelu, intermediate_a, intermediate_a, intermediate_b,
+            patch_rows, INTERMEDIATE_WIDTH, false,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(fc2_ms) = dispatch_linear(
+            queue, pipelines.linear, intermediate_b, fc2_weight, fc2_bias, branch,
+            patch_rows, WIDTH, INTERMEDIATE_WIDTH,
+        ) else { return 1; };
+        guard let option::Option[f64]::Some(mlp_add_ms) = dispatch_element(
+            queue, pipelines.add, current, branch, other, patch_rows, WIDTH, true,
+        ) else { return 1; };
+        let swapped_mlp: metal::Buffer = current;
+        current = other;
+        other = swapped_mlp;
+        total_gpu_ms = total_gpu_ms + norm1_ms + qkv_ms + rope_ms + attention_ms
+            + proj_ms + attention_add_ms + norm2_ms + fc1_ms + gelu_ms
+            + fc2_ms + mlp_add_ms;
+
+        if layer == (8 as usize) || layer == (16 as usize) || layer == (24 as usize) {
+            let deep_index: usize = if layer == (8 as usize) { 0 as usize }
+            else if layer == (16 as usize) { 1 as usize } else { 2 as usize };
+            let merger_prefix: text::Text =
+                "model.visual.deepstack_merger_list.${deep_index}";
+            if !execute_merger(
+                queue, pipelines, file, storage, region_begin,
+                merger_prefix.view(), true, current, norm, merged_a, merged_b,
+                merged_output, patch_rows,
+                deepstack + deep_index *% merged_rows *% OUTPUT_WIDTH,
+            ) { return 1; }
+            if !report_fixture(
+                deepstack + deep_index *% merged_rows *% OUTPUT_WIDTH,
+                fixture_directory, "deepstack_${deep_index}",
+                merged_rows *% OUTPUT_WIDTH,
+            ) { return 1; }
+        }
+        let boundary_name: text::Text = if layer < (10 as usize) {
+            "block_0${layer}"
+        } else { "block_${layer}" };
+        if !report_fixture(
+            current.contents() as *f32, fixture_directory, boundary_name.view(),
+            patch_rows *% WIDTH,
+        ) { return 1; }
+        layer = layer +% (1 as usize);
+    }
+
+    if !execute_merger(
+        queue, pipelines, file, storage, region_begin, "model.visual.merger", false,
+        current, norm, merged_a, merged_b, merged_output, patch_rows, output,
+    ) { return 1; }
+    if !report_fixture(
+        output, fixture_directory, "output", merged_rows *% OUTPUT_WIDTH,
+    ) { return 1; }
+    io::println(
+        "Qwen3-VL vision encoder: image=${width}x${height} patches=${patch_rows} tokens=${merged_rows} weight_region_bytes=${region_bytes} weight_read_ms=${weights_ready_ms - started_ms} block_gpu_ms=${total_gpu_ms} total_wall_ms=${time::now_millis() - started_ms} finite=verified",
+    );
+    return 0;
+}
+
+fn run_fixture(
+    model_root: str,
+    fixture_directory: str = "tests/fixtures/vision_encoder_fp32",
+) -> i32 {
+    let input_path: text::Text = "${fixture_directory}/input_rgb.f32";
+    guard let mapped::MapResult::Ok(input) = mapped::map_readonly(input_path.view()) else {
+        io::eprintln("vision encoder: missing fixture ${input_path}");
+        return 1;
+    };
+    let input_count: usize = (32 as usize) *% (32 as usize) *% (3 as usize);
+    if input.length() != input_count *% #size_of::[f32]() {
+        io::eprintln("vision encoder: invalid 32x32 RGB fixture");
+        return 1;
+    }
+    var output: vec::Vec[f32] = vec::Vec[f32]::with_capacity(OUTPUT_WIDTH);
+    var deepstack: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
+        (3 as usize) *% OUTPUT_WIDTH,
+    );
+    var index: usize = 0 as usize;
+    while index < OUTPUT_WIDTH {
+        if output.append(0.0f32) != status::Status::Ok { return 1; }
+        index = index +% (1 as usize);
+    }
+    index = 0 as usize;
+    while index < (3 as usize) *% OUTPUT_WIDTH {
+        if deepstack.append(0.0f32) != status::Status::Ok { return 1; }
+        index = index +% (1 as usize);
+    }
+    let result: i32 = encode_sized_to_host(
+        model_root, input.pointer() as *f32, 32 as usize, 32 as usize,
+        #slice_ptr(output.as_slice()), #slice_ptr(deepstack.as_slice()),
+        fixture_directory,
+    );
+    if result == (0 as i32) {
+        io::println("Qwen3-VL vision encoder PyTorch oracle: verified");
+    }
+    return result;
+}
+
+#[test]
+fn patch_and_merger_dimensions_match_pinned_qwen3_vl() {
+    assert PATCH_VALUES == (1536 as usize);
+    assert WIDTH / HEADS == HEAD_DIMENSION;
+    assert MERGED_WIDTH == (4608 as usize);
+    assert (512 as usize) / PATCH_SIZE *% ((512 as usize) / PATCH_SIZE)
+        == (1024 as usize);
+    assert (1024 as usize) / (MERGE_SIZE *% MERGE_SIZE) == (256 as usize);
+}

@@ -16,6 +16,7 @@ import "qwen_image/image_conditioning" as image_conditioning;
 import "qwen_image/image_input" as image_input;
 import "qwen_image/tokenizer" as tokenizer;
 import "qwen_image/qwen3vl_text" as qwen3vl_text;
+import "qwen_image/qwen3vl_vision" as qwen3vl_vision;
 import "qwen_image/tensor" as tensor;
 import "qwen_image/cpu_ops" as cpu_ops;
 import "stdlib/env" as env;
@@ -213,7 +214,7 @@ fn pack_is_distilled(packed_path: str) -> bool {
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-image-input SOURCE_OUTPUT | test-vae-encoder MODEL_DIR IMAGE [32|512] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-multi-image-prompt MODEL_DIR | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-image-input SOURCE_OUTPUT | test-vae-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-multi-image-prompt MODEL_DIR | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -1298,6 +1299,88 @@ fn main() -> i32 {
             "VAE condition encoding: output_resolution=${output_resolution} image=${input_image.shape.width}x${input_image.shape.height} latent_tokens=${input_image.shape.latent_tokens} values=${latent_values} min=${latent_min} max=${latent_max} mean_abs=${latent_abs_sum / latent_values as f64} finite_nonzero=verified",
         );
         return 0;
+    }
+    if command == "test-vision-encoder" {
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-vision-encoder MODEL_DIR IMAGE [32|512]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(image_path) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-vision-encoder MODEL_DIR IMAGE [32|512]");
+            return 2;
+        };
+        let output_resolution: usize = match env::arg(4 as usize) {
+            option::Option[text::Text]::Some(value) => {
+                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(value.view())
+                    else { return 2; };
+                if parsed != (32 as u64) && parsed != (512 as u64) {
+                    io::eprintln("vision encoder test resolution must be 32 or 512");
+                    return 2;
+                }
+                parsed as usize
+            }
+            option::Option[text::Text]::None => { 512 as usize }
+        };
+        guard let option::Option[image_input::Image]::Some(input_image) =
+            image_input::load_resized(image_path.view(), output_resolution) else {
+            io::eprintln("vision encoder test: could not load ${image_path}");
+            return 1;
+        };
+        let output_values: usize = input_image.shape.vision_tokens *% (4096 as usize);
+        var visual: vec::Vec[f32] = vec::Vec[f32]::with_capacity(output_values);
+        var deepstack: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
+            output_values *% (3 as usize),
+        );
+        var index: usize = 0 as usize;
+        while index < output_values {
+            if visual.append(0.0f32) != status::Status::Ok { return 1; }
+            index = index +% (1 as usize);
+        }
+        index = 0 as usize;
+        while index < output_values *% (3 as usize) {
+            if deepstack.append(0.0f32) != status::Status::Ok { return 1; }
+            index = index +% (1 as usize);
+        }
+        let encode_status: i32 = qwen3vl_vision::encode_sized_to_host(
+            model_path.view(), #slice_ptr(input_image.vision_pixels.as_slice()),
+            input_image.shape.width, input_image.shape.height,
+            #slice_ptr(visual.as_slice()), #slice_ptr(deepstack.as_slice()),
+        );
+        if encode_status != (0 as i32) { return encode_status; }
+        let visual_pointer: *f32 = #slice_ptr(visual.as_slice());
+        var minimum: f32 = visual_pointer[0];
+        var maximum: f32 = visual_pointer[0];
+        var mean_abs: f64 = 0.0f64;
+        index = 0 as usize;
+        while index < output_values {
+            let value: f32 = visual_pointer[index];
+            if value < minimum { minimum = value; }
+            if value > maximum { maximum = value; }
+            mean_abs = mean_abs + (value as f64).abs();
+            index = index +% (1 as usize);
+        }
+        if maximum - minimum < 0.000001f32 || mean_abs < 0.000001f64 {
+            io::eprintln("vision encoder: degenerate merged output");
+            return 1;
+        }
+        io::println(
+            "vision condition encoding: output_resolution=${output_resolution} image=${input_image.shape.width}x${input_image.shape.height} tokens=${input_image.shape.vision_tokens} values=${output_values} min=${minimum} max=${maximum} mean_abs=${mean_abs / output_values as f64} finite_nonzero=verified",
+        );
+        return 0;
+    }
+    if command == "test-vision-encoder-oracle" {
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR]");
+            return 2;
+        };
+        return match env::arg(3 as usize) {
+            option::Option[text::Text]::Some(fixture) => {
+                qwen3vl_vision::run_fixture(model_path.view(), fixture.view())
+            }
+            option::Option[text::Text]::None => {
+                qwen3vl_vision::run_fixture(model_path.view())
+            }
+        };
     }
     if command == "test-text-encoder" {
         guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {

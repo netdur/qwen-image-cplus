@@ -59,8 +59,8 @@ versioned with the runtime.
 - Pinned official [transformer source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/transformers/transformer_qwenimage21.py),
   [VAE source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py),
   and [pipeline source](https://github.com/huggingface/diffusers/blob/80c7ed262aeffbeb43ef13ae04baeb9b84515a69/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py)
-- Text model reference: Transformers 5.17.0
-  [Qwen3-VL implementation](https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py)
+- Vision model reference: model-pinned Transformers 4.57.1
+  [Qwen3-VL implementation](https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py)
 
 ## Resolution and step-count policy
 
@@ -141,13 +141,28 @@ the five down blocks, four 2x spatial reductions, middle attention, posterior
 mode selection, and per-channel latent normalization. A 32x32 smoke produces
 four finite nonzero latent tokens; the requested 512-area smoke encodes the
 736x352 reference into 1,012 finite nonzero 64-channel tokens. These are
-structural acceptance checks, not a numerical equivalence claim: the compact
-official-Python oracle generator is checked in, but this machine currently has
-no working PyTorch installation with which to create its fixtures. Remaining
-work is the Qwen3-VL vision tower, transformer condition-prefix assembly, and
-then CLI/C ABI exposure. Keeping those stages explicit avoids calling prompt
-plumbing end-to-end image editing before pixels have passed through both
-encoders.
+structural acceptance checks, not a numerical equivalence claim: its compact
+official-Python oracle generator is checked in, but its external dependency is
+not installed in the working Python environment.
+
+The native Qwen3-VL vision tower is complete and independently measured. It
+implements the pinned BF16 patch projection, exact 48x48 learned-position
+interpolation, axial vision RoPE, 27 bidirectional transformer blocks, 2x2
+final patch merger, and DeepStack mergers after blocks 8, 16, and 24. A
+dependency-light CPU PyTorch oracle reproduces the pinned Transformers 4.57.1
+equations without importing Transformers. On its deterministic four-patch
+32x32 fixture, final output nRMSE is **0.0282456**; the three DeepStack output
+nRMSE values are **0.00854384**, **0.013003**, and **0.0242081**. All recorded
+boundaries remain below the enforced 0.06 ceiling. The real requested 512-area
+case resizes the asymmetric input to 736x352, processes 1,012 patches into 253
+merged tokens, and completes the tower in **2.653 s** wall time on the M1 Max.
+This phase streams one contiguous 1.153 GB vision-weight region and keeps every
+operation on Metal after native input preparation.
+
+Remaining work is transformer condition-prefix assembly across one to ten
+images, then generation/CLI/C-ABI exposure. Keeping those stages explicit
+avoids calling prompt plumbing end-to-end image editing before both native
+encoders are connected to the denoiser.
 
 ## Package and API layout
 
@@ -281,6 +296,8 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-image-output reference.png
 ./cli/target/debug/qwen-image-cplus test-image-input /tmp/reference-input.png
 ./cli/target/debug/qwen-image-cplus test-vae-encoder /path/to/model/snapshot /path/to/reference.png 512
+./cli/target/debug/qwen-image-cplus test-vision-encoder /path/to/model/snapshot /path/to/reference.png 512
+./cli/target/debug/qwen-image-cplus test-vision-encoder-oracle /path/to/model/snapshot /path/to/vision_fixture
 ./cli/target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./cli/target/debug/qwen-image-cplus test-pipeline-1024-oracle transformer.qipack /path/to/model/snapshot output.png /path/to/trajectory_1024 /path/to/vae_oracle_1024
 ./cli/target/debug/qwen-image-cplus test-pipeline-cache-dit-1024-oracle transformer.qipack /path/to/model/snapshot cache.png 0.12 /path/to/trajectory_1024 /path/to/vae_oracle_1024
