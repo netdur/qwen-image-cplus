@@ -62,6 +62,8 @@ fn _run_generation(
     seed: u64,
     cache: qwen_image::CacheMode,
     cache_threshold: f64,
+    width: usize = 0 as usize,
+    height: usize = 0 as usize,
 ) -> i32 {
     guard let option::Option[u64]::Some(step_count) = parse_u64_decimal(steps) else {
         return 2;
@@ -76,6 +78,8 @@ fn _run_generation(
         seed: seed,
         cache: cache,
         cache_threshold: cache_threshold,
+        width: width,
+        height: height,
     };
     return match qwen_image::generate_to_png(request) {
         qwen_image::GenerateStatus::Ok => 0,
@@ -207,7 +211,7 @@ fn pack_is_distilled(packed_path: str) -> bool {
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -648,6 +652,67 @@ fn main() -> i32 {
         };
         return pipeline::run_fixture_cache_dit_256(
             packed_path.view(), model_path.view(), output_path.view(), threshold,
+        );
+    }
+    if command == "generate" {
+        let usage: str = "usage: qwen-image-cplus generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40]";
+        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(width_text) = env::arg(6 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(height_text) = env::arg(7 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[u64]::Some(width_value) = parse_u64_decimal(width_text.view()) else {
+            io::eprintln("generate: width must be an unsigned decimal integer"); return 2;
+        };
+        guard let option::Option[u64]::Some(height_value) = parse_u64_decimal(height_text.view()) else {
+            io::eprintln("generate: height must be an unsigned decimal integer"); return 2;
+        };
+        var seed: u64 = 1101 as u64;
+        match env::arg(8 as usize) {
+            option::Option[text::Text]::Some(seed_text) => {
+                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
+                    io::eprintln("generate: seed must be an unsigned decimal integer"); return 2;
+                };
+                seed = parsed;
+            }
+            option::Option[text::Text]::None => {}
+        }
+        guard let option::Option[str]::Some(pack_steps) = pack_default_steps(
+            packed_path.view(), ["3", "4", "8", "25", "40"],
+        ) else { return 2; };
+        var requested_steps: str = pack_steps;
+        match env::arg(9 as usize) {
+            option::Option[text::Text]::Some(steps_text) => {
+                if steps_text == "3" || steps_text == "4" || steps_text == "8"
+                    || steps_text == "25" || steps_text == "40" {
+                    requested_steps = if steps_text == "3" { "3" }
+                    else if steps_text == "4" { "4" }
+                    else if steps_text == "8" { "8" }
+                    else if steps_text == "25" { "25" } else { "40" };
+                } else {
+                    io::eprintln("generate: steps must be 3, 4, 8, 25, or 40"); return 2;
+                }
+            }
+            option::Option[text::Text]::None => {}
+        }
+        io::println("generate: output=${width_value}x${height_value} cache=none steps=${requested_steps}");
+        return _run_generation(
+            packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+            0 as usize, requested_steps, seed, qwen_image::CacheMode::None, 0.0f64,
+            width_value as usize, height_value as usize,
         );
     }
     if command == "generate-256" {

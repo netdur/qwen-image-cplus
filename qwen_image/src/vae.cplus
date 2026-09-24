@@ -1026,6 +1026,26 @@ fn decode_1024_from_host(
     return run_impl(model_root, "1024", "", normalized_latent, decoded_output, false, false);
 }
 
+// Decodes a caller-owned rectangular latent. Dimensions are latent-grid
+// dimensions, so a 64x48 input produces a 1024x768 RGBA output.
+fn decode_sized_from_host(
+    model_root: str,
+    normalized_latent: *f32,
+    decoded_output: *f32,
+    input_width: usize,
+    input_height: usize,
+) -> i32 {
+    if normalized_latent.is_null() || decoded_output.is_null()
+        || input_width == (0 as usize) || input_height == (0 as usize) {
+        io::eprintln("VAE: sized generation received an invalid host buffer or shape");
+        return 2;
+    }
+    return run_impl(
+        model_root, "sized", "", normalized_latent, decoded_output, false, false,
+        false, input_width, input_height,
+    );
+}
+
 fn run_impl(
     model_root: str,
     requested_case: str,
@@ -1035,6 +1055,8 @@ fn run_impl(
     validate_reference: bool,
     native_prompt_source: bool,
     profile_dispatches: bool = false,
+    requested_input_width: usize = 0 as usize,
+    requested_input_height: usize = 0 as usize,
 ) -> i32 {
     var input_height: usize = 0 as usize;
     var case_directory: str = "";
@@ -1050,11 +1072,18 @@ fn run_impl(
     } else if requested_case == "trajectory-1024" {
         input_height = 64 as usize;
         case_directory = "trajectory_1024";
+    } else if requested_case == "sized"
+        && requested_input_width > (0 as usize)
+        && requested_input_height > (0 as usize) {
+        input_height = requested_input_height;
+        case_directory = "";
     } else {
-        io::eprintln("VAE: case must be small, 256, 1024, or trajectory-1024");
+        io::eprintln("VAE: case must be small, 256, 1024, trajectory-1024, or a valid sized request");
         return 2;
     }
-    let input_width: usize = input_height;
+    let input_width: usize = if requested_case == "sized" {
+        requested_input_width
+    } else { input_height };
     let timing_start_ms: i64 = time::now_millis();
     let fixture_directory_text: text::Text = "${fixture_root}/${case_directory}";
     let fixture_directory: str = fixture_directory_text.view();

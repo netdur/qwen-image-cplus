@@ -4941,13 +4941,16 @@ fn run_scale_packed(
 fn fill_target_rope(
     destination: *f32,
     text_rows: usize,
-    side: usize,
+    image_height: usize,
+    image_width: usize,
 ) -> bool {
     if destination.is_null() { return false; }
-    if side == (0 as usize) || side % (2 as usize) != (0 as usize) {
+    if image_height == (0 as usize) || image_width == (0 as usize)
+        || image_height % (2 as usize) != (0 as usize)
+        || image_width % (2 as usize) != (0 as usize) {
         return false;
     }
-    let target_rows: usize = side *% side;
+    let target_rows: usize = image_height *% image_width;
     let rows: usize = text_rows +% target_rows;
     let theta_log: f32 = (10000.0f32).ln();
     var row: usize = 0 as usize;
@@ -4956,12 +4959,12 @@ fn fill_target_rope(
         let image_row: usize = if is_image { row -% text_rows } else { 0 as usize };
         let frame_position: i32 = if is_image { text_rows as i32 } else { row as i32 };
         let height_position: i32 = if is_image {
-            (image_row / side) as i32 - (side / (2 as usize)) as i32
+            (image_row / image_width) as i32 - (image_height / (2 as usize)) as i32
         } else {
             row as i32
         };
         let width_position: i32 = if is_image {
-            (image_row % side) as i32 - (side / (2 as usize)) as i32
+            (image_row % image_width) as i32 - (image_width / (2 as usize)) as i32
         } else {
             row as i32
         };
@@ -4991,7 +4994,7 @@ fn fill_target_rope(
 }
 
 fn fill_target_rope_256(destination: *f32, text_rows: usize) -> bool {
-    return fill_target_rope(destination, text_rows, 16 as usize);
+    return fill_target_rope(destination, text_rows, 16 as usize, 16 as usize);
 }
 
 fn fill_seeded_latent(destination: *f32, count: usize, seed: u64) -> bool {
@@ -5751,6 +5754,51 @@ fn run_prompt_trajectory_1024_to_host(
     );
 }
 
+// Runs an uncached native-prompt trajectory for an arbitrary rectangular
+// image grid. Width and height are image pixels; the transformer consumes one
+// 64-channel token per 16x16 output region.
+fn run_prompt_trajectory_sized_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    seed: u64,
+    final_latent: *f32,
+    image_width: usize,
+    image_height: usize,
+    requested_steps: str = "40",
+    validate_reference: bool = false,
+    fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
+    q4_eager_expand: bool = false,
+    q4_direct_packed: bool = false,
+) -> i32 {
+    if text_input.is_null() || final_latent.is_null() {
+        io::eprintln("trajectory: sized prompt handoff received a null buffer");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        requested_steps,
+        fixture_directory,
+        final_latent,
+        text_input,
+        text_rows,
+        seed,
+        true,
+        validate_reference,
+        false,
+        0.0f64,
+        image_width,
+        false,
+        0 as *f32,
+        0.0f32,
+        1.0f32,
+        q4_eager_expand,
+        q4_direct_packed,
+        image_width,
+        image_height,
+    );
+}
+
 fn run_prompt_trajectory_cache_dit_1024_to_host(
     packed_path: str,
     text_input: *f32,
@@ -6077,6 +6125,8 @@ fn run_trajectory_packed_impl(
     bottleneck_strength: f32 = 1.0f32,
     q4_eager_expand: bool = false,
     q4_direct_packed: bool = false,
+    image_width: usize = 0 as usize,
+    image_height: usize = 0 as usize,
 ) -> i32 {
     if taylorseer_enabled && !cache_dit_enabled {
         io::eprintln("trajectory: TaylorSeer requires Cache-DiT");
@@ -6112,9 +6162,12 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: text row count must be 1..512, got ${text_rows}");
         return 2;
     }
-    if !(pixels == (128 as usize) || pixels == (256 as usize) || pixels == (512 as usize)
-        || pixels == (1024 as usize)) {
-        io::eprintln("trajectory: pixels must be 128, 256, 512, or 1024");
+    let output_width: usize = if image_width == (0 as usize) { pixels } else { image_width };
+    let output_height: usize = if image_height == (0 as usize) { pixels } else { image_height };
+    if output_width < (128 as usize) || output_height < (128 as usize)
+        || output_width % (32 as usize) != (0 as usize)
+        || output_height % (32 as usize) != (0 as usize) {
+        io::eprintln("trajectory: width and height must be at least 128 and divisible by 32");
         return 2;
     }
     if validate_reference && step_limit == (25 as usize) {
@@ -6156,8 +6209,13 @@ fn run_trajectory_packed_impl(
         shift_terminal_name, shift_terminal_source, profile_skip.view(), cache_dit_enabled,
         cache_dit_warmup,
     );
-    let latent_side: usize = pixels / (16 as usize);
-    let target_rows: usize = latent_side *% latent_side;
+    let latent_height: usize = output_height / (16 as usize);
+    let latent_width: usize = output_width / (16 as usize);
+    let target_rows: usize = latent_height *% latent_width;
+    if target_rows > (4096 as usize) {
+        io::eprintln("trajectory: output exceeds the verified 4096-token memory ceiling");
+        return 2;
+    }
     let rows: usize = text_rows +% target_rows;
     let latent_count: usize = target_rows *% IMAGE_CHANNELS;
     var sigmas: [f32; 41] = [0.0f32; 41];
@@ -6232,8 +6290,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(q4_repack_owner) = pipeline(device, library, "qi_q4_repack_direct") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
-    let flash_attention: bool = pixels == (256 as usize) || pixels == (1024 as usize);
-    let use_graph_attention: bool = pixels == (1024 as usize)
+    let flash_attention: bool = target_rows == (256 as usize) || target_rows == (4096 as usize);
+    let use_graph_attention: bool = target_rows == (4096 as usize)
         && !env::has_var("QI_DISABLE_MPSGRAPH_ATTENTION");
     let attention_kernel_name: str = if flash_attention {
         "qi_block_attention_flash128"
@@ -6318,7 +6376,7 @@ fn run_trajectory_packed_impl(
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
 
     let storage_and_weights_start_ms: i64 = time::now_millis();
-    let ring_wanted: bool = (pixels == (1024 as usize) || env::has_var("QI_ENABLE_WEIGHT_RING"))
+    let ring_wanted: bool = (target_rows == (4096 as usize) || env::has_var("QI_ENABLE_WEIGHT_RING"))
         && weight_file.all_block_matrices_fp16()
         && !cache_dit_enabled
         && !env::has_var("QI_PROFILE_CACHED_BLOCK")
@@ -6336,7 +6394,7 @@ fn run_trajectory_packed_impl(
     } else { 0 as usize };
     let use_weight_ring: bool = ring_prefix_bytes > (0 as usize);
     let weight_ring_reason: str = if use_weight_ring {
-        if pixels == (1024 as usize) { "1024-default" } else { "explicit-memory-saving" }
+        if target_rows == (4096 as usize) { "4096-token-default" } else { "explicit-memory-saving" }
     } else { "resident" };
     if ring_wanted && !use_weight_ring {
         io::eprintln("trajectory: pack layout does not allow the weight ring; keeping the resident copy");
@@ -6468,7 +6526,7 @@ fn run_trajectory_packed_impl(
     } else { return 1; };
     let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
     if native_inputs && !fill_target_rope(
-        rope.contents() as *f32, text_rows, latent_side,
+        rope.contents() as *f32, text_rows, latent_height, latent_width,
     ) {
         io::eprintln("trajectory: could not construct dynamic RoPE");
         return 1;
@@ -7184,7 +7242,7 @@ fn run_trajectory_packed_impl(
         }
     }
     let trajectory_wall_ms: i64 = time::now_millis() - trajectory_wall_start_ms;
-    io::println("trajectory: pixels=${pixels} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} taylorseer=${taylorseer_enabled} bottleneck_shift=${bottleneck_shift} bottleneck_strength=${bottleneck_strength} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} shift_terminal=${shift_terminal_name} profile_skip=${profile_skip} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
+    io::println("trajectory: output=${output_width}x${output_height} tokens=${target_rows} steps=${step_limit} q8_dispatch_matrices=${total_quantized_matrices} prefix_cache_bytes=${(2 as u64) *% cache_arena_bytes} cache_dit=${cache_dit_enabled} taylorseer=${taylorseer_enabled} bottleneck_shift=${bottleneck_shift} bottleneck_strength=${bottleneck_strength} cache_dit_threshold=${cache_dit_threshold_value} cache_dit_steps=${total_cached_steps} shift_terminal=${shift_terminal_name} profile_skip=${profile_skip} total_gpu_ms=${total_ms} gpu_timing_fragmented=${use_graph_attention} total_wall_ms=${trajectory_wall_ms}");
     if all_ok {
         if taylorseer_enabled {
             io::println("Qwen-Image-2.1 TaylorSeer trajectory: complete; quality requires measured acceptance");
@@ -8623,6 +8681,20 @@ fn block_dimensions_match_pinned_model() {
     assert HEADS *% HEAD_DIMENSION == WIDTH;
     assert MLP_WIDTH == WIDTH *% (3 as usize);
     assert ROWS == (4 as usize);
+}
+
+#[test]
+fn rectangular_rope_uses_independent_height_and_width_coordinates() {
+    var rope: [f32; 1024] = [0.0f32; 1024];
+    assert fill_target_rope(#addr_of(rope[0]), 0 as usize, 2 as usize, 4 as usize);
+    // Row 0 is at (-1, -2); row 4 is at (0, -2). The first frequency
+    // of each spatial axis is 1, so these entries expose the coordinates.
+    assert (rope[8] - (-1.0f32).cos()).abs() < 0.000001f32;
+    assert (rope[(4 as usize) *% HEAD_DIMENSION +% (8 as usize)] - 1.0f32).abs()
+        < 0.000001f32;
+    assert (rope[36] - (-2.0f32).cos()).abs() < 0.000001f32;
+    assert (rope[HEAD_DIMENSION +% (36 as usize)] - (-1.0f32).cos()).abs()
+        < 0.000001f32;
 }
 
 #[test]

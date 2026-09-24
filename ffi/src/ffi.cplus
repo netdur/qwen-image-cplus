@@ -19,8 +19,11 @@ export enum QiCacheMode {
     CacheDiT,
 }
 
+// Frozen ABI-v1 prefix. New request fields are appended after this layout;
+// qi_generate_to_png checks struct_size before reading them so callers built
+// against the original header remain binary-compatible.
 #[repr(C)]
-export struct QiGenerateRequest {
+struct QiGenerateRequestV1 {
     abi_version: u32,
     struct_size: u32,
     opaque packed_path: *u8,
@@ -38,6 +41,29 @@ export struct QiGenerateRequest {
     cache_threshold: f64,
 }
 
+#[repr(C)]
+export struct QiGenerateRequest {
+    abi_version: u32,
+    struct_size: u32,
+    opaque packed_path: *u8,
+    packed_path_length: usize,
+    opaque model_root: *u8,
+    model_root_length: usize,
+    opaque output_path: *u8,
+    output_path_length: usize,
+    opaque prompt: *u8,
+    prompt_length: usize,
+    pixels: u32,
+    steps: u32,
+    seed: u64,
+    cache_mode: u32,
+    cache_threshold: f64,
+    // Set both for a rectangular output. Zero preserves the legacy
+    // `pixels`-by-`pixels` behavior.
+    width: u32,
+    height: u32,
+}
+
 export extern fn qi_abi_version() -> u32 {
     return ABI_VERSION;
 }
@@ -48,36 +74,46 @@ export extern fn qi_generate_request_size() -> u32 {
 
 export extern fn qi_generate_to_png(request: *QiGenerateRequest) -> QiStatus {
     if request.is_null() { return QiStatus::InvalidArgument; }
-    let value: QiGenerateRequest = { *request };
-    if value.abi_version != ABI_VERSION
-        || value.struct_size < (#size_of::[QiGenerateRequest]() as u32)
-        || value.packed_path.is_null() || value.packed_path_length == (0 as usize)
-        || value.model_root.is_null() || value.model_root_length == (0 as usize)
-        || value.output_path.is_null() || value.output_path_length == (0 as usize)
-        || value.prompt.is_null() || value.prompt_length == (0 as usize) {
+    let legacy: QiGenerateRequestV1 = { *(request as *QiGenerateRequestV1) };
+    if legacy.abi_version != ABI_VERSION
+        || legacy.struct_size < (#size_of::[QiGenerateRequestV1]() as u32)
+        || legacy.packed_path.is_null() || legacy.packed_path_length == (0 as usize)
+        || legacy.model_root.is_null() || legacy.model_root_length == (0 as usize)
+        || legacy.output_path.is_null() || legacy.output_path_length == (0 as usize)
+        || legacy.prompt.is_null() || legacy.prompt_length == (0 as usize) {
         return QiStatus::InvalidArgument;
     }
 
-    let cache: api::CacheMode = if value.cache_mode == (QiCacheMode::None as u32) {
+    var width: u32 = 0 as u32;
+    var height: u32 = 0 as u32;
+    if legacy.struct_size >= (#size_of::[QiGenerateRequest]() as u32) {
+        let extended: QiGenerateRequest = { *request };
+        width = extended.width;
+        height = extended.height;
+    }
+
+    let cache: api::CacheMode = if legacy.cache_mode == (QiCacheMode::None as u32) {
         api::CacheMode::None
-    } else if value.cache_mode == (QiCacheMode::TaylorSeer as u32) {
+    } else if legacy.cache_mode == (QiCacheMode::TaylorSeer as u32) {
         api::CacheMode::TaylorSeer
-    } else if value.cache_mode == (QiCacheMode::CacheDiT as u32) {
+    } else if legacy.cache_mode == (QiCacheMode::CacheDiT as u32) {
         api::CacheMode::CacheDiT
     } else {
         return QiStatus::InvalidArgument;
     };
 
     let native: api::GenerateRequest = api::GenerateRequest {
-        packed_path: { #str_from_raw_parts(value.packed_path, value.packed_path_length) },
-        model_root: { #str_from_raw_parts(value.model_root, value.model_root_length) },
-        output_path: { #str_from_raw_parts(value.output_path, value.output_path_length) },
-        prompt: { #str_from_raw_parts(value.prompt, value.prompt_length) },
-        pixels: value.pixels as usize,
-        steps: value.steps as usize,
-        seed: value.seed,
+        packed_path: { #str_from_raw_parts(legacy.packed_path, legacy.packed_path_length) },
+        model_root: { #str_from_raw_parts(legacy.model_root, legacy.model_root_length) },
+        output_path: { #str_from_raw_parts(legacy.output_path, legacy.output_path_length) },
+        prompt: { #str_from_raw_parts(legacy.prompt, legacy.prompt_length) },
+        pixels: legacy.pixels as usize,
+        steps: legacy.steps as usize,
+        seed: legacy.seed,
         cache: cache,
-        cache_threshold: value.cache_threshold,
+        cache_threshold: legacy.cache_threshold,
+        width: width as usize,
+        height: height as usize,
     };
     return match api::generate_to_png(native) {
         api::GenerateStatus::Ok => QiStatus::Ok,
@@ -90,5 +126,6 @@ export extern fn qi_generate_to_png(request: *QiGenerateRequest) -> QiStatus {
 fn ffi_version_and_request_size_are_self_describing() {
     assert qi_abi_version() == (1 as u32);
     assert qi_generate_request_size() == (#size_of::[QiGenerateRequest]() as u32);
+    assert #size_of::[QiGenerateRequestV1]() < #size_of::[QiGenerateRequest]();
     assert qi_generate_to_png(0 as *QiGenerateRequest) == QiStatus::InvalidArgument;
 }

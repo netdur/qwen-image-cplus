@@ -68,8 +68,25 @@ Qwen's own model documentation identifies **2048x2048** as the native and
 recommended 1:1 output, with comparable 2K-pixel-budget dimensions for other
 aspect ratios. The Diffusers implementation and Qwen's vLLM/SGLang examples
 also accept 1024x1024, so 1024 is a supported and useful lower-resolution mode,
-but it is not the model's native quality target. This runtime has completed
-256 and 1024 execution; 2048 support and its memory gate remain future work.
+but it is not the model's native quality target. The runtime accepts independent
+width and height values that are at least 256, divisible by 32, and no more
+than 4,096 latent tokens in total (equivalently, at most 1,048,576 output
+pixels). That includes 256x256, 512x512, 1024x1024, and practical rectangular
+shapes such as 1344x768 or 768x1344. The ceiling is deliberate: it preserves
+the completed 1024 memory envelope. Full 2048x2048 support needs 16,384 latent
+tokens and remains behind a separate memory gate.
+
+Rectangular generation carries the shape through latent allocation, the two
+independent spatial RoPE coordinates, transformer scheduling, VAE decode, and
+PNG output. Cache-DiT, TaylorSeer, and Bottleneck Sampling remain restricted
+to the 256x256 and 1024x1024 shapes where their behavior was calibrated;
+arbitrary dimensions currently use cache-off inference.
+
+The first end-to-end rectangular acceptance run used the Viggle 4-step pack at
+512x256 with seed 1301. It produced a correctly shaped PNG in **14.801 s**:
+2.334 s text, 11.813 s transformer, 0.649 s VAE, and 4 ms PNG output. This is a
+functional acceptance measurement on the M1 Max, not a claim that every aspect
+ratio has the same throughput or quality calibration.
 
 The authoritative Qwen and Diffusers sampling default is **40 Euler steps**.
 The 25-step experiment in this repository came from the
@@ -128,13 +145,19 @@ request.output_path = (uint8_t *)output_path;
 request.output_path_length = output_path_length;
 request.prompt = (uint8_t *)prompt;
 request.prompt_length = prompt_length;
-request.pixels = 1024;
+request.width = 1344;
+request.height = 768;
 request.steps = 40;
 request.seed = 1301;
 request.cache_mode = QiCacheMode_None;
 
 QiStatus status = qi_generate_to_png(&request);
 ```
+
+`width` and `height` were appended without changing ABI version 1. The library
+checks `struct_size` before reading them, so a binary built against the original
+request layout remains valid and continues to use `pixels` as a square width
+and height. New callers set both dimensions; setting only one is invalid.
 
 ## Build and verify
 
@@ -211,6 +234,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
 ./cli/target/debug/qwen-image-cplus test-native-inputs
 ./cli/target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./cli/target/debug/qwen-image-cplus generate transformer.qipack /path/to/model/snapshot output.png "your prompt" 1344 768 1101 40
 ./cli/target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
 ./cli/target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
 ./cli/target/debug/qwen-image-cplus generate-256-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
@@ -1852,8 +1876,9 @@ Until those gates pass, work is still measured at the 4,096-token 1024 shape;
 an optimization that only helps the 256x256 benchmark is no longer sufficient
 evidence:
 
-1. **Native 2048 feasibility.** Generalize the fixed square shape to 128x128
-   latent tokens, then run only one transformer step while recording allocation
+1. **Native 2048 feasibility.** The runtime shape path is now rectangular and
+   dynamic up to 4,096 latent tokens. Raise that explicit ceiling to a 128x128
+   latent grid only for a one-step transformer smoke while recording allocation
    and resident-memory peaks. Separately size or tile the 2048 VAE decode. Do
    not start a full 40-step image until both phases fit safely on the 32 GB M1
    Max. If they pass, the first resolution-scheduling candidate is

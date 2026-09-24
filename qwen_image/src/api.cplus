@@ -30,6 +30,25 @@ struct GenerateRequest {
     seed: u64,
     cache: CacheMode,
     cache_threshold: f64,
+    // Set both to select a rectangular output. When both are zero, `pixels`
+    // remains the backward-compatible square dimension.
+    width: usize,
+    height: usize,
+}
+
+fn _request_width(request: GenerateRequest) -> usize {
+    return if request.width == (0 as usize) { request.pixels } else { request.width };
+}
+
+fn _request_height(request: GenerateRequest) -> usize {
+    return if request.height == (0 as usize) { request.pixels } else { request.height };
+}
+
+fn _dimensions_supported(width: usize, height: usize) -> bool {
+    return width >= (256 as usize) && height >= (256 as usize)
+        && width % (32 as usize) == (0 as usize)
+        && height % (32 as usize) == (0 as usize)
+        && (width / (16 as usize)) *% (height / (16 as usize)) <= (4096 as usize);
 }
 
 fn _step_name(steps: usize) -> option::Option[str] {
@@ -53,18 +72,33 @@ fn _validate(request: GenerateRequest) -> GenerateStatus {
         || request.prompt.count() == (0 as usize) {
         return GenerateStatus::InvalidArgument;
     }
-    if request.pixels != (256 as usize) && request.pixels != (1024 as usize) {
+    if (request.width == (0 as usize)) != (request.height == (0 as usize)) {
+        return GenerateStatus::InvalidArgument;
+    }
+    if request.width == (0 as usize)
+        && request.pixels != (256 as usize) && request.pixels != (1024 as usize) {
+        return GenerateStatus::InvalidArgument;
+    }
+    let width: usize = _request_width(request);
+    let height: usize = _request_height(request);
+    if !_dimensions_supported(width, height) {
         return GenerateStatus::InvalidArgument;
     }
     match _step_name(request.steps) {
         option::Option::Some(_) => {}
         option::Option::None => { return GenerateStatus::InvalidArgument; }
     }
-    if request.pixels == (256 as usize)
+    if width == (256 as usize) && height == (256 as usize)
         && request.steps != (25 as usize) && request.steps != (40 as usize) {
         return GenerateStatus::InvalidArgument;
     }
-    if request.pixels == (256 as usize) && request.cache == CacheMode::TaylorSeer {
+    if width == (256 as usize) && height == (256 as usize)
+        && request.cache == CacheMode::TaylorSeer {
+        return GenerateStatus::InvalidArgument;
+    }
+    if request.cache != CacheMode::None
+        && !((width == (256 as usize) && height == (256 as usize))
+            || (width == (1024 as usize) && height == (1024 as usize))) {
         return GenerateStatus::InvalidArgument;
     }
     if request.cache != CacheMode::None && !_threshold_supported(request.cache_threshold) {
@@ -85,8 +119,10 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
     guard let option::Option[str]::Some(steps) = _step_name(request.steps) else {
         return GenerateStatus::InvalidArgument;
     };
+    let width: usize = _request_width(request);
+    let height: usize = _request_height(request);
 
-    let status: i32 = if request.pixels == (256 as usize) {
+    let status: i32 = if width == (256 as usize) && height == (256 as usize) {
         match request.cache {
             CacheMode::None => pipeline::generate_256(
                 request.packed_path,
@@ -107,7 +143,7 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
             ),
             CacheMode::TaylorSeer => 2,
         }
-    } else {
+    } else if width == (1024 as usize) && height == (1024 as usize) {
         match request.cache {
             CacheMode::None => pipeline::generate_1024(
                 request.packed_path,
@@ -136,6 +172,17 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
                 steps,
             ),
         }
+    } else {
+        pipeline::generate_sized(
+            request.packed_path,
+            request.model_root,
+            request.output_path,
+            request.prompt,
+            width,
+            height,
+            request.seed,
+            steps,
+        )
     };
     return _from_pipeline_status(status);
 }
@@ -152,6 +199,8 @@ fn public_generation_request_validation_is_typed() {
         seed: 1301 as u64,
         cache: CacheMode::None,
         cache_threshold: 0.0f64,
+        width: 0 as usize,
+        height: 0 as usize,
     };
     assert _validate(valid) == GenerateStatus::Ok;
 
@@ -165,6 +214,8 @@ fn public_generation_request_validation_is_typed() {
         seed: valid.seed,
         cache: valid.cache,
         cache_threshold: valid.cache_threshold,
+        width: 0 as usize,
+        height: 0 as usize,
     };
     assert _validate(bad_pixels) == GenerateStatus::InvalidArgument;
 
@@ -178,6 +229,23 @@ fn public_generation_request_validation_is_typed() {
         seed: valid.seed,
         cache: CacheMode::TaylorSeer,
         cache_threshold: 0.24f64,
+        width: 0 as usize,
+        height: 0 as usize,
     };
     assert _validate(unsupported_cache) == GenerateStatus::InvalidArgument;
+
+    let rectangle: GenerateRequest = GenerateRequest {
+        packed_path: valid.packed_path,
+        model_root: valid.model_root,
+        output_path: valid.output_path,
+        prompt: valid.prompt,
+        pixels: 0 as usize,
+        steps: valid.steps,
+        seed: valid.seed,
+        cache: CacheMode::None,
+        cache_threshold: 0.0f64,
+        width: 1344 as usize,
+        height: 768 as usize,
+    };
+    assert _validate(rectangle) == GenerateStatus::Ok;
 }

@@ -290,6 +290,8 @@ fn run_native_impl(
     steps: str = "40",
     q4_eager_expand: bool = false,
     q4_direct_packed: bool = false,
+    output_width: usize = 0 as usize,
+    output_height: usize = 0 as usize,
 ) -> i32 {
     let pipeline_wall_start_ms: i64 = time::now_millis();
     guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
@@ -313,6 +315,8 @@ fn run_native_impl(
         pipeline_wall_start_ms,
         q4_eager_expand,
         q4_direct_packed,
+        output_width,
+        output_height,
     );
 }
 
@@ -333,13 +337,26 @@ fn run_native_tokens_impl(
     text_wall_start_ms: i64,
     q4_eager_expand: bool = false,
     q4_direct_packed: bool = false,
+    output_width: usize = 0 as usize,
+    output_height: usize = 0 as usize,
 ) -> i32 {
-    if !(pixels == (256 as usize) || pixels == (1024 as usize)) {
-        io::eprintln("pipeline: pixels must be 256 or 1024");
+    let image_width: usize = if output_width == (0 as usize) { pixels } else { output_width };
+    let image_height: usize = if output_height == (0 as usize) { pixels } else { output_height };
+    if image_width < (256 as usize) || image_height < (256 as usize)
+        || image_width % (32 as usize) != (0 as usize)
+        || image_height % (32 as usize) != (0 as usize)
+        || (image_width / (16 as usize)) *% (image_height / (16 as usize)) > (4096 as usize) {
+        io::eprintln("pipeline: width and height must be at least 256, divisible by 32, and no more than 4096 latent tokens total");
         return 2;
     }
-    if validate_reference && pixels != (256 as usize) {
+    if validate_reference && !(image_width == (256 as usize) && image_height == (256 as usize)) {
         io::eprintln("pipeline: native reference validation is available only at 256px");
+        return 2;
+    }
+    if (cache_dit || taylorseer || bottleneck)
+        && !((image_width == (256 as usize) && image_height == (256 as usize))
+            || (image_width == (1024 as usize) && image_height == (1024 as usize))) {
+        io::eprintln("pipeline: cache and bottleneck modes are calibrated only for 256x256 or 1024x1024");
         return 2;
     }
     let vae_fixture: str = "tests/fixtures/vae_decoder_fp32/trajectory_256";
@@ -376,20 +393,19 @@ fn run_native_tokens_impl(
     }
     io::println("pipeline timing: text_wall_ms=${time::now_millis() - text_wall_start_ms}");
 
-    let latent_values: usize = if pixels == (1024 as usize) {
-        LATENT_VALUES_1024
-    } else {
-        LATENT_VALUES
-    };
+    let latent_width: usize = image_width / (16 as usize);
+    let latent_height: usize = image_height / (16 as usize);
+    let latent_values: usize = latent_width *% latent_height *% (64 as usize);
     var latent: vec::Vec[f32] = vec::Vec[f32]::with_capacity(latent_values);
     value_index = 0 as usize;
     while value_index < latent_values {
         latent.append(0.0f32);
         value_index = value_index +% (1 as usize);
     }
-    io::println("pipeline: phase=transformer-scheduler pixels=${pixels} text_rows=${text_rows} seed=${seed}");
+    io::println("pipeline: phase=transformer-scheduler output=${image_width}x${image_height} text_rows=${text_rows} seed=${seed}");
     let transformer_wall_start_ms: i64 = time::now_millis();
-    let transformer_status: i32 = if pixels == (1024 as usize) {
+    let transformer_status: i32 = if image_width == (1024 as usize)
+        && image_height == (1024 as usize) && (bottleneck || taylorseer || cache_dit) {
         if bottleneck {
             transformer::run_prompt_trajectory_bottleneck_1024_to_host(
                 packed_path,
@@ -430,7 +446,7 @@ fn run_native_tokens_impl(
                 q4_direct_packed,
             )
         }
-    } else if bottleneck {
+    } else if image_width == (256 as usize) && image_height == (256 as usize) && bottleneck {
         transformer::run_prompt_trajectory_bottleneck_256_to_host(
             packed_path,
             #slice_ptr(text_embeddings.as_slice()),
@@ -438,7 +454,7 @@ fn run_native_tokens_impl(
             seed,
             #slice_ptr(latent.as_slice()),
         )
-    } else if cache_dit {
+    } else if image_width == (256 as usize) && image_height == (256 as usize) && cache_dit {
         transformer::run_prompt_trajectory_cache_dit_256_to_host(
             packed_path,
             #slice_ptr(text_embeddings.as_slice()),
@@ -449,15 +465,19 @@ fn run_native_tokens_impl(
             steps,
         )
     } else {
-        transformer::run_prompt_trajectory_256_to_host(
+        transformer::run_prompt_trajectory_sized_to_host(
             packed_path,
             #slice_ptr(text_embeddings.as_slice()),
             text_rows,
             seed,
             #slice_ptr(latent.as_slice()),
+            image_width,
+            image_height,
+            steps,
             validate_reference,
             "tests/fixtures/trajectory_256_fp32",
-            steps,
+            q4_eager_expand,
+            q4_direct_packed,
         )
     };
     if transformer_status != (0 as i32) {
@@ -465,11 +485,7 @@ fn run_native_tokens_impl(
     }
     io::println("pipeline timing: transformer_wall_ms=${time::now_millis() - transformer_wall_start_ms}");
 
-    let decoded_values: usize = if pixels == (1024 as usize) {
-        DECODED_VALUES_1024
-    } else {
-        DECODED_VALUES
-    };
+    let decoded_values: usize = image_width *% image_height *% (4 as usize);
     var decoded: vec::Vec[f32] = vec::Vec[f32]::with_capacity(decoded_values);
     value_index = 0 as usize;
     while value_index < decoded_values {
@@ -478,7 +494,7 @@ fn run_native_tokens_impl(
     }
     io::println("pipeline: phase=vae model=${model_root}");
     let vae_wall_start_ms: i64 = time::now_millis();
-    let decode_status: i32 = if pixels == (1024 as usize) {
+    let decode_status: i32 = if image_width == (1024 as usize) && image_height == (1024 as usize) {
         vae::decode_1024_from_host(
             model_root,
             #slice_ptr(latent.as_slice()),
@@ -490,11 +506,19 @@ fn run_native_tokens_impl(
             #slice_ptr(latent.as_slice()),
             #slice_ptr(decoded.as_slice()),
         )
-    } else {
+    } else if image_width == (256 as usize) && image_height == (256 as usize) {
         vae::decode_256_from_host(
             model_root,
             #slice_ptr(latent.as_slice()),
             #slice_ptr(decoded.as_slice()),
+        )
+    } else {
+        vae::decode_sized_from_host(
+            model_root,
+            #slice_ptr(latent.as_slice()),
+            #slice_ptr(decoded.as_slice()),
+            latent_width,
+            latent_height,
         )
     };
     if decode_status != (0 as i32) {
@@ -511,16 +535,16 @@ fn run_native_tokens_impl(
         )
     } else {
         image_output::write_png_sized(
-            #slice_ptr(decoded.as_slice()), output_path, pixels, pixels,
+            #slice_ptr(decoded.as_slice()), output_path, image_width, image_height,
         )
     };
     if !write_ok { return 1; }
     io::println("pipeline timing: image_output_wall_ms=${time::now_millis() - image_wall_start_ms}");
     io::println("pipeline timing: total_wall_ms=${time::now_millis() - pipeline_wall_start_ms}");
     if validate_reference {
-        io::println("Qwen-Image-2.1 native prompt ${pixels}px pipeline: verified");
+        io::println("Qwen-Image-2.1 native prompt ${image_width}x${image_height} pipeline: verified");
     } else {
-        io::println("Qwen-Image-2.1 native prompt ${pixels}px generation: complete");
+        io::println("Qwen-Image-2.1 native prompt ${image_width}x${image_height} generation: complete");
     }
     return 0;
 }
@@ -647,6 +671,23 @@ fn generate_1024(
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
         false, false, false, false, 0.0f64, steps,
+    );
+}
+
+fn generate_sized(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    image_width: usize,
+    image_height: usize,
+    seed: u64 = 1101 as u64,
+    steps: str = "40",
+) -> i32 {
+    return run_native_impl(
+        packed_path, model_root, output_path, prompt, seed, image_width,
+        false, false, false, false, 0.0f64, steps, false, false,
+        image_width, image_height,
     );
 }
 

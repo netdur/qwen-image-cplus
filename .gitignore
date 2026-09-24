@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.qipack
 /models/
+/assets/
 target/
 /lib/
 /qwen_image/lib/
