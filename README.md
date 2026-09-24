@@ -164,6 +164,18 @@ images, then generation/CLI/C-ABI exposure. Keeping those stages explicit
 avoids calling prompt plumbing end-to-end image editing before both native
 encoders are connected to the denoiser.
 
+The first full two-image conditioning assembly now passes at the 512-area test
+budget. Two copies of the asymmetric reference each resize to 736x352 and
+produce, in official image order, 506 merged vision rows, a 540-row multimodal
+prompt after the 14-row system prefix is removed, and 2,024 normalized VAE
+condition rows. The measured wall time is **14.645 s**: 5.634 s for both vision
+towers, 8.102 s for the joint Qwen3-VL language pass, and 0.880 s for both VAE
+encodes (plus native input/tokenizer overhead). The test checks the image-pad
+mask count and finite nonzero prompt/latent outputs while exercising DeepStack
+layer-major repacking and condition-latent order. It also establishes why the
+denoiser cannot retain its old 512-row text-only ceiling: this valid two-image
+prompt has 540 rows before any VAE condition latents are prepended.
+
 ## Package and API layout
 
 The repository is split into three C+ packages, but remains one product:
@@ -323,6 +335,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
 ./cli/target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus test-multi-image-prompt /path/to/model/snapshot
+./cli/target/debug/qwen-image-cplus test-multi-image-conditioning /path/to/model/snapshot first.png second.png "Combine both references"
 ./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```

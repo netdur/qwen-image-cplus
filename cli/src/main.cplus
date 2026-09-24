@@ -17,6 +17,7 @@ import "qwen_image/image_input" as image_input;
 import "qwen_image/tokenizer" as tokenizer;
 import "qwen_image/qwen3vl_text" as qwen3vl_text;
 import "qwen_image/qwen3vl_vision" as qwen3vl_vision;
+import "qwen_image/multimodal_conditioning" as multimodal_conditioning;
 import "qwen_image/tensor" as tensor;
 import "qwen_image/cpu_ops" as cpu_ops;
 import "stdlib/env" as env;
@@ -1227,6 +1228,32 @@ fn main() -> i32 {
         };
         if !image_conditioning::reference_count_supported(2 as usize) { return 1; }
         return tokenizer::test_multi_image_prompt(model_path.view());
+    }
+    if command == "test-multi-image-conditioning" {
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(first_path) = env::arg(3 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT]");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(second_path) = env::arg(4 as usize) else {
+            io::eprintln("usage: qwen-image-cplus test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT]");
+            return 2;
+        };
+        return match env::arg(5 as usize) {
+            option::Option[text::Text]::Some(prompt) => {
+                multimodal_conditioning::run_two_image_512(
+                    model_path.view(), first_path.view(), second_path.view(), prompt.view(),
+                )
+            }
+            option::Option[text::Text]::None => {
+                multimodal_conditioning::run_two_image_512(
+                    model_path.view(), first_path.view(), second_path.view(),
+                )
+            }
+        };
     }
     if command == "test-image-input" {
         guard let option::Option[text::Text]::Some(source_path) = env::arg(2 as usize) else {
