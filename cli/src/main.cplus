@@ -1297,6 +1297,55 @@ fn main() -> i32 {
             }
         };
     }
+    if command == "generate-multi-image-512" {
+        let usage: str = "usage: qwen-image-cplus generate-multi-image-512 PACKED MODEL_DIR OUTPUT IMAGE_1 IMAGE_2 PROMPT [SEED] [1|2|40]";
+        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(first_path) = env::arg(5 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(second_path) = env::arg(6 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        guard let option::Option[text::Text]::Some(prompt) = env::arg(7 as usize) else {
+            io::eprintln(usage); return 2;
+        };
+        var seed: u64 = 1301 as u64;
+        match env::arg(8 as usize) {
+            option::Option[text::Text]::Some(seed_text) => {
+                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
+                    io::eprintln("generate-multi-image-512: seed must be an unsigned decimal integer");
+                    return 2;
+                };
+                seed = parsed;
+            }
+            option::Option[text::Text]::None => {}
+        }
+        var steps: str = "40";
+        match env::arg(9 as usize) {
+            option::Option[text::Text]::Some(steps_text) => {
+                if steps_text == "1" { steps = "1"; }
+                else if steps_text == "2" { steps = "2"; }
+                else if steps_text == "40" { steps = "40"; }
+                else {
+                    io::eprintln("generate-multi-image-512: steps must be 1, 2, or 40");
+                    return 2;
+                }
+            }
+            option::Option[text::Text]::None => {}
+        }
+        return multimodal_conditioning::run_two_image_transformer_512(
+            packed_path.view(), model_path.view(), first_path.view(),
+            second_path.view(), prompt.view(), steps, output_path.view(), seed,
+        );
+    }
     if command == "test-image-input" {
         guard let option::Option[text::Text]::Some(source_path) = env::arg(2 as usize) else {
             io::eprintln("usage: qwen-image-cplus test-image-input SOURCE_OUTPUT");

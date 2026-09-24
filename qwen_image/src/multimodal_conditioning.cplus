@@ -6,6 +6,7 @@
 
 import "./image_conditioning" as conditioning;
 import "./image_input" as image_input;
+import "./image_output" as image_output;
 import "./qwen3vl_text" as text_encoder;
 import "./qwen3vl_vision" as vision_encoder;
 import "./tokenizer" as tokenizer;
@@ -295,9 +296,10 @@ fn run_two_image_512(
     return 0;
 }
 
-// Full native handoff through one or two 512x512 denoising steps. The second
-// form also proves the target-only decode can reuse the interleaved prefix K/V
-// cache without paying for a complete 40-step test run.
+// Full native handoff through a short 512x512 transformer smoke or the complete
+// 40-step trajectory. Two steps prove that target-only decoding can reuse the
+// interleaved prefix K/V cache; an output path also performs native VAE decode
+// and PNG output.
 fn run_two_image_transformer_512(
     packed_path: str,
     model_root: str,
@@ -305,9 +307,11 @@ fn run_two_image_transformer_512(
     second_path: str,
     prompt: str = "Use Picture 1 and Picture 2 to create a coherent new scene.",
     requested_steps: str = "1",
+    output_path: str = "",
+    seed: u64 = 1301 as u64,
 ) -> i32 {
-    if !(requested_steps == "1" || requested_steps == "2") {
-        io::eprintln("multi-image transformer: steps must be 1 or 2");
+    if !(requested_steps == "1" || requested_steps == "2" || requested_steps == "40") {
+        io::eprintln("multi-image transformer: steps must be 1, 2, or 40");
         return 2;
     }
     let started_ms: i64 = time::now_millis();
@@ -339,7 +343,7 @@ fn run_two_image_transformer_512(
         encoded.condition_rows,
         #addr_of(shapes[0]),
         2 as usize,
-        1301 as u64,
+        seed,
         #slice_ptr(target.as_slice()),
         512 as usize,
         512 as usize,
@@ -349,8 +353,34 @@ fn run_two_image_transformer_512(
     if result != (0 as i32) || !finite_nonzero(
         #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
     ) {
-        io::eprintln("multi-image transformer: one-step target is invalid");
+        io::eprintln("multi-image transformer: trajectory target is invalid");
         return 1;
+    }
+    if output_path.count() > (0 as usize) {
+        guard let option::Option[vec::Vec[f32]]::Some(decoded) = zero_f32(
+            (512 as usize) *% (512 as usize) *% (4 as usize),
+        ) else { return 1; };
+        let vae_start_ms: i64 = time::now_millis();
+        if vae::decode_sized_from_host(
+            model_root,
+            #slice_ptr(target.as_slice()),
+            #slice_ptr(decoded.as_slice()),
+            32 as usize,
+            32 as usize,
+        ) != (0 as i32) {
+            return 1;
+        }
+        let vae_ms: i64 = time::now_millis() - vae_start_ms;
+        let output_start_ms: i64 = time::now_millis();
+        if !image_output::write_png_sized(
+            #slice_ptr(decoded.as_slice()), output_path, 512 as usize, 512 as usize,
+        ) {
+            return 1;
+        }
+        io::println(
+            "Qwen-Image-2.1 two-image generation: output=${output_path} pixels=512x512 steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        );
+        return 0;
     }
     io::println(
         "Qwen-Image-2.1 two-image transformer: verified output=512x512 steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",

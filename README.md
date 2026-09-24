@@ -191,8 +191,21 @@ first denoising step. The first transformer step itself took **21.298 s wall**.
 The two-step variant also passes, proving the enlarged prefix cache is consumed
 correctly: its first step took **19.107 s**, while the target-only cached-prefix
 second step took **6.529 s**; total end-to-end wall time was **43.265 s**. These
-are correctness smokes, not optimized benchmarks. Remaining image-edit work is
-the full trajectory, VAE decode/PNG handoff, and public CLI/C-ABI exposure.
+are correctness smokes, not optimized benchmarks.
+
+The complete native two-image path now also runs all 40 official Euler steps,
+decodes the final latent with the native VAE, and writes a 512x512 PNG. The
+first full run took **323.631 s end to end** on the M1 Max: **14.519 s** for
+input preparation and both image/text encoders, **308.302 s** for transformer
+setup and the trajectory, **0.799 s** for VAE decode, and **0.008 s** for PNG
+output. The first denoising step took **20.287 s**; cached-prefix steps then
+ranged from about **6.46 to 8.22 s**. With the same red-circle reference used
+twice, the output visibly contained two differentiated red circular forms, so
+this checks semantic conditioning rather than only finite tensors. This is a
+correctness baseline, not an optimized benchmark. The low-level layout accepts
+the official one-to-ten image range; the current high-level command is still
+the deliberately narrow two-image checkpoint. General 1-10 image orchestration
+and public C-ABI exposure remain.
 
 ## Package and API layout
 
@@ -355,6 +368,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-multi-image-prompt /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus test-multi-image-conditioning /path/to/model/snapshot first.png second.png "Combine both references"
 ./cli/target/debug/qwen-image-cplus test-multi-image-transformer transformer.qipack /path/to/model/snapshot first.png second.png "Combine both references" 2
+./cli/target/debug/qwen-image-cplus generate-multi-image-512 transformer.qipack /path/to/model/snapshot output.png first.png second.png "Combine both references" 1301 40
 ./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
