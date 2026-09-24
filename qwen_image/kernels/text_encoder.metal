@@ -96,14 +96,17 @@ kernel void qt_linear_16x16(
     }
 }
 
-// Text-only Qwen3-VL has the same position on all three mRoPE axes, reducing
-// exactly to ordinary half-rotated RoPE. Q and K use different head counts but
-// share the learned 128-element RMSNorm scale.
+// Qwen3-VL composes its 64 rotary frequencies from temporal, height, and width
+// positions in an interleaved 24/20/20 split. Text rows carry the same value on
+// all three axes, while image placeholders carry their merged 2D patch grid.
+// Q and K use different head counts but share the learned 128-element RMSNorm
+// scale.
 kernel void qt_qk_norm_rope(
     device const float *input [[buffer(0)]],
     device const ushort *weights [[buffer(1)]],
     device float *output [[buffer(2)]],
     constant TextParams &params [[buffer(3)]],
+    device const uint *position_ids [[buffer(4)]],
     uint index [[thread_position_in_grid]]) {
     const uint count = params.rows * params.heads;
     if (index >= count) return;
@@ -121,7 +124,12 @@ kernel void qt_qk_norm_rope(
         const float inverse_frequency = exp(
             -log(params.rope_theta) * (2.0f * float(frequency_column)) /
             float(params.head_dimension));
-        const float angle = float(row) * inverse_frequency;
+        uint axis = 0;
+        if (frequency_column < 60) {
+            const uint interleave = frequency_column % 3;
+            axis = interleave == 1 ? 1 : (interleave == 2 ? 2 : 0);
+        }
+        const float angle = float(position_ids[row * 3 + axis]) * inverse_frequency;
         const uint paired_column = column < half_dimension
             ? column + half_dimension : column - half_dimension;
         const float value = qt_round_bf16(
@@ -192,6 +200,25 @@ kernel void qt_add(
     uint index [[thread_position_in_grid]]) {
     const uint count = params.rows * params.width;
     if (index < count) output[index] = qt_round_bf16(left[index] + right[index]);
+}
+
+// DeepStack adds one vision-tower feature to every image-placeholder row
+// after each of the first three language-model layers. Text rows carry -1.
+kernel void qt_add_visual(
+    device const float *input [[buffer(0)]],
+    device const float *visual [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant TextParams &params [[buffer(3)]],
+    device const int *visual_row [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index >= count) return;
+    const uint row = index / params.width;
+    const uint column = index % params.width;
+    const int source_row = visual_row[row];
+    output[index] = source_row < 0
+        ? input[index]
+        : qt_round_bf16(input[index] + visual[uint(source_row) * params.width + column]);
 }
 
 kernel void qt_swiglu(

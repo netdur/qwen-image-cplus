@@ -13,6 +13,9 @@ import "./mmap_macos" as mapped;
 
 const IM_START: u32 = 151644 as u32;
 const IM_END: u32 = 151645 as u32;
+const VISION_START: u32 = 151652 as u32;
+const VISION_END: u32 = 151653 as u32;
+const IMAGE_PAD: u32 = 151655 as u32;
 const SYSTEM_PREFIX_TOKENS: usize = 14;
 const SPLIT_PATTERN: str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const SYSTEM_TEXT: str = "system\nComprehend and analyze the provided prompt.";
@@ -358,6 +361,70 @@ fn encode_full_prompt(tokenizer: Tokenizer, prompt: str) -> option::Option[vec::
     return option::Option[vec::Vec[u32]]::Some(full);
 }
 
+// Builds the exact image-conditioned raw template used by the pinned
+// QwenImage21Pipeline. The processor expands one `<|image_pad|>` placeholder
+// into one token per spatially merged vision patch; accepting the counts here
+// avoids materializing a very large intermediate template string.
+fn encode_full_prompt_with_images(
+    tokenizer: Tokenizer,
+    prompt: str,
+    image_token_counts: *usize,
+    image_count: usize,
+) -> option::Option[vec::Vec[u32]] {
+    if image_token_counts.is_null() || image_count == (0 as usize)
+        || image_count > (10 as usize) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    var full: vec::Vec[u32] = vec::new::[u32]();
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, SYSTEM_TEXT, full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_END);
+    if !encode_ordinary(tokenizer, "\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, "user\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+
+    var image: usize = 0 as usize;
+    while image < image_count {
+        if image > (0 as usize) && !encode_ordinary(tokenizer, " ", full) {
+            return option::Option[vec::Vec[u32]]::None;
+        }
+        let label: text::Text = "<image${image +% (1 as usize)}>";
+        if !encode_ordinary(tokenizer, label.view(), full) {
+            return option::Option[vec::Vec[u32]]::None;
+        }
+        full.append(VISION_START);
+        let image_tokens: usize = image_token_counts[image];
+        if image_tokens == (0 as usize) { return option::Option[vec::Vec[u32]]::None; }
+        var token: usize = 0 as usize;
+        while token < image_tokens {
+            if full.append(IMAGE_PAD) != status::Status::Ok {
+                return option::Option[vec::Vec[u32]]::None;
+            }
+            token = token +% (1 as usize);
+        }
+        full.append(VISION_END);
+        image = image +% (1 as usize);
+    }
+    if !encode_with_specials(tokenizer, prompt, full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_END);
+    if !encode_ordinary(tokenizer, "\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, "assistant\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    return option::Option[vec::Vec[u32]]::Some(full);
+}
+
 fn encode_prompt(tokenizer: Tokenizer, prompt: str) -> option::Option[vec::Vec[u32]] {
     guard let option::Option[vec::Vec[u32]]::Some(full) = encode_full_prompt(tokenizer, prompt) else {
         return option::Option[vec::Vec[u32]]::None;
@@ -390,6 +457,57 @@ fn tokenize_full_prompt_with(
     prompt: str,
 ) -> option::Option[vec::Vec[u32]] {
     return encode_full_prompt(tokenizer, prompt);
+}
+
+fn tokenize_full_prompt_with_images(
+    model_root: str,
+    prompt: str,
+    image_token_counts: *usize,
+    image_count: usize,
+) -> option::Option[vec::Vec[u32]] {
+    guard let LoadResult::Ok(tokenizer) = load(model_root) else LoadResult::Err {
+        return option::Option[vec::Vec[u32]]::None;
+    };
+    return encode_full_prompt_with_images(
+        tokenizer, prompt, image_token_counts, image_count,
+    );
+}
+
+fn test_multi_image_prompt(model_root: str) -> i32 {
+    var counts: [usize; 2] = [256 as usize, 256 as usize];
+    guard let option::Option[vec::Vec[u32]]::Some(tokens) =
+        tokenize_full_prompt_with_images(
+            model_root,
+        "Place Picture 1 and Picture 2 side by side.",
+        #addr_of(counts[0]),
+        2 as usize,
+    ) else {
+        io::eprintln("multi-image tokenizer: could not build prompt");
+        return 1;
+    };
+    var image_pads: usize = 0 as usize;
+    var vision_starts: usize = 0 as usize;
+    var vision_ends: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < tokens.count() {
+        guard let option::Option[u32]::Some(token) = tokens.at(index) else { return 1; };
+        if token == IMAGE_PAD { image_pads = image_pads +% (1 as usize); }
+        if token == VISION_START { vision_starts = vision_starts +% (1 as usize); }
+        if token == VISION_END { vision_ends = vision_ends +% (1 as usize); }
+        index = index +% (1 as usize);
+    }
+    io::println(
+        "multi-image prompt: images=2 output_resolution=512 vision_tokens=512 full_tokens=${tokens.count()}",
+    );
+    if image_pads != (512 as usize) || vision_starts != (2 as usize)
+        || vision_ends != (2 as usize) {
+        io::eprintln(
+            "multi-image tokenizer: pads=${image_pads} starts=${vision_starts} ends=${vision_ends}",
+        );
+        return 1;
+    }
+    io::println("Qwen3-VL two-image prompt layout: verified");
+    return 0;
 }
 
 fn validate_case(tokenizer: Tokenizer, fixture_directory: str, name: str, prompt: str) -> bool {

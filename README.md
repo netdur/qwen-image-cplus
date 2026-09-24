@@ -110,6 +110,31 @@ to render CASABLANCA and misspelled it (see the Viggle comparison below).
 Pack metadata can set another default. The adopted Viggle distillation pack
 defaults to 4 steps with an unstretched schedule.
 
+## Multi-image conditioning status
+
+The official Qwen-Image-2.1 pipeline accepts **one to ten reference images**.
+Native image-conditioned generation is under construction; it is not exposed
+through the public generation API yet. Integration tests use a 512x512 output
+budget so correctness work does not spend 1024 or 2048 generation time.
+
+The first completed checkpoint reproduces the pinned Diffusers/Qwen3-VL input
+contract: aspect-preserving area resize rounded to multiples of 32, one vision
+token per merged 2x2 group of 16px patches, one VAE condition latent per 16x16
+tile, the exact `<imageN>`/vision placeholder prompt layout, image-aware
+three-axis MRoPE positions, image-embedding substitution, and DeepStack feature
+injection after language layers 0, 1, and 2. For two square 512px references,
+that is 256 vision tokens and 1,024 VAE latent tokens per image. Together they
+produce 512 language-vision tokens and a 2,048-token VAE condition prefix; the
+512px output itself is another 1,024 latent tokens.
+
+The shape and MRoPE unit tests pass, the two-image tokenizer smoke produces the
+expected 512 placeholders, and the existing text-only encoder oracle remains
+unchanged at 0.0361069 output nRMSE. Remaining work is native image decode and
+resize, the Qwen3-VL vision tower, the VAE encoder, transformer condition-prefix
+assembly, and then CLI/C ABI exposure. Keeping those stages explicit avoids
+calling prompt plumbing end-to-end image editing before pixels have passed
+through both encoders.
+
 ## Package and API layout
 
 The repository is split into three C+ packages, but remains one product:
@@ -264,6 +289,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus benchmark-q4-direct-1024 transformer-q4.qipack /path/to/model/snapshot direct.png "your prompt" 1301 1
 ./cli/target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
 ./cli/target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
+./cli/target/debug/qwen-image-cplus test-multi-image-prompt /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```

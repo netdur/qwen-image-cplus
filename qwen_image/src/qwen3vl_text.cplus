@@ -1,4 +1,5 @@
 import "./mmap_macos" as mapped;
+import "./cpu_ops" as cpu;
 import "./safetensors" as safetensors;
 import "./tokenizer" as tokenizer;
 import "metal/metal" as metal;
@@ -132,6 +133,7 @@ struct Pipelines {
     qk_norm_rope: metal::ComputePipelineState,
     attention: metal::ComputePipelineState,
     add: metal::ComputePipelineState,
+    add_visual: metal::ComputePipelineState,
     swiglu: metal::ComputePipelineState,
 }
 
@@ -451,6 +453,89 @@ fn dispatch_element(
     return option::Option[f64]::Some((command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64);
 }
 
+fn dispatch_qk_rope(
+    queue: metal::CommandQueue,
+    pipeline_state: metal::ComputePipelineState,
+    input: metal::Buffer,
+    weight: Weight,
+    output: metal::Buffer,
+    positions: metal::Buffer,
+    params: *TextParams,
+    threads: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc =
+        OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(weight.storage, weight.offset, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_bytes(params as *u8, #size_of::[TextParams]() as u64, 3 as u64);
+    encoder.set_buffer(positions, 0 as u64, 4 as u64);
+    let width: u64 = pipeline_state.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: threads as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: width, height: 1 as u64, depth: 1 as u64 },
+    );
+    metal::CommandEncoder::from_raw(encoder.raw()).end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
+fn dispatch_add_visual(
+    queue: metal::CommandQueue,
+    pipeline_state: metal::ComputePipelineState,
+    input: metal::Buffer,
+    visual: metal::Buffer,
+    visual_offset: u64,
+    output: metal::Buffer,
+    visual_rows: metal::Buffer,
+    params: *TextParams,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc =
+        OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) =
+        command_buffer.compute_command_encoder() else {
+        return option::Option[f64]::None;
+    };
+    let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+    encoder.set_compute_pipeline_state(pipeline_state);
+    encoder.set_buffer(input, 0 as u64, 0 as u64);
+    encoder.set_buffer(visual, visual_offset, 1 as u64);
+    encoder.set_buffer(output, 0 as u64, 2 as u64);
+    encoder.set_bytes(params as *u8, #size_of::[TextParams]() as u64, 3 as u64);
+    encoder.set_buffer(visual_rows, 0 as u64, 4 as u64);
+    let threads: usize = (*params).rows as usize *% WIDTH;
+    let width: u64 = pipeline_state.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: threads as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: width, height: 1 as u64, depth: 1 as u64 },
+    );
+    metal::CommandEncoder::from_raw(encoder.raw()).end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return option::Option[f64]::Some(
+        (command_buffer.g_p_u_end_time() - command_buffer.g_p_u_start_time()) * 1000.0f64,
+    );
+}
+
 fn dispatch_attention(
     queue: metal::CommandQueue,
     pipeline_state: metal::ComputePipelineState,
@@ -541,13 +626,17 @@ fn run_impl(
     output_capacity: usize,
     output_row_count: *usize,
     validate_reference: bool,
+    position_ids: *u32 = 0 as *u32,
+    vision_embeddings: *f32 = 0 as *f32,
+    vision_token_count: usize = 0 as usize,
+    deepstack_embeddings: *f32 = 0 as *f32,
 ) -> i32 {
     if token_ids.is_null() {
         io::eprintln("text encoder: token IDs must not be null");
         return 2;
     }
     let rows: usize = token_count;
-    if rows <= SYSTEM_PREFIX_TOKENS || rows > (512 as usize) {
+    if rows <= SYSTEM_PREFIX_TOKENS || rows > (4096 as usize) {
         io::eprintln("text encoder: unsupported full token count ${rows}");
         return 1;
     }
@@ -555,6 +644,12 @@ fn run_impl(
     let output_values: usize = output_rows *% WIDTH;
     if !output.is_null() && output_capacity < output_values {
         io::eprintln("text encoder: output capacity ${output_capacity} is smaller than ${output_values}");
+        return 2;
+    }
+    if vision_embeddings.is_null() != (vision_token_count == (0 as usize))
+        || (!vision_embeddings.is_null()
+            && (position_ids.is_null() || deepstack_embeddings.is_null())) {
+        io::eprintln("text encoder: incomplete multimodal inputs");
         return 2;
     }
 
@@ -611,6 +706,9 @@ fn run_impl(
     guard let option::Option[OwnedObjc]::Some(qk_norm_rope_owner) = pipeline(device, library, "qt_qk_norm_rope") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(attention_owner) = pipeline(device, library, "qt_causal_gqa") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(add_owner) = pipeline(device, library, "qt_add") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(add_visual_owner) = pipeline(
+        device, library, "qt_add_visual",
+    ) else { return 1; };
     guard let option::Option[OwnedObjc]::Some(swiglu_owner) = pipeline(device, library, "qt_swiglu") else { return 1; };
     let pipelines: Pipelines = Pipelines {
         embedding: metal::ComputePipelineState::from_raw(embedding_owner.raw()),
@@ -619,6 +717,7 @@ fn run_impl(
         qk_norm_rope: metal::ComputePipelineState::from_raw(qk_norm_rope_owner.raw()),
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         add: metal::ComputePipelineState::from_raw(add_owner.raw()),
+        add_visual: metal::ComputePipelineState::from_raw(add_visual_owner.raw()),
         swiglu: metal::ComputePipelineState::from_raw(swiglu_owner.raw()),
     };
     let compile_wall_ms: i64 = time::now_millis() - compile_start_ms;
@@ -639,14 +738,77 @@ fn run_impl(
     let intermediate_bytes: u64 = (rows *% INTERMEDIATE_WIDTH *% #size_of::[f32]()) as u64;
     guard let option::Option[metal::Buffer]::Some(ids) = new_buffer(device, (rows *% #size_of::[u32]()) as u64) else { return 1; };
     let ids_owner: OwnedObjc = OwnedObjc::new(ids.raw());
+    guard let option::Option[metal::Buffer]::Some(positions) = new_buffer(
+        device, (rows *% (3 as usize) *% #size_of::[u32]()) as u64,
+    ) else { return 1; };
+    let positions_owner: OwnedObjc = OwnedObjc::new(positions.raw());
+    let position_values: *u32 = positions.contents() as *u32;
+    var position_row: usize = 0 as usize;
+    while position_row < rows {
+        var axis: usize = 0 as usize;
+        while axis < (3 as usize) {
+            position_values[position_row *% (3 as usize) +% axis] =
+                if position_ids.is_null() {
+                position_row as u32
+            } else {
+                position_ids[position_row *% (3 as usize) +% axis]
+            };
+            axis = axis +% (1 as usize);
+        }
+        position_row = position_row +% (1 as usize);
+    }
+    guard let option::Option[metal::Buffer]::Some(visual_rows) = new_buffer(
+        device, (rows *% #size_of::[i32]()) as u64,
+    ) else { return 1; };
+    let visual_rows_owner: OwnedObjc = OwnedObjc::new(visual_rows.raw());
+    let visual_row_values: *i32 = visual_rows.contents() as *i32;
+    var visual_row: usize = 0 as usize;
+    var row_index: usize = 0 as usize;
+    while row_index < rows {
+        if token_ids[row_index] == (151655 as u32) {
+            if vision_embeddings.is_null() || visual_row >= vision_token_count {
+                io::eprintln("text encoder: image placeholder has no vision feature");
+                return 2;
+            }
+            visual_row_values[row_index] = visual_row as i32;
+            visual_row = visual_row +% (1 as usize);
+        } else {
+            visual_row_values[row_index] = 0 -% (1 as i32);
+        }
+        row_index = row_index +% (1 as usize);
+    }
+    if visual_row != vision_token_count {
+        io::eprintln(
+            "text encoder: prompt has ${visual_row} image placeholders for ${vision_token_count} vision features",
+        );
+        return 2;
+    }
+    let deepstack_values: usize = (3 as usize) *% vision_token_count *% WIDTH;
+    guard let option::Option[metal::Buffer]::Some(deepstack) = new_buffer(
+        device,
+        if deepstack_values == (0 as usize) {
+            #size_of::[f32]() as u64
+        } else { (deepstack_values *% #size_of::[f32]()) as u64 },
+    ) else { return 1; };
+    let deepstack_owner: OwnedObjc = OwnedObjc::new(deepstack.raw());
+    if deepstack_values > (0 as usize) {
+        let deepstack_values_gpu: *f32 = deepstack.contents() as *f32;
+        var deepstack_index: usize = 0 as usize;
+        while deepstack_index < deepstack_values {
+            deepstack_values_gpu[deepstack_index] = deepstack_embeddings[deepstack_index];
+            deepstack_index = deepstack_index +% (1 as usize);
+        }
+    }
     guard let option::Option[metal::Buffer]::Some(embedding_rows) = new_buffer(device, (rows *% WIDTH *% #size_of::[u16]()) as u64) else { return 1; };
     let embedding_rows_owner: OwnedObjc = OwnedObjc::new(embedding_rows.raw());
     guard let option::Option[metal::Buffer]::Some(layer_storage_0) = new_buffer(device, LAYER_STREAM_BYTES as u64) else { return 1; };
     let layer_storage_0_owner: OwnedObjc = OwnedObjc::new(layer_storage_0.raw());
     guard let option::Option[metal::Buffer]::Some(layer_storage_1) = new_buffer(device, LAYER_STREAM_BYTES as u64) else { return 1; };
     let layer_storage_1_owner: OwnedObjc = OwnedObjc::new(layer_storage_1.raw());
-    guard let option::Option[metal::Buffer]::Some(hidden_a) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_a_owner: OwnedObjc = OwnedObjc::new(hidden_a.raw());
-    guard let option::Option[metal::Buffer]::Some(hidden_b) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_b_owner: OwnedObjc = OwnedObjc::new(hidden_b.raw());
+    guard let option::Option[metal::Buffer]::Some(hidden_a_buffer) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_a_owner: OwnedObjc = OwnedObjc::new(hidden_a_buffer.raw());
+    guard let option::Option[metal::Buffer]::Some(hidden_b_buffer) = new_buffer(device, hidden_bytes) else { return 1; }; let hidden_b_owner: OwnedObjc = OwnedObjc::new(hidden_b_buffer.raw());
+    var hidden_a: metal::Buffer = hidden_a_buffer;
+    var hidden_b: metal::Buffer = hidden_b_buffer;
     guard let option::Option[metal::Buffer]::Some(norm) = new_buffer(device, hidden_bytes) else { return 1; }; let norm_owner: OwnedObjc = OwnedObjc::new(norm.raw());
     guard let option::Option[metal::Buffer]::Some(query) = new_buffer(device, hidden_bytes) else { return 1; }; let query_owner: OwnedObjc = OwnedObjc::new(query.raw());
     guard let option::Option[metal::Buffer]::Some(key) = new_buffer(device, kv_bytes) else { return 1; }; let key_owner: OwnedObjc = OwnedObjc::new(key.raw());
@@ -672,18 +834,31 @@ fn run_impl(
             io::eprintln("text encoder: token ID ${token} exceeds vocabulary");
             return 1;
         }
-        if !stream_source_range(
-            reader_0,
-            reader_1,
-            reader_2,
-            reader_3,
-            compact_embedding + embedding_row *% embedding_row_bytes,
-            embedding_source,
-            token *% embedding_row_bytes as u64,
-            embedding_row_bytes,
-        ) {
-            io::eprintln("text encoder: could not stream embedding row ${embedding_row}");
-            return 1;
+        if token_ids[embedding_row] == (151655 as u32) && !vision_embeddings.is_null() {
+            let source_row: usize = visual_row_values[embedding_row] as usize;
+            let destination: *u16 =
+                (compact_embedding + embedding_row *% embedding_row_bytes) as *u16;
+            var column: usize = 0 as usize;
+            while column < WIDTH {
+                destination[column] = cpu::f32_to_bf16(
+                    vision_embeddings[source_row *% WIDTH +% column],
+                );
+                column = column +% (1 as usize);
+            }
+        } else {
+            if !stream_source_range(
+                reader_0,
+                reader_1,
+                reader_2,
+                reader_3,
+                compact_embedding + embedding_row *% embedding_row_bytes,
+                embedding_source,
+                token *% embedding_row_bytes as u64,
+                embedding_row_bytes,
+            ) {
+                io::eprintln("text encoder: could not stream embedding row ${embedding_row}");
+                return 1;
+            }
         }
         embedding_row = embedding_row +% (1 as usize);
     }
@@ -781,9 +956,15 @@ fn run_impl(
         guard let option::Option[f64]::Some(k_ms) = dispatch_linear(queue, pipelines.linear, norm, k_weight, key, rows, KV_WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + k_ms;
         guard let option::Option[f64]::Some(v_ms) = dispatch_linear(queue, pipelines.linear, norm, v_weight, value, rows, KV_WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + v_ms;
         params.heads = HEADS as u32;
-        guard let option::Option[f64]::Some(q_rope_ms) = dispatch_element(queue, pipelines.qk_norm_rope, query, q_norm.storage, query_rope, #addr_of(params), rows *% HEADS, 0 as u64, q_norm.offset) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + q_rope_ms;
+        guard let option::Option[f64]::Some(q_rope_ms) = dispatch_qk_rope(
+            queue, pipelines.qk_norm_rope, query, q_norm, query_rope,
+            positions, #addr_of(params), rows *% HEADS,
+        ) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + q_rope_ms;
         params.heads = KV_HEADS as u32;
-        guard let option::Option[f64]::Some(k_rope_ms) = dispatch_element(queue, pipelines.qk_norm_rope, key, k_norm.storage, key_rope, #addr_of(params), rows *% KV_HEADS, 0 as u64, k_norm.offset) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + k_rope_ms;
+        guard let option::Option[f64]::Some(k_rope_ms) = dispatch_qk_rope(
+            queue, pipelines.qk_norm_rope, key, k_norm, key_rope,
+            positions, #addr_of(params), rows *% KV_HEADS,
+        ) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + k_rope_ms;
         params.heads = HEADS as u32;
         guard let option::Option[f64]::Some(attention_ms) = dispatch_attention(queue, pipelines.attention, query_rope, key_rope, attended, value, #addr_of(params)) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + attention_ms;
         guard let option::Option[f64]::Some(o_ms) = dispatch_linear(queue, pipelines.linear, attended, o_weight, branch, rows, WIDTH, WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + o_ms;
@@ -794,6 +975,18 @@ fn run_impl(
         guard let option::Option[f64]::Some(swiglu_ms) = dispatch_element(queue, pipelines.swiglu, gate, up, activated, #addr_of(params), rows *% INTERMEDIATE_WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + swiglu_ms;
         guard let option::Option[f64]::Some(down_ms) = dispatch_linear(queue, pipelines.linear, activated, down_weight, branch, rows, WIDTH, INTERMEDIATE_WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + down_ms;
         guard let option::Option[f64]::Some(add_mlp_ms) = dispatch_element(queue, pipelines.add, hidden_b, branch, hidden_a, #addr_of(params), rows *% WIDTH) else { let _joined: i64 = prefetch_handle.join(); return 1; }; total_ms = total_ms + add_mlp_ms;
+        if layer < (3 as usize) && vision_token_count > (0 as usize) {
+            let deepstack_offset: u64 =
+                (layer *% vision_token_count *% WIDTH *% #size_of::[f32]()) as u64;
+            guard let option::Option[f64]::Some(deepstack_ms) = dispatch_add_visual(
+                queue, pipelines.add_visual, hidden_a, deepstack, deepstack_offset,
+                hidden_b, visual_rows, #addr_of(params),
+            ) else { let _joined: i64 = prefetch_handle.join(); return 1; };
+            total_ms = total_ms + deepstack_ms;
+            let swapped: metal::Buffer = hidden_a;
+            hidden_a = hidden_b;
+            hidden_b = swapped;
+        }
         let prefetch_wait_start_ms: i64 = time::now_millis();
         prefetched_stream_wall_ms = prefetch_handle.join();
         let prefetch_wait_wall_ms: i64 = time::now_millis() - prefetch_wait_start_ms;
@@ -882,6 +1075,29 @@ fn encode_tokens_to_host(
         output_capacity,
         output_row_count,
         false,
+    );
+}
+
+fn encode_multimodal_tokens_to_host(
+    model_root: str,
+    token_ids: *u32,
+    token_count: usize,
+    position_ids: *u32,
+    vision_embeddings: *f32,
+    vision_token_count: usize,
+    deepstack_embeddings: *f32,
+    output: *f32,
+    output_capacity: usize,
+    output_row_count: *usize,
+) -> i32 {
+    if output.is_null() || output_row_count.is_null() {
+        io::eprintln("text encoder: integrated output pointers must not be null");
+        return 2;
+    }
+    return run_impl(
+        model_root, token_ids, token_count, "", output, output_capacity,
+        output_row_count, false, position_ids, vision_embeddings,
+        vision_token_count, deepstack_embeddings,
     );
 }
 

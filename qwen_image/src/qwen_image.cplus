@@ -4,3 +4,4 @@
 // package remains entry-less so C+ can prebuild every module into one archive.
 
 import "./api" as _;
+import "./image_conditioning" as _;
