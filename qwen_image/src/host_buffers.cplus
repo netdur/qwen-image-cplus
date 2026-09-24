@@ -2,9 +2,32 @@
 // when allocation fails. (Typed rather than generic: a generic fill value
 // would have to be moved on every append.)
 
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/io" as io;
 import "stdlib/option" as option;
+import "stdlib/result" as result;
 import "stdlib/status" as status;
+import "stdlib/text" as text;
 import "stdlib/vec" as vec;
+
+// Debug tensor dumps for comparing against the Python reference. When
+// QI_DUMP_DIR is set, `values` is written raw (little-endian) to
+// ${QI_DUMP_DIR}/${name}; otherwise nothing happens.
+fn dump_bytes(name: str, values: *u8, count: usize) {
+    guard let option::Option[text::Text]::Some(directory) = env::var("QI_DUMP_DIR") else { return; };
+    var bytes: vec::Vec[u8] = vec::Vec[u8]::with_capacity(count);
+    if bytes.extend_from_raw(values, count) != status::Status::Ok { return; }
+    let path: text::Text = "${directory}/${name}";
+    match fs::write_string(path.view(), bytes.as_byte_view()) {
+        result::Result::Ok(_) => { io::println("dump: ${path} bytes=${count}"); }
+        result::Result::Err(_) => { io::eprintln("dump: could not write ${path}"); }
+    }
+}
+
+fn dump_f32(name: str, values: *f32, count: usize) {
+    dump_bytes(name, values as *u8, count *% (4 as usize));
+}
 
 fn zeroed_f32(count: usize) -> option::Option[vec::Vec[f32]] {
     var values: vec::Vec[f32] = vec::Vec[f32]::with_capacity(count);

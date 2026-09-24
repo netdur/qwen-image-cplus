@@ -80,7 +80,18 @@ struct Pipelines {
     attention: metal::ComputePipelineState,
     softmax: metal::ComputePipelineState,
     round_bf16: metal::ComputePipelineState,
+    bf16_to_f32: metal::ComputePipelineState,
+    bias_round: metal::ComputePipelineState,
+    // Linears with at least MPS_LINEAR_MIN_ROWS rows run as MPS FP32
+    // multiplications; `linear_scratch` holds one expanded weight matrix.
+    mps_linear: bool,
+    device: metal::Device,
+    linear_scratch: metal::Buffer,
 }
+
+// Below this many patch rows the scalar kernel is cheaper than expanding the
+// BF16 weights first.
+const MPS_LINEAR_MIN_ROWS: usize = 256;
 
 fn round_up(value: usize, alignment: usize) -> usize {
     return (value +% alignment -% (1 as usize)) / alignment *% alignment;
@@ -224,6 +235,93 @@ fn finish(
 }
 
 fn dispatch_linear(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    input: metal::Buffer,
+    weight: Weight,
+    bias: Weight,
+    output: metal::Buffer,
+    rows: usize,
+    output_width: usize,
+    input_width: usize,
+) -> option::Option[f64] {
+    if pipelines.mps_linear && rows >= MPS_LINEAR_MIN_ROWS {
+        return dispatch_linear_mps(
+            queue, pipelines, input, weight, bias, output, rows, output_width, input_width,
+        );
+    }
+    return dispatch_linear_scalar(
+        queue, pipelines.linear, input, weight, bias, output, rows, output_width, input_width,
+    );
+}
+
+fn dispatch_count(
+    encoder: metal::ComputeCommandEncoder,
+    pipeline_state: metal::ComputePipelineState,
+    count: usize,
+) {
+    let width: u64 = pipeline_state.thread_execution_width();
+    encoder.dispatch_threads(
+        metal::Size { width: count as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: width, height: 1 as u64, depth: 1 as u64 },
+    );
+}
+
+// output = bf16(input x W^T + bias): the BF16 weight is expanded to FP32
+// scratch, multiplied by MPS, then biased and rounded, in one command buffer.
+fn dispatch_linear_mps(
+    queue: metal::CommandQueue,
+    pipelines: Pipelines,
+    input: metal::Buffer,
+    weight: Weight,
+    bias: Weight,
+    output: metal::Buffer,
+    rows: usize,
+    output_width: usize,
+    input_width: usize,
+) -> option::Option[f64] {
+    let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
+    if pool_pointer.is_null() { return option::Option[f64]::None; }
+    let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
+    guard let option::Option[mps::Multiplication]::Some(operation) = mps::create_fp32(
+        pipelines.device,
+        mps::Fp32Operand { buffer: input, offset: 0 as u64, rows: rows, columns: input_width, row_bytes: input_width *% #size_of::[f32]() },
+        mps::Fp32Operand { buffer: pipelines.linear_scratch, offset: 0 as u64, rows: output_width, columns: input_width, row_bytes: input_width *% #size_of::[f32]() },
+        mps::Fp32Operand { buffer: output, offset: 0 as u64, rows: rows, columns: output_width, row_bytes: output_width *% #size_of::[f32]() },
+        false, true, input_width, 1.0f64,
+    ) else { return option::Option[f64]::None; };
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return option::Option[f64]::None; };
+    let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(convert_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let convert_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(convert_encoder.raw()));
+    var weight_count: u32 = (output_width *% input_width) as u32;
+    convert_encoder.set_compute_pipeline_state(pipelines.bf16_to_f32);
+    convert_encoder.set_buffer(weight.storage, weight.offset, 0 as u64);
+    convert_encoder.set_buffer(pipelines.linear_scratch, 0 as u64, 1 as u64);
+    convert_encoder.set_bytes(#addr_of(weight_count) as *u8, #size_of::[u32]() as u64, 2 as u64);
+    dispatch_count(convert_encoder, pipelines.bf16_to_f32, weight_count as usize);
+    metal::CommandEncoder::from_raw(convert_encoder.raw()).end_encoding();
+    operation.encode(command_buffer);
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(bias_encoder) =
+        command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
+    let bias_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(bias_encoder.raw()));
+    var params: VisionParams = VisionParams {
+        rows: rows as u32, width: input_width as u32,
+        output_width: output_width as u32, input_width: input_width as u32,
+        heads: HEADS as u32, head_dimension: HEAD_DIMENSION as u32,
+        epsilon: 0.000001f32, rope_theta: 10000.0f32,
+    };
+    bias_encoder.set_compute_pipeline_state(pipelines.bias_round);
+    bias_encoder.set_buffer(output, 0 as u64, 0 as u64);
+    bias_encoder.set_buffer(bias.storage, bias.offset, 1 as u64);
+    bias_encoder.set_bytes(#addr_of(params) as *u8, #size_of::[VisionParams]() as u64, 2 as u64);
+    dispatch_count(bias_encoder, pipelines.bias_round, rows *% output_width);
+    return option::Option[f64]::Some(finish(command_buffer, bias_encoder));
+}
+
+fn dispatch_linear_scalar(
     queue: metal::CommandQueue,
     pipeline_state: metal::ComputePipelineState,
     input: metal::Buffer,
@@ -767,7 +865,7 @@ fn execute_merger(
         norm_rows, norm_width,
     ) else { return false; };
     guard let option::Option[f64]::Some(_fc1_ms) = dispatch_linear(
-        queue, pipelines.linear, norm, fc1_weight, fc1_bias, wide_a,
+        queue, pipelines, norm, fc1_weight, fc1_bias, wide_a,
         merged_rows, MERGED_WIDTH, MERGED_WIDTH,
     ) else { return false; };
     guard let option::Option[f64]::Some(_gelu_ms) = dispatch_element(
@@ -775,7 +873,7 @@ fn execute_merger(
         merged_rows, MERGED_WIDTH, false,
     ) else { return false; };
     guard let option::Option[f64]::Some(_fc2_ms) = dispatch_linear(
-        queue, pipelines.linear, wide_b, fc2_weight, fc2_bias, output,
+        queue, pipelines, wide_b, fc2_weight, fc2_bias, output,
         merged_rows, OUTPUT_WIDTH, MERGED_WIDTH,
     ) else { return false; };
     if !finite(output, merged_rows *% OUTPUT_WIDTH) { return false; }
@@ -921,9 +1019,25 @@ fn encode_batch_to_host(
     guard let option::Option[OwnedObjc]::Some(round_owner) = pipeline(
         device, library, "qv_round_bf16_inplace",
     ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(bf16_to_f32_owner) = pipeline(
+        device, library, "qv_bf16_to_f32",
+    ) else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(bias_round_owner) = pipeline(
+        device, library, "qv_bias_round_bf16",
+    ) else { return 1; };
     let use_mps_attention: bool = !env::has_var("QI_DISABLE_VISION_MPS_ATTENTION")
         && mps::load_framework();
     let validate_attention: bool = env::has_var("QI_VALIDATE_VISION_ATTENTION");
+    let use_mps_linear: bool = !env::has_var("QI_DISABLE_VISION_MPS_LINEAR")
+        && mps::load_framework();
+    // The largest weight is the merger's MERGED_WIDTH x MERGED_WIDTH fc1.
+    guard let option::Option[metal::Buffer]::Some(linear_scratch) = new_buffer(
+        device,
+        if use_mps_linear {
+            (MERGED_WIDTH *% MERGED_WIDTH *% #size_of::[f32]()) as u64
+        } else { #size_of::[f32]() as u64 },
+    ) else { return 1; };
+    let linear_scratch_owner: OwnedObjc = OwnedObjc::new(linear_scratch.raw());
     let pipelines: Pipelines = Pipelines {
         linear: metal::ComputePipelineState::from_raw(linear_owner.raw()),
         norm: metal::ComputePipelineState::from_raw(norm_owner.raw()),
@@ -933,6 +1047,11 @@ fn encode_batch_to_host(
         attention: metal::ComputePipelineState::from_raw(attention_owner.raw()),
         softmax: metal::ComputePipelineState::from_raw(softmax_owner.raw()),
         round_bf16: metal::ComputePipelineState::from_raw(round_owner.raw()),
+        bf16_to_f32: metal::ComputePipelineState::from_raw(bf16_to_f32_owner.raw()),
+        bias_round: metal::ComputePipelineState::from_raw(bias_round_owner.raw()),
+        mps_linear: use_mps_linear,
+        device: device,
+        linear_scratch: linear_scratch,
     };
 
     guard let option::Option[metal::Buffer]::Some(storage) = new_buffer(
@@ -1095,7 +1214,7 @@ fn encode_loaded(
         file, storage, region_begin, "model.visual.patch_embed.proj.bias", WIDTH as u64,
     ) else { return 1; };
     guard let option::Option[f64]::Some(_patch_ms) = dispatch_linear(
-        queue, pipelines.linear, patches, patch_weight, patch_bias, hidden_a,
+        queue, pipelines, patches, patch_weight, patch_bias, hidden_a,
         patch_rows, WIDTH, PATCH_VALUES,
     ) else { return 1; };
     guard let option::Option[f64]::Some(_position_ms) = dispatch_element(
@@ -1163,7 +1282,7 @@ fn encode_loaded(
             patch_rows, WIDTH,
         ) else { return 1; };
         guard let option::Option[f64]::Some(qkv_ms) = dispatch_linear(
-            queue, pipelines.linear, norm, qkv_weight, qkv_bias, qkv,
+            queue, pipelines, norm, qkv_weight, qkv_bias, qkv,
             patch_rows, (3 as usize) *% WIDTH, WIDTH,
         ) else { return 1; };
         guard let option::Option[f64]::Some(rope_ms) = dispatch_rope(
@@ -1190,7 +1309,7 @@ fn encode_loaded(
             );
         }
         guard let option::Option[f64]::Some(proj_ms) = dispatch_linear(
-            queue, pipelines.linear, attended, proj_weight, proj_bias, branch,
+            queue, pipelines, attended, proj_weight, proj_bias, branch,
             patch_rows, WIDTH, WIDTH,
         ) else { return 1; };
         guard let option::Option[f64]::Some(attention_add_ms) = dispatch_element(
@@ -1204,7 +1323,7 @@ fn encode_loaded(
             patch_rows, WIDTH,
         ) else { return 1; };
         guard let option::Option[f64]::Some(fc1_ms) = dispatch_linear(
-            queue, pipelines.linear, norm, fc1_weight, fc1_bias, intermediate_a,
+            queue, pipelines, norm, fc1_weight, fc1_bias, intermediate_a,
             patch_rows, INTERMEDIATE_WIDTH, WIDTH,
         ) else { return 1; };
         guard let option::Option[f64]::Some(gelu_ms) = dispatch_element(
@@ -1212,7 +1331,7 @@ fn encode_loaded(
             patch_rows, INTERMEDIATE_WIDTH, false,
         ) else { return 1; };
         guard let option::Option[f64]::Some(fc2_ms) = dispatch_linear(
-            queue, pipelines.linear, intermediate_b, fc2_weight, fc2_bias, branch,
+            queue, pipelines, intermediate_b, fc2_weight, fc2_bias, branch,
             patch_rows, WIDTH, INTERMEDIATE_WIDTH,
         ) else { return 1; };
         guard let option::Option[f64]::Some(mlp_add_ms) = dispatch_element(
@@ -1262,7 +1381,7 @@ fn encode_loaded(
         output, fixture_directory, "output", merged_rows *% OUTPUT_WIDTH,
     ) { return 1; }
     io::println(
-        "Qwen3-VL vision encoder: image=${width}x${height} patches=${patch_rows} tokens=${merged_rows} weight_region_bytes=${region_bytes} weight_read_ms=${weight_read_ms} block_gpu_ms=${total_gpu_ms} mps_attention=${use_mps_attention} attention_gpu_ms=${attention_gpu_ms} linear_gpu_ms=${linear_gpu_ms} total_wall_ms=${time::now_millis() - started_ms} finite=verified",
+        "Qwen3-VL vision encoder: image=${width}x${height} patches=${patch_rows} tokens=${merged_rows} weight_region_bytes=${region_bytes} weight_read_ms=${weight_read_ms} block_gpu_ms=${total_gpu_ms} mps_attention=${use_mps_attention} mps_linear=${pipelines.mps_linear && patch_rows >= MPS_LINEAR_MIN_ROWS} attention_gpu_ms=${attention_gpu_ms} linear_gpu_ms=${linear_gpu_ms} total_wall_ms=${time::now_millis() - started_ms} finite=verified",
     );
     return 0;
 }

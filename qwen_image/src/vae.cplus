@@ -1,3 +1,4 @@
+import "./host_buffers" as host_buffers;
 import "./mmap_macos" as mapped;
 import "./mps_graph_attention" as graph_attention;
 import "./mps_graph_conv" as graph_conv;
@@ -1815,7 +1816,10 @@ fn encode_loaded(
         return 1;
     };
     let command_buffer: metal::CommandBuffer = context.metal();
-    let deferred: *u8 = command_buffer.raw();
+    // QI_DUMP_DIR runs each dispatch synchronously so stage outputs can be
+    // written for comparison with the reference encoder.
+    let dump_stages: bool = env::has_var("QI_DUMP_DIR");
+    let deferred: *u8 = if dump_stages { 0 as *u8 } else { command_buffer.raw() };
     var total_ms: f64 = 0.0f64;
 
     guard let option::Option[ConvWeight]::Some(conv_in) = conv_weight(
@@ -1827,6 +1831,12 @@ fn encode_loaded(
         3 as usize, 1 as usize, false, deferred,
     ) else { return 1; };
     total_ms = total_ms + conv_in_ms;
+    if dump_stages {
+        host_buffers::dump_f32(
+            "vae_encode_conv_in.f32", buffer_a.contents() as *f32,
+            input_height *% input_width *% (96 as usize),
+        );
+    }
 
     let input_channels_by_block: [usize; 5] = [
         96 as usize, 96 as usize, 192 as usize, 384 as usize, 768 as usize,
@@ -1903,6 +1913,12 @@ fn encode_loaded(
             ) else { return 1; };
             total_ms = total_ms + outer_add_ms;
         }
+        if dump_stages {
+            let stage: text::Text = "vae_encode_down_${block}.f32";
+            host_buffers::dump_f32(
+                stage.view(), current.contents() as *f32, height *% width *% output_channels,
+            );
+        }
         block = block +% (1 as usize);
     }
 
@@ -1968,6 +1984,11 @@ fn encode_loaded(
         + projection_ms + attention_add_ms + mid_residual_1_ms;
     current = other;
 
+    if dump_stages {
+        host_buffers::dump_f32(
+            "vae_encode_mid.f32", current.contents() as *f32, latent_pixels *% (768 as usize),
+        );
+    }
     guard let option::Option[u64]::Some(final_norm) = gamma_offset(
         file, "encoder.norm_out.gamma", 768 as usize,
     ) else { return 1; };
@@ -1992,6 +2013,11 @@ fn encode_loaded(
         1 as usize, 0 as usize, false, deferred,
     ) else { return 1; };
     total_ms = total_ms + final_norm_ms + conv_out_ms + quant_ms;
+    if dump_stages {
+        host_buffers::dump_f32(
+            "vae_encode_conv_out.f32", buffer_d.contents() as *f32, latent_pixels *% (128 as usize),
+        );
+    }
 
     let command_wait_started_ms: i64 = time::now_millis();
     command_buffer.commit();

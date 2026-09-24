@@ -140,6 +140,8 @@ struct Pipelines {
     bf16_to_f32: metal::ComputePipelineState,
     round_bf16: metal::ComputePipelineState,
     causal_softmax: metal::ComputePipelineState,
+    bf16_to_f16: metal::ComputePipelineState,
+    f32_to_f16: metal::ComputePipelineState,
 }
 
 // Long prompts (reference images add a vision token per merged patch) run
@@ -147,8 +149,11 @@ struct Pipelines {
 // weight matrix at a time.
 struct MpsLinear {
     enabled: bool,
+    // FP16 operands with FP32 accumulation; otherwise FP32 throughout.
+    half_precision: bool,
     device: metal::Device,
     scratch: metal::Buffer,
+    input_scratch: metal::Buffer,
 }
 
 // Below this many rows the linears are bandwidth-bound on the BF16 weights,
@@ -465,23 +470,41 @@ fn dispatch_linear_mps(
     let pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
     if pool_pointer.is_null() { return option::Option[f64]::None; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
-    guard let option::Option[mps::Multiplication]::Some(operation) = mps::create_fp32(
-        linear.device,
-        mps::Fp32Operand { buffer: input, offset: 0 as u64, rows: rows, columns: input_columns, row_bytes: input_columns *% #size_of::[f32]() },
-        mps::Fp32Operand { buffer: linear.scratch, offset: 0 as u64, rows: output_columns, columns: input_columns, row_bytes: input_columns *% #size_of::[f32]() },
-        mps::Fp32Operand { buffer: output, offset: 0 as u64, rows: rows, columns: output_columns, row_bytes: output_columns *% #size_of::[f32]() },
-        false, true, input_columns, 1.0f64,
-    ) else { return option::Option[f64]::None; };
+    guard let option::Option[mps::Multiplication]::Some(operation) = if linear.half_precision {
+        mps::create(
+            linear.device, linear.input_scratch, 0 as u64, linear.scratch, 0 as u64,
+            output, 0 as u64, rows, output_columns, input_columns,
+        )
+    } else {
+        mps::create_fp32(
+            linear.device,
+            mps::Fp32Operand { buffer: input, offset: 0 as u64, rows: rows, columns: input_columns, row_bytes: input_columns *% #size_of::[f32]() },
+            mps::Fp32Operand { buffer: linear.scratch, offset: 0 as u64, rows: output_columns, columns: input_columns, row_bytes: input_columns *% #size_of::[f32]() },
+            mps::Fp32Operand { buffer: output, offset: 0 as u64, rows: rows, columns: output_columns, row_bytes: output_columns *% #size_of::[f32]() },
+            false, true, input_columns, 1.0f64,
+        )
+    } else { return option::Option[f64]::None; };
     guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else { return option::Option[f64]::None; };
     let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
     guard let option::Option[metal::ComputeCommandEncoder]::Some(convert_encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
     let convert_encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(convert_encoder.raw()));
     var weight_count: u32 = (output_columns *% input_columns) as u32;
-    convert_encoder.set_compute_pipeline_state(pipelines.bf16_to_f32);
+    let weight_pipeline: metal::ComputePipelineState = if linear.half_precision {
+        pipelines.bf16_to_f16
+    } else { pipelines.bf16_to_f32 };
+    convert_encoder.set_compute_pipeline_state(weight_pipeline);
     convert_encoder.set_buffer(weight.storage, weight.offset, 0 as u64);
     convert_encoder.set_buffer(linear.scratch, 0 as u64, 1 as u64);
     convert_encoder.set_bytes(#addr_of(weight_count) as *u8, #size_of::[u32]() as u64, 2 as u64);
-    dispatch_one_count(convert_encoder, pipelines.bf16_to_f32, weight_count as usize);
+    dispatch_one_count(convert_encoder, weight_pipeline, weight_count as usize);
+    if linear.half_precision {
+        var input_count: u32 = (rows *% input_columns) as u32;
+        convert_encoder.set_compute_pipeline_state(pipelines.f32_to_f16);
+        convert_encoder.set_buffer(input, 0 as u64, 0 as u64);
+        convert_encoder.set_buffer(linear.input_scratch, 0 as u64, 1 as u64);
+        convert_encoder.set_bytes(#addr_of(input_count) as *u8, #size_of::[u32]() as u64, 2 as u64);
+        dispatch_one_count(convert_encoder, pipelines.f32_to_f16, input_count as usize);
+    }
     metal::CommandEncoder::from_raw(convert_encoder.raw()).end_encoding();
     operation.encode(command_buffer);
     guard let option::Option[metal::ComputeCommandEncoder]::Some(round_encoder) = command_buffer.compute_command_encoder() else { return option::Option[f64]::None; };
@@ -883,6 +906,8 @@ fn run_impl(
     guard let option::Option[OwnedObjc]::Some(bf16_to_f32_owner) = pipeline(device, library, "qt_bf16_to_f32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(round_bf16_owner) = pipeline(device, library, "qt_round_bf16_inplace") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(causal_softmax_owner) = pipeline(device, library, "qt_causal_row_softmax") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(bf16_to_f16_owner) = pipeline(device, library, "qt_bf16_to_f16") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(f32_to_f16_owner) = pipeline(device, library, "qt_f32_to_f16") else { return 1; };
     let pipelines: Pipelines = Pipelines {
         embedding: metal::ComputePipelineState::from_raw(embedding_owner.raw()),
         rms_norm: metal::ComputePipelineState::from_raw(rms_norm_owner.raw()),
@@ -895,6 +920,8 @@ fn run_impl(
         bf16_to_f32: metal::ComputePipelineState::from_raw(bf16_to_f32_owner.raw()),
         round_bf16: metal::ComputePipelineState::from_raw(round_bf16_owner.raw()),
         causal_softmax: metal::ComputePipelineState::from_raw(causal_softmax_owner.raw()),
+        bf16_to_f16: metal::ComputePipelineState::from_raw(bf16_to_f16_owner.raw()),
+        f32_to_f16: metal::ComputePipelineState::from_raw(f32_to_f16_owner.raw()),
     };
     let compile_wall_ms: i64 = time::now_millis() - compile_start_ms;
 
@@ -1018,10 +1045,20 @@ fn run_impl(
         } else { #size_of::[f32]() as u64 },
     ) else { return 1; };
     let attention_scores_owner: OwnedObjc = OwnedObjc::new(attention_scores.raw());
+    let half_linear: bool = use_mps_linear && !env::has_var("QI_DISABLE_TEXT_FP16_LINEAR");
+    guard let option::Option[metal::Buffer]::Some(linear_input_scratch) = new_buffer(
+        device,
+        if half_linear {
+            (rows *% INTERMEDIATE_WIDTH *% #size_of::[u16]()) as u64
+        } else { #size_of::[u16]() as u64 },
+    ) else { return 1; };
+    let linear_input_scratch_owner: OwnedObjc = OwnedObjc::new(linear_input_scratch.raw());
     let mps_linear: MpsLinear = MpsLinear {
         enabled: use_mps_linear,
+        half_precision: half_linear,
         device: device,
         scratch: linear_scratch,
+        input_scratch: linear_input_scratch,
     };
     let scratch_wall_ms: i64 = time::now_millis() - scratch_start_ms;
 
@@ -1251,7 +1288,7 @@ fn run_impl(
         if error > (0.04f64) { return 1; }
         io::println("Qwen3-VL native text conditioning: verified");
     } else {
-        io::println("Qwen3-VL text encoder: full_tokens=${rows} output_tokens=${output_rows} gpu_ms=${total_ms} attention_gpu_ms=${attention_total_ms} mps_linear=${use_mps_linear} mps_attention=${use_mps_attention} finite=${finite_ok}");
+        io::println("Qwen3-VL text encoder: full_tokens=${rows} output_tokens=${output_rows} gpu_ms=${total_ms} attention_gpu_ms=${attention_total_ms} mps_linear=${use_mps_linear} fp16_linear=${half_linear} mps_attention=${use_mps_attention} finite=${finite_ok}");
     }
     return 0;
 }

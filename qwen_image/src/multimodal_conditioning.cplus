@@ -139,6 +139,10 @@ fn encode_images(
         model_root, #slice_ptr(vision_inputs.as_slice()), image_count,
     ) != (0 as i32) { return option::Option[Encoded]::None; }
     vision_ms = time::now_millis() - vision_start_ms;
+    host_buffers::dump_f32("vision_features.f32", vision_values, vision_rows *% WIDTH);
+    host_buffers::dump_f32(
+        "deepstack_features.f32", deep_values, DEEPSTACK_LAYERS *% vision_rows *% WIDTH,
+    );
     let vae_start_ms: i64 = time::now_millis();
     if vae::encode_batch_from_host(
         model_root, #slice_ptr(vae_inputs.as_slice()), image_count,
@@ -331,6 +335,18 @@ fn run_multi_image_transformer(
     guard let option::Option[vec::Vec[f32]]::Some(target) = host_buffers::zeroed_f32(
         target_rows *% LATENT_CHANNELS,
     ) else { return 1; };
+    host_buffers::dump_f32(
+        "prompt_embeddings.f32", #slice_ptr(encoded.prompt_embeddings.as_slice()),
+        encoded.prompt_rows *% WIDTH,
+    );
+    host_buffers::dump_bytes(
+        "prompt_image_mask.u8", #slice_ptr(encoded.prompt_image_mask.as_slice()),
+        encoded.prompt_rows,
+    );
+    host_buffers::dump_f32(
+        "condition_latents.f32", #slice_ptr(encoded.condition_latents.as_slice()),
+        encoded.condition_rows *% LATENT_CHANNELS,
+    );
     let transformer_start_ms: i64 = time::now_millis();
     let result: i32 = transformer::run_conditioned_trajectory_sized_to_host(
         packed_path,
@@ -348,6 +364,9 @@ fn run_multi_image_transformer(
         requested_steps,
     );
     let transformer_ms: i64 = time::now_millis() - transformer_start_ms;
+    host_buffers::dump_f32(
+        "final_latent.f32", #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
+    );
     if result != (0 as i32) || !finite_nonzero(
         #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
     ) {

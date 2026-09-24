@@ -189,10 +189,10 @@ The native VAE condition encoder is also structurally complete. It implements
 the five down blocks, four 2x spatial reductions, middle attention, posterior
 mode selection, and per-channel latent normalization. A 32x32 smoke produces
 four finite nonzero latent tokens; the requested 512-area smoke encodes the
-736x352 reference into 1,012 finite nonzero 64-channel tokens. These are
-structural acceptance checks, not a numerical equivalence claim: its compact
-official-Python oracle generator is checked in, but its external dependency is
-not installed in the working Python environment.
+736x352 reference into 1,012 finite nonzero 64-channel tokens. It is now also
+numerically validated (see "Image-conditioned validation against the pinned
+Python pipeline" below): 0.0055 normalized-latent nRMSE against an FP32 CPU
+reference on a 1024x1024 image.
 
 The native Qwen3-VL vision tower is complete and independently measured. It
 implements the pinned BF16 patch projection, exact 48x48 learned-position
@@ -302,6 +302,7 @@ uses the official 40 uncached steps.
 | Viggle 4-step, 1 image | 47.5 s (vision 30.3, text 16.4, VAE 0.8) | 60.4 s | 110.4 s | 7.2 GB |
 | Viggle 4-step, 1 image, MPS vision attention | 23.1 s (vision 6.2, text 16.1, VAE 0.8) | 61.1 s | 86.6 s | 7.2 GB |
 | Viggle 4-step, 1 image, + MPS text linears and attention | 10.6 s (vision 5.5, text 4.3, VAE 0.8) | 59.7 s | **72.5 s** | 7.2 GB |
+| + MPS vision linears, FP16-operand text linears | **6.4 s** (vision 2.6, text 2.9, VAE 0.8) | see note | about 68 s | 7.2 GB |
 | Base 40 steps Cache-DiT 0.16, text | 2.2 s text | 119.4 s | **123.8 s** | 16.0 GB |
 | Base 40 steps uncached, text | 2.2 s text | 435.2 s | **440.6 s** | 7.0 GB |
 | Base 40 steps uncached, 1 image | 59.7 s (vision 36.5, text 22.3, VAE 0.8) | 683.8 s | **746.4 s** | 7.2 GB |
@@ -324,13 +325,80 @@ head h reading KV head h/4. The encoder drops from **16.1 s to 4.3 s**
 nRMSE 0.0324 against 0.0361. Shorter prompts keep the original kernels, where
 the weight reads dominate; the 1024 Viggle text-only PNG is byte-identical.
 `QI_DISABLE_TEXT_MPS_LINEAR` and `QI_DISABLE_TEXT_MPS_ATTENTION` restore the
-old kernels. With both encoders fixed, one 1024 reference adds about 33 s to
+old kernels.
+
+Two further encoder changes bring conditioning from 10.6 s to **6.4 s**:
+
+- **Vision linears** at 256+ patch rows use the same three-step MPS linear,
+  with a BF16 bias-and-round epilogue matching the scalar kernel's. On a 1024
+  reference they drop from 2.93 s to 0.48 s (tower 5.5 to 2.4 s). The vision
+  features are bit-identical in accuracy: 0.0934 nRMSE against FP32 before and
+  after. `QI_DISABLE_VISION_MPS_LINEAR` restores the scalar kernel.
+- **Text-encoder linears** take FP16 operands with FP32 accumulation. BF16
+  weights and BF16-rounded activations convert to FP16 exactly within its
+  range, and non-finite output would fail the encoder's finite check. Encoder
+  GPU time drops from 6.4 s to 2.5 s. Against the reference language model
+  (same vision in), image rows improve from 0.089 to 0.074 and text rows move
+  from 0.031 to 0.036; the forced 22-row oracle moves from 0.0324 to 0.0379
+  (the original kernel's figure was 0.0361). `QI_DISABLE_TEXT_FP16_LINEAR`
+  keeps the FP32 multiplication.
+
+The end-to-end run for this row had background GPU load (a running GUI build
+and a Chrome renderer held the GPU at 13-16%), which slowed the unchanged
+denoising steps (step 1 32.5 s against 26.6 s). The total shown is 72.5 s minus
+the measured 4.2 s conditioning saving, not a clean measurement.
+
+With the encoders fixed, denoising is compute-bound near the M1 Max limit.
+Step 1 processes about 9.2k rows: about 131 TFLOP of matrix multiplication
+(7.1 B parameters) plus about 45 TFLOP of attention, which at 26.3 s is about
+6.7 TFLOP/s against roughly 10.4 TFLOP/s peak. Each cached step (about 78
+TFLOP) runs at the same rate. The flash kernel is slower than the MPSGraph and
+steel attention here (step 1 30.3 s, cached steps 15.1 s). Further image-mode
+savings therefore need less work, not faster kernels: reusing the text and
+reference prefix across seeds, or fewer reference tokens. With both encoders fixed, one 1024 reference adds about 33 s to
 the distilled run (39.0 to 72.5 s), almost all of it in denoising: step 1
 covers about 9.2k rows (26 s against 9 s), and each cached step attends to
 4,096 extra keys (about 11.4 s against 8.4 s). The Viggle image run performed
 the edit (MARRAKECH, scene and tagline kept). The base run reproduced the
 reference but kept CASABLANCA, over-saturated; that quality difference is not
 yet explained.
+
+### Image-conditioned validation against the pinned Python pipeline
+
+On 2026-09-24 the base pack ignored an edit instruction that the distilled pack
+followed ("Change the headline to "MARRAKECH""; one 1024x1024 reference). To
+tell a native bug from model behaviour, each stage was compared against the
+pinned `QwenImage21Pipeline` (diffusers `80c7ed2`, transformers 5.17, torch
+2.9) with Viggle's distilled transformer (`bafc91e`, BF16), the same
+reference, prompt and seed. `QI_DUMP_DIR=dir` makes the native run write the
+tensors used here (vision and DeepStack features, prompt embeddings and
+image mask, condition latents, initial and final latents, and per-stage VAE
+encoder activations).
+
+| Stage | Native vs reference | Reference's own BF16 error |
+| --- | ---: | ---: |
+| Vision pixel values (resize, normalize, patch order) | 6.7e-8 | — |
+| Vision tower output, vs FP32 | 0.093 | 0.059 |
+| Language model, same vision features in, image / text rows | 0.089 / 0.031 | — |
+| VAE condition encode, vs FP32 on CPU | 0.0055 | — |
+| Transformer + scheduler, 4 steps, identical inputs (final latent) | 0.038 (image PSNR 30.3 dB) | — |
+
+The whole native conditioned path therefore matches the reference within BF16
+precision. The reference produces the same image, saturation included, so
+the base pack's result is model behaviour, not a native bug.
+
+Two reference-side findings came out of this:
+
+- PyTorch's MPS backend returns zeros from `QwenImage21AvgDown3D` (the
+  encoder's view/permute/mean shortcut) once the input reaches 512x512
+  (96->192 channels), while CPU is correct. The official pipeline run on a
+  Mac therefore encodes condition images wrongly: 0.59 latent nRMSE against
+  CPU FP32. The VAE encoder comparison above uses CPU for that reason.
+- The pipeline draws its initial noise with `torch.randn(..., dtype=bfloat16)`.
+  Native reproduces PyTorch's FP32 `randn` and rounds to BF16, which matched
+  the earlier trajectory fixtures but gives different noise for the same seed
+  than the current pipeline. The comparison above passes native's noise to
+  the pipeline through `latents=`.
 
 ## Package and API layout
 
@@ -2321,11 +2389,18 @@ right-side gutter so cards do not sit underneath the overlay scrollbar.
 The Settings window remains a simpler standalone screen with the default
 safe-area inset.
 
-The prompt is an editable text area with no placeholder. The disabled Create
-icon sits beside the Create heading until generation is connected. Width and
-height are text fields with live guidance for the current minimum and
-multiple-of-32 rule; seed accepts the engine's full unsigned 64-bit decimal
-range. Steps use a native picker containing the supported 3, 4, 8, 25, and
+The prompt is an editable text area with no placeholder. It receives focus on
+the generation window's first activation, but later activations do not steal
+focus back from another control. On AppKit the text-area node backs an
+`NSScrollView`, so the screen's `Active` handler focuses its inner `NSTextView`;
+nested child components do not receive `Active`. The disabled Create icon sits
+beside the Create heading until generation is connected. Width and
+height are digit-only text fields with live guidance for the current minimum
+and multiple-of-32 rule. The seed field also filters typed or pasted input to
+ASCII digits. It shares a row with a checkbox labeled Random, which disables
+manual entry without erasing its value; actual randomization awaits backend
+integration.
+Steps use a native picker containing the supported 3, 4, 8, 25, and
 40-step choices. The compact + button sits beside the reference-image count;
 the thumbnail strip is hidden when empty. A new image appears first and the
 strip returns to the left so it is immediately visible. Each local-file
@@ -2334,7 +2409,24 @@ top-left. The backing provides contrast against pale images, where a shadow
 alone was insufficient. At ten images the + button is disabled. These are
 local window inputs only: no model loads or inference runs, and the preview
 remains empty. The Settings window opens from the native menu and remains a
-placeholder. Preference storage is unwired.
+placeholder. Width, height, steps, Random mode, and the last valid manual seed
+persist through macOS UserDefaults in the stable
+`dev.netdur.qwen-image-cplus.preferences` domain. The GUI accepts only supported
+steps, dimensions of at least 256 in multiples of 32, and decimal seeds within
+the unsigned 64-bit range when loading or saving. The manual seed is stored as a
+string to preserve that full range; incomplete or invalid edits never replace
+the last valid saved value. The Model card opens a native file picker, displays
+the selected file name, and saves its full path in the same preferences domain;
+it does not load the model yet. The Reference Images and Model cards also accept
+Finder file drops anywhere on their surfaces. Both routes validate real local
+files: references accept common image extensions and stop at ten, while the
+model card accepts a `.qipack` file and persists its path. A multi-image drop
+keeps the Finder order at the front of the thumbnail strip. Unsupported files
+are ignored. Facet's built-in drop gesture currently carries plain text only,
+so `gui/src/file_drop.cplus` adds an AppKit file-URL destination to the two
+existing card views; it does not replace their click controls. Drop handlers
+are cleared when their components unmount. Prompt text and reference images
+remain session-only.
 When inference is connected, expensive work must run in a background service:
 stage worker results separately, then apply them on the UI thread. A
 window-lifetime component should not own an inference job that must survive

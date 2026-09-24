@@ -291,3 +291,21 @@ kernel void qt_causal_row_softmax(
         values[index] = index < valid ? values[index] * inverse_sum : 0.0f;
     }
 }
+
+// FP16 operands for the MPS linear path. BF16 weights and BF16-rounded
+// activations are exact in FP16 inside its range; products accumulate in FP32.
+kernel void qt_bf16_to_f16(
+    device const ushort *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) output[index] = half(qt_bf16(input[index]));
+}
+
+kernel void qt_f32_to_f16(
+    device const float *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) output[index] = half(input[index]);
+}

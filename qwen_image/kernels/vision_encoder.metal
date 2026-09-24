@@ -246,3 +246,24 @@ kernel void qv_round_bf16_inplace(
     uint index [[thread_position_in_grid]]) {
     if (index < params.rows * params.width) values[index] = qv_round_bf16(values[index]);
 }
+
+// Expands one BF16 weight matrix to FP32 for the MPS linear path (exact).
+kernel void qv_bf16_to_f32(
+    device const ushort *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) output[index] = qv_bf16(input[index]);
+}
+
+// MPS linear epilogue: adds the BF16 bias and rounds to BF16, as
+// qv_linear_bf16_bias_16x16 does per element.
+kernel void qv_bias_round_bf16(
+    device float *values [[buffer(0)]],
+    device const ushort *bias [[buffer(1)]],
+    constant VisionParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < params.rows * params.output_width) {
+        values[index] = qv_round_bf16(values[index] + qv_bf16(bias[index % params.output_width]));
+    }
+}

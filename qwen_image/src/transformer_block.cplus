@@ -1,3 +1,4 @@
+import "./host_buffers" as host_buffers;
 import "./cpu_ops" as cpu;
 import "./metal_primitives" as metrics;
 import "./mmap_macos" as mapped;
@@ -6871,6 +6872,7 @@ fn run_trajectory_packed_impl(
             io::eprintln("trajectory: could not generate the seeded latent");
             return 1;
         }
+        host_buffers::dump_f32("initial_latent.f32", latents.contents() as *f32, latent_count);
     }
     guard let option::Option[metal::Buffer]::Some(text_input) = if native_inputs {
         device.new_buffer_with_bytes(
