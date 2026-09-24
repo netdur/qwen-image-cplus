@@ -9,14 +9,14 @@ test -f "$dist/include/qwen_image.h"
 test -f "$dist/lib/libqwen_image.a"
 test -f "$dist/lib/libqwen_image.dylib"
 
-lipo -verify_arch arm64 "$dist/bin/qwen-image-cplus"
-lipo -verify_arch arm64 "$dist/lib/libqwen_image.dylib"
+lipo "$dist/bin/qwen-image-cplus" -verify_arch arm64
+lipo "$dist/lib/libqwen_image.dylib" -verify_arch arm64
 
-if lipo -archs "$dist/bin/qwen-image-cplus" | grep -q x86_64; then
+if lipo "$dist/bin/qwen-image-cplus" -archs | grep -q x86_64; then
     echo "distribution unexpectedly contains an Intel CLI slice" >&2
     exit 1
 fi
-if lipo -archs "$dist/lib/libqwen_image.dylib" | grep -q x86_64; then
+if lipo "$dist/lib/libqwen_image.dylib" -archs | grep -q x86_64; then
     echo "distribution unexpectedly contains an Intel library slice" >&2
     exit 1
 fi
