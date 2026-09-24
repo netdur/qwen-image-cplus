@@ -42,6 +42,20 @@ const PACKED_SCHEME_INT4_ROTATED: u32 = 4;
 const RUNTIME_SCHEME_INT4_DIRECT: u32 = 5;
 const VM_PAGE_BYTES: usize = 16384;
 
+// Spatial shape in the transformer's latent-token grid. Condition images use
+// one 64-channel token per 16x16 input region; both sides are even because one
+// Qwen3-VL image slot expands to a 2x2 group of these tokens.
+struct LatentShape {
+    height: usize,
+    width: usize,
+}
+
+struct JointLayoutCounts {
+    condition_rows: usize,
+    prefix_rows: usize,
+    rows: usize,
+}
+
 struct OwnedObjc {
     opaque pointer: *u8,
 }
@@ -4999,6 +5013,205 @@ fn fill_target_rope_256(destination: *f32, text_rows: usize) -> bool {
     return fill_target_rope(destination, text_rows, 16 as usize, 16 as usize);
 }
 
+// Size the exact Qwen-Image-2.1 joint stream before allocating Metal buffers.
+// Every true prompt slot is replaced by four condition-latent rows. The target
+// image is appended as the final block and is not part of the cached prefix.
+fn conditioned_joint_counts(
+    prompt_image_mask: *u8,
+    prompt_rows: usize,
+    condition_shapes: *LatentShape,
+    condition_count: usize,
+    target_height: usize,
+    target_width: usize,
+) -> option::Option[JointLayoutCounts] {
+    if prompt_image_mask.is_null() || condition_shapes.is_null()
+        || condition_count == (0 as usize)
+        || target_height == (0 as usize) || target_width == (0 as usize) {
+        return option::Option[JointLayoutCounts]::None;
+    }
+    var mask_rows: usize = 0 as usize;
+    var row: usize = 0 as usize;
+    while row < prompt_rows {
+        if prompt_image_mask[row] != (0 as u8) {
+            mask_rows = mask_rows +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    var condition_rows: usize = 0 as usize;
+    var expected_slots: usize = 0 as usize;
+    var image: usize = 0 as usize;
+    while image < condition_count {
+        let shape: LatentShape = condition_shapes[image];
+        if shape.height == (0 as usize) || shape.width == (0 as usize)
+            || shape.height % (2 as usize) != (0 as usize)
+            || shape.width % (2 as usize) != (0 as usize) {
+            return option::Option[JointLayoutCounts]::None;
+        }
+        let image_rows: usize = shape.height *% shape.width;
+        condition_rows = condition_rows +% image_rows;
+        expected_slots = expected_slots +% image_rows / (4 as usize);
+        image = image +% (1 as usize);
+    }
+    if mask_rows != expected_slots {
+        return option::Option[JointLayoutCounts]::None;
+    }
+    let prefix_rows: usize = prompt_rows -% mask_rows +% condition_rows;
+    return option::Option[JointLayoutCounts]::Some(JointLayoutCounts {
+        condition_rows: condition_rows,
+        prefix_rows: prefix_rows,
+        rows: prefix_rows +% target_height *% target_width,
+    });
+}
+
+fn fill_rope_row(
+    destination: *f32,
+    row: usize,
+    frame_position: i32,
+    height_position: i32,
+    width_position: i32,
+) {
+    let theta_log: f32 = (10000.0f32).ln();
+    let positions: [i32; 3] = [frame_position, height_position, width_position];
+    let dimensions: [usize; 3] = [16 as usize, 56 as usize, 56 as usize];
+    var complex_offset: usize = 0 as usize;
+    var axis: usize = 0 as usize;
+    while axis < (3 as usize) {
+        let dimension: usize = dimensions[axis];
+        let complex_count: usize = dimension / (2 as usize);
+        var pair: usize = 0 as usize;
+        while pair < complex_count {
+            let exponent: f32 = (0.0f32 - theta_log) * ((2 as usize) *% pair) as f32
+                / dimension as f32;
+            let angle: f32 = positions[axis] as f32 * exponent.exp();
+            let output_index: usize = row *% HEAD_DIMENSION +% complex_offset +% pair;
+            destination[output_index] = angle.cos();
+            destination[output_index +% (HEAD_DIMENSION / (2 as usize))] = angle.sin();
+            pair = pair +% (1 as usize);
+        }
+        complex_offset = complex_offset +% complex_count;
+        axis = axis +% (1 as usize);
+    }
+}
+
+// Reproduce Diffusers' repeat-interleave/substitute layout. Negative source
+// indices select projected prompt rows (-1-row); non-negative indices select
+// condition latents followed by target latents. Shape lengths, rather than
+// runs of true mask values, keep adjacent condition images as separate blocks.
+fn fill_conditioned_joint_layout(
+    prompt_image_mask: *u8,
+    prompt_rows: usize,
+    condition_shapes: *LatentShape,
+    condition_count: usize,
+    target_height: usize,
+    target_width: usize,
+    source_index: *i32,
+    target_mask: *u8,
+    image_ids: *i32,
+    rope: *f32,
+) -> bool {
+    if source_index.is_null() || target_mask.is_null() || image_ids.is_null()
+        || rope.is_null() {
+        return false;
+    }
+    guard let option::Option[JointLayoutCounts]::Some(counts) = conditioned_joint_counts(
+        prompt_image_mask, prompt_rows, condition_shapes, condition_count,
+        target_height, target_width,
+    ) else { return false; };
+    var prompt_cursor: usize = 0 as usize;
+    var joint_row: usize = 0 as usize;
+    var image_source: usize = 0 as usize;
+    var position: usize = 0 as usize;
+    var image: usize = 0 as usize;
+    while image < condition_count {
+        var block_start: usize = prompt_cursor;
+        while block_start < prompt_rows
+            && prompt_image_mask[block_start] == (0 as u8) {
+            block_start = block_start +% (1 as usize);
+        }
+        if block_start >= prompt_rows { return false; }
+        var prompt_row: usize = prompt_cursor;
+        while prompt_row < block_start {
+            source_index[joint_row] = 0 -% (prompt_row as i32) -% (1 as i32);
+            target_mask[joint_row] = 0 as u8;
+            image_ids[joint_row] = 0 -% (1 as i32);
+            fill_rope_row(
+                rope, joint_row, position as i32, position as i32, position as i32,
+            );
+            position = position +% (1 as usize);
+            joint_row = joint_row +% (1 as usize);
+            prompt_row = prompt_row +% (1 as usize);
+        }
+        let shape: LatentShape = condition_shapes[image];
+        let slots: usize = shape.height *% shape.width / (4 as usize);
+        var slot: usize = 0 as usize;
+        while slot < slots {
+            if block_start +% slot >= prompt_rows
+                || prompt_image_mask[block_start +% slot] == (0 as u8) {
+                return false;
+            }
+            slot = slot +% (1 as usize);
+        }
+        var spatial: usize = 0 as usize;
+        while spatial < shape.height *% shape.width {
+            source_index[joint_row] = image_source as i32;
+            target_mask[joint_row] = 0 as u8;
+            image_ids[joint_row] = image as i32;
+            fill_rope_row(
+                rope,
+                joint_row,
+                position as i32,
+                (spatial / shape.width) as i32
+                    - (shape.height -% shape.height / (2 as usize)) as i32,
+                (spatial % shape.width) as i32
+                    - (shape.width -% shape.width / (2 as usize)) as i32,
+            );
+            image_source = image_source +% (1 as usize);
+            joint_row = joint_row +% (1 as usize);
+            spatial = spatial +% (1 as usize);
+        }
+        position = position +% if shape.height > shape.width {
+            shape.height
+        } else { shape.width };
+        prompt_cursor = block_start +% slots;
+        image = image +% (1 as usize);
+    }
+    var prompt_row: usize = prompt_cursor;
+    while prompt_row < prompt_rows {
+        if prompt_image_mask[prompt_row] != (0 as u8) { return false; }
+        source_index[joint_row] = 0 -% (prompt_row as i32) -% (1 as i32);
+        target_mask[joint_row] = 0 as u8;
+        image_ids[joint_row] = 0 -% (1 as i32);
+        fill_rope_row(
+            rope, joint_row, position as i32, position as i32, position as i32,
+        );
+        position = position +% (1 as usize);
+        joint_row = joint_row +% (1 as usize);
+        prompt_row = prompt_row +% (1 as usize);
+    }
+    if joint_row != counts.prefix_rows || image_source != counts.condition_rows {
+        return false;
+    }
+    let target_rows: usize = target_height *% target_width;
+    var spatial: usize = 0 as usize;
+    while spatial < target_rows {
+        source_index[joint_row] = (counts.condition_rows +% spatial) as i32;
+        target_mask[joint_row] = 1 as u8;
+        image_ids[joint_row] = condition_count as i32;
+        fill_rope_row(
+            rope,
+            joint_row,
+            position as i32,
+            (spatial / target_width) as i32
+                - (target_height -% target_height / (2 as usize)) as i32,
+            (spatial % target_width) as i32
+                - (target_width -% target_width / (2 as usize)) as i32,
+        );
+        joint_row = joint_row +% (1 as usize);
+        spatial = spatial +% (1 as usize);
+    }
+    return joint_row == counts.rows;
+}
+
 fn fill_seeded_latent(destination: *f32, count: usize, seed: u64) -> bool {
     if !random::torch_randn_f32(destination, count, seed) { return false; }
     var index: usize = 0 as usize;
@@ -5844,6 +6057,59 @@ fn run_prompt_trajectory_sized_to_host(
     );
 }
 
+// Runs the native Qwen-Image-2.1 image-conditioned trajectory. Prompt image
+// slots are expanded and replaced by the condition latents according to the
+// official block-causal joint layout; only the final target block is updated.
+fn run_conditioned_trajectory_sized_to_host(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    prompt_image_mask: *u8,
+    condition_latents: *f32,
+    condition_rows: usize,
+    condition_shapes: *LatentShape,
+    condition_count: usize,
+    seed: u64,
+    final_latent: *f32,
+    image_width: usize,
+    image_height: usize,
+    requested_steps: str = "1",
+) -> i32 {
+    if text_input.is_null() || prompt_image_mask.is_null()
+        || condition_latents.is_null() || condition_shapes.is_null()
+        || final_latent.is_null() || condition_count == (0 as usize) {
+        io::eprintln("trajectory: conditioned handoff received invalid buffers");
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path,
+        requested_steps,
+        "",
+        final_latent,
+        text_input,
+        text_rows,
+        seed,
+        true,
+        false,
+        false,
+        0.0f64,
+        image_width,
+        false,
+        0 as *f32,
+        0.0f32,
+        1.0f32,
+        false,
+        false,
+        image_width,
+        image_height,
+        condition_latents,
+        condition_rows,
+        prompt_image_mask,
+        condition_shapes,
+        condition_count,
+    );
+}
+
 fn run_prompt_trajectory_cache_dit_1024_to_host(
     packed_path: str,
     text_input: *f32,
@@ -6172,6 +6438,11 @@ fn run_trajectory_packed_impl(
     q4_direct_packed: bool = false,
     image_width: usize = 0 as usize,
     image_height: usize = 0 as usize,
+    native_condition_latents: *f32 = 0 as *f32,
+    native_condition_rows: usize = 0 as usize,
+    native_prompt_image_mask: *u8 = 0 as *u8,
+    native_condition_shapes: *LatentShape = 0 as *LatentShape,
+    native_condition_count: usize = 0 as usize,
 ) -> i32 {
     if taylorseer_enabled && !cache_dit_enabled {
         io::eprintln("trajectory: TaylorSeer requires Cache-DiT");
@@ -6203,8 +6474,14 @@ fn run_trajectory_packed_impl(
         return 2;
     }
     let text_rows: usize = if native_inputs { native_text_rows } else { 22 as usize };
-    if text_rows == (0 as usize) || text_rows > (512 as usize) {
-        io::eprintln("trajectory: text row count must be 1..512, got ${text_rows}");
+    if text_rows == (0 as usize) || text_rows > (4096 as usize) {
+        io::eprintln("trajectory: text row count must be 1..4096, got ${text_rows}");
+        return 2;
+    }
+    let conditioned: bool = native_condition_count > (0 as usize);
+    if conditioned && (!native_inputs || native_condition_latents.is_null()
+        || native_prompt_image_mask.is_null() || native_condition_shapes.is_null()) {
+        io::eprintln("trajectory: conditioned generation requires native prompt, mask, shapes, and latents");
         return 2;
     }
     let output_width: usize = if image_width == (0 as usize) { pixels } else { image_width };
@@ -6262,7 +6539,25 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: output exceeds the ${maximum_target_rows}-token limit for this path");
         return 2;
     }
-    let rows: usize = text_rows +% target_rows;
+    var condition_rows: usize = 0 as usize;
+    var prefix_rows: usize = text_rows;
+    var rows: usize = text_rows +% target_rows;
+    if conditioned {
+        guard let option::Option[JointLayoutCounts]::Some(layout_counts) = conditioned_joint_counts(
+            native_prompt_image_mask, text_rows, native_condition_shapes,
+            native_condition_count, latent_height, latent_width,
+        ) else {
+            io::eprintln("trajectory: invalid conditioned joint layout");
+            return 2;
+        };
+        if layout_counts.condition_rows != native_condition_rows {
+            io::eprintln("trajectory: condition rows expected=${layout_counts.condition_rows} actual=${native_condition_rows}");
+            return 2;
+        }
+        condition_rows = layout_counts.condition_rows;
+        prefix_rows = layout_counts.prefix_rows;
+        rows = layout_counts.rows;
+    }
     let latent_count: usize = target_rows *% IMAGE_CHANNELS;
     var sigmas: [f32; 41] = [0.0f32; 41];
     var timesteps: [f32; 40] = [0.0f32; 40];
@@ -6353,6 +6648,7 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(gelu_owner) = pipeline(device, library, "qi_gelu_tanh") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(text_norm_owner) = pipeline(device, library, "qi_zero_center_rms_norm") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(assemble_owner) = pipeline(device, library, "qi_joint_assemble") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(conditioned_assemble_owner) = pipeline(device, library, "qi_conditioned_joint_assemble") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(final_norm_owner) = pipeline(device, library, "qi_final_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(cache_copy_owner) = pipeline(device, library, "qi_copy_prefix_kv") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(flash_prepare_owner) = pipeline(device, library, "qi_flash_prepare_kv") else { return 1; };
@@ -6399,6 +6695,7 @@ fn run_trajectory_packed_impl(
     let gelu_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(gelu_owner.raw());
     let text_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(text_norm_owner.raw());
     let assemble_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(assemble_owner.raw());
+    let conditioned_assemble_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(conditioned_assemble_owner.raw());
     let final_norm_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(final_norm_owner.raw());
     let cache_copy_pipeline: metal::ComputePipelineState = if flash_attention {
         metal::ComputePipelineState::from_raw(flash_prepare_owner.raw())
@@ -6525,8 +6822,10 @@ fn run_trajectory_packed_impl(
     let text_bytes: u64 = (text_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let image_input_bytes: u64 = (latent_count *% #size_of::[f32]()) as u64;
     let image_projected_bytes: u64 = (target_rows *% WIDTH *% #size_of::[f32]()) as u64;
+    let condition_input_bytes: u64 = (condition_rows *% IMAGE_CHANNELS *% #size_of::[f32]()) as u64;
+    let condition_projected_bytes: u64 = (condition_rows *% WIDTH *% #size_of::[f32]()) as u64;
     let mlp_bytes: u64 = (rows *% MLP_WIDTH *% #size_of::[f32]()) as u64;
-    let per_block_cache_bytes: u64 = (text_rows *% WIDTH *% if flash_attention {
+    let per_block_cache_bytes: u64 = (prefix_rows *% WIDTH *% if flash_attention {
         #size_of::[u16]()
     } else {
         #size_of::[f32]()
@@ -6540,6 +6839,14 @@ fn run_trajectory_packed_impl(
         fixture_buffer(device, fixture_directory, "image_input", image_input_bytes)
     } else { return 1; };
     let latents_owner: OwnedObjc = OwnedObjc::new(latents.raw());
+    guard let option::Option[metal::Buffer]::Some(condition_input) = if conditioned {
+        device.new_buffer_with_bytes(
+            native_condition_latents as *u8,
+            condition_input_bytes,
+            metal::resource_options_m_t_l_resource_storage_mode_shared,
+        )
+    } else { new_buffer(device, 4 as u64) } else { return 1; };
+    let condition_input_owner: OwnedObjc = OwnedObjc::new(condition_input.raw());
     if native_inputs {
         if !initial_latent.is_null() {
             let latent_values: *f32 = latents.contents() as *f32;
@@ -6570,11 +6877,20 @@ fn run_trajectory_packed_impl(
         fixture_buffer(device, fixture_directory, "rope", rope_bytes)
     } else { return 1; };
     let rope_owner: OwnedObjc = OwnedObjc::new(rope.raw());
-    if native_inputs && !fill_target_rope(
-        rope.contents() as *f32, text_rows, latent_height, latent_width,
-    ) {
-        io::eprintln("trajectory: could not construct dynamic RoPE");
-        return 1;
+    if native_inputs {
+        let rope_ok: bool = if conditioned {
+            // Metadata buffers are filled below; RoPE shares the same helper
+            // there so the stream can only be constructed one consistent way.
+            true
+        } else {
+            fill_target_rope(
+                rope.contents() as *f32, text_rows, latent_height, latent_width,
+            )
+        };
+        if !rope_ok {
+            io::eprintln("trajectory: could not construct dynamic RoPE");
+            return 1;
+        }
     }
     let startup_inputs_ms: i64 = time::now_millis();
     if validate_reference {
@@ -6610,6 +6926,10 @@ fn run_trajectory_packed_impl(
     }
 
     guard let option::Option[metal::Buffer]::Some(image_projected) = new_buffer(device, image_projected_bytes) else { return 1; }; let image_projected_owner: OwnedObjc = OwnedObjc::new(image_projected.raw());
+    guard let option::Option[metal::Buffer]::Some(condition_projected) = new_buffer(
+        device, if conditioned { condition_projected_bytes } else { 4 as u64 },
+    ) else { return 1; };
+    let condition_projected_owner: OwnedObjc = OwnedObjc::new(condition_projected.raw());
     guard let option::Option[metal::Buffer]::Some(text_normalized) = new_buffer(device, text_bytes) else { return 1; }; let text_normalized_owner: OwnedObjc = OwnedObjc::new(text_normalized.raw());
     guard let option::Option[metal::Buffer]::Some(text_hidden) = new_buffer(device, text_bytes) else { return 1; }; let text_hidden_owner: OwnedObjc = OwnedObjc::new(text_hidden.raw());
     guard let option::Option[metal::Buffer]::Some(text_activated) = new_buffer(device, text_bytes) else { return 1; }; let text_activated_owner: OwnedObjc = OwnedObjc::new(text_activated.raw());
@@ -6634,21 +6954,49 @@ fn run_trajectory_packed_impl(
     guard let option::Option[f64]::Some(text_in_ms) = dispatch_weighted_linear(queue, pipelines, text_normalized, text_in_weight, text_hidden, WIDTH, WIDTH, text_rows) else { return 1; }; total_ms = total_ms + text_in_ms;
     guard let option::Option[f64]::Some(gelu_ms) = dispatch_1d(queue, gelu_pipeline, text_hidden, dummy, text_activated, dummy, dummy, dummy, #addr_of(params), text_rows *% WIDTH) else { return 1; }; total_ms = total_ms + gelu_ms;
     guard let option::Option[f64]::Some(text_out_ms) = dispatch_weighted_linear(queue, pipelines, text_activated, text_out_weight, text_projected, WIDTH, WIDTH, text_rows) else { return 1; }; total_ms = total_ms + text_out_ms;
+    if conditioned {
+        guard let option::Option[f64]::Some(condition_projection_ms) = dispatch_weighted_linear(
+            queue, pipelines, condition_input, img_in_weight, condition_projected,
+            WIDTH, IMAGE_CHANNELS, condition_rows,
+        ) else { return 1; };
+        total_ms = total_ms + condition_projection_ms;
+    }
 
     let startup_text_projection_ms: i64 = time::now_millis();
     guard let option::Option[metal::Buffer]::Some(source_index) = new_buffer(device, (rows *% #size_of::[i32]()) as u64) else { return 1; }; let source_index_owner: OwnedObjc = OwnedObjc::new(source_index.raw());
     let sources: *i32 = source_index.contents() as *i32;
     var row: usize = 0 as usize;
-    while row < text_rows { sources[row] = 0 -% (row as i32) -% (1 as i32); row = row +% (1 as usize); }
-    while row < rows { sources[row] = (row -% text_rows) as i32; row = row +% (1 as usize); }
     guard let option::Option[metal::Buffer]::Some(target_mask) = new_buffer(device, rows as u64) else { return 1; }; let target_mask_owner: OwnedObjc = OwnedObjc::new(target_mask.raw());
     guard let option::Option[metal::Buffer]::Some(image_ids) = new_buffer(device, (rows *% #size_of::[i32]()) as u64) else { return 1; }; let image_ids_owner: OwnedObjc = OwnedObjc::new(image_ids.raw());
     guard let option::Option[metal::Buffer]::Some(key_valid) = new_buffer(device, rows as u64) else { return 1; }; let key_valid_owner: OwnedObjc = OwnedObjc::new(key_valid.raw());
     let ids: *i32 = image_ids.contents() as *i32;
+    if conditioned {
+        if !fill_conditioned_joint_layout(
+            native_prompt_image_mask, text_rows, native_condition_shapes,
+            native_condition_count, latent_height, latent_width, sources,
+            target_mask.contents(), ids, rope.contents() as *f32,
+        ) {
+            io::eprintln("trajectory: could not construct conditioned joint metadata");
+            return 1;
+        }
+    } else {
+        while row < text_rows {
+            sources[row] = 0 -% (row as i32) -% (1 as i32);
+            row = row +% (1 as usize);
+        }
+        while row < rows {
+            sources[row] = (row -% text_rows) as i32;
+            row = row +% (1 as usize);
+        }
+        row = 0 as usize;
+        while row < rows {
+            (target_mask.contents())[row] = if row >= text_rows { 1 as u8 } else { 0 as u8 };
+            ids[row] = if row >= text_rows { 0 as i32 } else { 0 -% (1 as i32) };
+            row = row +% (1 as usize);
+        }
+    }
     row = 0 as usize;
     while row < rows {
-        (target_mask.contents())[row] = if row >= text_rows { 1 as u8 } else { 0 as u8 };
-        ids[row] = if row >= text_rows { 0 as i32 } else { 0 -% (1 as i32) };
         (key_valid.contents())[row] = 1 as u8;
         row = row +% (1 as usize);
     }
@@ -6657,7 +7005,7 @@ fn run_trajectory_packed_impl(
     let cached_rope_values: *f32 = cached_rope.contents() as *f32;
     var copy_index: usize = 0 as usize;
     while copy_index < target_rows *% HEAD_DIMENSION {
-        cached_rope_values[copy_index] = rope_values[text_rows *% HEAD_DIMENSION +% copy_index];
+        cached_rope_values[copy_index] = rope_values[prefix_rows *% HEAD_DIMENSION +% copy_index];
         copy_index = copy_index +% (1 as usize);
     }
     guard let option::Option[metal::Buffer]::Some(cached_target_mask) = new_buffer(device, target_rows as u64) else { return 1; }; let cached_target_mask_owner: OwnedObjc = OwnedObjc::new(cached_target_mask.raw());
@@ -6676,7 +7024,8 @@ fn run_trajectory_packed_impl(
         while query_row < rows {
             var key_row: usize = 0 as usize;
             while key_row < rows {
-                let same_image: bool = query_row >= text_rows && key_row >= text_rows;
+                let same_image: bool = ids[query_row] >= (0 as i32)
+                    && ids[query_row] == ids[key_row];
                 graph_mask_values[query_row *% rows +% key_row] =
                     if query_row >= key_row || same_image {
                     0 as u16
@@ -6747,7 +7096,9 @@ fn run_trajectory_packed_impl(
         option::Option[OwnedObjc]::Some(owner) => owner,
         option::Option[OwnedObjc]::None => OwnedObjc::new(0 as *u8),
     };
-    let steel_prefill_wanted: bool = env::has_var("QI_STEEL_PREFILL");
+    // Steel's prefill specialization currently models one causal text prefix;
+    // conditioned prefixes contain bidirectional image blocks between text runs.
+    let steel_prefill_wanted: bool = !conditioned && env::has_var("QI_STEEL_PREFILL");
     let steel_causal_owner: OwnedObjc = if steel_prefill_wanted {
         match create_steel_attention_pipeline(
             device, steel_library_owner.raw(), text_rows, text_rows, true,
@@ -6910,7 +7261,22 @@ fn run_trajectory_packed_impl(
         var next: metal::Buffer = first_hidden;
         if step == (0 as usize) {
             params.rows = rows as u32;
-            guard let option::Option[f64]::Some(assemble_ms) = dispatch_1d(queue, assemble_pipeline, text_projected, image_projected, first_hidden, source_index, dummy, dummy, #addr_of(params), rows *% WIDTH) else { return 1; }; step_ms = step_ms + assemble_ms;
+            params.slot = condition_rows as u32;
+            let assemble_result: option::Option[f64] = if conditioned {
+                dispatch_1d(
+                    queue, conditioned_assemble_pipeline, text_projected,
+                    condition_projected, first_hidden, source_index,
+                    image_projected, dummy, #addr_of(params), rows *% WIDTH,
+                )
+            } else {
+                dispatch_1d(
+                    queue, assemble_pipeline, text_projected, image_projected,
+                    first_hidden, source_index, dummy, dummy, #addr_of(params),
+                    rows *% WIDTH,
+                )
+            };
+            guard let option::Option[f64]::Some(assemble_ms) = assemble_result else { return 1; };
+            step_ms = step_ms + assemble_ms;
             active_rows = rows;
             cache_mode = 1 as u32;
             active_workspace = workspace;
@@ -6991,7 +7357,7 @@ fn run_trajectory_packed_impl(
                     block_command_buffer, pipelines, mps_workspace, block_weights,
                     active_workspace, current, next, active_rows, cache_mode,
                     cache_copy_pipeline, cache_key_arena, cache_value_arena, cache_offset,
-                    text_rows,
+                    prefix_rows,
                     use_graph_attention, #addr_of(graph_prefill_attention),
                     #addr_of(graph_cached_attention), graph_mask,
                 ) { return 1; }
@@ -7012,7 +7378,7 @@ fn run_trajectory_packed_impl(
                     transformer_command_buffer, pipelines, mps_workspace, block_weights,
                     active_workspace, current, next, active_rows, cache_mode,
                     cache_copy_pipeline, cache_key_arena, cache_value_arena, cache_offset,
-                    text_rows,
+                    prefix_rows,
                     use_graph_attention, #addr_of(graph_prefill_attention),
                     #addr_of(graph_cached_attention), graph_mask,
                 ) { return 1; }
@@ -7020,7 +7386,7 @@ fn run_trajectory_packed_impl(
                 let block_result: option::Option[f64] = execute_mps_mlp_runtime_block(
                     queue, pipelines, mps_workspace, block_weights, active_workspace,
                     current, next, active_rows, cache_mode, cache_copy_pipeline,
-                    cache_key_arena, cache_value_arena, cache_offset, text_rows,
+                    cache_key_arena, cache_value_arena, cache_offset, prefix_rows,
                     use_graph_attention, #addr_of(graph_prefill_attention),
                     #addr_of(graph_cached_attention), graph_mask,
                     profile_cached_block
@@ -7045,7 +7411,7 @@ fn run_trajectory_packed_impl(
             if cache_dit_enabled && block == (0 as usize) {
                 params.rows = target_rows as u32;
                 params.width = WIDTH as u32;
-                params.slot = if step == (0 as usize) { text_rows as u32 } else { 0 as u32 };
+                params.slot = if step == (0 as usize) { prefix_rows as u32 } else { 0 as u32 };
                 guard let option::Option[f64]::Some(first_residual_ms) = dispatch_1d(
                     queue,
                     cache_first_residual_pipeline,
@@ -7180,7 +7546,7 @@ fn run_trajectory_packed_impl(
         if cache_dit_enabled && !cache_dit_cached_step {
             params.rows = target_rows as u32;
             params.width = WIDTH as u32;
-            params.slot = if step == (0 as usize) { text_rows as u32 } else { 0 as u32 };
+            params.slot = if step == (0 as usize) { prefix_rows as u32 } else { 0 as u32 };
             var store_ms: f64 = 0.0f64;
             if taylorseer_enabled && have_cache_residual {
                 let full_step_window: usize = step -% last_full_step;
@@ -7226,7 +7592,7 @@ fn run_trajectory_packed_impl(
         guard let option::Option[f64]::Some(final_norm_ms) = dispatch_1d(queue, final_norm_pipeline, current, final_scale, final_normalized, active_workspace.target_mask, dummy, dummy, #addr_of(params), active_rows) else { return 1; }; step_ms = step_ms + final_norm_ms;
         guard let option::Option[f64]::Some(output_ms) = dispatch_weighted_linear(queue, pipelines, final_normalized, proj_out_weight, noise_output, IMAGE_CHANNELS, WIDTH, active_rows) else { return 1; }; step_ms = step_ms + output_ms;
         if !finite("trajectory noise step ${step +% (1 as usize)}", noise_output, active_rows *% IMAGE_CHANNELS) { return 1; }
-        let noise_offset: usize = if step == (0 as usize) { text_rows *% IMAGE_CHANNELS } else { 0 as usize };
+        let noise_offset: usize = if step == (0 as usize) { prefix_rows *% IMAGE_CHANNELS } else { 0 as usize };
         flow::euler_step_bf16(
             latents.contents() as *f32,
             (noise_output.contents() as *f32) + noise_offset,
@@ -8750,6 +9116,47 @@ fn rectangular_rope_uses_independent_height_and_width_coordinates() {
     assert (rope[36] - (-2.0f32).cos()).abs() < 0.000001f32;
     assert (rope[HEAD_DIMENSION +% (36 as usize)] - (-1.0f32).cos()).abs()
         < 0.000001f32;
+}
+
+#[test]
+fn conditioned_layout_interleaves_images_and_keeps_adjacent_blocks_distinct() {
+    // The first two slots and the immediately adjacent third slot represent
+    // different images. Shape lengths, not a false separator, split them.
+    var mask: [u8; 5] = [0 as u8, 1 as u8, 1 as u8, 1 as u8, 0 as u8];
+    var shapes: [LatentShape; 2] = [
+        LatentShape { height: 2 as usize, width: 4 as usize },
+        LatentShape { height: 2 as usize, width: 2 as usize },
+    ];
+    guard let option::Option[JointLayoutCounts]::Some(counts) = conditioned_joint_counts(
+        #addr_of(mask[0]), 5 as usize, #addr_of(shapes[0]), 2 as usize,
+        2 as usize, 2 as usize,
+    ) else { assert false; return; };
+    assert counts.condition_rows == (12 as usize);
+    assert counts.prefix_rows == (14 as usize);
+    assert counts.rows == (18 as usize);
+    var sources: [i32; 18] = [0 as i32; 18];
+    var target: [u8; 18] = [0 as u8; 18];
+    var ids: [i32; 18] = [0 as i32; 18];
+    var rope: [f32; 2304] = [0.0f32; 2304];
+    assert fill_conditioned_joint_layout(
+        #addr_of(mask[0]), 5 as usize, #addr_of(shapes[0]), 2 as usize,
+        2 as usize, 2 as usize, #addr_of(sources[0]), #addr_of(target[0]),
+        #addr_of(ids[0]), #addr_of(rope[0]),
+    );
+    assert sources[0] == (0 -% (1 as i32));
+    assert sources[1] == (0 as i32) && sources[8] == (7 as i32);
+    assert sources[9] == (8 as i32) && sources[12] == (11 as i32);
+    assert sources[13] == (0 -% (5 as i32));
+    assert sources[14] == (12 as i32) && sources[17] == (15 as i32);
+    assert ids[1] == (0 as i32) && ids[8] == (0 as i32);
+    assert ids[9] == (1 as i32) && ids[12] == (1 as i32);
+    assert ids[14] == (2 as i32) && ids[17] == (2 as i32);
+    assert target[13] == (0 as u8) && target[14] == (1 as u8);
+    // The first frequency exposes the exact centred spatial positions.
+    assert (rope[(1 as usize) *% HEAD_DIMENSION +% (8 as usize)]
+        - (-1.0f32).cos()).abs() < 0.000001f32;
+    assert (rope[(9 as usize) *% HEAD_DIMENSION +% (8 as usize)]
+        - (-1.0f32).cos()).abs() < 0.000001f32;
 }
 
 #[test]

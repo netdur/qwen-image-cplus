@@ -159,10 +159,15 @@ merged tokens, and completes the tower in **2.653 s** wall time on the M1 Max.
 This phase streams one contiguous 1.153 GB vision-weight region and keeps every
 operation on Metal after native input preparation.
 
-Remaining work is transformer condition-prefix assembly across one to ten
-images, then generation/CLI/C-ABI exposure. Keeping those stages explicit
-avoids calling prompt plumbing end-to-end image editing before both native
-encoders are connected to the denoiser.
+The transformer condition-prefix assembly now works across the same one-to-ten
+image contract. Qwen-Image 2.1 does not simply prepend all condition latents:
+each Qwen3-VL image placeholder expands fourfold, the corresponding VAE rows
+replace those positions, and the target block is appended last. Text is causal,
+each image block is internally bidirectional, and shape lengths keep adjacent
+images as distinct blocks. Text and condition-image rows use the zero-timestep
+modulation and form the reusable K/V prefix; only the target rows use the
+sampled timestep and Euler update. Unit tests pin this ordering, block identity,
+target mask, and centred three-axis RoPE coordinates.
 
 The first full two-image conditioning assembly now passes at the 512-area test
 budget. Two copies of the asymmetric reference each resize to 736x352 and
@@ -175,6 +180,19 @@ mask count and finite nonzero prompt/latent outputs while exercising DeepStack
 layer-major repacking and condition-latent order. It also establishes why the
 denoiser cannot retain its old 512-row text-only ceiling: this valid two-image
 prompt has 540 rows before any VAE condition latents are prepended.
+
+The next integration checkpoint connects that assembly to the real FP16
+transformer. With the same asymmetric reference supplied twice, a current run
+produced 506 vision rows, a 542-row prompt, 2,024 condition-latent rows, and an
+expanded 2,060-row cacheable prefix. A one-step 512x512 target run completed
+with finite output in **38.435 s end to end**: **14.122 s** for native
+two-image conditioning and **24.313 s** for transformer loading, setup, and the
+first denoising step. The first transformer step itself took **21.298 s wall**.
+The two-step variant also passes, proving the enlarged prefix cache is consumed
+correctly: its first step took **19.107 s**, while the target-only cached-prefix
+second step took **6.529 s**; total end-to-end wall time was **43.265 s**. These
+are correctness smokes, not optimized benchmarks. Remaining image-edit work is
+the full trajectory, VAE decode/PNG handoff, and public CLI/C-ABI exposure.
 
 ## Package and API layout
 
@@ -336,6 +354,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus test-multi-image-prompt /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus test-multi-image-conditioning /path/to/model/snapshot first.png second.png "Combine both references"
+./cli/target/debug/qwen-image-cplus test-multi-image-transformer transformer.qipack /path/to/model/snapshot first.png second.png "Combine both references" 2
 ./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```

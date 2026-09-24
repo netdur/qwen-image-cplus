@@ -629,6 +629,33 @@ kernel void qi_joint_assemble(
         : text[uint(-source - 1) * params.width + column];
 }
 
+// Conditioned generation projects the fixed condition images once and the
+// changing target image on every denoising step. Non-negative source indices
+// address their logical concatenation; params.slot is the condition row count.
+kernel void qi_conditioned_joint_assemble(
+    device const float *text [[buffer(0)]],
+    device const float *condition [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    device const int *source_index [[buffer(3)]],
+    constant BlockParams &params [[buffer(4)]],
+    device const float *target [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint count = params.rows * params.width;
+    if (index >= count) {
+        return;
+    }
+    const uint row = index / params.width;
+    const uint column = index % params.width;
+    const int source = source_index[row];
+    if (source < 0) {
+        output[index] = text[uint(-source - 1) * params.width + column];
+    } else if (uint(source) < params.slot) {
+        output[index] = condition[uint(source) * params.width + column];
+    } else {
+        output[index] = target[(uint(source) - params.slot) * params.width + column];
+    }
+}
+
 kernel void qi_final_layernorm_modulate(
     device const float *input [[buffer(0)]],
     device const float *scale [[buffer(1)]],
