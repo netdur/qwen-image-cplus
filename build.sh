@@ -76,7 +76,8 @@ clang -std=c11 -Wall -Wextra -Werror \
     "$project_root/tests/ffi_smoke.c" \
     -I "$artifact_dir/include" \
     "$artifact_dir/lib/libqwen_image.a" \
-    -framework Foundation -framework Metal -lobjc \
+    -framework CoreFoundation -framework CoreGraphics -framework Foundation \
+    -framework ImageIO -framework Metal -lobjc \
     -o "$smoke_binary"
 "$smoke_binary"
 

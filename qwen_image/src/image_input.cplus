@@ -1,0 +1,223 @@
+// Native reference-image decode and resize for image-conditioned generation.
+//
+// ImageIO decodes common macOS image formats and Core Graphics resamples into
+// an explicit top-down RGBA surface. The public result is interleaved RGB
+// FP32 in [0, 1]; the vision and VAE encoders apply their own normalization.
+
+import "./image_conditioning" as conditioning;
+import "./image_output" as image_output;
+import "objc/runtime" as rt;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/vec" as vec;
+
+extern fn CFURLCreateFromFileSystemRepresentation(
+    allocator: *u8,
+    bytes: *u8,
+    length: isize,
+    is_directory: bool,
+) -> *u8;
+extern fn CGImageSourceCreateWithURL(url: *u8, options: *u8) -> *u8;
+extern fn CGImageSourceCreateImageAtIndex(
+    source: *u8,
+    index: usize,
+    options: *u8,
+) -> *u8;
+extern fn CGImageGetWidth(image: *u8) -> usize;
+extern fn CGImageGetHeight(image: *u8) -> usize;
+extern fn CGColorSpaceCreateDeviceRGB() -> *u8;
+extern fn CGBitmapContextCreate(
+    data: *u8,
+    width: usize,
+    height: usize,
+    bits_per_component: usize,
+    bytes_per_row: usize,
+    color_space: *u8,
+    bitmap_info: u32,
+) -> *u8;
+extern fn CGContextSetInterpolationQuality(context: *u8, quality: i32);
+extern fn CGContextDrawImage(context: *u8, rect: rt::Rect, image: *u8);
+extern fn CFRelease(value: *u8);
+
+const CHANNELS: usize = 3;
+const RGBA_CHANNELS: usize = 4;
+const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+const BYTE_ORDER_32_BIG: u32 = 4 << 12;
+const INTERPOLATION_HIGH: i32 = 3;
+
+struct OwnedCf {
+    pointer: *u8,
+}
+
+impl OwnedCf {
+    fn new(pointer: *u8) -> OwnedCf { return OwnedCf { pointer: pointer }; }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() { CFRelease(this.pointer); }
+        this.pointer = 0 as *u8;
+    }
+}
+
+struct Image {
+    shape: conditioning::Shape,
+    pixels: vec::Vec[f32],
+}
+
+fn zero_bytes(count: usize) -> option::Option[vec::Vec[u8]] {
+    var bytes: vec::Vec[u8] = vec::Vec[u8]::with_capacity(count);
+    var index: usize = 0 as usize;
+    while index < count {
+        if bytes.append(0 as u8) != status::Status::Ok {
+            return option::Option[vec::Vec[u8]]::None;
+        }
+        index = index +% (1 as usize);
+    }
+    return option::Option[vec::Vec[u8]]::Some(bytes);
+}
+
+fn load_resized_rgb(
+    path: str,
+    output_resolution: usize = 512 as usize,
+) -> option::Option[Image] {
+    if path.count() == (0 as usize) { return option::Option[Image]::None; }
+    let url_pointer: *u8 = CFURLCreateFromFileSystemRepresentation(
+        0 as *u8, #str_ptr(path), path.count() as isize, false,
+    );
+    if url_pointer.is_null() { return option::Option[Image]::None; }
+    let url_owner: OwnedCf = OwnedCf::new(url_pointer);
+    let source_pointer: *u8 = CGImageSourceCreateWithURL(url_pointer, 0 as *u8);
+    if source_pointer.is_null() { return option::Option[Image]::None; }
+    let source_owner: OwnedCf = OwnedCf::new(source_pointer);
+    let image_pointer: *u8 = CGImageSourceCreateImageAtIndex(
+        source_pointer, 0 as usize, 0 as *u8,
+    );
+    if image_pointer.is_null() { return option::Option[Image]::None; }
+    let image_owner: OwnedCf = OwnedCf::new(image_pointer);
+
+    let source_width: usize = CGImageGetWidth(image_pointer);
+    let source_height: usize = CGImageGetHeight(image_pointer);
+    guard let option::Option[conditioning::Shape]::Some(shape) =
+        conditioning::calculate_shape(
+            source_width, source_height, output_resolution,
+    ) else { return option::Option[Image]::None; };
+    let rgba_count: usize = shape.width *% shape.height *% RGBA_CHANNELS;
+    guard let option::Option[vec::Vec[u8]]::Some(rgba) = zero_bytes(rgba_count)
+        else { return option::Option[Image]::None; };
+    let color_space_pointer: *u8 = CGColorSpaceCreateDeviceRGB();
+    if color_space_pointer.is_null() { return option::Option[Image]::None; }
+    let color_space_owner: OwnedCf = OwnedCf::new(color_space_pointer);
+    let context_pointer: *u8 = CGBitmapContextCreate(
+        #slice_ptr(rgba.as_slice()),
+        shape.width,
+        shape.height,
+        8 as usize,
+        shape.width *% RGBA_CHANNELS,
+        color_space_pointer,
+        ALPHA_PREMULTIPLIED_LAST | BYTE_ORDER_32_BIG,
+    );
+    if context_pointer.is_null() { return option::Option[Image]::None; }
+    let context_owner: OwnedCf = OwnedCf::new(context_pointer);
+    CGContextSetInterpolationQuality(context_pointer, INTERPOLATION_HIGH);
+    // CGImage drawing into this explicit bitmap layout leaves the first
+    // memory row at the visual top. Keep the coordinates untransformed; a
+    // Core Graphics y-flip here would invert the image processor input.
+    CGContextDrawImage(
+        context_pointer,
+        rt::Rect {
+            x: 0.0f64,
+            y: 0.0f64,
+            w: shape.width as f64,
+            h: shape.height as f64,
+        },
+        image_pointer,
+    );
+
+    let pixel_count: usize = shape.width *% shape.height;
+    var pixels: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
+        pixel_count *% CHANNELS,
+    );
+    let rgba_values: *u8 = #slice_ptr(rgba.as_slice());
+    var pixel: usize = 0 as usize;
+    while pixel < pixel_count {
+        let source_offset: usize = pixel *% RGBA_CHANNELS;
+        var channel: usize = 0 as usize;
+        while channel < CHANNELS {
+            if pixels.append(
+                rgba_values[source_offset +% channel] as f32 / 255.0f32,
+            ) != status::Status::Ok {
+                return option::Option[Image]::None;
+            }
+            channel = channel +% (1 as usize);
+        }
+        pixel = pixel +% (1 as usize);
+    }
+    return option::Option[Image]::Some(Image { shape: shape, pixels: pixels });
+}
+
+// Creates an asymmetric source image so the smoke checks decode, exact 512
+// area-resize dimensions, RGB channel order, and top-down row orientation.
+fn run_reference(source_path: str) -> i32 {
+    let source_width: usize = 64;
+    let source_height: usize = 32;
+    var source: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
+        source_width *% source_height *% RGBA_CHANNELS,
+    );
+    var y: usize = 0 as usize;
+    while y < source_height {
+        var x: usize = 0 as usize;
+        while x < source_width {
+            let top: bool = y < source_height / (2 as usize);
+            source.append(if top { 1.0f32 } else { -1.0f32 });
+            source.append(-1.0f32);
+            source.append(if top { -1.0f32 } else { 1.0f32 });
+            source.append(1.0f32);
+            x = x +% (1 as usize);
+        }
+        y = y +% (1 as usize);
+    }
+    if !image_output::write_png_sized(
+        #slice_ptr(source.as_slice()), source_path, source_width, source_height,
+    ) { return 1; }
+    guard let option::Option[Image]::Some(decoded) = load_resized_rgb(
+        source_path, 512 as usize,
+    ) else {
+        io::eprintln("image input: could not decode generated reference");
+        return 1;
+    };
+    if decoded.shape.width != (736 as usize)
+        || decoded.shape.height != (352 as usize)
+        || decoded.shape.vision_tokens != (253 as usize)
+        || decoded.shape.latent_tokens != (1012 as usize) {
+        io::eprintln(
+            "image input: unexpected 512-area shape ${decoded.shape.width}x${decoded.shape.height}",
+        );
+        return 1;
+    }
+    let center_x: usize = decoded.shape.width / (2 as usize);
+    let top_offset: usize = center_x *% CHANNELS;
+    let bottom_offset: usize = (
+        (decoded.shape.height -% (1 as usize)) *% decoded.shape.width +% center_x
+    ) *% CHANNELS;
+    guard let option::Option[f32]::Some(top_red) = decoded.pixels.at(top_offset)
+        else { return 1; };
+    guard let option::Option[f32]::Some(top_blue) = decoded.pixels.at(
+        top_offset +% (2 as usize),
+    ) else { return 1; };
+    guard let option::Option[f32]::Some(bottom_red) = decoded.pixels.at(bottom_offset)
+        else { return 1; };
+    guard let option::Option[f32]::Some(bottom_blue) = decoded.pixels.at(
+        bottom_offset +% (2 as usize),
+    ) else { return 1; };
+    if top_red < 0.99f32 || top_blue > 0.01f32
+        || bottom_red > 0.01f32 || bottom_blue < 0.99f32 {
+        io::eprintln(
+            "image input: channel/orientation mismatch top=${top_red},${top_blue} bottom=${bottom_red},${bottom_blue}",
+        );
+        return 1;
+    }
+    io::println(
+        "reference image input: source=64x32 resized=736x352 output_resolution=512 vision_tokens=253 latent_tokens=1012 RGB/top-down=verified",
+    );
+    return 0;
+}

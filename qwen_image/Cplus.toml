@@ -11,3 +11,6 @@ stdlib      = "*"
 objc          = "*"
 metal         = "*"
 foundation    = "*"
+
+[link]
+frameworks = ["CoreFoundation", "CoreGraphics", "ImageIO"]

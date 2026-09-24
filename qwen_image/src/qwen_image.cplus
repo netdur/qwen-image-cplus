@@ -5,3 +5,4 @@
 
 import "./api" as _;
 import "./image_conditioning" as _;
+import "./image_input" as _;

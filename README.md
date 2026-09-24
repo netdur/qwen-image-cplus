@@ -129,11 +129,14 @@ produce 512 language-vision tokens and a 2,048-token VAE condition prefix; the
 
 The shape and MRoPE unit tests pass, the two-image tokenizer smoke produces the
 expected 512 placeholders, and the existing text-only encoder oracle remains
-unchanged at 0.0361069 output nRMSE. Remaining work is native image decode and
-resize, the Qwen3-VL vision tower, the VAE encoder, transformer condition-prefix
-assembly, and then CLI/C ABI exposure. Keeping those stages explicit avoids
-calling prompt plumbing end-to-end image editing before pixels have passed
-through both encoders.
+unchanged at 0.0361069 output nRMSE. Native ImageIO/Core Graphics input now
+decodes and resizes directly to interleaved RGB FP32 without Python or a GUI
+framework. Its asymmetric 64x32 smoke verifies channel order, top-down row
+orientation, and the official 512-area result of 736x352 (253 vision tokens and
+1,012 VAE latent tokens). Remaining work is the Qwen3-VL vision tower, the VAE
+encoder, transformer condition-prefix assembly, and then CLI/C ABI exposure.
+Keeping those stages explicit avoids calling prompt plumbing end-to-end image
+editing before pixels have passed through both encoders.
 
 ## Package and API layout
 
@@ -265,6 +268,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 2048
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot trajectory-1024 /path/to/vae_oracle_1024
 ./cli/target/debug/qwen-image-cplus test-image-output reference.png
+./cli/target/debug/qwen-image-cplus test-image-input /tmp/reference-input.png
 ./cli/target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./cli/target/debug/qwen-image-cplus test-pipeline-1024-oracle transformer.qipack /path/to/model/snapshot output.png /path/to/trajectory_1024 /path/to/vae_oracle_1024
 ./cli/target/debug/qwen-image-cplus test-pipeline-cache-dit-1024-oracle transformer.qipack /path/to/model/snapshot cache.png 0.12 /path/to/trajectory_1024 /path/to/vae_oracle_1024
