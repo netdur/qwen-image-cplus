@@ -1,0 +1,30 @@
+[package]
+name    = "gui"
+version = "0.0.1"
+edition = "2026"
+
+[macos]
+entry = "src/main.cplus"
+
+[dependencies]
+stdlib        = "*"
+facet         = "*"
+facet_runtime = "*"
+flex_layout   = "*"
+events        = "*"
+
+[macos.dependencies]
+facet_appkit = "*"
+appkit       = "*"
+foundation   = "*"
+objc         = "*"
+quartzcore   = "*"
+webkit       = "*"
+
+inspector    = "*"
+facet_agent  = "*"
+agent_appkit = "*"
+agent_core   = "*"
+agent_inapp  = "*"
+agent_mcp    = "*"
+json         = "*"

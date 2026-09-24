@@ -1,0 +1,34 @@
+import "facet_runtime/runtime" as runtime;
+import "facet_agent/agent" as agent;
+import "facet/screen" as screen;
+import "stdlib/status" as status;
+import "./screens/generation" as generation;
+import "./screens/settings" as settings;
+
+fn run() -> i32 {
+    agent::enable();
+    let app: runtime::App = runtime::App::new("qwen_image_gui");
+    let _generation = app.window(
+        "generation",
+        generation::boxed,
+        chrome: screen::Chrome::new(
+            title: "Qwen Image", width: 1180.0f64, height: 760.0f64,
+            min_width: 1000.0f64, min_height: 700.0f64,
+            bar: screen::Bar::Blended,
+        ),
+    );
+    let _settings = app.window(
+        "settings",
+        settings::boxed,
+        chrome: screen::Chrome::new(
+            title: "Qwen Image Settings", width: 720.0f64, height: 520.0f64,
+            min_width: 600.0f64, min_height: 440.0f64,
+            bar: screen::Bar::Blended,
+        ),
+    );
+    app.agent_mcp();
+    match app.run("generation") {
+        status::Status::Ok => { return 0; }
+        _other => { return 1; }
+    }
+}

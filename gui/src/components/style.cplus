@@ -1,0 +1,28 @@
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/vocabulary" as vocab;
+
+fn title(value: str, key: str) -> core::Node {
+    return ui::label(value, key: key, font_size: 23.0f64,
+    font_weight: vocab::FontWeight::Bold,
+    text_color: vocab::Color::ink());
+}
+
+fn caption(value: str, key: str) -> core::Node {
+    return ui::label(value, key: key, font_size: 11.0f64,
+    font_weight: vocab::FontWeight::Semibold,
+    text_color: vocab::Color::ink(0.55f64));
+}
+
+fn secondary(value: str, key: str) -> core::Node {
+    return ui::label(value, key: key, font_size: 13.0f64,
+    text_color: vocab::Color::ink(0.62f64), max_lines: 4 as i64,
+    line_break: vocab::LineBreak::WordWrap);
+}
+
+fn card(take content: core::Node) -> core::Node {
+    var surface: core::Node = content.padding(18.0f64);
+    surface.set_background_color(vocab::Color::raised());
+    surface.set_corner_radius(vocab::Corners::all(14.0f64));
+    return surface;
+}

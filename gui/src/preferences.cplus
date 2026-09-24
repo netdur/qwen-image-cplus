@@ -1,0 +1,210 @@
+import "foundation/foundation" as foundation;
+import "objc/bridge" as bridge;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+
+struct GenerationPreferences {
+    width: i64,
+    height: i64,
+    steps: i64,
+    seed: text::Text,
+    random_seed: bool,
+}
+
+fn store() -> foundation::UserDefaults {
+    return foundation::UserDefaults::new_with_suite_name(
+        "dev.netdur.qwen-image-cplus.preferences");
+}
+
+fn valid_dimension(value: i64) -> bool {
+    return value >= (256 as i64) && value % (32 as i64) == (0 as i64);
+}
+
+fn valid_steps(value: i64) -> bool {
+    return value == (3 as i64) || value == (4 as i64) ||
+        value == (8 as i64) || value == (25 as i64) || value == (40 as i64);
+}
+
+fn valid_seed(value: str) -> bool {
+    if value.count() == (0 as usize) || value.count() > (20 as usize) {
+        return false;
+    }
+    var result: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < value.count() {
+        guard let option::Option[u8]::Some(byte) = value.byte_at(index)
+            else { return false; };
+        if byte < (48 as u8) || byte > (57 as u8) { return false; }
+        let digit: u64 = (byte -% (48 as u8)) as u64;
+        if result > ((18446744073709551615 as u64) -% digit) /
+            (10 as u64) { return false; }
+        result = result *% (10 as u64) +% digit;
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn step_index(value: i64) -> i64 {
+    return match value {
+        3 => 0 as i64,
+        4 => 1 as i64,
+        8 => 2 as i64,
+        25 => 3 as i64,
+        _ => 4 as i64,
+    };
+}
+
+fn step_value(index: i64) -> i64 {
+    return match index {
+        0 => 3 as i64,
+        1 => 4 as i64,
+        2 => 8 as i64,
+        3 => 25 as i64,
+        _ => 40 as i64,
+    };
+}
+
+fn load_from(defaults: foundation::UserDefaults) -> GenerationPreferences {
+    let stored_width: i64 = defaults.integer_for_key("generation.width");
+    let stored_height: i64 = defaults.integer_for_key("generation.height");
+    let stored_steps: i64 = defaults.integer_for_key("generation.steps");
+    var seed: text::Text = text::from_str("1301");
+    match defaults.string_for_key("generation.seed") {
+        option::Option[text::Text]::Some(value) => {
+            if valid_seed(value.view()) { seed = value; }
+        }
+        option::Option::None => {}
+    }
+    return GenerationPreferences {
+        width: if valid_dimension(stored_width) { stored_width } else { 512 as i64 },
+        height: if valid_dimension(stored_height) { stored_height } else { 512 as i64 },
+        steps: if valid_steps(stored_steps) { stored_steps } else { 40 as i64 },
+        seed: seed,
+        random_seed: defaults.bool_for_key("generation.random_seed"),
+    };
+}
+
+fn load() -> GenerationPreferences { return load_from(store()); }
+
+fn save_dimensions_to(defaults: foundation::UserDefaults,
+width: str, height: str) -> bool {
+    guard let option::Option[i64]::Some(w) = width.to_i64()
+        else { return false; };
+    guard let option::Option[i64]::Some(h) = height.to_i64()
+        else { return false; };
+    if !valid_dimension(w) || !valid_dimension(h) { return false; }
+    defaults.set_integer(w, for_key: "generation.width");
+    defaults.set_integer(h, for_key: "generation.height");
+    return true;
+}
+
+fn save_dimensions(width: str, height: str) -> bool {
+    return save_dimensions_to(store(), width, height);
+}
+
+fn save_steps_to(defaults: foundation::UserDefaults, value: i64) -> bool {
+    if !valid_steps(value) { return false; }
+    defaults.set_integer(value, for_key: "generation.steps");
+    return true;
+}
+
+fn save_steps(value: i64) -> bool { return save_steps_to(store(), value); }
+
+fn save_seed_to(defaults: foundation::UserDefaults, value: str) -> bool {
+    if !valid_seed(value) { return false; }
+    defaults.set_object(bridge::nsstring(value), for_key: "generation.seed");
+    return true;
+}
+
+fn save_seed(value: str) -> bool { return save_seed_to(store(), value); }
+
+fn save_random_seed_to(defaults: foundation::UserDefaults, value: bool) {
+    defaults.set_bool(value, for_key: "generation.random_seed");
+}
+
+fn save_random_seed(value: bool) { save_random_seed_to(store(), value); }
+
+fn load_model_path_from(defaults: foundation::UserDefaults) -> option::Option[text::Text] {
+    return defaults.string_for_key("generation.model_path");
+}
+
+fn load_model_path() -> option::Option[text::Text] {
+    return load_model_path_from(store());
+}
+
+fn save_model_path_to(defaults: foundation::UserDefaults, path: str) -> bool {
+    if path.count() == (0 as usize) { return false; }
+    defaults.set_object(bridge::nsstring(path), for_key: "generation.model_path");
+    return true;
+}
+
+fn save_model_path(path: str) -> bool {
+    return save_model_path_to(store(), path);
+}
+
+#[test]
+fn generation_preferences_round_trip_and_validate() {
+    let defaults: foundation::UserDefaults =
+        foundation::UserDefaults::new_with_suite_name(
+            "dev.netdur.qwen-image-cplus.preferences.tests");
+    defaults.remove_object_for_key("generation.width");
+    defaults.remove_object_for_key("generation.height");
+    defaults.remove_object_for_key("generation.steps");
+    defaults.remove_object_for_key("generation.seed");
+    defaults.remove_object_for_key("generation.random_seed");
+    defaults.remove_object_for_key("generation.model_path");
+
+    let initial: GenerationPreferences = load_from(defaults);
+    assert initial.width == (512 as i64);
+    assert initial.height == (512 as i64);
+    assert initial.steps == (40 as i64);
+    assert initial.seed.view() == "1301";
+    assert !initial.random_seed;
+    match load_model_path_from(defaults) {
+        option::Option::None => {}
+        option::Option::Some(_) => { assert false; }
+    }
+
+    assert save_dimensions_to(defaults, "768", "1024");
+    assert !save_dimensions_to(defaults, "770", "1024");
+    assert save_steps_to(defaults, 8 as i64);
+    assert !save_steps_to(defaults, 7 as i64);
+    assert save_seed_to(defaults, "18446744073709551615");
+    assert !save_seed_to(defaults, "18446744073709551616");
+    save_random_seed_to(defaults, true);
+    assert save_model_path_to(defaults, "/tmp/example.qipack");
+    assert !save_model_path_to(defaults, "");
+
+    let saved: GenerationPreferences = load_from(defaults);
+    assert saved.width == (768 as i64);
+    assert saved.height == (1024 as i64);
+    assert saved.steps == (8 as i64);
+    assert saved.seed.view() == "18446744073709551615";
+    assert saved.random_seed;
+    match load_model_path_from(defaults) {
+        option::Option[text::Text]::Some(path) => {
+            assert path.view() == "/tmp/example.qipack";
+        }
+        option::Option::None => { assert false; }
+    }
+    assert step_index(saved.steps) == (2 as i64);
+    assert step_value(2 as i64) == (8 as i64);
+
+    defaults.set_integer(17 as i64, for_key: "generation.width");
+    defaults.set_integer(7 as i64, for_key: "generation.steps");
+    defaults.set_object(bridge::nsstring("18446744073709551616"),
+    for_key: "generation.seed");
+    let repaired: GenerationPreferences = load_from(defaults);
+    assert repaired.width == (512 as i64);
+    assert repaired.height == (1024 as i64);
+    assert repaired.steps == (40 as i64);
+    assert repaired.seed.view() == "1301";
+
+    defaults.remove_object_for_key("generation.width");
+    defaults.remove_object_for_key("generation.height");
+    defaults.remove_object_for_key("generation.steps");
+    defaults.remove_object_for_key("generation.seed");
+    defaults.remove_object_for_key("generation.random_seed");
+    defaults.remove_object_for_key("generation.model_path");
+}

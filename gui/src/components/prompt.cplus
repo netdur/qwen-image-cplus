@@ -1,0 +1,39 @@
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "./style" as style;
+
+struct Prompt { _shell: u8 }
+
+impl Prompt {
+    fn new() -> Prompt { return Prompt { _shell: 0 as u8 }; }
+}
+
+impl Prompt: component::Component {
+    fn build(ref this) -> core::Node {
+        let content: core::Node = @ui {
+            column(key: "prompt:card") {
+                style::caption("PROMPT", "prompt:title")
+                text_area("", key: "prompt:input")
+                    .height(126.0f64)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+            }
+            .gap(10.0f64)
+        };
+        return style::card(content);
+    }
+}
+
+impl Prompt: component::Lifecycle {
+    fn on_attach(ref this, _why: component::Attach) {}
+    fn on_detach(ref this, _why: component::Detach) {}
+}
+
+impl Prompt: core::IntoNode {
+    fn into_node(take this) -> core::Node {
+        return component::child::[Prompt](this);
+    }
+}
+
+fn prompt() -> Prompt { return Prompt::new(); }

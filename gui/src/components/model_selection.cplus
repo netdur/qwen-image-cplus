@@ -1,0 +1,158 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/label" as label;
+import "facet/mount" as mount;
+import "facet_runtime/runtime" as runtime;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "../file_drop" as file_drop;
+import "../preferences" as preferences;
+import "./style" as style;
+
+struct ModelSelection { path: text::Text, opaque drop_view: *u8 }
+
+fn has_model_extension(path: str) -> bool {
+    let lower: text::Text = path.to_text().lowercased();
+    return lower.view().has_suffix(".qipack");
+}
+
+fn is_model_file(path: str) -> bool {
+    return file_drop::is_regular_file(path) && has_model_extension(path);
+}
+
+fn selected_name(path: str) -> text::Text {
+    if path.count() == (0 as usize) { return text::from_str("No file selected"); }
+    match path.rfind("/") {
+        option::Option[usize]::Some(index) => {
+            match path.slice(index +% (1 as usize), path.count()) {
+                option::Option[str]::Some(name) => {
+                    if name.count() > (0 as usize) { return text::from_str(name); }
+                }
+                option::Option::None => {}
+            }
+        }
+        option::Option::None => {}
+    }
+    return text::from_str(path);
+}
+
+impl ModelSelection {
+    fn new() -> ModelSelection {
+        let path: text::Text = match preferences::load_model_path() {
+            option::Option[text::Text]::Some(saved) => saved,
+            option::Option::None => text::new(),
+        };
+        return ModelSelection { path: path, drop_view: 0 as *u8 };
+    }
+
+    fn selected_label(this) -> core::Node {
+        let name: text::Text = selected_name(this.path.view());
+        var display: core::Node = style::secondary(name.view(), "model:selected");
+        if this.path.count() > (0 as usize) {
+            core::set_tooltip(#addr_of(display), this.path.view());
+        }
+        return display;
+    }
+
+    fn refresh(this) {
+        let name: text::Text = selected_name(this.path.view());
+        match label::find("model:selected") {
+            option::Option[label::Label]::Some(display) => {
+                let _display: label::Label = display.set_text(name.view());
+            }
+            option::Option::None => {}
+        }
+        match mount::find("model:selected") {
+            option::Option[*core::Node]::Some(display) => {
+                core::set_tooltip(display, this.path.view());
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_choose(ref this, _sender: *u8) {
+        match runtime::choose_file() {
+            option::Option[text::Text]::Some(path) => {
+                if !is_model_file(path.view()) { return; }
+                if !preferences::save_model_path(path.view()) { return; }
+                this.path = path;
+                this.refresh();
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_dropped_path(ref this, path: text::Text, commit: bool) -> bool {
+        if !is_model_file(path.view()) { return false; }
+        if !commit { return true; }
+        if !preferences::save_model_path(path.view()) { return false; }
+        this.path = path.clone();
+        this.refresh();
+        return true;
+    }
+}
+
+impl ModelSelection: component::Component {
+    fn build(ref this) -> core::Node {
+        let content: core::Node = @ui {
+            column(key: "model:card") {
+                hstack {
+                    style::caption("MODEL", "model:title")
+                    spacer().grow(1.0f64)
+                    text_button("Choose file…", key: "model:choose",
+                    bordered: true, on_click: this.on_choose)
+                        .width(112.0f64).height(28.0f64)
+                }
+                .align(flex::Align::Center)
+                this.selected_label()
+            }
+            .gap(8.0f64)
+        };
+        return style::card(content);
+    }
+}
+
+impl ModelSelection: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        match mount::find("model:card") {
+            option::Option[*core::Node]::Some(card) => {
+                this.drop_view = core::native(card);
+                file_drop::install(this.drop_view,
+                #str_ptr("QwenModelFileDropView\0"),
+                this.on_dropped_path);
+            }
+            option::Option::None => {}
+        }
+    }
+    fn on_detach(ref this, why: component::Detach) {
+        if why != component::Detach::Unmount { return; }
+        file_drop::clear(this.drop_view);
+        this.drop_view = 0 as *u8;
+    }
+}
+
+impl ModelSelection: core::IntoNode {
+    fn into_node(take this) -> core::Node {
+        return component::child::[ModelSelection](this);
+    }
+}
+
+fn model_selection() -> ModelSelection { return ModelSelection::new(); }
+
+#[test]
+fn selected_model_name_uses_file_name() {
+    assert selected_name("/models/qwen-image.qipack").view() == "qwen-image.qipack";
+    assert selected_name("/models/نموذج.qipack").view() == "نموذج.qipack";
+    assert selected_name("").view() == "No file selected";
+}
+
+#[test]
+fn model_drop_accepts_qipack_extension_only() {
+    assert has_model_extension("/tmp/model.QIPACK");
+    assert !has_model_extension("/tmp/model.safetensors");
+    assert !is_model_file("/nonexistent/model.qipack");
+}

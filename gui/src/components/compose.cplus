@@ -1,0 +1,78 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/scroll" as scroll;
+import "facet/vocabulary" as vocab;
+import "stdlib/option" as option;
+import "./style" as style;
+import "./prompt" as prompt;
+import "./references" as references;
+import "./output_options" as output_options;
+import "./model_selection" as model_selection;
+
+struct Compose { _shell: u8 }
+
+impl Compose {
+    fn new() -> Compose { return Compose { _shell: 0 as u8 }; }
+
+    fn create_button(this) -> core::Node {
+        var action: core::Node = ui::icon_button("sparkles",
+        key: "compose:create", bordered: true,
+        corner_radius: vocab::Corners::all(10.0f64));
+        core::set_enabled(#addr_of(action), false);
+        return action.width(36.0f64).height(36.0f64);
+    }
+}
+
+impl Compose: component::Component {
+    fn build(ref this) -> core::Node {
+        let content: core::Node = @ui {
+            column(key: "compose:content") {
+                hstack {
+                    style::title("Create", "compose:title")
+                    spacer().grow(1.0f64)
+                    this.create_button()
+                }
+                .align(flex::Align::Center)
+                style::secondary(
+                    "Write a prompt and add references to shape an image.",
+                    "compose:subtitle")
+                prompt::prompt()
+                references::references()
+                output_options::output_options()
+                model_selection::model_selection()
+            }
+            .width_percent(100.0f64)
+            .padding_edge(flex::Edge::Left, 18.0f64)
+            .padding_edge(flex::Edge::Right, 20.0f64)
+            .gap(15.0f64)
+        };
+        var viewport: core::Node = @ui {
+            scroll(key: "compose:scroll", axis: vocab::ScrollAxis::Vertical)
+                .width_percent(100.0f64)
+                .grow(1.0f64)
+                .shrink(1.0f64)
+        };
+        match scroll::find("compose:scroll", within: #addr_of(viewport)) {
+            option::Option[scroll::Scroll]::Some(scroller) => {
+                let _scroller: scroll::Scroll = scroller.set_content(content);
+            }
+            option::Option::None => {}
+        }
+        return viewport;
+    }
+}
+
+impl Compose: component::Lifecycle {
+    fn on_attach(ref this, _why: component::Attach) {}
+    fn on_detach(ref this, _why: component::Detach) {}
+}
+
+impl Compose: core::IntoNode {
+    fn into_node(take this) -> core::Node {
+        return component::child::[Compose](this);
+    }
+}
+
+fn compose() -> Compose { return Compose::new(); }

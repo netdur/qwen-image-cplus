@@ -1,0 +1,73 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/vocabulary" as vocab;
+import "./style" as style;
+
+struct Preview { _shell: u8 }
+
+impl Preview {
+    fn new() -> Preview { return Preview { _shell: 0 as u8 }; }
+
+    fn empty_canvas(this) -> core::Node {
+        var canvas: core::Node = @ui {
+            column(key: "preview:canvas") {
+                label("✦", key: "preview:icon", font_size: 56.0f64,
+                text_color: vocab::Color::ink(0.30f64))
+                label("Your image will appear here", key: "preview:empty",
+                font_size: 19.0f64,
+                font_weight: vocab::FontWeight::Semibold,
+                text_color: vocab::Color::ink(0.80f64))
+                style::secondary("A quiet canvas for the finished image.",
+                "preview:hint")
+            }
+            .grow(1.0f64)
+            .shrink(1.0f64)
+            .align(flex::Align::Center)
+            .justify(flex::Justify::Center)
+            .gap(10.0f64)
+        };
+        canvas.set_background_color(vocab::Color::sunken());
+        canvas.set_corner_radius(vocab::Corners::all(16.0f64));
+        return canvas;
+    }
+}
+
+impl Preview: component::Component {
+    fn build(ref this) -> core::Node {
+        let content: core::Node = @ui {
+            column(key: "preview:panel") {
+                hstack {
+                    style::title("Preview", "preview:title")
+                    spacer().grow(1.0f64)
+                    style::caption("NO OUTPUT YET", "preview:state")
+                }
+                .align(flex::Align::Center)
+                this.empty_canvas()
+                hstack {
+                    style::secondary("PNG output", "preview:format")
+                    spacer().grow(1.0f64)
+                    style::secondary("Nothing generated yet", "preview:footer")
+                }
+            }
+            .grow(1.0f64)
+            .shrink(1.0f64)
+            .gap(16.0f64)
+        };
+        return style::card(content).grow(1.0f64).shrink(1.0f64);
+    }
+}
+
+impl Preview: component::Lifecycle {
+    fn on_attach(ref this, _why: component::Attach) {}
+    fn on_detach(ref this, _why: component::Detach) {}
+}
+
+impl Preview: core::IntoNode {
+    fn into_node(take this) -> core::Node {
+        return component::child::[Preview](this);
+    }
+}
+
+fn preview() -> Preview { return Preview::new(); }

@@ -1,0 +1,148 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/screen" as screen;
+import "facet/split" as split;
+import "facet/text_area" as text_area;
+import "facet/vocabulary" as vocab;
+import "facet/window_chrome" as _;
+import "facet_runtime/runtime" as runtime;
+import "appkit/appkit" as ak;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/vec" as vec;
+import "../components/style" as style;
+import "../components/compose" as compose;
+import "../components/preview" as preview;
+
+struct Generation { did_initial_focus: bool }
+
+impl Generation {
+    fn new() -> Generation { return Generation { did_initial_focus: false }; }
+
+    fn header(this) -> core::Node {
+        return @ui {
+            hstack(key: "generation:header") {
+                column {
+                    label("Qwen Image", key: "brand:title", font_size: 20.0f64,
+                    font_weight: vocab::FontWeight::Bold,
+                    text_color: vocab::Color::ink())
+                    style::secondary("Local image studio", "brand:subtitle")
+                }
+                .gap(2.0f64)
+                spacer().grow(1.0f64)
+                style::caption("INTERFACE PREVIEW", "header:state")
+            }
+            .align(flex::Align::Center)
+            .gap(13.0f64)
+            .height(64.0f64)
+            .shrink(0.0f64)
+            .padding_edge(flex::Edge::Horizontal, 24.0f64)
+            .window_drag()
+        };
+    }
+
+    fn on_menu_settings(this, _sender: *u8) {
+        let _opened = runtime::app().open_window("settings");
+    }
+}
+
+impl Generation: component::Component {
+    fn build(ref this) -> core::Node {
+        var root: core::Node = @ui {
+            split(
+                key: "generation:split",
+                position: 390.0f64,
+                min_leading: 380.0f64,
+                max_leading: 500.0f64,
+                min_trailing: 500.0f64,
+                role_leading: split::PaneRole::Content,
+            ) {
+                column(key: "generation:compose-pane") {
+                    hstack(key: "generation:window-header") {
+                        window_buttons(key: "generation:window-buttons")
+                        spacer().grow(1.0f64)
+                    }
+                    .height(52.0f64)
+                    .shrink(0.0f64)
+                    .align(flex::Align::Center)
+                    .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                    .window_drag()
+                    column(key: "generation:compose-body") {
+                        compose::compose()
+                    }
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .padding_edge(flex::Edge::Bottom, 18.0f64)
+                }
+                .grow(1.0f64)
+                .shrink(1.0f64)
+                .set_background_color(vocab::Color::sunken())
+                column(key: "generation:preview-pane") {
+                    this.header()
+                    column(key: "generation:preview-body") {
+                        preview::preview()
+                        style::secondary(
+                            "Inputs are editable · generation is not connected",
+                            "status:message")
+                    }
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .padding(24.0f64)
+                    .gap(16.0f64)
+                }
+                .grow(1.0f64)
+                .shrink(1.0f64)
+                .set_background_color(vocab::Color::surface())
+            }
+            .grow(1.0f64)
+            .shrink(1.0f64)
+        };
+        root.set_safe_area(vocab::SafeArea::None);
+        return root;
+    }
+}
+
+impl Generation: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Active || this.did_initial_focus { return; }
+        match text_area::find("prompt:input") {
+            option::Option[text_area::TextArea]::Some(input) => {
+                let native: *u8 = input.native();
+                if native.is_null() { return; }
+                match ak::ScrollView::from_raw(native).document_view() {
+                    option::Option[ak::View]::Some(editor) => {
+                        match editor.window() {
+                            option::Option[ak::Window]::Some(window) => {
+                                window.set_initial_first_responder(editor);
+                                if window.make_first_responder(editor.as_responder()) {
+                                    this.did_initial_focus = true;
+                                }
+                            }
+                            option::Option::None => {}
+                        }
+                    }
+                    option::Option::None => {}
+                }
+            }
+            option::Option::None => {}
+        }
+    }
+    fn on_detach(ref this, _why: component::Detach) {}
+}
+
+impl Generation: screen::Screen {
+    fn menu_items(this) -> vec::Vec[screen::MenuItem] {
+        var items: vec::Vec[screen::MenuItem] =
+            vec::new::[screen::MenuItem]();
+        let _added: status::Status = items.append(screen::MenuItem::new(
+            "Qwen Image", "Settings…", key: ",",
+            on_click: this.on_menu_settings));
+        return items;
+    }
+}
+
+fn boxed() -> screen::ScreenBox {
+    return screen::screen_box::[Generation](Generation::new());
+}

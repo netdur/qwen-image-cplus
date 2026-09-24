@@ -1,0 +1,269 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/icon_button" as icon_button;
+import "facet/image" as image;
+import "facet/label" as label;
+import "facet/mount" as mount;
+import "facet/scroll" as scroll;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+import "../file_drop" as file_drop;
+import "./style" as style;
+
+struct References { paths: vec::Vec[text::Text], opaque drop_view: *u8 }
+
+fn has_image_extension(path: str) -> bool {
+    let lower: text::Text = path.to_text().lowercased();
+    let name: str = lower.view();
+    return name.has_suffix(".png") || name.has_suffix(".jpg") ||
+        name.has_suffix(".jpeg") || name.has_suffix(".heic") ||
+        name.has_suffix(".heif") || name.has_suffix(".webp") ||
+        name.has_suffix(".gif") || name.has_suffix(".tif") ||
+        name.has_suffix(".tiff") || name.has_suffix(".bmp");
+}
+
+fn is_image_file(path: str) -> bool {
+    return file_drop::is_regular_file(path) && has_image_extension(path);
+}
+
+impl References {
+    fn new() -> References {
+        return References { paths: vec::new::[text::Text](), drop_view: 0 as *u8 };
+    }
+
+    fn remove_button(ref this, index: usize) -> core::Node {
+        var action: core::Node = ui::text_button("×",
+        key: "references:remove:${index}",
+        text_color: vocab::Color::rgba(1.0f64, 1.0f64, 1.0f64, 1.0f64),
+        font_size: 18.0f64, font_weight: vocab::FontWeight::Bold,
+        font_scales: false, on_click: this.on_remove)
+            .width(24.0f64)
+            .height(24.0f64);
+        core::set_item_index(#addr_of(action), index);
+        action.set_position(flex::Edge::Top, flex::StyleLength::points(6.0f64));
+        action.set_position(flex::Edge::Left, flex::StyleLength::points(6.0f64));
+        action.set_z_index(1 as i32);
+        action.set_background_color(
+            vocab::Color::rgba(0.0f64, 0.0f64, 0.0f64, 0.72f64));
+        action.set_corner_radius(vocab::Corners::all(12.0f64));
+        core::set_shadow(#addr_of(action), vocab::Shadow {
+            color: vocab::Color::rgba(0.0f64, 0.0f64, 0.0f64, 1.0f64),
+            offset: vocab::Point::of(0.0f64, 1.0f64),
+            radius: 2.0f64,
+            opacity: 0.25f64,
+        });
+        core::set_accessibility_label(#addr_of(action), "Remove reference image");
+        core::set_tooltip(#addr_of(action), "Remove image");
+        return action;
+    }
+
+    fn thumbnail(ref this, index: usize) -> core::Node {
+        var tile: core::Node = @ui {
+            zstack(key: "references:tile:${index}") {
+                image("", key: "references:image:${index}",
+                fit: vocab::ImageFit::AspectFill)
+                    .width(104.0f64)
+                    .height(120.0f64)
+                this.remove_button(index)
+            }
+            .width(104.0f64)
+            .height(120.0f64)
+        };
+        tile.set_background_color(vocab::Color::sunken());
+        tile.set_corner_radius(vocab::Corners::all(12.0f64));
+        core::set_shown(#addr_of(tile), false);
+        return tile;
+    }
+
+    fn add_button(ref this) -> core::Node {
+        var action: core::Node = ui::icon_button("plus.circle.fill",
+        key: "references:add", fit: vocab::ImageFit::AspectFit,
+        on_clicked: this.on_add)
+            .width(24.0f64)
+            .height(24.0f64);
+        core::set_accessibility_label(#addr_of(action), "Add reference image");
+        core::set_tooltip(#addr_of(action), "Add image");
+        return action;
+    }
+
+    fn strip(ref this) -> core::Node {
+        let content: core::Node = @ui {
+            hstack(key: "references:items") {
+                this.thumbnail(0 as usize)
+                this.thumbnail(1 as usize)
+                this.thumbnail(2 as usize)
+                this.thumbnail(3 as usize)
+                this.thumbnail(4 as usize)
+                this.thumbnail(5 as usize)
+                this.thumbnail(6 as usize)
+                this.thumbnail(7 as usize)
+                this.thumbnail(8 as usize)
+                this.thumbnail(9 as usize)
+            }
+            .height(128.0f64)
+            .gap(8.0f64)
+        };
+        var viewport: core::Node = @ui {
+            scroll(key: "references:strip", axis: vocab::ScrollAxis::Horizontal)
+                .height(134.0f64)
+                .width_percent(100.0f64)
+        };
+        match scroll::find("references:strip", within: #addr_of(viewport)) {
+            option::Option[scroll::Scroll]::Some(found) => {
+                let _found: scroll::Scroll = found.set_content(content);
+            }
+            option::Option::None => {}
+        }
+        core::set_shown(#addr_of(viewport), false);
+        return viewport;
+    }
+
+    fn refresh(ref this) {
+        match label::find("references:count") {
+            option::Option[label::Label]::Some(found) => {
+                let _found: label::Label =
+                    found.set_text("${this.paths.count()} / 10");
+            }
+            option::Option::None => {}
+        }
+        match icon_button::find("references:add") {
+            option::Option[icon_button::IconButton]::Some(found) => {
+                let _found: icon_button::IconButton =
+                    found.set_enabled(this.paths.count() < (10 as usize));
+            }
+            option::Option::None => {}
+        }
+        var index: usize = 0 as usize;
+        while index < (10 as usize) {
+            let visible: bool = index < this.paths.count();
+            match mount::find("references:tile:${index}") {
+                option::Option[*core::Node]::Some(tile) => {
+                    core::set_shown(tile, visible);
+                    if visible { core::relayout(tile); }
+                }
+                option::Option::None => {}
+            }
+            match image::find("references:image:${index}") {
+                option::Option[image::Image]::Some(found) => {
+                    match this.paths.at_ptr(index) {
+                        option::Option[*text::Text]::Some(path) => {
+                            let _found: image::Image =
+                                found.set_source({ (*path).view() });
+                        }
+                        option::Option::None => {
+                            let _found: image::Image = found.set_source("");
+                        }
+                    }
+                }
+                option::Option::None => {}
+            }
+            index = index +% (1 as usize);
+        }
+        match mount::find("references:strip") {
+            option::Option[*core::Node]::Some(strip) => {
+                let visible: bool = this.paths.count() > (0 as usize);
+                core::set_shown(strip, visible);
+                if visible { core::relayout(strip); }
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_add(ref this, _sender: *u8) {
+        if this.paths.count() >= (10 as usize) { return; }
+        match runtime::choose_file() {
+            option::Option[text::Text]::Some(path) => {
+                let _accepted: bool = this.on_dropped_path(path, true);
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_dropped_path(ref this, path: text::Text, commit: bool) -> bool {
+        if this.paths.count() >= (10 as usize) || !is_image_file(path.view()) {
+            return false;
+        }
+        if !commit { return true; }
+        let _added: status::Status =
+            this.paths.insert(path.clone(), at: 0 as usize);
+        this.refresh();
+        match scroll::find("references:strip") {
+            option::Option[scroll::Scroll]::Some(found) => {
+                let _found: scroll::Scroll = found.set_scroll_x(0.0f64);
+            }
+            option::Option::None => {}
+        }
+        return true;
+    }
+
+    fn on_remove(ref this, sender: *u8) {
+        guard let option::Option[usize]::Some(index) =
+            component::item_index_of(sender) else { return; };
+        let _removed: option::Option[text::Text] = this.paths.remove(index);
+        this.refresh();
+    }
+}
+
+impl References: component::Component {
+    fn build(ref this) -> core::Node {
+        let content: core::Node = @ui {
+            column(key: "references:card") {
+                hstack {
+                    style::caption("REFERENCE IMAGES", "references:title")
+                    spacer().grow(1.0f64)
+                    style::secondary("0 / 10", "references:count")
+                    this.add_button()
+                }
+                .align(flex::Align::Center)
+                .gap(8.0f64)
+                this.strip()
+            }
+            .gap(12.0f64)
+        };
+        return style::card(content);
+    }
+}
+
+impl References: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        this.refresh();
+        match mount::find("references:card") {
+            option::Option[*core::Node]::Some(card) => {
+                this.drop_view = core::native(card);
+                file_drop::install(this.drop_view,
+                #str_ptr("QwenReferenceFileDropView\0"),
+                this.on_dropped_path);
+            }
+            option::Option::None => {}
+        }
+    }
+    fn on_detach(ref this, why: component::Detach) {
+        if why != component::Detach::Unmount { return; }
+        file_drop::clear(this.drop_view);
+        this.drop_view = 0 as *u8;
+    }
+}
+
+impl References: core::IntoNode {
+    fn into_node(take this) -> core::Node {
+        return component::child::[References](this);
+    }
+}
+
+fn references() -> References { return References::new(); }
+
+#[test]
+fn image_drop_accepts_supported_extensions_only() {
+    assert has_image_extension("/tmp/PHOTO.PNG");
+    assert has_image_extension("/tmp/photo.heic");
+    assert !has_image_extension("/tmp/image.txt");
+    assert !is_image_file("/nonexistent/image.png");
+}

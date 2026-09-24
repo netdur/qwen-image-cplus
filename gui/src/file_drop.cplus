@@ -1,0 +1,182 @@
+import "objc/bridge" as bridge;
+import "objc/runtime" as rt;
+import "objc/synthesis" as synth;
+import "stdlib/fs" as fs;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+
+#[link_name = "object_getClass"]
+extern fn object_get_class(object: *u8) -> *u8;
+#[link_name = "object_setClass"]
+extern fn object_set_class(object: *u8, cls: *u8) -> *u8;
+
+fn handler_key() -> *u8 { return { 41001 as *u8 }; }
+fn context_key() -> *u8 { return { 41002 as *u8 }; }
+
+fn is_regular_file(path: str) -> bool {
+    guard let result::Result[fs::Metadata, result::IoError]::Ok(info) =
+        fs::metadata(path) else { return false; };
+    return !info.is_dir;
+}
+
+fn visit_pasteboard(pasteboard: *u8, receiver: *u8, commit: bool) -> bool {
+    let callback: fn(text::Text, bool, *u8) -> bool =
+        { synth::get_associated(receiver, handler_key()) as fn(text::Text, bool, *u8) -> bool };
+    if { callback as *u8 } == { 0 as *u8 } { return false; }
+    let context: *u8 = synth::get_associated(receiver, context_key());
+    let items: *u8 = rt::msg_id(pasteboard, rt::sel(#str_ptr("pasteboardItems\0")));
+    if items == { 0 as *u8 } { return false; }
+    let count: u64 = rt::msg_u64(items, rt::sel(#str_ptr("count\0")));
+    var accepted: bool = false;
+    var index: u64 = count;
+    while index > (0 as u64) {
+        index = index -% (1 as u64);
+        let item: *u8 = rt::msg_id_u64(items, rt::sel(#str_ptr("objectAtIndex:\0")), index);
+        let raw_url: *u8 = rt::msg_id_id(item, rt::sel(#str_ptr("stringForType:\0")),
+        bridge::nsstring("public.file-url"));
+        if raw_url != { 0 as *u8 } {
+            let url: *u8 = rt::msg_id_id(rt::get_class(#str_ptr("NSURL\0")),
+            rt::sel(#str_ptr("URLWithString:\0")), raw_url);
+            if url != { 0 as *u8 } &&
+                rt::msg_i8(url, rt::sel(#str_ptr("isFileURL\0"))) != (0 as i8) {
+                let path: text::Text = bridge::to_text(
+                    rt::msg_id(url, rt::sel(#str_ptr("path\0"))));
+                if callback(path, commit, context) { accepted = true; }
+            }
+        }
+    }
+    return accepted;
+}
+
+fn visit_files(sender: *u8, receiver: *u8, commit: bool) -> bool {
+    if sender == { 0 as *u8 } { return false; }
+    return visit_pasteboard(
+        rt::msg_id(sender, rt::sel(#str_ptr("draggingPasteboard\0"))),
+        receiver, commit);
+}
+
+fn drag_entered(self_obj: *u8, _cmd: *u8, sender: *u8) -> u64 {
+    if visit_files(sender, self_obj, false) { return 1 as u64; }
+    return 0 as u64;
+}
+
+fn drag_updated(self_obj: *u8, cmd: *u8, sender: *u8) -> u64 {
+    return drag_entered(self_obj, cmd, sender);
+}
+
+fn drag_exited(_self_obj: *u8, _cmd: *u8, _sender: *u8) {}
+
+fn drag_prepared(self_obj: *u8, _cmd: *u8, sender: *u8) -> i8 {
+    if visit_files(sender, self_obj, false) { return 1 as i8; }
+    return 0 as i8;
+}
+
+fn drag_performed(self_obj: *u8, _cmd: *u8, sender: *u8) -> i8 {
+    if visit_files(sender, self_obj, true) { return 1 as i8; }
+    return 0 as i8;
+}
+
+fn install(view: *u8, class_name: *u8,
+handler: fn(text::Text, bool, *u8) -> bool, context: *u8 = 0 as *u8) {
+    if view == { 0 as *u8 } { return; }
+    var cls: *u8 = rt::get_class(class_name);
+    if cls == { 0 as *u8 } {
+        cls = synth::allocate_class_pair(object_get_class(view), class_name, 0 as usize);
+        if cls == { 0 as *u8 } { return; }
+        let _entered: i8 = synth::add_method_u64_1id(cls,
+        rt::sel(#str_ptr("draggingEntered:\0")), drag_entered, #str_ptr("Q@:@\0"));
+        let _updated: i8 = synth::add_method_u64_1id(cls,
+        rt::sel(#str_ptr("draggingUpdated:\0")), drag_updated, #str_ptr("Q@:@\0"));
+        let _exited: i8 = synth::add_method_v_1id(cls,
+        rt::sel(#str_ptr("draggingExited:\0")), drag_exited, #str_ptr("v@:@\0"));
+        let _prepared: i8 = synth::add_method_i8_1id(cls,
+        rt::sel(#str_ptr("prepareForDragOperation:\0")), drag_prepared, #str_ptr("c@:@\0"));
+        let _performed: i8 = synth::add_method_i8_1id(cls,
+        rt::sel(#str_ptr("performDragOperation:\0")), drag_performed, #str_ptr("c@:@\0"));
+        synth::register_class_pair(cls);
+    }
+    if object_get_class(view) != cls {
+        let _previous: *u8 = object_set_class(view, cls);
+    }
+    synth::set_associated(view, handler_key(), { handler as *u8 });
+    synth::set_associated(view, context_key(), context);
+    let types: *u8 = rt::msg_id_id(rt::get_class(#str_ptr("NSArray\0")),
+    rt::sel(#str_ptr("arrayWithObject:\0")), bridge::nsstring("public.file-url"));
+    rt::msg_void_id(view, rt::sel(#str_ptr("registerForDraggedTypes:\0")), types);
+}
+
+fn clear(view: *u8) {
+    if view == { 0 as *u8 } { return; }
+    synth::set_associated(view, handler_key(), 0 as *u8);
+    synth::set_associated(view, context_key(), 0 as *u8);
+    rt::msg_void(view, rt::sel(#str_ptr("unregisterDraggedTypes\0")));
+}
+
+struct TestDrop { path: text::Text, previews: usize, commits: usize }
+
+fn test_drop(path: text::Text, commit: bool, ctx: *u8) -> bool {
+    let state: *TestDrop = { ctx as *TestDrop };
+    { (*state).path = path.clone(); }
+    if commit { (*state).commits = { (*state).commits } +% (1 as usize); }
+    else { (*state).previews = { (*state).previews } +% (1 as usize); }
+    return true;
+}
+
+#[test]
+fn file_url_drop_decodes_paths_and_preserves_selection_order() {
+    let pasteboard: *u8 = rt::msg_id(rt::get_class(#str_ptr("NSPasteboard\0")),
+    rt::sel(#str_ptr("pasteboardWithUniqueName\0")));
+    assert pasteboard != { 0 as *u8 };
+    let item: *u8 = rt::msg_id(rt::get_class(#str_ptr("NSPasteboardItem\0")),
+    rt::sel(#str_ptr("new\0")));
+    assert rt::msg_i8_id_id(item, rt::sel(#str_ptr("setString:forType:\0")),
+    bridge::nsstring("file:///tmp/first%20image.png"),
+    bridge::nsstring("public.file-url")) != (0 as i8);
+    let second: *u8 = rt::msg_id(rt::get_class(#str_ptr("NSPasteboardItem\0")),
+    rt::sel(#str_ptr("new\0")));
+    assert rt::msg_i8_id_id(second, rt::sel(#str_ptr("setString:forType:\0")),
+    bridge::nsstring("file:///tmp/second.png"),
+    bridge::nsstring("public.file-url")) != (0 as i8);
+    let items: *u8 = rt::msg_id(rt::get_class(#str_ptr("NSMutableArray\0")),
+    rt::sel(#str_ptr("array\0")));
+    rt::msg_void_id(items, rt::sel(#str_ptr("addObject:\0")), item);
+    rt::msg_void_id(items, rt::sel(#str_ptr("addObject:\0")), second);
+    assert rt::msg_i8_id(pasteboard, rt::sel(#str_ptr("writeObjects:\0")),
+    items) != (0 as i8);
+    let receiver: *u8 = rt::msg_id(rt::get_class(#str_ptr("NSObject\0")),
+    rt::sel(#str_ptr("new\0")));
+    var state: TestDrop = TestDrop {
+        path: text::new(), previews: 0 as usize, commits: 0 as usize,
+    };
+    let callback: fn(text::Text, bool, *u8) -> bool = test_drop;
+    synth::set_associated(receiver, handler_key(), { callback as *u8 });
+    synth::set_associated(receiver, context_key(), #addr_of(state) as *u8);
+    assert visit_pasteboard(pasteboard, receiver, false);
+    assert state.path.view() == "/tmp/first image.png";
+    assert state.previews == (2 as usize);
+    assert visit_pasteboard(pasteboard, receiver, true);
+    assert state.commits == (2 as usize);
+    rt::msg_void(pasteboard, rt::sel(#str_ptr("releaseGlobally\0")));
+    rt::msg_void(receiver, rt::sel(#str_ptr("release\0")));
+    rt::msg_void(item, rt::sel(#str_ptr("release\0")));
+    rt::msg_void(second, rt::sel(#str_ptr("release\0")));
+}
+
+#[test]
+fn native_drop_view_registers_file_urls_and_clears_its_context() {
+    let view: *u8 = rt::msg_id(rt::get_class(#str_ptr("NSView\0")),
+    rt::sel(#str_ptr("new\0")));
+    var state: TestDrop = TestDrop {
+        path: text::new(), previews: 0 as usize, commits: 0 as usize,
+    };
+    let callback: fn(text::Text, bool, *u8) -> bool = test_drop;
+    install(view, #str_ptr("QwenTestFileDropView\0"), callback,
+    #addr_of(state) as *u8);
+    assert object_get_class(view) == rt::get_class(#str_ptr("QwenTestFileDropView\0"));
+    let types: *u8 = rt::msg_id(view, rt::sel(#str_ptr("registeredDraggedTypes\0")));
+    assert rt::msg_u64(types, rt::sel(#str_ptr("count\0"))) == (1 as u64);
+    assert synth::get_associated(view, context_key()) == (#addr_of(state) as *u8);
+    clear(view);
+    assert synth::get_associated(view, context_key()) == { 0 as *u8 };
+    rt::msg_void(view, rt::sel(#str_ptr("release\0")));
+}

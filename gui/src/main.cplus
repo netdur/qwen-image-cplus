@@ -1,0 +1,5 @@
+import "./app" as app;
+
+fn main() -> i32 {
+    return app::run();
+}

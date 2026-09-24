@@ -1,0 +1,68 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/screen" as screen;
+import "facet/vocabulary" as vocab;
+import "stdlib/vec" as vec;
+import "../components/style" as style;
+
+struct Settings { _shell: u8 }
+
+impl Settings {
+    fn new() -> Settings { return Settings { _shell: 0 as u8 }; }
+
+    fn section(this, key: str, heading: str, detail: str) -> core::Node {
+        let content: core::Node = @ui {
+            column(key: key) {
+                label(heading, font_size: 15.0f64,
+                font_weight: vocab::FontWeight::Semibold,
+                text_color: vocab::Color::ink())
+                style::secondary(detail, "${key}:detail")
+            }
+            .gap(8.0f64)
+        };
+        return style::card(content);
+    }
+}
+
+impl Settings: component::Component {
+    fn build(ref this) -> core::Node {
+        var root: core::Node = @ui {
+            column(key: "settings:root") {
+                style::title("Settings", "settings:window:title")
+                style::secondary(
+                    "Preferences for local image generation will live here.",
+                    "settings:window:subtitle")
+                this.section("settings:model", "Models",
+                "Model location and selection are not connected yet.")
+                this.section("settings:defaults", "Generation defaults",
+                "Output size, steps, and seed will be configurable later.")
+                spacer().grow(1.0f64)
+                style::secondary("This window is a layout preview.",
+                "settings:window:status")
+            }
+            .grow(1.0f64)
+            .shrink(1.0f64)
+            .padding(28.0f64)
+            .gap(16.0f64)
+        };
+        root.set_background_color(vocab::Color::surface());
+        return root;
+    }
+}
+
+impl Settings: component::Lifecycle {
+    fn on_attach(ref this, _why: component::Attach) {}
+    fn on_detach(ref this, _why: component::Detach) {}
+}
+
+impl Settings: screen::Screen {
+    fn menu_items(this) -> vec::Vec[screen::MenuItem] {
+        return vec::new::[screen::MenuItem]();
+    }
+}
+
+fn boxed() -> screen::ScreenBox {
+    return screen::screen_box::[Settings](Settings::new());
+}

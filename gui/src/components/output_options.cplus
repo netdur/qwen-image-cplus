@@ -1,0 +1,299 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/checkbox" as checkbox;
+import "facet/label" as label;
+import "facet/popup" as popup;
+import "facet/text_field" as text_field;
+import "facet/vocabulary" as vocab;
+import "appkit/appkit" as ak;
+import "objc/runtime" as rt;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "../preferences" as preferences;
+import "./style" as style;
+
+struct OutputOptions { _shell: u8 }
+
+struct DigitsEdit {
+    digits: text::Text,
+    caret: u64,
+    changed: bool,
+}
+
+impl OutputOptions {
+    fn new() -> OutputOptions { return OutputOptions { _shell: 0 as u8 }; }
+
+    fn steps(this) -> vocab::TextList {
+        var choices: vocab::TextList = vocab::TextList::new();
+        let _a: status::Status = choices.add("3");
+        let _b: status::Status = choices.add("4");
+        let _c: status::Status = choices.add("8");
+        let _d: status::Status = choices.add("25");
+        let _e: status::Status = choices.add("40");
+        return choices;
+    }
+
+    fn valid_dimension(this, key: str) -> bool {
+        guard let option::Option[text_field::TextField]::Some(field) =
+            text_field::find(key) else { return false; };
+        return match field.text().to_i64() {
+            option::Option[i64]::Some(value) =>
+            value >= (256 as i64) && value % (32 as i64) == (0 as i64),
+            option::Option::None => false,
+        };
+    }
+
+    fn digits_only(this, value: str, caret: u64) -> DigitsEdit {
+        var result: DigitsEdit = DigitsEdit {
+            digits: text::new(), caret: 0 as u64, changed: false,
+        };
+        var index: usize = 0 as usize;
+        var position: u64 = 0 as u64;
+        while index < value.count() {
+            guard let option::Option[u8]::Some(byte) = value.byte_at(index)
+                else { break; };
+            if byte >= (48 as u8) && byte <= (57 as u8) &&
+                result.digits.count() < (20 as usize) {
+                match value.slice(index, index +% (1 as usize)) {
+                    option::Option[str]::Some(digit) => {
+                        let _appended: status::Status = result.digits.append(digit);
+                        if position < caret { result.caret = result.caret +% (1 as u64); }
+                    }
+                    option::Option::None => {}
+                }
+            } else {
+                result.changed = true;
+            }
+            if byte < (128 as u8) {
+                index = index +% (1 as usize);
+                position = position +% (1 as u64);
+            } else if byte < (224 as u8) {
+                index = index +% (2 as usize);
+                position = position +% (1 as u64);
+            } else if byte < (240 as u8) {
+                index = index +% (3 as usize);
+                position = position +% (1 as u64);
+            } else {
+                index = index +% (4 as usize);
+                position = position +% (2 as u64);
+            }
+        }
+        return result;
+    }
+
+    fn sanitize_field(ref this, key: str, sender: *u8) {
+        guard let option::Option[text_field::TextField]::Some(field) =
+            text_field::find(key) else { return; };
+        let original: text::Text = text::from_str(field.text());
+        let caret: u64 = if field.cursor_position() < (0 as i64) {
+            0 as u64
+        } else {
+            field.cursor_position() as u64
+        };
+        let edit: DigitsEdit = this.digits_only(original.view(), caret);
+        if edit.changed {
+            let _field: text_field::TextField =
+                field.set_text(edit.digits.view())
+                    .set_cursor_position(edit.caret as i64);
+            if sender.is_not_null() {
+                match ak::TextField::from_raw(sender).as_control().current_editor() {
+                    option::Option[ak::Text]::Some(editor) => {
+                        editor.set_string(edit.digits.view());
+                        editor.set_selected_range(rt::Range {
+                            location: edit.caret, length: 0 as u64,
+                        });
+                    }
+                    option::Option::None => {}
+                }
+            }
+        }
+    }
+
+    fn on_dimension_changed(ref this, key: str, sender: *u8) {
+        this.sanitize_field(key, sender);
+        let valid: bool = this.valid_dimension("settings:width") &&
+            this.valid_dimension("settings:height");
+        match label::find("settings:size:hint") {
+            option::Option[label::Label]::Some(hint) => {
+                let _hint: label::Label = hint.set_text(if valid {
+                    "Width and height are multiples of 32."
+                } else {
+                    "Use at least 256 pixels, in multiples of 32."
+                });
+            }
+            option::Option::None => {}
+        }
+        if valid {
+            guard let option::Option[text_field::TextField]::Some(width) =
+                text_field::find("settings:width") else { return; };
+            guard let option::Option[text_field::TextField]::Some(height) =
+                text_field::find("settings:height") else { return; };
+            let _saved: bool =
+                preferences::save_dimensions(width.text(), height.text());
+        }
+    }
+
+    fn on_width_changed(ref this, sender: *u8) {
+        this.on_dimension_changed("settings:width", sender);
+    }
+
+    fn on_height_changed(ref this, sender: *u8) {
+        this.on_dimension_changed("settings:height", sender);
+    }
+
+    fn on_seed_changed(ref this, sender: *u8) {
+        this.sanitize_field("settings:seed", sender);
+        match text_field::find("settings:seed") {
+            option::Option[text_field::TextField]::Some(field) => {
+                let _saved: bool = preferences::save_seed(field.text());
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_steps_changed(ref this, _sender: *u8) {
+        match popup::find("settings:steps") {
+            option::Option[popup::Popup]::Some(field) => {
+                let _saved: bool = preferences::save_steps(
+                    preferences::step_value(field.selected_index()));
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn set_seed_enabled(ref this, random: bool) {
+        match text_field::find("settings:seed") {
+            option::Option[text_field::TextField]::Some(field) => {
+                let _field: text_field::TextField = field.set_enabled(!random);
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_random_seed(ref this, _sender: *u8) {
+        guard let option::Option[checkbox::Checkbox]::Some(choice) =
+            checkbox::find("settings:random-seed") else { return; };
+        let random: bool = choice.on();
+        this.set_seed_enabled(random);
+        preferences::save_random_seed(random);
+    }
+}
+
+impl OutputOptions: component::Component {
+    fn build(ref this) -> core::Node {
+        let saved: preferences::GenerationPreferences = preferences::load();
+        let width: text::Text = "${saved.width}";
+        let height: text::Text = "${saved.height}";
+        return @ui {
+            column(key: "settings:output") {
+                style::caption("OUTPUT", "settings:title")
+                column {
+                    style::caption("SIZE", "settings:size:title")
+                    hstack {
+                        text_field(width.view(), key: "settings:width",
+                        keyboard: vocab::Keyboard::Numeric,
+                        max_length: 20 as i64,
+                        checks_spelling: false, predicts_text: false,
+                        on_text_changed: this.on_width_changed)
+                            .grow(1.0f64).shrink(1.0f64)
+                        label("×", key: "settings:size:separator")
+                        text_field(height.view(), key: "settings:height",
+                        keyboard: vocab::Keyboard::Numeric,
+                        max_length: 20 as i64,
+                        checks_spelling: false, predicts_text: false,
+                        on_text_changed: this.on_height_changed)
+                            .grow(1.0f64).shrink(1.0f64)
+                    }
+                    .align(flex::Align::Center)
+                    .gap(8.0f64)
+                    style::secondary("Width and height are multiples of 32.",
+                    "settings:size:hint")
+                }
+                .gap(8.0f64)
+                .padding(16.0f64)
+                .set_background_color(vocab::Color::raised())
+                hstack {
+                    column {
+                        style::caption("STEPS", "settings:steps:title")
+                        popup("Steps", key: "settings:steps", items: this.steps(),
+                        selected_index: preferences::step_index(saved.steps),
+                        on_selected_index_changed: this.on_steps_changed)
+                    }
+                    .gap(8.0f64)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .padding(16.0f64)
+                    .set_background_color(vocab::Color::raised())
+                    column {
+                        style::caption("SEED", "settings:seed:title")
+                        hstack {
+                            text_field(saved.seed.view(), key: "settings:seed",
+                            keyboard: vocab::Keyboard::Numeric,
+                            max_length: 20 as i64,
+                            checks_spelling: false, predicts_text: false,
+                            on_text_changed: this.on_seed_changed)
+                                .width(88.0f64)
+                            checkbox(saved.random_seed, key: "settings:random-seed",
+                            on_checked_changed: this.on_random_seed)
+                                .width(18.0f64).height(18.0f64)
+                            style::secondary("Random", "settings:random-seed:label")
+                        }
+                        .align(flex::Align::Center)
+                        .gap(6.0f64)
+                    }
+                    .gap(8.0f64)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .padding(16.0f64)
+                    .set_background_color(vocab::Color::raised())
+                }
+                .gap(8.0f64)
+            }
+            .gap(10.0f64)
+        };
+    }
+}
+
+impl OutputOptions: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        match checkbox::find("settings:random-seed") {
+            option::Option[checkbox::Checkbox]::Some(choice) => {
+                this.set_seed_enabled(choice.on());
+            }
+            option::Option::None => {}
+        }
+    }
+    fn on_detach(ref this, _why: component::Detach) {}
+}
+
+impl OutputOptions: core::IntoNode {
+    fn into_node(take this) -> core::Node {
+        return component::child::[OutputOptions](this);
+    }
+}
+
+fn output_options() -> OutputOptions { return OutputOptions::new(); }
+
+#[test]
+fn numeric_filter_keeps_digits_and_caret() {
+    let options: OutputOptions = OutputOptions::new();
+    let mixed: DigitsEdit = options.digits_only("12a3", 3 as u64);
+    assert mixed.digits.view() == "123";
+    assert mixed.caret == (2 as u64);
+    assert mixed.changed;
+
+    let unicode: DigitsEdit = options.digits_only("1🙂2", 3 as u64);
+    assert unicode.digits.view() == "12";
+    assert unicode.caret == (1 as u64);
+    assert unicode.changed;
+
+    let numeric: DigitsEdit = options.digits_only("1301", 4 as u64);
+    assert numeric.digits.view() == "1301";
+    assert numeric.caret == (4 as u64);
+    assert !numeric.changed;
+}
