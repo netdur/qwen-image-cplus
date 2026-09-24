@@ -1,0 +1,183 @@
+// Native C+ API for Qwen Image generation.
+//
+// This first surface is deliberately synchronous and file-oriented. It keeps
+// the command-line client out of the inference implementation while preserving
+// the current phase-scoped model-memory behavior. A resident Engine can be
+// added behind this module later without changing the C ABI entry module.
+
+import "./pipeline" as pipeline;
+import "stdlib/option" as option;
+
+enum CacheMode {
+    None,
+    TaylorSeer,
+    CacheDiT,
+}
+
+enum GenerateStatus {
+    Ok,
+    InvalidArgument,
+    Failed,
+}
+
+struct GenerateRequest {
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    pixels: usize,
+    steps: usize,
+    seed: u64,
+    cache: CacheMode,
+    cache_threshold: f64,
+}
+
+fn _step_name(steps: usize) -> option::Option[str] {
+    if steps == (3 as usize) { return option::Option[str]::Some("3"); }
+    if steps == (4 as usize) { return option::Option[str]::Some("4"); }
+    if steps == (8 as usize) { return option::Option[str]::Some("8"); }
+    if steps == (25 as usize) { return option::Option[str]::Some("25"); }
+    if steps == (40 as usize) { return option::Option[str]::Some("40"); }
+    return option::Option[str]::None;
+}
+
+fn _threshold_supported(value: f64) -> bool {
+    return value == 0.12f64 || value == 0.14f64
+        || value == 0.16f64 || value == 0.24f64;
+}
+
+fn _validate(request: GenerateRequest) -> GenerateStatus {
+    if request.packed_path.count() == (0 as usize)
+        || request.model_root.count() == (0 as usize)
+        || request.output_path.count() == (0 as usize)
+        || request.prompt.count() == (0 as usize) {
+        return GenerateStatus::InvalidArgument;
+    }
+    if request.pixels != (256 as usize) && request.pixels != (1024 as usize) {
+        return GenerateStatus::InvalidArgument;
+    }
+    match _step_name(request.steps) {
+        option::Option::Some(_) => {}
+        option::Option::None => { return GenerateStatus::InvalidArgument; }
+    }
+    if request.pixels == (256 as usize)
+        && request.steps != (25 as usize) && request.steps != (40 as usize) {
+        return GenerateStatus::InvalidArgument;
+    }
+    if request.pixels == (256 as usize) && request.cache == CacheMode::TaylorSeer {
+        return GenerateStatus::InvalidArgument;
+    }
+    if request.cache != CacheMode::None && !_threshold_supported(request.cache_threshold) {
+        return GenerateStatus::InvalidArgument;
+    }
+    return GenerateStatus::Ok;
+}
+
+fn _from_pipeline_status(status: i32) -> GenerateStatus {
+    if status == (0 as i32) { return GenerateStatus::Ok; }
+    if status == (2 as i32) { return GenerateStatus::InvalidArgument; }
+    return GenerateStatus::Failed;
+}
+
+fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
+    let validation: GenerateStatus = _validate(request);
+    if validation != GenerateStatus::Ok { return validation; }
+    guard let option::Option[str]::Some(steps) = _step_name(request.steps) else {
+        return GenerateStatus::InvalidArgument;
+    };
+
+    let status: i32 = if request.pixels == (256 as usize) {
+        match request.cache {
+            CacheMode::None => pipeline::generate_256(
+                request.packed_path,
+                request.model_root,
+                request.output_path,
+                request.prompt,
+                request.seed,
+                steps,
+            ),
+            CacheMode::CacheDiT => pipeline::generate_256_cache_dit(
+                request.packed_path,
+                request.model_root,
+                request.output_path,
+                request.prompt,
+                request.seed,
+                request.cache_threshold,
+                steps,
+            ),
+            CacheMode::TaylorSeer => 2,
+        }
+    } else {
+        match request.cache {
+            CacheMode::None => pipeline::generate_1024(
+                request.packed_path,
+                request.model_root,
+                request.output_path,
+                request.prompt,
+                request.seed,
+                steps,
+            ),
+            CacheMode::TaylorSeer => pipeline::generate_1024_taylorseer(
+                request.packed_path,
+                request.model_root,
+                request.output_path,
+                request.prompt,
+                request.seed,
+                request.cache_threshold,
+                steps,
+            ),
+            CacheMode::CacheDiT => pipeline::generate_1024_cache_dit(
+                request.packed_path,
+                request.model_root,
+                request.output_path,
+                request.prompt,
+                request.seed,
+                request.cache_threshold,
+                steps,
+            ),
+        }
+    };
+    return _from_pipeline_status(status);
+}
+
+#[test]
+fn public_generation_request_validation_is_typed() {
+    let valid: GenerateRequest = GenerateRequest {
+        packed_path: "model.qipack",
+        model_root: "models/qwen",
+        output_path: "output.png",
+        prompt: "A geometric poster",
+        pixels: 1024 as usize,
+        steps: 40 as usize,
+        seed: 1301 as u64,
+        cache: CacheMode::None,
+        cache_threshold: 0.0f64,
+    };
+    assert _validate(valid) == GenerateStatus::Ok;
+
+    let bad_pixels: GenerateRequest = GenerateRequest {
+        packed_path: valid.packed_path,
+        model_root: valid.model_root,
+        output_path: valid.output_path,
+        prompt: valid.prompt,
+        pixels: 512 as usize,
+        steps: valid.steps,
+        seed: valid.seed,
+        cache: valid.cache,
+        cache_threshold: valid.cache_threshold,
+    };
+    assert _validate(bad_pixels) == GenerateStatus::InvalidArgument;
+
+    let unsupported_cache: GenerateRequest = GenerateRequest {
+        packed_path: valid.packed_path,
+        model_root: valid.model_root,
+        output_path: valid.output_path,
+        prompt: valid.prompt,
+        pixels: 256 as usize,
+        steps: 40 as usize,
+        seed: valid.seed,
+        cache: CacheMode::TaylorSeer,
+        cache_threshold: 0.24f64,
+    };
+    assert _validate(unsupported_cache) == GenerateStatus::InvalidArgument;
+}

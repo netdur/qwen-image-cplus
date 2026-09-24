@@ -1,0 +1,6 @@
+// Root module for the native C+ engine package.
+//
+// Consumers import the focused public surface from `qwen_image/api`. The
+// package remains entry-less so C+ can prebuild every module into one archive.
+
+import "./api" as _;

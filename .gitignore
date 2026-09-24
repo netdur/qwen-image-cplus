@@ -4,9 +4,12 @@ __pycache__/
 *.qipack
 /models/
 target/
+/lib/
+/qwen_image/lib/
+/dist/
 tests/fixtures/small/
 /bugs/
-/vendor
-/vendors/
+vendor
+**/vendor
 /plan.md
 /plan-*.md

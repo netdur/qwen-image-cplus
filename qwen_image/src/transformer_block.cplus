@@ -2355,8 +2355,8 @@ fn finite(label: str, buffer: metal::Buffer, count: usize) -> bool {
     let values: *f32 = buffer.contents() as *f32;
     var index: usize = 0 as usize;
     while index < count {
-        var value: f32 = values[index];
-        let bits: u32 = { *({ #addr_of(value) } as *u32) };
+        let value: f32 = values[index];
+        let bits: u32 = #bitcast::[u32](value);
         if (bits & (0x7F800000 as u32)) == (0x7F800000 as u32) {
             io::eprintln("${label}: non-finite value at ${index}");
             return false;

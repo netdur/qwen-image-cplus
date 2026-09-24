@@ -1,0 +1,19 @@
+[package]
+name    = "qwen_image_ffi"
+version = "0.0.1"
+edition = "2026"
+
+[library]
+name  = "qwen_image"
+entry = "src/ffi.cplus"
+kind  = "both"
+
+[dependencies]
+qwen_image = "*"
+json       = "*"
+stdlib     = "*"
+
+[macos.dependencies]
+objc       = "*"
+metal      = "*"
+foundation = "*"

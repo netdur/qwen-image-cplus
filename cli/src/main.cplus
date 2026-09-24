@@ -1,20 +1,21 @@
-import "./metal_probe" as metal_probe;
-import "./metal_primitives" as metal_primitives;
-import "./metal_linear" as metal_linear;
-import "./metal_int8_linear" as metal_int8_linear;
-import "./metal_q4_dot" as metal_q4_dot;
-import "./transformer_block" as transformer_block;
-import "./packed_model" as packed_model;
-import "./model_inventory" as model_inventory;
-import "./safetensors" as safetensors;
-import "./scheduler" as scheduler;
-import "./vae" as vae;
-import "./pipeline" as pipeline;
-import "./image_output" as image_output;
-import "./tokenizer" as tokenizer;
-import "./qwen3vl_text" as qwen3vl_text;
-import "./tensor" as tensor;
-import "./cpu_ops" as cpu_ops;
+import "qwen_image/api" as qwen_image;
+import "qwen_image/metal_probe" as metal_probe;
+import "qwen_image/metal_primitives" as metal_primitives;
+import "qwen_image/metal_linear" as metal_linear;
+import "qwen_image/metal_int8_linear" as metal_int8_linear;
+import "qwen_image/metal_q4_dot" as metal_q4_dot;
+import "qwen_image/transformer_block" as transformer_block;
+import "qwen_image/packed_model" as packed_model;
+import "qwen_image/model_inventory" as model_inventory;
+import "qwen_image/safetensors" as safetensors;
+import "qwen_image/scheduler" as scheduler;
+import "qwen_image/vae" as vae;
+import "qwen_image/pipeline" as pipeline;
+import "qwen_image/image_output" as image_output;
+import "qwen_image/tokenizer" as tokenizer;
+import "qwen_image/qwen3vl_text" as qwen3vl_text;
+import "qwen_image/tensor" as tensor;
+import "qwen_image/cpu_ops" as cpu_ops;
 import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/option" as option;
@@ -49,6 +50,38 @@ fn parse_cache_dit_threshold(value: str) -> option::Option[f64] {
     if value == "0.16" { return option::Option[f64]::Some(0.16f64); }
     if value == "0.24" { return option::Option[f64]::Some(0.24f64); }
     return option::Option[f64]::None;
+}
+
+fn _run_generation(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    pixels: usize,
+    steps: str,
+    seed: u64,
+    cache: qwen_image::CacheMode,
+    cache_threshold: f64,
+) -> i32 {
+    guard let option::Option[u64]::Some(step_count) = parse_u64_decimal(steps) else {
+        return 2;
+    };
+    let request: qwen_image::GenerateRequest = qwen_image::GenerateRequest {
+        packed_path: packed_path,
+        model_root: model_root,
+        output_path: output_path,
+        prompt: prompt,
+        pixels: pixels,
+        steps: step_count as usize,
+        seed: seed,
+        cache: cache,
+        cache_threshold: cache_threshold,
+    };
+    return match qwen_image::generate_to_png(request) {
+        qwen_image::GenerateStatus::Ok => 0,
+        qwen_image::GenerateStatus::InvalidArgument => 2,
+        qwen_image::GenerateStatus::Failed => 1,
+    };
 }
 
 #[test]
@@ -657,13 +690,16 @@ fn main() -> i32 {
             }
             option::Option[text::Text]::None => {}
         }
-        return pipeline::generate_256(
+        return _run_generation(
             packed_path.view(),
             model_path.view(),
             output_path.view(),
             prompt.view(),
-            seed,
+            256 as usize,
             if use_25_steps { "25" } else { "40" },
+            seed,
+            qwen_image::CacheMode::None,
+            0.0f64,
         );
     }
     if command == "generate-256-cache-dit" {
@@ -714,14 +750,16 @@ fn main() -> i32 {
             }
             option::Option[text::Text]::None => {}
         }
-        return pipeline::generate_256_cache_dit(
+        return _run_generation(
             packed_path.view(),
             model_path.view(),
             output_path.view(),
             prompt.view(),
-            seed,
-            threshold,
+            256 as usize,
             if use_25_steps { "25" } else { "40" },
+            seed,
+            qwen_image::CacheMode::CacheDiT,
+            threshold,
         );
     }
     if command == "generate-256-bottleneck" {
@@ -865,23 +903,25 @@ fn main() -> i32 {
             }
             io::println("generate-1024: cache=${cache_policy} steps=${requested_steps}");
             if cache_policy == "taylorseer" {
-                return pipeline::generate_1024_taylorseer(
+                return _run_generation(
                     packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                    seed, 0.24f64, requested_steps,
+                    1024 as usize, requested_steps, seed,
+                    qwen_image::CacheMode::TaylorSeer, 0.24f64,
                 );
             }
-            return pipeline::generate_1024_cache_dit(
+            return _run_generation(
                 packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                seed, 0.16f64, requested_steps,
+                1024 as usize, requested_steps, seed,
+                qwen_image::CacheMode::CacheDiT, 0.16f64,
             );
         }
         if pack_is_distilled(packed_path.view()) && requested_steps != pack_steps {
             io::println("generate-1024: pack kind=distilled steps=${pack_steps}; running the requested ${requested_steps} steps");
         }
         io::println("generate-1024: cache=none steps=${requested_steps}");
-        return pipeline::generate_1024(
-            packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
-            requested_steps,
+        return _run_generation(
+            packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+            1024 as usize, requested_steps, seed, qwen_image::CacheMode::None, 0.0f64,
         );
     }
     if command == "generate-1024-bottleneck" {
@@ -978,16 +1018,16 @@ fn main() -> i32 {
         }
         io::println("${command}: steps=${cache_steps}");
         if command == "generate-1024-taylorseer" {
-            return pipeline::generate_1024_taylorseer(
-                packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
-                threshold,
-                cache_steps,
+            return _run_generation(
+                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+                1024 as usize, cache_steps, seed,
+                qwen_image::CacheMode::TaylorSeer, threshold,
             );
         }
-        return pipeline::generate_1024_cache_dit(
-            packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
-            threshold,
-            cache_steps,
+        return _run_generation(
+            packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
+            1024 as usize, cache_steps, seed,
+            qwen_image::CacheMode::CacheDiT, threshold,
         );
     }
     if command == "benchmark-process-reuse-256" {

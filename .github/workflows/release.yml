@@ -1,0 +1,138 @@
+name: Release prebuilt binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.publish.outputs.sha }}
+    steps:
+      - name: Resolve and validate version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+
+      - name: Require Apple Silicon and matching package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          version="${{ steps.meta.outputs.version }}"
+          for manifest in qwen_image/Cplus.toml cli/Cplus.toml ffi/Cplus.toml; do
+            grep -Eq "^version *= *\"${version}\"$" "$manifest"
+          done
+
+      - name: Install pinned C+ compiler
+        run: |
+          scripts/install-cpc.sh "$RUNNER_TEMP/cplus"
+          echo "$RUNNER_TEMP/cplus" >> "$GITHUB_PATH"
+
+      - name: Install released C+ packages
+        run: cpc pm install qwen_image
+
+      - name: Build and verify distribution
+        run: |
+          cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus
+          cpc fmt --check cli/src/main.cplus
+          cpc fmt --check ffi/src/ffi.cplus
+          ./build.sh
+          scripts/verify-dist.sh
+
+      - name: Run project tests
+        run: |
+          (cd qwen_image && cpc test --release --json --filter qwen_image::src) \
+            | tee "$RUNNER_TEMP/qwen-image-tests.jsonl"
+          tail -n 1 "$RUNNER_TEMP/qwen-image-tests.jsonl" | jq -e '.failed == 0'
+
+          (cd ffi && cpc test --release --json --filter ffi_version) \
+            | tee "$RUNNER_TEMP/qwen-image-ffi-tests.jsonl"
+          tail -n 1 "$RUNNER_TEMP/qwen-image-ffi-tests.jsonl" | jq -e '.failed == 0'
+
+      - name: Package distribution
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset=qwen-image-cplus-aarch64-apple-darwin.tar.gz
+          tar -czf "$asset" -C dist bin include lib
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable release asset
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          asset="${{ steps.package.outputs.asset }}"
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --generate-notes
+          fi
+
+          if gh release view "$tag" --json assets \
+              --jq '.assets[].name' | grep -Fxq "$asset"; then
+            mkdir existing-release
+            gh release download "$tag" --pattern "$asset" --dir existing-release
+            published_asset="existing-release/$asset"
+          else
+            gh release upload "$tag" "$asset"
+            published_asset="$asset"
+          fi
+
+          sha=$(shasum -a 256 "$published_asset" | cut -d' ' -f1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "published $asset ($sha)"
+
+  update-formula:
+    needs: build-macos-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out current main branch
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Render formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Formula
+          sed \
+            -e "s/@VERSION@/${{ needs.build-macos-arm64.outputs.version }}/g" \
+            -e "s/@SHA@/${{ needs.build-macos-arm64.outputs.sha }}/g" \
+            .github/homebrew/qwen-image-cplus.rb.in \
+            > Formula/qwen-image-cplus.rb
+          cat Formula/qwen-image-cplus.rb
+
+      - name: Commit formula update
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- Formula/qwen-image-cplus.rb)" ]; then
+            echo "formula is already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/qwen-image-cplus.rb
+          git commit -m "Update Homebrew formula for v${{ needs.build-macos-arm64.outputs.version }}"
+          git push origin HEAD:main

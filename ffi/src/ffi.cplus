@@ -1,0 +1,94 @@
+// Stable C ABI for libqwen_image.
+//
+// `cpc build` generates qwen_image.h from the exported declarations in this
+// file. Native C+ clients import `qwen_image/api` instead.
+
+import "qwen_image/api" as api;
+
+const ABI_VERSION: u32 = 1;
+
+export enum QiStatus {
+    Ok,
+    InvalidArgument,
+    GenerationFailed,
+}
+
+export enum QiCacheMode {
+    None,
+    TaylorSeer,
+    CacheDiT,
+}
+
+#[repr(C)]
+export struct QiGenerateRequest {
+    abi_version: u32,
+    struct_size: u32,
+    opaque packed_path: *u8,
+    packed_path_length: usize,
+    opaque model_root: *u8,
+    model_root_length: usize,
+    opaque output_path: *u8,
+    output_path_length: usize,
+    opaque prompt: *u8,
+    prompt_length: usize,
+    pixels: u32,
+    steps: u32,
+    seed: u64,
+    cache_mode: u32,
+    cache_threshold: f64,
+}
+
+export extern fn qi_abi_version() -> u32 {
+    return ABI_VERSION;
+}
+
+export extern fn qi_generate_request_size() -> u32 {
+    return #size_of::[QiGenerateRequest]() as u32;
+}
+
+export extern fn qi_generate_to_png(request: *QiGenerateRequest) -> QiStatus {
+    if request.is_null() { return QiStatus::InvalidArgument; }
+    let value: QiGenerateRequest = { *request };
+    if value.abi_version != ABI_VERSION
+        || value.struct_size < (#size_of::[QiGenerateRequest]() as u32)
+        || value.packed_path.is_null() || value.packed_path_length == (0 as usize)
+        || value.model_root.is_null() || value.model_root_length == (0 as usize)
+        || value.output_path.is_null() || value.output_path_length == (0 as usize)
+        || value.prompt.is_null() || value.prompt_length == (0 as usize) {
+        return QiStatus::InvalidArgument;
+    }
+
+    let cache: api::CacheMode = if value.cache_mode == (QiCacheMode::None as u32) {
+        api::CacheMode::None
+    } else if value.cache_mode == (QiCacheMode::TaylorSeer as u32) {
+        api::CacheMode::TaylorSeer
+    } else if value.cache_mode == (QiCacheMode::CacheDiT as u32) {
+        api::CacheMode::CacheDiT
+    } else {
+        return QiStatus::InvalidArgument;
+    };
+
+    let native: api::GenerateRequest = api::GenerateRequest {
+        packed_path: { #str_from_raw_parts(value.packed_path, value.packed_path_length) },
+        model_root: { #str_from_raw_parts(value.model_root, value.model_root_length) },
+        output_path: { #str_from_raw_parts(value.output_path, value.output_path_length) },
+        prompt: { #str_from_raw_parts(value.prompt, value.prompt_length) },
+        pixels: value.pixels as usize,
+        steps: value.steps as usize,
+        seed: value.seed,
+        cache: cache,
+        cache_threshold: value.cache_threshold,
+    };
+    return match api::generate_to_png(native) {
+        api::GenerateStatus::Ok => QiStatus::Ok,
+        api::GenerateStatus::InvalidArgument => QiStatus::InvalidArgument,
+        api::GenerateStatus::Failed => QiStatus::GenerationFailed,
+    };
+}
+
+#[test]
+fn ffi_version_and_request_size_are_self_describing() {
+    assert qi_abi_version() == (1 as u32);
+    assert qi_generate_request_size() == (#size_of::[QiGenerateRequest]() as u32);
+    assert qi_generate_to_png(0 as *QiGenerateRequest) == QiStatus::InvalidArgument;
+}

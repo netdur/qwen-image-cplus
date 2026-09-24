@@ -3,13 +3,11 @@ import "stdlib/math" as _;
 extern fn tanhf(value: f32) -> f32;
 
 fn f32_from_bits(bits: u32) -> f32 {
-    var storage: u32 = bits;
-    return { *({ #addr_of(storage) } as *f32) };
+    return #bitcast::[f32](bits);
 }
 
 fn f32_bits(value: f32) -> u32 {
-    var storage: f32 = value;
-    return { *({ #addr_of(storage) } as *u32) };
+    return #bitcast::[u32](value);
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {
