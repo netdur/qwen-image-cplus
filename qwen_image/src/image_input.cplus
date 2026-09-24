@@ -1,8 +1,9 @@
 // Native reference-image decode and resize for image-conditioned generation.
 //
 // ImageIO decodes common macOS image formats and Core Graphics resamples into
-// an explicit top-down RGBA surface. The public result is interleaved RGB
-// FP32 in [0, 1]; the vision and VAE encoders apply their own normalization.
+// an explicit top-down RGBA surface. The result retains straight-alpha RGBA
+// for the VAE and also provides RGB composited over white for Qwen3-VL, which
+// is the split used by the pinned official pipeline.
 
 import "./image_conditioning" as conditioning;
 import "./image_output" as image_output;
@@ -61,7 +62,8 @@ impl OwnedCf {
 
 struct Image {
     shape: conditioning::Shape,
-    pixels: vec::Vec[f32],
+    vision_pixels: vec::Vec[f32],
+    vae_pixels: vec::Vec[f32],
 }
 
 fn zero_bytes(count: usize) -> option::Option[vec::Vec[u8]] {
@@ -76,7 +78,7 @@ fn zero_bytes(count: usize) -> option::Option[vec::Vec[u8]] {
     return option::Option[vec::Vec[u8]]::Some(bytes);
 }
 
-fn load_resized_rgb(
+fn load_resized(
     path: str,
     output_resolution: usize = 512 as usize,
 ) -> option::Option[Image] {
@@ -134,25 +136,45 @@ fn load_resized_rgb(
     );
 
     let pixel_count: usize = shape.width *% shape.height;
-    var pixels: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
+    var vision_pixels: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
         pixel_count *% CHANNELS,
+    );
+    var vae_pixels: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
+        pixel_count *% RGBA_CHANNELS,
     );
     let rgba_values: *u8 = #slice_ptr(rgba.as_slice());
     var pixel: usize = 0 as usize;
     while pixel < pixel_count {
         let source_offset: usize = pixel *% RGBA_CHANNELS;
+        let alpha_u8: u8 = rgba_values[source_offset +% (3 as usize)];
+        let alpha: f32 = alpha_u8 as f32 / 255.0f32;
         var channel: usize = 0 as usize;
         while channel < CHANNELS {
-            if pixels.append(
-                rgba_values[source_offset +% channel] as f32 / 255.0f32,
-            ) != status::Status::Ok {
+            let premultiplied: f32 =
+                rgba_values[source_offset +% channel] as f32 / 255.0f32;
+            // Core Graphics supplies premultiplied color. White composition
+            // can use it directly; recover straight color for the VAE where
+            // alpha is nonzero.
+            let vision_value: f32 = premultiplied + (1.0f32 - alpha);
+            let vae_value: f32 = if alpha_u8 == (0 as u8) {
+                0.0f32
+            } else { (premultiplied / alpha).min(1.0f32) };
+            if vision_pixels.append(vision_value.min(1.0f32)) != status::Status::Ok
+                || vae_pixels.append(vae_value) != status::Status::Ok {
                 return option::Option[Image]::None;
             }
             channel = channel +% (1 as usize);
         }
+        if vae_pixels.append(alpha) != status::Status::Ok {
+            return option::Option[Image]::None;
+        }
         pixel = pixel +% (1 as usize);
     }
-    return option::Option[Image]::Some(Image { shape: shape, pixels: pixels });
+    return option::Option[Image]::Some(Image {
+        shape: shape,
+        vision_pixels: vision_pixels,
+        vae_pixels: vae_pixels,
+    });
 }
 
 // Creates an asymmetric source image so the smoke checks decode, exact 512
@@ -171,7 +193,9 @@ fn run_reference(source_path: str) -> i32 {
             source.append(if top { 1.0f32 } else { -1.0f32 });
             source.append(-1.0f32);
             source.append(if top { -1.0f32 } else { 1.0f32 });
-            source.append(1.0f32);
+            source.append(if x < source_width / (2 as usize) {
+                1.0f32
+            } else { 0.0f32 });
             x = x +% (1 as usize);
         }
         y = y +% (1 as usize);
@@ -179,7 +203,7 @@ fn run_reference(source_path: str) -> i32 {
     if !image_output::write_png_sized(
         #slice_ptr(source.as_slice()), source_path, source_width, source_height,
     ) { return 1; }
-    guard let option::Option[Image]::Some(decoded) = load_resized_rgb(
+    guard let option::Option[Image]::Some(decoded) = load_resized(
         source_path, 512 as usize,
     ) else {
         io::eprintln("image input: could not decode generated reference");
@@ -194,19 +218,19 @@ fn run_reference(source_path: str) -> i32 {
         );
         return 1;
     }
-    let center_x: usize = decoded.shape.width / (2 as usize);
+    let center_x: usize = decoded.shape.width / (4 as usize);
     let top_offset: usize = center_x *% CHANNELS;
     let bottom_offset: usize = (
         (decoded.shape.height -% (1 as usize)) *% decoded.shape.width +% center_x
     ) *% CHANNELS;
-    guard let option::Option[f32]::Some(top_red) = decoded.pixels.at(top_offset)
+    guard let option::Option[f32]::Some(top_red) = decoded.vision_pixels.at(top_offset)
         else { return 1; };
-    guard let option::Option[f32]::Some(top_blue) = decoded.pixels.at(
+    guard let option::Option[f32]::Some(top_blue) = decoded.vision_pixels.at(
         top_offset +% (2 as usize),
     ) else { return 1; };
-    guard let option::Option[f32]::Some(bottom_red) = decoded.pixels.at(bottom_offset)
+    guard let option::Option[f32]::Some(bottom_red) = decoded.vision_pixels.at(bottom_offset)
         else { return 1; };
-    guard let option::Option[f32]::Some(bottom_blue) = decoded.pixels.at(
+    guard let option::Option[f32]::Some(bottom_blue) = decoded.vision_pixels.at(
         bottom_offset +% (2 as usize),
     ) else { return 1; };
     if top_red < 0.99f32 || top_blue > 0.01f32
@@ -216,8 +240,26 @@ fn run_reference(source_path: str) -> i32 {
         );
         return 1;
     }
+    let translucent_x: usize = decoded.shape.width *% (3 as usize) / (4 as usize);
+    let translucent_vision: usize = translucent_x *% CHANNELS;
+    let translucent_vae: usize = translucent_x *% RGBA_CHANNELS;
+    guard let option::Option[f32]::Some(vision_green) = decoded.vision_pixels.at(
+        translucent_vision +% (1 as usize),
+    ) else { return 1; };
+    guard let option::Option[f32]::Some(vae_red) = decoded.vae_pixels.at(translucent_vae)
+        else { return 1; };
+    guard let option::Option[f32]::Some(vae_alpha) = decoded.vae_pixels.at(
+        translucent_vae +% (3 as usize),
+    ) else { return 1; };
+    if vision_green < 0.49f32 || vision_green > 0.51f32
+        || vae_red < 0.99f32 || vae_alpha < 0.49f32 || vae_alpha > 0.51f32 {
+        io::eprintln(
+            "image input: alpha split mismatch vision_green=${vision_green} vae_red=${vae_red} vae_alpha=${vae_alpha}",
+        );
+        return 1;
+    }
     io::println(
-        "reference image input: source=64x32 resized=736x352 output_resolution=512 vision_tokens=253 latent_tokens=1012 RGB/top-down=verified",
+        "reference image input: source=64x32 resized=736x352 output_resolution=512 vision_tokens=253 latent_tokens=1012 RGBA/vision-white/top-down=verified",
     );
     return 0;
 }

@@ -130,13 +130,24 @@ produce 512 language-vision tokens and a 2,048-token VAE condition prefix; the
 The shape and MRoPE unit tests pass, the two-image tokenizer smoke produces the
 expected 512 placeholders, and the existing text-only encoder oracle remains
 unchanged at 0.0361069 output nRMSE. Native ImageIO/Core Graphics input now
-decodes and resizes directly to interleaved RGB FP32 without Python or a GUI
-framework. Its asymmetric 64x32 smoke verifies channel order, top-down row
-orientation, and the official 512-area result of 736x352 (253 vision tokens and
-1,012 VAE latent tokens). Remaining work is the Qwen3-VL vision tower, the VAE
-encoder, transformer condition-prefix assembly, and then CLI/C ABI exposure.
-Keeping those stages explicit avoids calling prompt plumbing end-to-end image
-editing before pixels have passed through both encoders.
+decodes and resizes without Python or a GUI framework. It preserves straight
+RGBA FP32 for the VAE while separately compositing RGB over white for Qwen3-VL,
+matching the official split. Its asymmetric 64x32 smoke verifies alpha and
+channel handling, top-down row orientation, and the official 512-area result
+of 736x352 (253 vision tokens and 1,012 VAE latent tokens).
+
+The native VAE condition encoder is also structurally complete. It implements
+the five down blocks, four 2x spatial reductions, middle attention, posterior
+mode selection, and per-channel latent normalization. A 32x32 smoke produces
+four finite nonzero latent tokens; the requested 512-area smoke encodes the
+736x352 reference into 1,012 finite nonzero 64-channel tokens. These are
+structural acceptance checks, not a numerical equivalence claim: the compact
+official-Python oracle generator is checked in, but this machine currently has
+no working PyTorch installation with which to create its fixtures. Remaining
+work is the Qwen3-VL vision tower, transformer condition-prefix assembly, and
+then CLI/C ABI exposure. Keeping those stages explicit avoids calling prompt
+plumbing end-to-end image editing before pixels have passed through both
+encoders.
 
 ## Package and API layout
 
@@ -269,6 +280,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot trajectory-1024 /path/to/vae_oracle_1024
 ./cli/target/debug/qwen-image-cplus test-image-output reference.png
 ./cli/target/debug/qwen-image-cplus test-image-input /tmp/reference-input.png
+./cli/target/debug/qwen-image-cplus test-vae-encoder /path/to/model/snapshot /path/to/reference.png 512
 ./cli/target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
 ./cli/target/debug/qwen-image-cplus test-pipeline-1024-oracle transformer.qipack /path/to/model/snapshot output.png /path/to/trajectory_1024 /path/to/vae_oracle_1024
 ./cli/target/debug/qwen-image-cplus test-pipeline-cache-dit-1024-oracle transformer.qipack /path/to/model/snapshot cache.png 0.12 /path/to/trajectory_1024 /path/to/vae_oracle_1024

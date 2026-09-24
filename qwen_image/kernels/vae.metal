@@ -15,6 +15,7 @@ struct ConvParams {
     uint kernel_size;
     uint padding;
     uint upsample;
+    uint stride;
 };
 
 struct NormParams {
@@ -81,8 +82,8 @@ kernel void vae_conv2d_f32_simdgroup_64x64(
                 const uint kernel_position = input_inner % kernel_area;
                 const int kernel_y = int(kernel_position / params.kernel_size);
                 const int kernel_x = int(kernel_position % params.kernel_size);
-                const int sample_y = int(output_y) + kernel_y - int(params.padding);
-                const int sample_x = int(output_x) + kernel_x - int(params.padding);
+                const int sample_y = int(output_y * params.stride) + kernel_y - int(params.padding);
+                const int sample_x = int(output_x * params.stride) + kernel_x - int(params.padding);
                 if (params.upsample != 0) {
                     const int expanded_height = int(params.input_height * 2);
                     const int expanded_width = int(params.input_width * 2);
@@ -342,6 +343,14 @@ kernel void vae_add(
     }
 }
 
+kernel void vae_copy(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant ElementParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < params.elements) output[index] = input[index];
+}
+
 kernel void vae_denormalize(
     device const float *input [[buffer(0)]],
     device const float *mean [[buffer(1)]],
@@ -379,6 +388,41 @@ kernel void vae_dup_up_shortcut(
     const uint input_channel = repeated_channel / params.repeats;
     output[index] = input[((output_y / 2) * params.input_width + (output_x / 2))
                           * params.input_channels + input_channel];
+}
+
+// ResidualDownBlock's shortcut is a reshape/permutation followed by a mean,
+// not spatial average pooling by channel. Reconstruct the flattened group
+// directly. For a still image with factor_t=2, temporal sub-index 0 is the
+// prepended zero frame and sub-index 1 is the source frame.
+kernel void vae_avg_down_shortcut(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant DupParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint output_height = params.input_height / 2;
+    const uint output_width = params.input_width / 2;
+    const uint elements = output_height * output_width * params.output_channels;
+    if (index >= elements) return;
+    const uint output_channel = index % params.output_channels;
+    const uint pixel = index / params.output_channels;
+    const uint output_y = pixel / output_width;
+    const uint output_x = pixel % output_width;
+    float total = 0.0f;
+    for (uint group = 0; group < params.repeats; ++group) {
+        uint expanded = output_channel * params.repeats + group;
+        const uint dx = expanded % 2;
+        expanded /= 2;
+        const uint dy = expanded % 2;
+        expanded /= 2;
+        const uint dt = expanded % params.factor_t;
+        const uint input_channel = expanded / params.factor_t;
+        if (dt == params.factor_t - 1) {
+            total += input[((output_y * 2 + dy) * params.input_width
+                            + (output_x * 2 + dx)) * params.input_channels
+                           + input_channel];
+        }
+    }
+    output[index] = total / float(params.repeats);
 }
 
 kernel void vae_single_head_attention(
