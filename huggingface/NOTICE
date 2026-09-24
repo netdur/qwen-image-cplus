@@ -1,0 +1,25 @@
+Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.
+
+Modification notice
+-------------------
+
+The distributed QIPACK files were converted from their named source
+checkpoints for use by qwen-image-cplus on Apple Silicon. The conversion
+changes the tensor storage container and stores transformer-block matrices as
+FP16 while retaining vectors and global tensors as BF16. It does not retrain
+the model.
+
+The base pack was converted from:
+
+  Qwen/Qwen-Image-2.1
+  Revision b3179ad355be050328e483a9dfdd9e60cd62adfa
+
+The four-step distilled pack was converted from the full transformer in:
+
+  Viggle/Qwen-Image-2.1-viggle-turbo
+  Revision bafc91e4cc934f5fb1406b22496a0bed9b99c548
+
+The distilled model was created and published by Viggle under the Qwen
+Research License. The QIPACK conversion was produced by the
+qwen-image-cplus project.
+

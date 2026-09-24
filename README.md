@@ -44,6 +44,12 @@ paths supplied to the CLI or library request. Keeping models separate makes
 application upgrades small and lets applications manage their own model
 storage.
 
+The QIPACK files are published at
+[`netdur/Qwen-Image-2.1-QIPACK`](https://huggingface.co/netdur/Qwen-Image-2.1-QIPACK).
+Their model card, Qwen license, required attribution, and artifact manifest
+live in [`huggingface/`](huggingface/README.md) so the published metadata stays
+versioned with the runtime.
+
 ## Pinned reference
 
 - Model: `Qwen/Qwen-Image-2.1`

@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "repository": "netdur/Qwen-Image-2.1-QIPACK",
+  "format": {
+    "name": "QIPACK1",
+    "version": 1,
+    "policy": "transformer:all-matrix-f16-v4",
+    "byte_order": "little-endian",
+    "tensor_count": 297,
+    "parameter_count": 7115124736,
+    "matrix_storage": "fp16",
+    "vector_and_global_storage": "bf16"
+  },
+  "license": {
+    "name": "Qwen Research License Agreement",
+    "use": "non-commercial research and evaluation only",
+    "file": "LICENSE"
+  },
+  "artifacts": [
+    {
+      "path": "base/qwen-image-2.1-fp16-v4.qipack",
+      "local_source": "models/qwen-image-2.1-all-fp16-v4.qipack",
+      "bytes": 14230327296,
+      "sha256": "9fe30bcae5678c6e21618d48d9f058fc150ed5b71b7534e5283bb7a05c163750",
+      "source": {
+        "repository": "Qwen/Qwen-Image-2.1",
+        "revision": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+        "component": "transformer"
+      },
+      "generation_defaults": {
+        "kind": "base",
+        "steps": 40,
+        "shift_terminal": 0.02,
+        "cache": "taylorseer"
+      },
+      "verification": "structural validation and exact source round-trip passed"
+    },
+    {
+      "path": "distilled/qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack",
+      "local_source": "models/qwen-image-2.1-viggle-turbo-EXPERIMENT-fp16-v4.qipack",
+      "bytes": 14230327296,
+      "sha256": "d05edecbf9d3e7b03b0e708ae41da5370d5fe245f1d3b5f6775aef18f18857d1",
+      "source": {
+        "repository": "Viggle/Qwen-Image-2.1-viggle-turbo",
+        "revision": "bafc91e4cc934f5fb1406b22496a0bed9b99c548",
+        "component": "transformer/diffusion_pytorch_model.safetensors",
+        "variant": "v0.1 four-step full fine-tune, not LoRA"
+      },
+      "generation_defaults": {
+        "kind": "distilled",
+        "steps": 4,
+        "shift_terminal": null,
+        "cache": "none"
+      },
+      "verification": "structural validation and exact source round-trip passed"
+    }
+  ]
+}
+
