@@ -16,6 +16,7 @@ import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/status" as status;
+import "stdlib/text" as text;
 import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 
@@ -31,8 +32,7 @@ struct Encoded {
     prompt_rows: usize,
     condition_latents: vec::Vec[f32],
     condition_rows: usize,
-    first_shape: conditioning::Shape,
-    second_shape: conditioning::Shape,
+    shapes: vec::Vec[conditioning::Shape],
 }
 
 fn zero_f32(count: usize) -> option::Option[vec::Vec[f32]] {
@@ -59,101 +59,132 @@ fn zero_u32(count: usize) -> option::Option[vec::Vec[u32]] {
     return option::Option[vec::Vec[u32]]::Some(values);
 }
 
-fn encode_two_images_512(
+fn encode_images_512(
     model_root: str,
     prompt: str,
-    first_path: str,
-    second_path: str,
+    image_paths: *str,
+    image_count: usize,
 ) -> option::Option[Encoded] {
-    if !conditioning::reference_count_supported(2 as usize) {
+    if !conditioning::reference_count_supported(image_count) {
+        io::eprintln("multimodal conditioning: reference image count must be 1 through 10");
         return option::Option[Encoded]::None;
     }
     let started_ms: i64 = time::now_millis();
-    guard let option::Option[image_input::Image]::Some(first) =
-        image_input::load_resized(first_path, 512 as usize) else {
-        io::eprintln("multimodal conditioning: could not load ${first_path}");
-        return option::Option[Encoded]::None;
-    };
-    guard let option::Option[image_input::Image]::Some(second) =
-        image_input::load_resized(second_path, 512 as usize) else {
-        io::eprintln("multimodal conditioning: could not load ${second_path}");
-        return option::Option[Encoded]::None;
-    };
-    let input_ms: i64 = time::now_millis() - started_ms;
-    let first_shape: conditioning::Shape = first.shape;
-    let second_shape: conditioning::Shape = second.shape;
-    let vision_rows: usize = first_shape.vision_tokens +% second_shape.vision_tokens;
-    let condition_rows: usize = first_shape.latent_tokens +% second_shape.latent_tokens;
+    var input_ms: i64 = 0 as i64;
+    var vision_ms: i64 = 0 as i64;
+    var vae_ms: i64 = 0 as i64;
+    var shapes: vec::Vec[conditioning::Shape] =
+        vec::Vec[conditioning::Shape]::with_capacity(image_count);
+    var image_token_counts: vec::Vec[usize] = vec::Vec[usize]::with_capacity(image_count);
+    var vision_rows: usize = 0 as usize;
+    var condition_rows: usize = 0 as usize;
+
+    // Discover every resized shape before allocating the combined outputs.
+    // Image input is intentionally reloaded for the encoder pass below. The
+    // extra native decode is milliseconds and avoids retaining up to ten RGBA
+    // and RGB float images simultaneously.
+    var image_index: usize = 0 as usize;
+    while image_index < image_count {
+        let input_start_ms: i64 = time::now_millis();
+        guard let option::Option[image_input::Image]::Some(image) =
+            image_input::load_resized(image_paths[image_index], 512 as usize) else {
+            io::eprintln(
+                "multimodal conditioning: could not load ${image_paths[image_index]}",
+            );
+            return option::Option[Encoded]::None;
+        };
+        input_ms = input_ms + (time::now_millis() - input_start_ms);
+        let shape: conditioning::Shape = image.shape;
+        if shapes.append(shape) != status::Status::Ok
+            || image_token_counts.append(shape.vision_tokens) != status::Status::Ok {
+            return option::Option[Encoded]::None;
+        }
+        vision_rows = vision_rows +% shape.vision_tokens;
+        condition_rows = condition_rows +% shape.latent_tokens;
+        image_index = image_index +% (1 as usize);
+    }
+
     guard let option::Option[vec::Vec[f32]]::Some(vision) = zero_f32(
         vision_rows *% WIDTH,
     ) else { return option::Option[Encoded]::None; };
     guard let option::Option[vec::Vec[f32]]::Some(deepstack) = zero_f32(
         DEEPSTACK_LAYERS *% vision_rows *% WIDTH,
     ) else { return option::Option[Encoded]::None; };
-
-    let first_deep_values: usize =
-        DEEPSTACK_LAYERS *% first_shape.vision_tokens *% WIDTH;
-    guard let option::Option[vec::Vec[f32]]::Some(first_deep) = zero_f32(
-        first_deep_values,
+    guard let option::Option[vec::Vec[f32]]::Some(condition_latents) = zero_f32(
+        condition_rows *% LATENT_CHANNELS,
     ) else { return option::Option[Encoded]::None; };
-    if vision_encoder::encode_sized_to_host(
-        model_root,
-        #slice_ptr(first.vision_pixels.as_slice()),
-        first_shape.width,
-        first_shape.height,
-        #slice_ptr(vision.as_slice()),
-        #slice_ptr(first_deep.as_slice()),
-    ) != (0 as i32) { return option::Option[Encoded]::None; }
 
-    let second_vision_offset: usize = first_shape.vision_tokens *% WIDTH;
-    let second_deep_values: usize =
-        DEEPSTACK_LAYERS *% second_shape.vision_tokens *% WIDTH;
-    guard let option::Option[vec::Vec[f32]]::Some(second_deep) = zero_f32(
-        second_deep_values,
-    ) else { return option::Option[Encoded]::None; };
-    if vision_encoder::encode_sized_to_host(
-        model_root,
-        #slice_ptr(second.vision_pixels.as_slice()),
-        second_shape.width,
-        second_shape.height,
-        #slice_ptr(vision.as_slice()) + second_vision_offset,
-        #slice_ptr(second_deep.as_slice()),
-    ) != (0 as i32) { return option::Option[Encoded]::None; }
-
-    // Each per-image encoder returns [layer, local token, channel]. Repack to
-    // [layer, all images' tokens, channel] for the language model.
+    let shape_values: *conditioning::Shape = #slice_ptr(shapes.as_slice());
+    let vision_values: *f32 = #slice_ptr(vision.as_slice());
     let deep_values: *f32 = #slice_ptr(deepstack.as_slice());
-    let first_deep_values_pointer: *f32 = #slice_ptr(first_deep.as_slice());
-    let second_deep_values_pointer: *f32 = #slice_ptr(second_deep.as_slice());
-    var layer: usize = 0 as usize;
-    while layer < DEEPSTACK_LAYERS {
-        var local: usize = 0 as usize;
-        while local < first_shape.vision_tokens *% WIDTH {
-            deep_values[layer *% vision_rows *% WIDTH +% local] =
-                first_deep_values_pointer[
-                    layer *% first_shape.vision_tokens *% WIDTH +% local
-                ];
-            local = local +% (1 as usize);
-        }
-        local = 0 as usize;
-        while local < second_shape.vision_tokens *% WIDTH {
-            deep_values[
-                layer *% vision_rows *% WIDTH +% second_vision_offset +% local
-            ] = second_deep_values_pointer[
-                layer *% second_shape.vision_tokens *% WIDTH +% local
-            ];
-            local = local +% (1 as usize);
-        }
-        layer = layer +% (1 as usize);
-    }
-    let vision_ms: i64 = time::now_millis() - started_ms - input_ms;
+    let latent_values: *f32 = #slice_ptr(condition_latents.as_slice());
+    var vision_row_offset: usize = 0 as usize;
+    var latent_row_offset: usize = 0 as usize;
+    image_index = 0 as usize;
+    while image_index < image_count {
+        let shape: conditioning::Shape = shape_values[image_index];
+        let input_start_ms: i64 = time::now_millis();
+        guard let option::Option[image_input::Image]::Some(image) =
+            image_input::load_resized(image_paths[image_index], 512 as usize) else {
+            io::eprintln(
+                "multimodal conditioning: could not reload ${image_paths[image_index]}",
+            );
+            return option::Option[Encoded]::None;
+        };
+        input_ms = input_ms + (time::now_millis() - input_start_ms);
 
-    var image_token_counts: [usize; 2] = [
-        first_shape.vision_tokens, second_shape.vision_tokens,
-    ];
+        let local_deep_values: usize =
+            DEEPSTACK_LAYERS *% shape.vision_tokens *% WIDTH;
+        guard let option::Option[vec::Vec[f32]]::Some(local_deep) = zero_f32(
+            local_deep_values,
+        ) else { return option::Option[Encoded]::None; };
+        let vision_start_ms: i64 = time::now_millis();
+        if vision_encoder::encode_sized_to_host(
+            model_root,
+            #slice_ptr(image.vision_pixels.as_slice()),
+            shape.width,
+            shape.height,
+            vision_values + vision_row_offset *% WIDTH,
+            #slice_ptr(local_deep.as_slice()),
+        ) != (0 as i32) { return option::Option[Encoded]::None; }
+        vision_ms = vision_ms + (time::now_millis() - vision_start_ms);
+
+        // Each image returns [layer, local token, channel]. Repack it into
+        // [layer, all images' tokens, channel] for the language model.
+        let local_deep_pointer: *f32 = #slice_ptr(local_deep.as_slice());
+        var layer: usize = 0 as usize;
+        while layer < DEEPSTACK_LAYERS {
+            var local: usize = 0 as usize;
+            while local < shape.vision_tokens *% WIDTH {
+                deep_values[
+                    layer *% vision_rows *% WIDTH
+                        +% vision_row_offset *% WIDTH +% local
+                ] = local_deep_pointer[
+                    layer *% shape.vision_tokens *% WIDTH +% local
+                ];
+                local = local +% (1 as usize);
+            }
+            layer = layer +% (1 as usize);
+        }
+
+        let vae_start_ms: i64 = time::now_millis();
+        if vae::encode_sized_from_host(
+            model_root,
+            #slice_ptr(image.vae_pixels.as_slice()),
+            shape.width,
+            shape.height,
+            latent_values + latent_row_offset *% LATENT_CHANNELS,
+        ) != (0 as i32) { return option::Option[Encoded]::None; }
+        vae_ms = vae_ms + (time::now_millis() - vae_start_ms);
+        vision_row_offset = vision_row_offset +% shape.vision_tokens;
+        latent_row_offset = latent_row_offset +% shape.latent_tokens;
+        image_index = image_index +% (1 as usize);
+    }
+
+    let text_start_ms: i64 = time::now_millis();
     guard let option::Option[vec::Vec[u32]]::Some(tokens) =
         tokenizer::tokenize_full_prompt_with_images(
-            model_root, prompt, #addr_of(image_token_counts[0]), 2 as usize,
+            model_root, prompt, #slice_ptr(image_token_counts.as_slice()), image_count,
     ) else {
         io::eprintln("multimodal conditioning: could not tokenize prompt");
         return option::Option[Encoded]::None;
@@ -161,10 +192,9 @@ fn encode_two_images_512(
     guard let option::Option[vec::Vec[u32]]::Some(positions) = zero_u32(
         tokens.count() *% (3 as usize),
     ) else { return option::Option[Encoded]::None; };
-    var shapes: [conditioning::Shape; 2] = [first_shape, second_shape];
     if !conditioning::fill_language_positions(
-        #slice_ptr(tokens.as_slice()), tokens.count(), #addr_of(shapes[0]),
-        2 as usize, #slice_ptr(positions.as_slice()),
+        #slice_ptr(tokens.as_slice()), tokens.count(), shape_values,
+        image_count, #slice_ptr(positions.as_slice()),
     ) {
         io::eprintln("multimodal conditioning: could not build MRoPE positions");
         return option::Option[Encoded]::None;
@@ -179,9 +209,9 @@ fn encode_two_images_512(
         #slice_ptr(tokens.as_slice()),
         tokens.count(),
         #slice_ptr(positions.as_slice()),
-        #slice_ptr(vision.as_slice()),
+        vision_values,
         vision_rows,
-        #slice_ptr(deepstack.as_slice()),
+        deep_values,
         #slice_ptr(prompt_embeddings.as_slice()),
         prompt_rows *% WIDTH,
         #addr_of(encoded_rows),
@@ -200,30 +230,10 @@ fn encode_two_images_512(
         ) != status::Status::Ok { return option::Option[Encoded]::None; }
         token = token +% (1 as usize);
     }
-    let text_ms: i64 = time::now_millis() - started_ms - input_ms - vision_ms;
-
-    guard let option::Option[vec::Vec[f32]]::Some(condition_latents) = zero_f32(
-        condition_rows *% LATENT_CHANNELS,
-    ) else { return option::Option[Encoded]::None; };
-    if vae::encode_sized_from_host(
-        model_root,
-        #slice_ptr(first.vae_pixels.as_slice()),
-        first_shape.width,
-        first_shape.height,
-        #slice_ptr(condition_latents.as_slice()),
-    ) != (0 as i32) { return option::Option[Encoded]::None; }
-    if vae::encode_sized_from_host(
-        model_root,
-        #slice_ptr(second.vae_pixels.as_slice()),
-        second_shape.width,
-        second_shape.height,
-        #slice_ptr(condition_latents.as_slice())
-            + first_shape.latent_tokens *% LATENT_CHANNELS,
-    ) != (0 as i32) { return option::Option[Encoded]::None; }
-    let vae_ms: i64 = time::now_millis() - started_ms - input_ms - vision_ms - text_ms;
+    let text_ms: i64 = time::now_millis() - text_start_ms;
 
     io::println(
-        "multi-image conditioning: images=2 output_resolution=512 vision_rows=${vision_rows} prompt_rows=${prompt_rows} condition_rows=${condition_rows} input_ms=${input_ms} vision_ms=${vision_ms} text_ms=${text_ms} vae_ms=${vae_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        "multi-image conditioning: images=${image_count} output_resolution=512 vision_rows=${vision_rows} prompt_rows=${prompt_rows} condition_rows=${condition_rows} input_ms=${input_ms} vision_ms=${vision_ms} text_ms=${text_ms} vae_ms=${vae_ms} total_wall_ms=${time::now_millis() - started_ms}",
     );
     return option::Option[Encoded]::Some(Encoded {
         prompt_embeddings: prompt_embeddings,
@@ -231,9 +241,18 @@ fn encode_two_images_512(
         prompt_rows: prompt_rows,
         condition_latents: condition_latents,
         condition_rows: condition_rows,
-        first_shape: first_shape,
-        second_shape: second_shape,
+        shapes: shapes,
     });
+}
+
+fn encode_two_images_512(
+    model_root: str,
+    prompt: str,
+    first_path: str,
+    second_path: str,
+) -> option::Option[Encoded] {
+    var image_paths: [str; 2] = [first_path, second_path];
+    return encode_images_512(model_root, prompt, #addr_of(image_paths[0]), 2 as usize);
 }
 
 fn finite_nonzero(values: *f32, count: usize) -> bool {
@@ -271,10 +290,11 @@ fn run_two_image_512(
         }
         row = row +% (1 as usize);
     }
+    let shape_values: *conditioning::Shape = #slice_ptr(encoded.shapes.as_slice());
     let expected_vision_rows: usize =
-        encoded.first_shape.vision_tokens +% encoded.second_shape.vision_tokens;
+        shape_values[0].vision_tokens +% shape_values[1].vision_tokens;
     let shape_rows: usize =
-        encoded.first_shape.latent_tokens +% encoded.second_shape.latent_tokens;
+        shape_values[0].latent_tokens +% shape_values[1].latent_tokens;
     let prompt_ok: bool = finite_nonzero(
         #slice_ptr(encoded.prompt_embeddings.as_slice()),
         encoded.prompt_rows *% WIDTH,
@@ -300,11 +320,11 @@ fn run_two_image_512(
 // 40-step trajectory. Two steps prove that target-only decoding can reuse the
 // interleaved prefix K/V cache; an output path also performs native VAE decode
 // and PNG output.
-fn run_two_image_transformer_512(
+fn run_multi_image_transformer_512(
     packed_path: str,
     model_root: str,
-    first_path: str,
-    second_path: str,
+    image_paths: *str,
+    image_count: usize,
     prompt: str = "Use Picture 1 and Picture 2 to create a coherent new scene.",
     requested_steps: str = "1",
     output_path: str = "",
@@ -315,19 +335,20 @@ fn run_two_image_transformer_512(
         return 2;
     }
     let started_ms: i64 = time::now_millis();
-    guard let option::Option[Encoded]::Some(encoded) = encode_two_images_512(
-        model_root, prompt, first_path, second_path,
+    guard let option::Option[Encoded]::Some(encoded) = encode_images_512(
+        model_root, prompt, image_paths, image_count,
     ) else { return 1; };
-    var shapes: [transformer::LatentShape; 2] = [
-        transformer::LatentShape {
-            height: encoded.first_shape.height / (16 as usize),
-            width: encoded.first_shape.width / (16 as usize),
-        },
-        transformer::LatentShape {
-            height: encoded.second_shape.height / (16 as usize),
-            width: encoded.second_shape.width / (16 as usize),
-        },
-    ];
+    var shapes: vec::Vec[transformer::LatentShape] =
+        vec::Vec[transformer::LatentShape]::with_capacity(image_count);
+    let condition_shapes: *conditioning::Shape = #slice_ptr(encoded.shapes.as_slice());
+    var shape_index: usize = 0 as usize;
+    while shape_index < image_count {
+        if shapes.append(transformer::LatentShape {
+            height: condition_shapes[shape_index].height / (16 as usize),
+            width: condition_shapes[shape_index].width / (16 as usize),
+        }) != status::Status::Ok { return 1; }
+        shape_index = shape_index +% (1 as usize);
+    }
     let target_rows: usize = (512 as usize) / (16 as usize)
         *% ((512 as usize) / (16 as usize));
     guard let option::Option[vec::Vec[f32]]::Some(target) = zero_f32(
@@ -341,8 +362,8 @@ fn run_two_image_transformer_512(
         #slice_ptr(encoded.prompt_image_mask.as_slice()),
         #slice_ptr(encoded.condition_latents.as_slice()),
         encoded.condition_rows,
-        #addr_of(shapes[0]),
-        2 as usize,
+        #slice_ptr(shapes.as_slice()),
+        image_count,
         seed,
         #slice_ptr(target.as_slice()),
         512 as usize,
@@ -378,12 +399,35 @@ fn run_two_image_transformer_512(
             return 1;
         }
         io::println(
-            "Qwen-Image-2.1 two-image generation: output=${output_path} pixels=512x512 steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
+            "Qwen-Image-2.1 multi-image generation: images=${image_count} output=${output_path} pixels=512x512 steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
         );
         return 0;
     }
     io::println(
-        "Qwen-Image-2.1 two-image transformer: verified output=512x512 steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        "Qwen-Image-2.1 multi-image transformer: verified images=${image_count} output=512x512 steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",
     );
     return 0;
+}
+
+fn run_two_image_transformer_512(
+    packed_path: str,
+    model_root: str,
+    first_path: str,
+    second_path: str,
+    prompt: str = "Use Picture 1 and Picture 2 to create a coherent new scene.",
+    requested_steps: str = "1",
+    output_path: str = "",
+    seed: u64 = 1301 as u64,
+) -> i32 {
+    var image_paths: [str; 2] = [first_path, second_path];
+    return run_multi_image_transformer_512(
+        packed_path,
+        model_root,
+        #addr_of(image_paths[0]),
+        2 as usize,
+        prompt,
+        requested_steps,
+        output_path,
+        seed,
+    );
 }

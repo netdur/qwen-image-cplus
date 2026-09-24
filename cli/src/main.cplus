@@ -215,7 +215,7 @@ fn pack_is_distilled(packed_path: str) -> bool {
 fn main() -> i32 {
     if env::argc() < (2 as usize) {
         io::println(
-            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-image-input SOURCE_OUTPUT | test-vae-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-multi-image-prompt MODEL_DIR | test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
+            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | generate-multi-image-512 PACKED MODEL_DIR OUTPUT PROMPT SEED 1|2|40 IMAGE [IMAGE ... up to 10] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-image-input SOURCE_OUTPUT | test-vae-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-multi-image-prompt MODEL_DIR | test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
         );
         return 0;
     }
@@ -1298,7 +1298,7 @@ fn main() -> i32 {
         };
     }
     if command == "generate-multi-image-512" {
-        let usage: str = "usage: qwen-image-cplus generate-multi-image-512 PACKED MODEL_DIR OUTPUT IMAGE_1 IMAGE_2 PROMPT [SEED] [1|2|40]";
+        let usage: str = "usage: qwen-image-cplus generate-multi-image-512 PACKED MODEL_DIR OUTPUT PROMPT SEED 1|2|40 IMAGE [IMAGE ... up to 10]";
         guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
             io::eprintln(usage); return 2;
         };
@@ -1308,42 +1308,50 @@ fn main() -> i32 {
         guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
             io::eprintln(usage); return 2;
         };
-        guard let option::Option[text::Text]::Some(first_path) = env::arg(5 as usize) else {
+        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
             io::eprintln(usage); return 2;
         };
-        guard let option::Option[text::Text]::Some(second_path) = env::arg(6 as usize) else {
+        guard let option::Option[text::Text]::Some(seed_text) = env::arg(6 as usize) else {
             io::eprintln(usage); return 2;
         };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(7 as usize) else {
+        guard let option::Option[u64]::Some(seed) = parse_u64_decimal(seed_text.view()) else {
+            io::eprintln("generate-multi-image-512: seed must be an unsigned decimal integer");
+            return 2;
+        };
+        guard let option::Option[text::Text]::Some(steps_text) = env::arg(7 as usize) else {
             io::eprintln(usage); return 2;
         };
-        var seed: u64 = 1301 as u64;
-        match env::arg(8 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate-multi-image-512: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
+        let steps: str = steps_text.view();
+        if !(steps == "1" || steps == "2" || steps == "40") {
+            io::eprintln("generate-multi-image-512: steps must be 1, 2, or 40");
+            return 2;
         }
-        var steps: str = "40";
-        match env::arg(9 as usize) {
-            option::Option[text::Text]::Some(steps_text) => {
-                if steps_text == "1" { steps = "1"; }
-                else if steps_text == "2" { steps = "2"; }
-                else if steps_text == "40" { steps = "40"; }
-                else {
-                    io::eprintln("generate-multi-image-512: steps must be 1, 2, or 40");
-                    return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
+        let image_count: usize = env::argc() -% (8 as usize);
+        if image_count < (1 as usize) || image_count > (10 as usize) {
+            io::eprintln("generate-multi-image-512: provide 1 through 10 image paths");
+            return 2;
         }
-        return multimodal_conditioning::run_two_image_transformer_512(
-            packed_path.view(), model_path.view(), first_path.view(),
-            second_path.view(), prompt.view(), steps, output_path.view(), seed,
+        var path_owners: vec::Vec[text::Text] =
+            vec::Vec[text::Text]::with_capacity(image_count);
+        var image_index: usize = 0 as usize;
+        while image_index < image_count {
+            guard let option::Option[text::Text]::Some(image_path) =
+                env::arg((8 as usize) +% image_index) else {
+                io::eprintln(usage); return 2;
+            };
+            if path_owners.append(image_path) != status::Status::Ok { return 1; }
+            image_index = image_index +% (1 as usize);
+        }
+        var image_paths: [str; 10] = ["", "", "", "", "", "", "", "", "", ""];
+        let owner_values: *text::Text = #slice_ptr(path_owners.as_slice());
+        image_index = 0 as usize;
+        while image_index < image_count {
+            image_paths[image_index] = owner_values[image_index].view();
+            image_index = image_index +% (1 as usize);
+        }
+        return multimodal_conditioning::run_multi_image_transformer_512(
+            packed_path.view(), model_path.view(), #addr_of(image_paths[0]),
+            image_count, prompt.view(), steps, output_path.view(), seed,
         );
     }
     if command == "test-image-input" {

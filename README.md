@@ -113,9 +113,10 @@ defaults to 4 steps with an unstretched schedule.
 ## Multi-image conditioning status
 
 The official Qwen-Image-2.1 pipeline accepts **one to ten reference images**.
-Native image-conditioned generation is under construction; it is not exposed
-through the public generation API yet. Integration tests use a 512x512 output
-budget so correctness work does not spend 1024 or 2048 generation time.
+Native image-conditioned generation is available through a provisional CLI;
+it is not exposed through the public C+/C generation APIs yet. Integration
+tests use a 512x512 output budget so correctness work does not spend 1024 or
+2048 generation time.
 
 The first completed checkpoint reproduces the pinned Diffusers/Qwen3-VL input
 contract: aspect-preserving area resize rounded to multiples of 32, one vision
@@ -203,9 +204,15 @@ ranged from about **6.46 to 8.22 s**. With the same red-circle reference used
 twice, the output visibly contained two differentiated red circular forms, so
 this checks semantic conditioning rather than only finite tensors. This is a
 correctness baseline, not an optimized benchmark. The low-level layout accepts
-the official one-to-ten image range; the current high-level command is still
-the deliberately narrow two-image checkpoint. General 1-10 image orchestration
-and public C-ABI exposure remain.
+the official one-to-ten image range, and the native orchestration/CLI now do as
+well. One-image and three-image one-step boundary smokes complete in **21.153
+s** and **57.904 s** end to end respectively. Their prefix caches are **1.087
+GB** and **3.234 GB**, showing the approximately linear memory cost per 512-area
+reference. Ten images are accepted by the model contract and implementation,
+but were not forced through this 32 GB M1 Max: the estimated **10.7 GB** prefix
+cache plus the **14.23 GB** resident transformer and working memory leaves too
+little responsible headroom. The practical image-count ceiling is therefore
+unified-memory dependent. Public C+/C API exposure remains.
 
 ## Package and API layout
 
@@ -368,7 +375,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus test-multi-image-prompt /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus test-multi-image-conditioning /path/to/model/snapshot first.png second.png "Combine both references"
 ./cli/target/debug/qwen-image-cplus test-multi-image-transformer transformer.qipack /path/to/model/snapshot first.png second.png "Combine both references" 2
-./cli/target/debug/qwen-image-cplus generate-multi-image-512 transformer.qipack /path/to/model/snapshot output.png first.png second.png "Combine both references" 1301 40
+./cli/target/debug/qwen-image-cplus generate-multi-image-512 transformer.qipack /path/to/model/snapshot output.png "Combine the references" 1301 40 first.png second.png [more.png ...]
 ./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
