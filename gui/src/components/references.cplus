@@ -10,6 +10,8 @@ import "facet/scroll" as scroll;
 import "facet/vocabulary" as vocab;
 import "facet_runtime/runtime" as runtime;
 import "events/events" as events;
+import "qwen_image/image_input" as image_input;
+import "qwen_image/image_output" as image_output;
 import "stdlib/option" as option;
 import "stdlib/fs" as fs;
 import "stdlib/status" as status;
@@ -19,7 +21,10 @@ import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 import "../file_drop" as file_drop;
 import "../current_image" as current_image;
+import "../new_image" as new_image;
+import "../preferences" as preferences;
 import "./style" as style;
+import "./output_options" as output_options;
 
 extern fn getpid() -> i32;
 
@@ -27,6 +32,7 @@ struct References {
     paths: vec::Vec[text::Text],
     opaque drop_view: *u8,
     edit_sub: events::SignalSubscription[text::Text],
+    clear_sub: events::SignalSubscription[new_image::Change],
 }
 
 static SNAPSHOT: vec::Vec[text::Text] = #zero::[vec::Vec[text::Text]]();
@@ -66,6 +72,7 @@ impl References {
             paths: vec::new::[text::Text](),
             drop_view: 0 as *u8,
             edit_sub: events::SignalSubscription[text::Text]::none(),
+            clear_sub: events::SignalSubscription[new_image::Change]::none(),
         };
     }
 
@@ -222,7 +229,10 @@ impl References {
         if this.paths.count() >= (10 as usize) { return; }
         match runtime::choose_file() {
             option::Option[text::Text]::Some(path) => {
-                let _accepted: bool = this.on_dropped_path(path, true);
+                if !this.on_dropped_path(path, true) {
+                    runtime::alert("Image unavailable",
+                        "This file could not be read as a reference image.", "OK");
+                }
             }
             option::Option::None => {}
         }
@@ -233,8 +243,15 @@ impl References {
             return false;
         }
         if !commit { return true; }
-        let _added: status::Status =
-            this.paths.insert(path.clone(), at: 0 as usize);
+        guard let option::Option[image_input::Dimensions]::Some(dimensions) =
+            image_input::source_dimensions(path.view()) else { return false; };
+        let first: bool = this.paths.count() == (0 as usize);
+        if this.paths.insert(path.clone(), at: 0 as usize) != status::Status::Ok {
+            return false;
+        }
+        if first {
+            output_options::apply_reference_size(dimensions.width, dimensions.height);
+        }
         this.refresh();
         match scroll::find("references:strip") {
             option::Option[scroll::Scroll]::Some(found) => {
@@ -263,6 +280,11 @@ impl References {
             "The generated image could not be added to references.", "OK");
         }
     }
+
+    fn on_new(ref this, _change: new_image::Change) {
+        this.paths = vec::new::[text::Text]();
+        this.refresh();
+    }
 }
 
 impl References: component::Component {
@@ -289,6 +311,7 @@ impl References: component::Lifecycle {
     fn on_attach(ref this, why: component::Attach) {
         if why != component::Attach::Mount { return; }
         this.edit_sub = current_image::watch_edit(this.on_edit_current);
+        this.clear_sub = new_image::watch(this.on_new);
         this.refresh();
         match mount::find("references:card") {
             option::Option[*core::Node]::Some(card) => {
@@ -304,6 +327,7 @@ impl References: component::Lifecycle {
         if why != component::Detach::Unmount { return; }
         SNAPSHOT = vec::new::[text::Text]();
         let _cancelled: bool = this.edit_sub.cancel();
+        let _cleared: bool = this.clear_sub.cancel();
         file_drop::clear(this.drop_view);
         this.drop_view = 0 as *u8;
     }
@@ -329,7 +353,16 @@ fn image_drop_accepts_supported_extensions_only() {
 fn edit_current_image_adds_it_to_the_reference_strip() {
     let path: text::Text =
         "/tmp/qwen-image-gui-edit-${getpid()}-${time::now_millis()}.png";
-    let _written = fs::write_string(path.view(), "png bytes");
+    let saved: preferences::GenerationPreferences = preferences::load();
+    var pixels: vec::Vec[f32] = vec::Vec[f32]::with_capacity(4096 as usize);
+    var index: usize = 0 as usize;
+    while index < (4096 as usize) {
+        let _added: status::Status = pixels.append(0.0f32);
+        index = index +% (1 as usize);
+    }
+    assert image_output::write_png_sized(
+        #slice_ptr(pixels.as_slice()), path.view(), 32 as usize, 32 as usize,
+    );
     var references: References = References::new();
     references.edit_sub = current_image::watch_edit(references.on_edit_current);
     assert current_image::set_png(path.view());
@@ -341,6 +374,15 @@ fn edit_current_image_adds_it_to_the_reference_strip() {
         }
         option::Option::None => { assert false; }
     }
+    let adopted: preferences::GenerationPreferences = preferences::load();
+    assert adopted.width == (256 as i64);
+    assert adopted.height == (256 as i64);
+    references.on_new(new_image::Change { value: 1 as i32 });
+    assert references.paths.count() == (0 as usize);
+    assert snapshot().count() == (0 as usize);
     current_image::clear();
     let _removed = fs::remove_file(path.view());
+    let width: text::Text = "${saved.width}";
+    let height: text::Text = "${saved.height}";
+    let _restored: bool = preferences::save_dimensions(width.view(), height.view());
 }

@@ -25,6 +25,7 @@ struct Request {
 
 enum Event {
     Progress(u64, control::Progress),
+    Diagnostic(u64, text::Text),
     Finished(u64, api::GenerateStatus, f64),
 }
 
@@ -69,6 +70,13 @@ fn _report(progress: control::Progress, raw: *u8) -> bool {
     return true;
 }
 
+fn _diagnose(message: str, raw: *u8) {
+    let context: *ObserverContext = raw as *ObserverContext;
+    let _sent: status::Status = { (*context).events.send(
+        Event::Diagnostic((*context).id, message.to_text()),
+    ) };
+}
+
 fn _execute_native(request: Request, observer: control::Observer) -> api::GenerateStatus {
     if request.image_paths.count() == (0 as usize) {
         return api::generate_to_png(api::GenerateRequest {
@@ -85,7 +93,8 @@ fn _execute_native(request: Request, observer: control::Observer) -> api::Genera
             height: request.height,
         }, observer);
     }
-    if request.cache != api::CacheMode::None || request.width != request.height {
+    if request.cache != api::CacheMode::None {
+        control::diagnose(observer, "Reference images require cache mode Off.");
         return api::GenerateStatus::InvalidArgument;
     }
     var paths: vec::Vec[str] = vec::Vec[str]::with_capacity(request.image_paths.count());
@@ -94,21 +103,26 @@ fn _execute_native(request: Request, observer: control::Observer) -> api::Genera
         match request.image_paths.at_ptr(index) {
             option::Option[*text::Text]::Some(path) => {
                 if paths.append({ (*path).view() }) != status::Status::Ok {
+                    control::diagnose(observer, "Could not prepare the reference-image list.");
                     return api::GenerateStatus::Failed;
                 }
             }
-            option::Option::None => { return api::GenerateStatus::Failed; }
+            option::Option::None => {
+                control::diagnose(observer, "Could not read a reference-image path.");
+                return api::GenerateStatus::Failed;
+            }
         }
         index = index +% (1 as usize);
     }
-    return api::generate_multi_image_to_png(api::MultiImageGenerateRequest {
+    return api::generate_multi_image_sized_to_png(api::MultiImageSizedGenerateRequest {
         packed_path: request.packed_path.view(),
         model_root: request.model_root.view(),
         output_path: request.output_path.view(),
         prompt: request.prompt.view(),
         image_paths: #slice_ptr(paths.as_slice()),
         image_count: paths.count(),
-        pixels: request.width,
+        width: request.width,
+        height: request.height,
         steps: request.steps,
         seed: request.seed,
     }, observer);
@@ -127,6 +141,7 @@ fn _run(take input: WorkerInput) -> i32 {
                         };
                         let observer: control::Observer = control::Observer {
                             callback: _report,
+                            diagnostic: _diagnose,
                             context: #addr_of(context) as *u8,
                         };
                         let result: api::GenerateStatus = input.execute(request, observer);
@@ -252,6 +267,37 @@ fn _mock_execute(request: Request, observer: control::Observer) -> api::Generate
     return api::GenerateStatus::Ok;
 }
 
+fn _mock_failure(_request: Request, observer: control::Observer) -> api::GenerateStatus {
+    control::diagnose(observer, "Could not open the selected model file.");
+    return api::GenerateStatus::Failed;
+}
+
+#[test]
+fn worker_delivers_failure_reason_before_completion() {
+    guard let option::Option[Service]::Some(service) = start_with(_mock_failure) else {
+        assert false;
+        return;
+    };
+    guard let option::Option[u64]::Some(id) = service.submit(_test_request(), clock_seconds()) else {
+        assert false;
+        return;
+    };
+    match service.events.receive() {
+        channel::ReceiveResult::Value(Event::Diagnostic(event_id, detail)) => {
+            assert event_id == id;
+            assert detail.view() == "Could not open the selected model file.";
+        }
+        _other => { assert false; }
+    }
+    match service.events.receive() {
+        channel::ReceiveResult::Value(Event::Finished(event_id, result, _elapsed_ms)) => {
+            assert event_id == id;
+            assert result == api::GenerateStatus::Failed;
+        }
+        _other => { assert false; }
+    }
+}
+
 #[test]
 fn worker_reports_progress_completion_and_elapsed_without_inference() {
     guard let option::Option[Service]::Some(service) = start_with(_mock_execute) else {
@@ -268,7 +314,7 @@ fn worker_reports_progress_completion_and_elapsed_without_inference() {
         option::Option::Some(_) => { assert false; }
     }
     match service.events.receive() {
-        channel::ReceiveResult::Value(Event::Progress(event_id, progress)) => {
+            channel::ReceiveResult::Value(Event::Progress(event_id, progress)) => {
             assert event_id == id;
             assert progress.phase == control::Phase::Preparing;
         }

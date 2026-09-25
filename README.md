@@ -166,10 +166,17 @@ defaults to 4 steps with an unstretched schedule.
 
 The official Qwen-Image-2.1 pipeline accepts **one to ten reference images**.
 Native image-conditioned generation is available through the CLI and the
-public C+/C generation APIs (see Package and API layout). Output is square,
-512x512 or 1024x1024. As in the reference pipeline's `output_resolution`,
-references are resized to the output area. Integration tests use the 512
+public C+/C generation APIs (see Package and API layout). The original entry
+points produce square 512x512 or 1024x1024 output. The native sized entry
+point also accepts rectangular dimensions from 256 through 2048 in multiples
+of 32, within a 1024x1024 pixel budget. References are aspect-preserving
+resized to approximately the output area. Integration tests use the 512
 budget so correctness work does not spend 1024 or 2048 generation time.
+A 768x512, three-step rectangular image-conditioned smoke completed through
+vision encoding, the conditioned transformer, sized VAE decode, and PNG output
+in 26.895 seconds on the M1 Max. This is a functional check, not a quality or
+like-for-like speed comparison. The 256x256 lower bound also completed through
+the same path in 8.710 seconds.
 
 The first completed checkpoint reproduces the pinned Diffusers/Qwen3-VL input
 contract: aspect-preserving area resize rounded to multiples of 32, one vision
@@ -451,9 +458,12 @@ extension, not something callers should infer from the current surface.
 
 Image-conditioned generation is exposed by the same engine as
 `MultiImageGenerateRequest`/`generate_multi_image_to_png` for C+ and by
-`QiMultiImageGenerateRequest`/`qi_generate_multi_image_to_png` for C. The
-current public image-conditioned surface produces square output (`pixels`
-512 or 1024), accepts 1-10 borrowed image paths, and takes the same step counts as
+`QiMultiImageGenerateRequest`/`qi_generate_multi_image_to_png` for C. Those
+original entry points produce square output (`pixels` 512 or 1024). The C+
+`MultiImageSizedGenerateRequest`/`generate_multi_image_sized_to_png` entry point
+and `generate-multi-image-sized` CLI command accept rectangular output within
+the same 1 MP area limit; the C ABI remains square-only for now. All accept
+1-10 borrowed image paths and take the same step counts as
 text-to-image generation: 3, 4, 8, 25, or 40. The pack's `shift_terminal`
 metadata selects the schedule, so a distilled pack runs its own few-step
 schedule. The CLI accepts `pack` in place of a step count to use the pack's
@@ -635,6 +645,7 @@ cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src
 ./cli/target/debug/qwen-image-cplus generate-multi-image-512 transformer.qipack /path/to/model/snapshot output.png "Combine the references" 1301 40 first.png second.png [more.png ...]
 ./cli/target/debug/qwen-image-cplus generate-multi-image-512 viggle.qipack /path/to/model/snapshot output.png "Combine the references" 1301 pack first.png second.png
 ./cli/target/debug/qwen-image-cplus generate-multi-image-1024 viggle.qipack /path/to/model/snapshot output.png "Change the headline" 1301 pack reference.png
+./cli/target/debug/qwen-image-cplus generate-multi-image-sized viggle.qipack /path/to/model/snapshot output.png "Edit this image" 1301 pack 768 512 reference.png
 ./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
 ./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
 ```
@@ -2394,9 +2405,10 @@ scope.
 
 ## Native GUI structure
 
-The macOS GUI in `gui/` is currently an editable input shell, not a generation client.
-`src/app.cplus` only registers the Generation and Settings windows and starts
-the app; neither window uses navigation routes. Each window has its own screen
+The macOS GUI in `gui/` is a generation client backed by the native worker.
+`src/app.cplus` registers the Generation and Settings windows, installs the
+standard first-responder Edit menu, and starts the app; neither window uses
+navigation routes. Each window has its own screen
 under `gui/src/screens/`. The generation screen composes the prompt, reference
 image, output-option, and preview components from `gui/src/components/`.
 Those components build retained `@ui` trees and implement `core::IntoNode` via
@@ -2412,42 +2424,54 @@ The Settings window remains a simpler standalone screen with the default
 safe-area inset.
 The main pane is a single flexible canvas rather than a card nested inside
 another card. Its header keeps the app identity; the canvas fills the remaining
-space and centers one empty-state message. A narrow footer reserves status and
-elapsed-time readouts for generation, without pretending an image exists yet.
-Edit and Save sit at the far right of the header. Both stay disabled until a
+space and centers one empty-state message until generation finishes. A narrow
+footer shows the current phase, denoising step count, and click-to-PNG elapsed
+time.
+New, Edit, and Save sit at the far right of the header. New is also available
+from File → New Image (⌘N). It starts a fresh session by clearing the prompt,
+reference strip, current preview, and elapsed/status display while retaining
+the chosen model and generation settings. If a generation is active, New
+requests cooperative cancellation and ignores its eventual result so an old
+image cannot reappear. Generated PNG files already written on disk are not
+deleted. Edit and Save stay disabled until a
 PNG is published as the current image on the UI thread. The current-image
 module then shows it in the canvas and enables both actions: Edit inserts that
 file at the front of the reference strip (subject to the ten-image limit), and
 Save opens a native save dialog and writes an atomic copy to the chosen path.
-The original generated file is not moved or renamed. The generation worker is
-not yet connected to this current-image module.
+The original generated file is not moved or renamed. A successful worker
+completion publishes its PNG through this current-image module on the UI thread.
 
 The prompt is an editable text area with no placeholder. It receives focus on
 the generation window's first activation, but later activations do not steal
 focus back from another control. On AppKit the text-area node backs an
 `NSScrollView`, so the screen's `Active` handler focuses its inner `NSTextView`;
-nested child components do not receive `Active`. The disabled Create icon sits
-beside the Create heading until generation is connected. Width and
+nested child components do not receive `Active`. Create starts one request on
+the long-running worker; it disables while busy and reveals Cancel beside the
+heading. Width and
 height are digit-only text fields with live guidance for the current minimum
 and multiple-of-32 rule. The seed field also filters typed or pasted input to
 ASCII digits. It shares a row with a checkbox labeled Random, which disables
-manual entry without erasing its value; actual randomization awaits backend
-integration.
+manual entry without erasing its value. Each generation with Random checked
+draws a new unsigned 64-bit seed.
 Steps use a native picker containing the supported 3, 4, 8, 25, and
 40-step choices. The compact + button sits beside the reference-image count;
 the thumbnail strip is hidden when empty. A new image appears first and the
 strip returns to the left so it is immediately visible. Each local-file
 thumbnail fills its card, with a white × on a dark circular backing at the
 top-left. The backing provides contrast against pale images, where a shadow
-alone was insufficient. At ten images the + button is disabled. These are
-local window inputs only: no model loads or inference runs, and the preview
-remains empty. The Settings window opens from the native menu and contains
+alone was insufficient. At ten images the + button is disabled. The first
+reference added to an empty strip reads its EXIF-corrected displayed size and
+sets the output to the nearest supported 32-pixel-aligned dimensions. Images
+larger than the conditioned path's 1 MP budget are proportionally reduced;
+the size hint shows source and selected dimensions and explains the cap. Later
+references do not change a manually adjusted size. This is a starting value,
+not a locked aspect ratio. The Settings window opens from the native menu and contains
 persistent cache mode (Model default, Off, TaylorSeer, or Cache-DiT), cache
 threshold (Recommended, 0.12, 0.14, 0.16, or 0.24), and output PNG folder
 controls. Recommended resolves to 0.24 for TaylorSeer and 0.16 for Cache-DiT.
 The output folder uses `/tmp` when none has been chosen, and the window has a
-button to restore that default. These settings are not connected to inference
-yet. Width, height, steps, Random mode, and the last valid manual seed persist
+button to restore that default. These settings feed the next generation
+request. Width, height, steps, Random mode, and the last valid manual seed persist
 through macOS UserDefaults in the stable
 `dev.netdur.qwen-image-cplus.preferences` domain. The GUI accepts only supported
 steps, dimensions of at least 256 in multiples of 32, and decimal seeds within
@@ -2455,7 +2479,7 @@ the unsigned 64-bit range when loading or saving. The manual seed is stored as a
 string to preserve that full range; incomplete or invalid edits never replace
 the last valid saved value. The Model card opens a native file picker, displays
 the selected file name, and saves its full path in the same preferences domain;
-it does not load the model yet. Selection requires the tokenizer, four
+the worker loads it when a request starts. Selection requires the tokenizer, four
 text-encoder shards, and VAE file in subdirectories beside the QIPACK; an
 incomplete saved selection shows a warning. The Reference Images and Model
 cards also accept Finder file drops anywhere on their surfaces. Both routes
@@ -2468,8 +2492,8 @@ so `gui/src/file_drop.cplus` adds an AppKit file-URL destination to the two
 existing card views; it does not replace their click controls. Drop handlers
 are cleared when their components unmount. Prompt text and reference images
 remain session-only.
-The generation worker now exists in `qwen_image/src/generation_worker.cplus`,
-but the GUI controls are not wired to it yet. A single long-lived thread accepts
+The generation worker in `qwen_image/src/generation_worker.cplus` is driven by
+`gui/src/generation_session.cplus`. A single long-lived thread accepts
 an owned request through a typed channel, executes the native API, and sends
 typed progress and completion events back through another channel. The caller
 passes a monotonic timestamp captured at the Create click to `submit`; the
@@ -2479,12 +2503,24 @@ that request. The observer checks the mark at phase boundaries and after each
 denoising step, so cancellation is cooperative and may take up to the current
 model operation to finish. It does not interrupt a Metal command buffer, VAE
 decode, or PNG write mid-operation. Dropping the service closes its command
-channel; it does not forcibly terminate an in-flight request.
+channel; it does not forcibly terminate an in-flight request. The GUI polls
+worker events on the main thread and retains the previous image after a
+cancelled or failed run. A 512x512 three-step GUI smoke produced a PNG in 14
+seconds; a second run cancelled in nine seconds with the first image still
+visible.
+Failures now carry a diagnostic event from the native pipeline through the
+worker to the GUI. The preview keeps the short status in its footer and shows
+the detailed reason on a separate wrapping line, even when a previous image
+remains visible. Validation, reference loading, tokenizer/text, vision/VAE,
+transformer, and PNG-output failures report the failing stage and a useful
+check; deeper Metal/model diagnostics remain in the app log. Starting another
+generation or choosing New clears the old reason, and cancellation does not
+show a failure message.
 
 The native API's optional observer is passed through text-to-image and
 multi-image paths. It reports preparation, reference/text encoding, denoising
 step counts, VAE decoding, and PNG writing, and can return `Cancelled` without
 breaking the existing synchronous CLI or C ABI. The worker uses no Facet or
-AppKit calls; the eventual GUI integration must drain events on the main thread
-and stage state updates there. Mock-worker tests cover progress, elapsed time,
+AppKit calls; the GUI drains events on the main thread and stages state updates
+there. Mock-worker tests cover progress, elapsed time,
 per-request cancellation, and a subsequent request without running inference.

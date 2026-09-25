@@ -1,0 +1,27 @@
+import "events/events" as events;
+import "./current_image" as current_image;
+import "./generation_session" as generation_session;
+
+struct Change { value: i32 }
+
+static CHANGES: events::Signal[Change] = #zero::[events::Signal[Change]]();
+static READY: bool = false;
+
+fn ensure() {
+    if READY { return; }
+    CHANGES = events::Signal[Change]::new();
+    READY = true;
+}
+
+fn watch(f: fn(Change, *u8), ctx: *u8 = 0 as *u8)
+        -> events::SignalSubscription[Change] {
+    ensure();
+    return CHANGES.on(f, ctx: ctx);
+}
+
+fn begin() {
+    ensure();
+    generation_session::reset_for_new_image();
+    current_image::clear();
+    CHANGES.emit(Change { value: 1 as i32 });
+}

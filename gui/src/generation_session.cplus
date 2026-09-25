@@ -16,10 +16,12 @@ struct Session {
     worker: box::Box[worker::Service],
     ready: bool,
     id: u64,
+    discard_result: bool,
     started_at: f64,
     elapsed_ms: f64,
     output_path: text::Text,
     state: text::Text,
+    failure_detail: text::Text,
     timer: services::Cancellable,
     changes: events::Signal[Change],
 }
@@ -35,9 +37,11 @@ fn ensure() -> bool {
     SESSION.worker = owned;
     SESSION.ready = true;
     SESSION.id = 0 as u64;
+    SESSION.discard_result = false;
     SESSION.elapsed_ms = 0.0f64;
     SESSION.output_path = text::new();
     SESSION.state = "Waiting to generate".to_text();
+    SESSION.failure_detail = text::new();
     SESSION.timer = services::Cancellable::none();
     SESSION.changes = events::Signal[Change]::new();
     return true;
@@ -53,6 +57,11 @@ fn busy() -> bool {
 fn status_text() -> text::Text {
     if !ensure() { return "Worker unavailable".to_text(); }
     return SESSION.state.clone();
+}
+
+fn failure_text() -> text::Text {
+    if !ensure() { return text::new(); }
+    return SESSION.failure_detail.clone();
 }
 
 fn elapsed_seconds() -> i64 {
@@ -75,10 +84,12 @@ fn start(take request: worker::Request) -> bool {
     guard let option::Option[u64]::Some(id) =
         { (*SESSION.worker.ptr()).submit(request, started) } else { return false; };
     SESSION.id = id;
+    SESSION.discard_result = false;
     SESSION.started_at = started;
     SESSION.elapsed_ms = 0.0f64;
     SESSION.output_path = output;
     SESSION.state = "Preparing".to_text();
+    SESSION.failure_detail = text::new();
     notify();
     SESSION.timer = services::after(0.1f64, tick, 0 as *u8);
     return true;
@@ -89,6 +100,22 @@ fn cancel() -> bool {
     SESSION.state = "Cancelling…".to_text();
     notify();
     return true;
+}
+
+fn reset_for_new_image() {
+    if !ensure() { return; }
+    SESSION.failure_detail = text::new();
+    if busy() {
+        SESSION.discard_result = true;
+        let _cancelled: bool = { (*SESSION.worker.ptr()).cancel(SESSION.id) };
+        SESSION.state = "Cancelling…".to_text();
+    } else {
+        SESSION.discard_result = false;
+        SESSION.elapsed_ms = 0.0f64;
+        SESSION.output_path = text::new();
+        SESSION.state = "Waiting to generate".to_text();
+    }
+    notify();
 }
 
 fn progress_text(progress: control::Progress) -> text::Text {
@@ -105,14 +132,41 @@ fn progress_text(progress: control::Progress) -> text::Text {
 
 fn finished(result: api::GenerateStatus, elapsed_ms: f64) {
     SESSION.id = 0 as u64;
+    if SESSION.discard_result {
+        SESSION.discard_result = false;
+        SESSION.elapsed_ms = 0.0f64;
+        SESSION.output_path = text::new();
+        SESSION.state = "Waiting to generate".to_text();
+        SESSION.failure_detail = text::new();
+        notify();
+        return;
+    }
     SESSION.elapsed_ms = elapsed_ms;
+    let previous_state: text::Text = SESSION.state.clone();
     SESSION.state = match result {
         api::GenerateStatus::Ok => if current_image::set_png(SESSION.output_path.view()) {
+            SESSION.failure_detail = text::new();
             "Finished".to_text()
-        } else { "PNG could not be opened".to_text() },
-        api::GenerateStatus::Cancelled => "Cancelled".to_text(),
-        api::GenerateStatus::InvalidArgument => "Unsupported settings".to_text(),
-        api::GenerateStatus::Failed => "Generation failed".to_text(),
+        } else {
+            SESSION.failure_detail = "The PNG was written but could not be opened from ${SESSION.output_path}.";
+            "Output unavailable".to_text()
+        },
+        api::GenerateStatus::Cancelled => {
+            SESSION.failure_detail = text::new();
+            "Cancelled".to_text()
+        },
+        api::GenerateStatus::InvalidArgument => {
+            if SESSION.failure_detail.count() == (0 as usize) {
+                SESSION.failure_detail = "This combination of size, steps, cache, and references is unsupported.".to_text();
+            }
+            "Unsupported settings".to_text()
+        },
+        api::GenerateStatus::Failed => {
+            if SESSION.failure_detail.count() == (0 as usize) {
+                SESSION.failure_detail = "Failure during ${previous_state}. Check the app log for the underlying error.";
+            }
+            "Generation failed".to_text()
+        },
     };
     notify();
 }
@@ -122,9 +176,16 @@ fn tick(_ctx: *u8) {
     loop {
         match { (*SESSION.worker.ptr()).try_event() } {
             channel::TryReceiveResult::Value(worker::Event::Progress(id, progress)) => {
-                if id == SESSION.id && SESSION.state.view() != "Cancelling…" {
+                if id == SESSION.id && !SESSION.discard_result &&
+                    SESSION.state.view() != "Cancelling…" {
                     SESSION.state = progress_text(progress);
                     notify();
+                }
+            }
+            channel::TryReceiveResult::Value(worker::Event::Diagnostic(id, detail)) => {
+                if id == SESSION.id && !SESSION.discard_result &&
+                    SESSION.failure_detail.count() == (0 as usize) {
+                    SESSION.failure_detail = detail;
                 }
             }
             channel::TryReceiveResult::Value(worker::Event::Finished(id, result, elapsed)) => {
@@ -137,4 +198,33 @@ fn tick(_ctx: *u8) {
         notify();
         SESSION.timer = services::after(0.1f64, tick, 0 as *u8);
     }
+}
+
+#[test]
+fn new_image_discards_completion_from_cancelled_request() {
+    assert ensure();
+    current_image::clear();
+    SESSION.id = 123 as u64;
+    SESSION.output_path = "/tmp/old-generation.png".to_text();
+    SESSION.state = "Denoising".to_text();
+    reset_for_new_image();
+    assert SESSION.discard_result;
+    finished(api::GenerateStatus::Ok, 9000.0f64);
+    assert !current_image::has_image();
+    assert !busy();
+    assert status_text().view() == "Waiting to generate";
+    assert elapsed_seconds() == (0 as i64);
+}
+
+#[test]
+fn failed_generation_keeps_the_worker_reason_until_the_next_run() {
+    assert ensure();
+    SESSION.id = 456 as u64;
+    SESSION.state = "Encoding prompt".to_text();
+    SESSION.failure_detail = "Could not open the selected model file.".to_text();
+    finished(api::GenerateStatus::Failed, 1200.0f64);
+    assert status_text().view() == "Generation failed";
+    assert failure_text().view() == "Could not open the selected model file.";
+    reset_for_new_image();
+    assert failure_text().count() == (0 as usize);
 }

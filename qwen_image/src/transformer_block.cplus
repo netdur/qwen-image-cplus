@@ -6473,6 +6473,7 @@ fn run_trajectory_packed_impl(
     }
     if !mps::load_framework() {
         io::eprintln("trajectory: could not load MetalPerformanceShaders");
+        control::diagnose(observer, "Could not load MetalPerformanceShaders on this Mac.");
         return 1;
     }
     var step_limit: usize = 0 as usize;
@@ -6611,6 +6612,7 @@ fn run_trajectory_packed_impl(
     let packed_load_start_ms: i64 = time::now_millis();
     guard let packed::LoadResult::Ok(weight_file) = packed::load(packed_path) else {
         io::eprintln("trajectory: could not load validated packed file ${packed_path}");
+        control::diagnose(observer, "Could not load or validate the selected QIPACK: ${packed_path}.");
         return 1;
     };
     let packed_load_wall_ms: i64 = time::now_millis() - packed_load_start_ms;
@@ -6620,7 +6622,10 @@ fn run_trajectory_packed_impl(
     if pool_pointer.is_null() { return 1; }
     let pool: OwnedObjc = OwnedObjc::new(pool_pointer);
     let device_pointer: *u8 = MTLCreateSystemDefaultDevice();
-    if device_pointer.is_null() { return 1; }
+    if device_pointer.is_null() {
+        control::diagnose(observer, "No Metal GPU is available for generation.");
+        return 1;
+    }
     let device_owner: OwnedObjc = OwnedObjc::new(rt::retain(device_pointer));
     let device: metal::Device = metal::Device::from_raw(device_owner.raw());
     guard let option::Option[metal::CommandQueue]::Some(queue) = device.new_command_queue() else { return 1; };
@@ -6638,6 +6643,7 @@ fn run_trajectory_packed_impl(
             let description: *u8 = rt::msg_id(compile_error, rt::sel(#str_ptr("localizedDescription\0")));
             io::eprintln("trajectory Metal compile: ${bridge::to_text(description)}");
         }
+        control::diagnose(observer, "Metal shader compilation failed. See the app log for the compiler error.");
         return 1;
     };
     let library_owner: OwnedObjc = OwnedObjc::new(library.raw());
@@ -6802,7 +6808,10 @@ fn run_trajectory_packed_impl(
     guard let option::Option[metal::Buffer]::Some(storage) =
         if !env::has_var("QI_DISABLE_PACK_PREAD") {
         read_packed_storage_buffer(device, packed_path, weight_file, ring_prefix_bytes)
-    } else { packed_storage_buffer(device, weight_file) } else { return 1; };
+    } else { packed_storage_buffer(device, weight_file) } else {
+        control::diagnose(observer, "Could not load transformer weights into Metal memory. Check available memory and the QIPACK file.");
+        return 1;
+    };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
     let q4_model: bool = weight_file.int4_rotated();
     let eager_q4: bool = q4_model && q4_eager_expand;

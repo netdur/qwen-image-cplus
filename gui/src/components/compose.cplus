@@ -158,11 +158,11 @@ impl Compose {
             _ => api::CacheMode::None,
         };
         if images.count() > (0 as usize) &&
-            (width != height ||
-             (width != (512 as i64) && width != (1024 as i64)) ||
+            (width > (2048 as i64) || height > (2048 as i64) ||
+             width > (1048576 as i64) / height ||
              cache != api::CacheMode::None) {
             runtime::alert("Unsupported reference settings",
-                "References require 512 or 1024 square output with cache off.", "OK");
+                "Reference output must fit within 1 MP with cache off. Reduce the size or use the suggested dimensions.", "OK");
             return;
         }
         if cache != api::CacheMode::None &&

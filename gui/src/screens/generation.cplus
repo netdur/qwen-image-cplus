@@ -23,6 +23,7 @@ import "../components/style" as style;
 import "../components/compose" as compose;
 import "../components/preview" as preview;
 import "../current_image" as current_image;
+import "../new_image" as new_image;
 
 extern fn getpid() -> i32;
 
@@ -55,6 +56,13 @@ impl Generation {
         return action;
     }
 
+    fn new_button(ref this) -> core::Node {
+        return ui::button("New", key: "generation:new",
+            bordered: true, corner_radius: vocab::Corners::all(8.0f64),
+            font_size: 13.0f64, on_click: this.on_new)
+            .width(68.0f64).height(32.0f64);
+    }
+
     fn save_button(ref this) -> core::Node {
         var action: core::Node = ui::button("Save", key: "generation:save",
             bordered: true, corner_radius: vocab::Corners::all(8.0f64),
@@ -76,6 +84,7 @@ impl Generation {
                 .gap(2.0f64)
                 .window_drag()
                 spacer().grow(1.0f64).window_drag()
+                this.new_button()
                 this.edit_button()
                 this.save_button()
             }
@@ -111,6 +120,10 @@ impl Generation {
         let _sent: bool = current_image::edit();
     }
 
+    fn on_new(ref this, _sender: *u8) {
+        new_image::begin();
+    }
+
     fn on_save(ref this, _sender: *u8) {
         guard let option::Option[text::Text]::Some(source) =
             current_image::path() else { return; };
@@ -131,9 +144,6 @@ impl Generation {
         }
     }
 
-    fn on_menu_settings(this, _sender: *u8) {
-        let _opened = runtime::app().open_window("settings");
-    }
 }
 
 impl Generation: component::Component {
@@ -227,12 +237,7 @@ impl Generation: component::Lifecycle {
 
 impl Generation: screen::Screen {
     fn menu_items(this) -> vec::Vec[screen::MenuItem] {
-        var items: vec::Vec[screen::MenuItem] =
-            vec::new::[screen::MenuItem]();
-        let _added: status::Status = items.append(screen::MenuItem::new(
-            "Qwen Image", "Settings…", key: ",",
-            on_click: this.on_menu_settings));
-        return items;
+        return vec::new::[screen::MenuItem]();
     }
 }
 

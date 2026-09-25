@@ -77,6 +77,8 @@ fn encode_images(
             io::eprintln(
                 "multimodal conditioning: could not load ${image_paths[image_index]}",
             );
+            control::diagnose(observer,
+                "Could not open reference image ${image_paths[image_index]}.");
             return option::Option[Encoded]::None;
         };
         input_ms = input_ms + (time::now_millis() - input_start_ms);
@@ -145,7 +147,10 @@ fn encode_images(
     }
     if vision_encoder::encode_batch_to_host(
         model_root, #slice_ptr(vision_inputs.as_slice()), image_count,
-    ) != (0 as i32) { return option::Option[Encoded]::None; }
+    ) != (0 as i32) {
+        control::diagnose(observer, "The vision encoder failed while processing reference images. Check its model files and available memory.");
+        return option::Option[Encoded]::None;
+    }
     vision_ms = time::now_millis() - vision_start_ms;
     host_buffers::dump_f32("vision_features.f32", vision_values, vision_rows *% WIDTH);
     host_buffers::dump_f32(
@@ -154,7 +159,10 @@ fn encode_images(
     let vae_start_ms: i64 = time::now_millis();
     if vae::encode_batch_from_host(
         model_root, #slice_ptr(vae_inputs.as_slice()), image_count,
-    ) != (0 as i32) { return option::Option[Encoded]::None; }
+    ) != (0 as i32) {
+        control::diagnose(observer, "The VAE encoder failed while processing reference images. Check its model file and available memory.");
+        return option::Option[Encoded]::None;
+    }
     vae_ms = time::now_millis() - vae_start_ms;
 
     let text_start_ms: i64 = time::now_millis();
@@ -166,6 +174,7 @@ fn encode_images(
             model_root, prompt, #slice_ptr(image_token_counts.as_slice()), image_count,
     ) else {
         io::eprintln("multimodal conditioning: could not tokenize prompt");
+        control::diagnose(observer, "Could not tokenize the prompt and references. Check the tokenizer files beside the selected QIPACK.");
         return option::Option[Encoded]::None;
     };
     guard let option::Option[vec::Vec[u32]]::Some(positions) = host_buffers::zeroed_u32(
@@ -198,6 +207,7 @@ fn encode_images(
         io::eprintln(
             "multimodal conditioning: text rows expected=${prompt_rows} actual=${encoded_rows}",
         );
+        control::diagnose(observer, "The text encoder failed while combining the prompt and references. Check its model shards and available memory.");
         return option::Option[Encoded]::None;
     }
     var prompt_image_mask: vec::Vec[u8] = vec::Vec[u8]::with_capacity(prompt_rows);
@@ -312,12 +322,24 @@ fn run_multi_image_transformer(
     seed: u64 = 1301 as u64,
     output_resolution: usize = 512 as usize,
     observer: control::Observer = control::none(),
+    output_width: usize = 0 as usize,
+    output_height: usize = 0 as usize,
 ) -> i32 {
     if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
         return 3;
     }
-    if output_resolution != (512 as usize) && output_resolution != (1024 as usize) {
-        io::eprintln("multi-image transformer: output resolution must be 512 or 1024");
+    let width: usize = if output_width == (0 as usize) {
+        output_resolution
+    } else { output_width };
+    let height: usize = if output_height == (0 as usize) {
+        output_resolution
+    } else { output_height };
+    if width < (256 as usize) || height < (256 as usize)
+        || width > (2048 as usize) || height > (2048 as usize)
+        || width % (32 as usize) != (0 as usize)
+        || height % (32 as usize) != (0 as usize)
+        || width > (1048576 as usize) / height {
+        io::eprintln("multi-image transformer: output size must fit within 1024x1024 pixels with both sides at least 256 and divisible by 32");
         return 2;
     }
     let smoke_steps: bool = requested_steps == "1" || requested_steps == "2";
@@ -331,8 +353,10 @@ fn run_multi_image_transformer(
         return 2;
     }
     let started_ms: i64 = time::now_millis();
+    let reference_resolution: usize =
+        ((width *% height) as f64).sqrt() as usize;
     guard let option::Option[Encoded]::Some(encoded) = encode_images(
-        model_root, prompt, image_paths, image_count, output_resolution, observer,
+        model_root, prompt, image_paths, image_count, reference_resolution, observer,
     ) else {
         if !control::report(observer, control::Phase::EncodingReferences, 0 as usize, image_count) {
             return 3;
@@ -350,8 +374,9 @@ fn run_multi_image_transformer(
         }) != status::Status::Ok { return 1; }
         shape_index = shape_index +% (1 as usize);
     }
-    let latent_side: usize = output_resolution / (16 as usize);
-    let target_rows: usize = latent_side *% latent_side;
+    let latent_width: usize = width / (16 as usize);
+    let latent_height: usize = height / (16 as usize);
+    let target_rows: usize = latent_width *% latent_height;
     guard let option::Option[vec::Vec[f32]]::Some(target) = host_buffers::zeroed_f32(
         target_rows *% LATENT_CHANNELS,
     ) else { return 1; };
@@ -379,8 +404,8 @@ fn run_multi_image_transformer(
         image_count,
         seed,
         #slice_ptr(target.as_slice()),
-        output_resolution,
-        output_resolution,
+        width,
+        height,
         requested_steps,
         observer,
     );
@@ -393,6 +418,7 @@ fn run_multi_image_transformer(
         #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
     ) {
         io::eprintln("multi-image transformer: trajectory target is invalid");
+        control::diagnose(observer, "The transformer failed or produced an invalid image latent. Check the QIPACK and app log for the underlying Metal error.");
         return 1;
     }
     if output_path.count() > (0 as usize) {
@@ -400,11 +426,12 @@ fn run_multi_image_transformer(
             return 3;
         }
         guard let option::Option[vec::Vec[f32]]::Some(decoded) = host_buffers::zeroed_f32(
-            output_resolution *% output_resolution *% (4 as usize),
+            width *% height *% (4 as usize),
         ) else { return 1; };
         let vae_start_ms: i64 = time::now_millis();
         // 1024 uses the same decoder entry as text-to-image 1024.
-        let decode_status: i32 = if output_resolution == (1024 as usize) {
+        let decode_status: i32 = if width == (1024 as usize)
+            && height == (1024 as usize) {
             vae::decode_1024_from_host(
                 model_root, #slice_ptr(target.as_slice()), #slice_ptr(decoded.as_slice()),
             )
@@ -413,11 +440,12 @@ fn run_multi_image_transformer(
                 model_root,
                 #slice_ptr(target.as_slice()),
                 #slice_ptr(decoded.as_slice()),
-                latent_side,
-                latent_side,
+                latent_width,
+                latent_height,
             )
         };
         if decode_status != (0 as i32) {
+            control::diagnose(observer, "The VAE decoder failed. Check its model file and available memory.");
             return 1;
         }
         let vae_ms: i64 = time::now_millis() - vae_start_ms;
@@ -426,17 +454,18 @@ fn run_multi_image_transformer(
             return 3;
         }
         if !image_output::write_png_sized(
-            #slice_ptr(decoded.as_slice()), output_path, output_resolution, output_resolution,
+            #slice_ptr(decoded.as_slice()), output_path, width, height,
         ) {
+            control::diagnose(observer, "Could not write the output PNG to ${output_path}. Check the destination folder and free space.");
             return 1;
         }
         io::println(
-            "Qwen-Image-2.1 multi-image generation: images=${image_count} output=${output_path} pixels=${output_resolution}x${output_resolution} steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
+            "Qwen-Image-2.1 multi-image generation: images=${image_count} output=${output_path} pixels=${width}x${height} steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
         );
         return 0;
     }
     io::println(
-        "Qwen-Image-2.1 multi-image transformer: verified images=${image_count} output=${output_resolution}x${output_resolution} steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        "Qwen-Image-2.1 multi-image transformer: verified images=${image_count} output=${width}x${height} steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",
     );
     return 0;
 }

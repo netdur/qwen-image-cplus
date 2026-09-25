@@ -1,12 +1,31 @@
 import "facet/facet" as core;
 import "facet/elements" as ui;
 import "facet/component" as component;
+import "facet/text_area" as text_area;
+import "events/events" as events;
+import "stdlib/option" as option;
+import "../new_image" as new_image;
 import "./style" as style;
 
-struct Prompt { _shell: u8 }
+struct Prompt {
+    clear_sub: events::SignalSubscription[new_image::Change],
+}
 
 impl Prompt {
-    fn new() -> Prompt { return Prompt { _shell: 0 as u8 }; }
+    fn new() -> Prompt {
+        return Prompt {
+            clear_sub: events::SignalSubscription[new_image::Change]::none(),
+        };
+    }
+
+    fn on_new(ref this, _change: new_image::Change) {
+        match text_area::find("prompt:input") {
+            option::Option[text_area::TextArea]::Some(input) => {
+                let _input: text_area::TextArea = input.set_text("");
+            }
+            option::Option::None => {}
+        }
+    }
 }
 
 impl Prompt: component::Component {
@@ -26,8 +45,16 @@ impl Prompt: component::Component {
 }
 
 impl Prompt: component::Lifecycle {
-    fn on_attach(ref this, _why: component::Attach) {}
-    fn on_detach(ref this, _why: component::Detach) {}
+    fn on_attach(ref this, why: component::Attach) {
+        if why == component::Attach::Mount {
+            this.clear_sub = new_image::watch(this.on_new);
+        }
+    }
+    fn on_detach(ref this, why: component::Detach) {
+        if why == component::Detach::Unmount {
+            let _cancelled: bool = this.clear_sub.cancel();
+        }
+    }
 }
 
 impl Prompt: core::IntoNode {

@@ -15,14 +15,22 @@ struct Progress {
 
 struct Observer {
     callback: fn(Progress, *u8) -> bool,
+    diagnostic: fn(str, *u8),
     opaque context: *u8,
 }
 
 fn none() -> Observer {
     return Observer {
         callback: 0 as fn(Progress, *u8) -> bool,
+        diagnostic: 0 as fn(str, *u8),
         context: 0 as *u8,
     };
+}
+
+fn diagnose(observer: Observer, message: str) {
+    if !observer.diagnostic.is_null() {
+        observer.diagnostic(message, observer.context);
+    }
 }
 
 fn report(observer: Observer, phase: Phase, completed_steps: usize, total_steps: usize) -> bool {

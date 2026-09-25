@@ -9,6 +9,7 @@ import "./pipeline" as pipeline;
 import "./generation_control" as control;
 import "./multimodal_conditioning" as multimodal_conditioning;
 import "stdlib/option" as option;
+import "stdlib/text" as text;
 import "stdlib/vec" as vec;
 
 enum CacheMode {
@@ -40,9 +41,8 @@ struct GenerateRequest {
     height: usize,
 }
 
-// Image-conditioned generation produces a square `pixels` x `pixels` output,
-// 512 or 1024; references are resized to the same area. `image_paths` is
-// borrowed for the synchronous duration of the call.
+// The original square image-conditioned entry point remains available for
+// existing FFI clients. `image_paths` is borrowed for the synchronous call.
 struct MultiImageGenerateRequest {
     packed_path: str,
     model_root: str,
@@ -51,6 +51,19 @@ struct MultiImageGenerateRequest {
     opaque image_paths: *str,
     image_count: usize,
     pixels: usize,
+    steps: usize,
+    seed: u64,
+}
+
+struct MultiImageSizedGenerateRequest {
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    opaque image_paths: *str,
+    image_count: usize,
+    width: usize,
+    height: usize,
     steps: usize,
     seed: u64,
 }
@@ -77,7 +90,10 @@ fn _threshold_supported(value: f64) -> bool {
         || value == 0.16f64 || value == 0.24f64;
 }
 
-fn _validate_multi_image(request: MultiImageGenerateRequest) -> GenerateStatus {
+fn _validate_multi_image(
+    request: MultiImageGenerateRequest,
+    observer: control::Observer = control::none(),
+) -> GenerateStatus {
     if request.packed_path.count() == (0 as usize)
         || request.model_root.count() == (0 as usize)
         || request.output_path.count() == (0 as usize)
@@ -86,15 +102,20 @@ fn _validate_multi_image(request: MultiImageGenerateRequest) -> GenerateStatus {
         || request.image_count < (1 as usize)
         || request.image_count > (10 as usize)
         || (request.pixels != (512 as usize) && request.pixels != (1024 as usize)) {
+        control::diagnose(observer, "Reference generation needs 1–10 images, a prompt, model, output path, and a 512 or 1024 square output.");
         return GenerateStatus::InvalidArgument;
     }
     match _step_name(request.steps) {
         option::Option::Some(_) => {}
-        option::Option::None => { return GenerateStatus::InvalidArgument; }
+        option::Option::None => {
+            control::diagnose(observer, "Unsupported step count; choose 3, 4, 8, 25, or 40.");
+            return GenerateStatus::InvalidArgument;
+        }
     }
     var image_index: usize = 0 as usize;
     while image_index < request.image_count {
         if request.image_paths[image_index].count() == (0 as usize) {
+            control::diagnose(observer, "A reference-image path is empty.");
             return GenerateStatus::InvalidArgument;
         }
         image_index = image_index +% (1 as usize);
@@ -102,43 +123,96 @@ fn _validate_multi_image(request: MultiImageGenerateRequest) -> GenerateStatus {
     return GenerateStatus::Ok;
 }
 
-fn _validate(request: GenerateRequest) -> GenerateStatus {
+fn _validate_multi_image_sized(
+    request: MultiImageSizedGenerateRequest,
+    observer: control::Observer = control::none(),
+) -> GenerateStatus {
+    if request.packed_path.count() == (0 as usize)
+        || request.model_root.count() == (0 as usize)
+        || request.output_path.count() == (0 as usize)
+        || request.prompt.count() == (0 as usize)
+        || request.image_paths.is_null()
+        || request.image_count < (1 as usize)
+        || request.image_count > (10 as usize)
+        || request.width < (256 as usize)
+        || request.height < (256 as usize)
+        || request.width > (2048 as usize)
+        || request.height > (2048 as usize)
+        || request.width % (32 as usize) != (0 as usize)
+        || request.height % (32 as usize) != (0 as usize)
+        || request.width > (1048576 as usize) / request.height {
+        control::diagnose(observer, "Reference output needs 1–10 images and a valid size: each side 256–2048 in multiples of 32, at most 1 MP total.");
+        return GenerateStatus::InvalidArgument;
+    }
+    match _step_name(request.steps) {
+        option::Option::Some(_) => {}
+        option::Option::None => {
+            control::diagnose(observer, "Unsupported step count; choose 3, 4, 8, 25, or 40.");
+            return GenerateStatus::InvalidArgument;
+        }
+    }
+    var image_index: usize = 0 as usize;
+    while image_index < request.image_count {
+        if request.image_paths[image_index].count() == (0 as usize) {
+            control::diagnose(observer, "A reference-image path is empty.");
+            return GenerateStatus::InvalidArgument;
+        }
+        image_index = image_index +% (1 as usize);
+    }
+    return GenerateStatus::Ok;
+}
+
+fn _validate(
+    request: GenerateRequest,
+    observer: control::Observer = control::none(),
+) -> GenerateStatus {
     if request.packed_path.count() == (0 as usize)
         || request.model_root.count() == (0 as usize)
         || request.output_path.count() == (0 as usize)
         || request.prompt.count() == (0 as usize) {
+        control::diagnose(observer, "The prompt, model file, model folder, and output path are required.");
         return GenerateStatus::InvalidArgument;
     }
     if (request.width == (0 as usize)) != (request.height == (0 as usize)) {
+        control::diagnose(observer, "Set both output width and height.");
         return GenerateStatus::InvalidArgument;
     }
     if request.width == (0 as usize)
         && request.pixels != (256 as usize) && request.pixels != (1024 as usize) {
+        control::diagnose(observer, "Unsupported square output size.");
         return GenerateStatus::InvalidArgument;
     }
     let width: usize = _request_width(request);
     let height: usize = _request_height(request);
     if !pipeline::output_dimensions_supported(width, height) {
+        control::diagnose(observer, "Output size must use multiples of 32 and fit within the model's token limit.");
         return GenerateStatus::InvalidArgument;
     }
     match _step_name(request.steps) {
         option::Option::Some(_) => {}
-        option::Option::None => { return GenerateStatus::InvalidArgument; }
+        option::Option::None => {
+            control::diagnose(observer, "Unsupported step count; choose 3, 4, 8, 25, or 40.");
+            return GenerateStatus::InvalidArgument;
+        }
     }
     if width == (256 as usize) && height == (256 as usize)
         && request.steps != (25 as usize) && request.steps != (40 as usize) {
+        control::diagnose(observer, "256 × 256 output requires 25 or 40 steps.");
         return GenerateStatus::InvalidArgument;
     }
     if width == (256 as usize) && height == (256 as usize)
         && request.cache == CacheMode::TaylorSeer {
+        control::diagnose(observer, "TaylorSeer is unavailable at 256 × 256.");
         return GenerateStatus::InvalidArgument;
     }
     if request.cache != CacheMode::None
         && !((width == (256 as usize) && height == (256 as usize))
             || (width == (1024 as usize) && height == (1024 as usize))) {
+        control::diagnose(observer, "Cache modes are supported only for 256 × 256 or 1024 × 1024 output.");
         return GenerateStatus::InvalidArgument;
     }
     if request.cache != CacheMode::None && !_threshold_supported(request.cache_threshold) {
+        control::diagnose(observer, "Unsupported cache threshold.");
         return GenerateStatus::InvalidArgument;
     }
     return GenerateStatus::Ok;
@@ -155,7 +229,7 @@ fn generate_to_png(
     request: GenerateRequest,
     observer: control::Observer = control::none(),
 ) -> GenerateStatus {
-    let validation: GenerateStatus = _validate(request);
+    let validation: GenerateStatus = _validate(request, observer);
     if validation != GenerateStatus::Ok { return validation; }
     guard let option::Option[str]::Some(steps) = _step_name(request.steps) else {
         return GenerateStatus::InvalidArgument;
@@ -238,7 +312,27 @@ fn generate_multi_image_to_png(
     request: MultiImageGenerateRequest,
     observer: control::Observer = control::none(),
 ) -> GenerateStatus {
-    let validation: GenerateStatus = _validate_multi_image(request);
+    let validation: GenerateStatus = _validate_multi_image(request, observer);
+    if validation != GenerateStatus::Ok { return validation; }
+    return generate_multi_image_sized_to_png(MultiImageSizedGenerateRequest {
+        packed_path: request.packed_path,
+        model_root: request.model_root,
+        output_path: request.output_path,
+        prompt: request.prompt,
+        image_paths: request.image_paths,
+        image_count: request.image_count,
+        width: request.pixels,
+        height: request.pixels,
+        steps: request.steps,
+        seed: request.seed,
+    }, observer);
+}
+
+fn generate_multi_image_sized_to_png(
+    request: MultiImageSizedGenerateRequest,
+    observer: control::Observer = control::none(),
+) -> GenerateStatus {
+    let validation: GenerateStatus = _validate_multi_image_sized(request, observer);
     if validation != GenerateStatus::Ok { return validation; }
     guard let option::Option[str]::Some(steps) = _step_name(request.steps) else {
         return GenerateStatus::InvalidArgument;
@@ -253,8 +347,10 @@ fn generate_multi_image_to_png(
             steps,
             request.output_path,
             request.seed,
-            request.pixels,
+            request.width,
             observer,
+            output_width: request.width,
+            output_height: request.height,
         ),
     );
 }
@@ -263,10 +359,43 @@ fn _cancel_immediately(_progress: control::Progress, _context: *u8) -> bool {
     return false;
 }
 
+struct DiagnosticCapture { message: text::Text }
+
+fn _capture_diagnostic(message: str, raw: *u8) {
+    let capture: *DiagnosticCapture = raw as *DiagnosticCapture;
+    { (*capture).message = message.to_text(); }
+}
+
+#[test]
+fn invalid_generation_reports_a_specific_reason_without_model_io() {
+    var capture: DiagnosticCapture = DiagnosticCapture { message: text::new() };
+    let observer: control::Observer = control::Observer {
+        callback: 0 as fn(control::Progress, *u8) -> bool,
+        diagnostic: _capture_diagnostic,
+        context: #addr_of(capture) as *u8,
+    };
+    let request: GenerateRequest = GenerateRequest {
+        packed_path: "absent.qipack",
+        model_root: "absent-model",
+        output_path: "unused.png",
+        prompt: "test",
+        pixels: 256 as usize,
+        steps: 4 as usize,
+        seed: 1 as u64,
+        cache: CacheMode::None,
+        cache_threshold: 0.0f64,
+        width: 0 as usize,
+        height: 0 as usize,
+    };
+    assert generate_to_png(request, observer) == GenerateStatus::InvalidArgument;
+    assert capture.message.view() == "256 × 256 output requires 25 or 40 steps.";
+}
+
 #[test]
 fn observer_cancels_both_api_paths_before_model_io() {
     let observer: control::Observer = control::Observer {
         callback: _cancel_immediately,
+        diagnostic: 0 as fn(str, *u8),
         context: 0 as *u8,
     };
     let request: GenerateRequest = GenerateRequest {
@@ -460,4 +589,35 @@ fn public_multi_image_request_enforces_count_resolution_and_steps() {
         seed: valid.seed,
     };
     assert _validate_multi_image(distilled_steps) == GenerateStatus::Ok;
+}
+
+#[test]
+fn sized_multi_image_request_preserves_aspect_within_budget() {
+    var paths: [str; 1] = ["first.png"];
+    let portrait: MultiImageSizedGenerateRequest = MultiImageSizedGenerateRequest {
+        packed_path: "model.qipack",
+        model_root: "models/qwen",
+        output_path: "output.png",
+        prompt: "Edit this image",
+        image_paths: #addr_of(paths[0]),
+        image_count: 1 as usize,
+        width: 768 as usize,
+        height: 1024 as usize,
+        steps: 4 as usize,
+        seed: 1301 as u64,
+    };
+    assert _validate_multi_image_sized(portrait) == GenerateStatus::Ok;
+    let over_budget: MultiImageSizedGenerateRequest = MultiImageSizedGenerateRequest {
+        packed_path: portrait.packed_path,
+        model_root: portrait.model_root,
+        output_path: portrait.output_path,
+        prompt: portrait.prompt,
+        image_paths: portrait.image_paths,
+        image_count: portrait.image_count,
+        width: 1024 as usize,
+        height: 1056 as usize,
+        steps: portrait.steps,
+        seed: portrait.seed,
+    };
+    assert _validate_multi_image_sized(over_budget) == GenerateStatus::InvalidArgument;
 }

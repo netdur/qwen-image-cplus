@@ -14,6 +14,7 @@ import "stdlib/status" as status;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
 import "../preferences" as preferences;
+import "../reference_size" as reference_size;
 import "./style" as style;
 
 struct OutputOptions { _shell: u8 }
@@ -278,6 +279,39 @@ impl OutputOptions: core::IntoNode {
 }
 
 fn output_options() -> OutputOptions { return OutputOptions::new(); }
+
+fn apply_reference_size(source_width: usize, source_height: usize) {
+    let suggested: reference_size::Suggestion =
+        reference_size::suggest(source_width, source_height);
+    let width: text::Text = "${suggested.width}";
+    let height: text::Text = "${suggested.height}";
+    match text_field::find("settings:width") {
+        option::Option[text_field::TextField]::Some(field) => {
+            let _field: text_field::TextField = field.set_text(width.view());
+        }
+        option::Option::None => {}
+    }
+    match text_field::find("settings:height") {
+        option::Option[text_field::TextField]::Some(field) => {
+            let _field: text_field::TextField = field.set_text(height.view());
+        }
+        option::Option::None => {}
+    }
+    let _saved: bool = preferences::save_dimensions(width.view(), height.view());
+    let message: text::Text = if suggested.limited {
+        "First image ${source_width} × ${source_height}; using ${suggested.width} × ${suggested.height} to fit the 1 MP limit."
+    } else if source_width != suggested.width || source_height != suggested.height {
+        "First image ${source_width} × ${source_height}; using nearest supported size ${suggested.width} × ${suggested.height}."
+    } else {
+        "Matched first image: ${suggested.width} × ${suggested.height}."
+    };
+    match label::find("settings:size:hint") {
+        option::Option[label::Label]::Some(hint) => {
+            let _hint: label::Label = hint.set_text(message.view());
+        }
+        option::Option::None => {}
+    }
+}
 
 #[test]
 fn numeric_filter_keeps_digits_and_caret() {

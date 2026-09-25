@@ -108,6 +108,21 @@ impl Preview {
             }
             option::Option::None => {}
         }
+        let failure: text::Text = generation_session::failure_text();
+        match label::find("preview:failure") {
+            option::Option[label::Label]::Some(found) => {
+                let _found: label::Label = found.set_text(failure.view());
+            }
+            option::Option::None => {}
+        }
+        match mount::find("preview:failure") {
+            option::Option[*core::Node]::Some(found) => {
+                let visible: bool = failure.count() > (0 as usize);
+                core::set_shown(found, visible);
+                if visible { core::relayout(found); }
+            }
+            option::Option::None => {}
+        }
         let elapsed: i64 = generation_session::elapsed_seconds();
         let elapsed_label: text::Text = if elapsed == (0 as i64)
             && !generation_session::busy() { "—".to_text() } else { "${elapsed} s" };
@@ -121,6 +136,16 @@ impl Preview {
 
     fn on_session(ref this, _change: generation_session::Change) {
         this.refresh_status();
+    }
+
+    fn failure_label(this) -> core::Node {
+        var failure: core::Node = ui::label("", key: "preview:failure",
+            font_size: 13.0f64,
+            text_color: vocab::Color::rgba(0.95f64, 0.42f64, 0.42f64, 1.0f64),
+            line_break: vocab::LineBreak::WordWrap, max_lines: 3 as i64)
+            .width_percent(100.0f64);
+        core::set_shown(#addr_of(failure), false);
+        return failure;
     }
 }
 
@@ -138,6 +163,7 @@ impl Preview: component::Component {
                 }
                 .align(flex::Align::Center)
                 .gap(10.0f64)
+                this.failure_label()
             }
             .grow(1.0f64)
             .shrink(1.0f64)

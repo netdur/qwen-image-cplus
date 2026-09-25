@@ -4,7 +4,33 @@ import "facet/screen" as screen;
 import "stdlib/status" as status;
 import "./screens/generation" as generation;
 import "./screens/settings" as settings;
+import "./new_image" as new_image;
 import "qwen_image/generation_worker" as _;
+
+fn open_settings(_sender: *u8, _ctx: *u8) {
+    let _opened = runtime::app().open_window("settings");
+}
+
+fn start_new_image(_sender: *u8, _ctx: *u8) {
+    new_image::begin();
+}
+
+fn app_menu() -> runtime::AppMenu {
+    var menu: runtime::AppMenu = runtime::app_menu("Qwen Image");
+    menu.add_command("Qwen Image", "Settings…", key: ",",
+        on_click: open_settings);
+    menu.add_item("Qwen Image", "Quit Qwen Image", "q",
+        runtime::menu_action_quit());
+    menu.add_command("File", "New Image", key: "n",
+        on_click: start_new_image);
+    menu.add_item("Edit", "Undo", "z", runtime::menu_action_undo());
+    menu.add_item("Edit", "Redo", "z", runtime::menu_action_redo(), shift: true);
+    menu.add_item("Edit", "Cut", "x", runtime::menu_action_cut());
+    menu.add_item("Edit", "Copy", "c", runtime::menu_action_copy());
+    menu.add_item("Edit", "Paste", "v", runtime::menu_action_paste());
+    menu.add_item("Edit", "Select All", "a", runtime::menu_action_select_all());
+    return menu;
+}
 
 fn run() -> i32 {
     agent::enable();
@@ -27,6 +53,7 @@ fn run() -> i32 {
             bar: screen::Bar::Blended,
         ),
     );
+    app.menu(app_menu);
     app.agent_mcp();
     match app.run("generation") {
         status::Status::Ok => { return 0; }

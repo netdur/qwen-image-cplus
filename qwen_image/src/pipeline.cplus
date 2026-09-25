@@ -301,6 +301,7 @@ fn run_native_impl(
     }
     guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
         tokenizer::tokenize_full_prompt(model_root, prompt) else {
+        control::diagnose(observer, "Could not tokenize the prompt. Check the tokenizer files beside the selected QIPACK.");
         return 1;
     };
     return run_native_tokens_impl(
@@ -380,6 +381,7 @@ fn run_native_tokens_impl(
     }
     if full_tokens.count() <= SYSTEM_PREFIX_TOKENS || full_tokens.count() > (512 as usize) {
         io::eprintln("pipeline: unsupported full prompt token count ${full_tokens.count()}");
+        control::diagnose(observer, "The prompt is too long for the text encoder (maximum 512 full tokens).");
         return 2;
     }
     let expected_text_rows: usize = full_tokens.count() -% SYSTEM_PREFIX_TOKENS;
@@ -403,10 +405,12 @@ fn run_native_tokens_impl(
         text_capacity,
         #addr_of(text_rows),
     ) != (0 as i32) {
+        control::diagnose(observer, "The text encoder failed. Check its model shards and available memory.");
         return 1;
     }
     if text_rows != expected_text_rows {
         io::eprintln("pipeline: tokenizer/text row disagreement expected=${expected_text_rows} actual=${text_rows}");
+        control::diagnose(observer, "The text encoder returned an unexpected number of tokens.");
         return 1;
     }
     io::println("pipeline timing: text_wall_ms=${time::now_millis() - text_wall_start_ms}");
@@ -497,6 +501,9 @@ fn run_native_tokens_impl(
         )
     };
     if transformer_status != (0 as i32) {
+        if transformer_status != (3 as i32) {
+            control::diagnose(observer, "The transformer failed while reading or running the selected QIPACK. Check the app log for the underlying model or Metal error.");
+        }
         return transformer_status;
     }
     io::println("pipeline timing: transformer_wall_ms=${time::now_millis() - transformer_wall_start_ms}");
@@ -541,6 +548,7 @@ fn run_native_tokens_impl(
         )
     };
     if decode_status != (0 as i32) {
+        control::diagnose(observer, "The VAE decoder failed. Check its model file and available memory.");
         return 1;
     }
     io::println("pipeline timing: vae_wall_ms=${time::now_millis() - vae_wall_start_ms}");
@@ -560,7 +568,10 @@ fn run_native_tokens_impl(
             #slice_ptr(decoded.as_slice()), output_path, image_width, image_height,
         )
     };
-    if !write_ok { return 1; }
+    if !write_ok {
+        control::diagnose(observer, "Could not write the output PNG to ${output_path}. Check the destination folder and free space.");
+        return 1;
+    }
     io::println("pipeline timing: image_output_wall_ms=${time::now_millis() - image_wall_start_ms}");
     io::println("pipeline timing: total_wall_ms=${time::now_millis() - pipeline_wall_start_ms}");
     if validate_reference {

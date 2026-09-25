@@ -1,0 +1,95 @@
+import "stdlib/math" as _;
+
+const ALIGNMENT: usize = 32;
+const MIN_SIDE: usize = 256;
+const MAX_SIDE: usize = 2048;
+const MAX_PIXELS: usize = 1048576;
+
+struct Suggestion {
+    width: usize,
+    height: usize,
+    limited: bool,
+}
+
+fn aligned(value: f64, down: bool) -> usize {
+    let units: f64 = value / ALIGNMENT as f64;
+    let rounded: usize = if down {
+        units.floor() as usize
+    } else {
+        (units + 0.5f64).floor() as usize
+    };
+    let pixels: usize = rounded *% ALIGNMENT;
+    if pixels < MIN_SIDE { return MIN_SIDE; }
+    if pixels > MAX_SIDE { return MAX_SIDE; }
+    return pixels;
+}
+
+fn suggest(source_width: usize, source_height: usize) -> Suggestion {
+    if source_width == (0 as usize) || source_height == (0 as usize) {
+        return Suggestion {
+            width: 512 as usize,
+            height: 512 as usize,
+            limited: false,
+        };
+    }
+    let width: f64 = source_width as f64;
+    let height: f64 = source_height as f64;
+    let area_scale: f64 = (MAX_PIXELS as f64 / (width * height)).sqrt();
+    let fit_scale: f64 = area_scale
+        .min(MAX_SIDE as f64 / width)
+        .min(MAX_SIDE as f64 / height);
+    let scale: f64 = 1.0f64
+        .max(MIN_SIDE as f64 / width)
+        .max(MIN_SIDE as f64 / height)
+        .min(fit_scale);
+    let limited: bool = scale < 1.0f64;
+    var suggested_width: usize = aligned(width * scale, limited);
+    var suggested_height: usize = aligned(height * scale, limited);
+    while suggested_width > MAX_PIXELS / suggested_height {
+        if suggested_width >= suggested_height && suggested_width > MIN_SIDE {
+            suggested_width = suggested_width -% ALIGNMENT;
+        } else if suggested_height > MIN_SIDE {
+            suggested_height = suggested_height -% ALIGNMENT;
+        } else { break; }
+    }
+    return Suggestion {
+        width: suggested_width,
+        height: suggested_height,
+        limited: limited,
+    };
+}
+
+#[test]
+fn reference_output_size_stays_close_and_within_budget() {
+    let exact: Suggestion = suggest(1024 as usize, 768 as usize);
+    assert exact.width == (1024 as usize);
+    assert exact.height == (768 as usize);
+    assert !exact.limited;
+
+    let aligned_size: Suggestion = suggest(1000 as usize, 701 as usize);
+    assert aligned_size.width == (992 as usize);
+    assert aligned_size.height == (704 as usize);
+    assert !aligned_size.limited;
+
+    let photo: Suggestion = suggest(4032 as usize, 3024 as usize);
+    assert photo.width == (1152 as usize);
+    assert photo.height == (864 as usize);
+    assert photo.limited;
+
+    let portrait: Suggestion = suggest(3024 as usize, 4032 as usize);
+    assert portrait.width == (864 as usize);
+    assert portrait.height == (1152 as usize);
+
+    let small: Suggestion = suggest(120 as usize, 200 as usize);
+    assert small.width == MIN_SIDE;
+    assert small.height == (416 as usize);
+
+    let tiny_wide: Suggestion = suggest(64 as usize, 32 as usize);
+    assert tiny_wide.width == (512 as usize);
+    assert tiny_wide.height == MIN_SIDE;
+
+    let panoramic: Suggestion = suggest(10000 as usize, 500 as usize);
+    assert panoramic.width <= MAX_SIDE;
+    assert panoramic.height >= MIN_SIDE;
+    assert panoramic.width *% panoramic.height <= MAX_PIXELS;
+}
