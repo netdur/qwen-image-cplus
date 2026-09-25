@@ -42,6 +42,10 @@ struct MappedFile {
     _length: usize,
 }
 
+fn inactive_mapped_file() -> MappedFile {
+    return MappedFile { _ptr: 0 as *u8, _length: 0 as usize };
+}
+
 // A positional reader for large, one-pass weight streams. F_NOCACHE keeps
 // those reads from evicting the denoiser and VAE working sets from the unified
 // page cache after the text phase has consumed them.

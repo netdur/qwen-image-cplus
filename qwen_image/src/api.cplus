@@ -79,6 +79,7 @@ fn _request_height(request: GenerateRequest) -> usize {
 fn _step_name(steps: usize) -> option::Option[str] {
     if steps == (3 as usize) { return option::Option[str]::Some("3"); }
     if steps == (4 as usize) { return option::Option[str]::Some("4"); }
+    if steps == (6 as usize) { return option::Option[str]::Some("6"); }
     if steps == (8 as usize) { return option::Option[str]::Some("8"); }
     if steps == (25 as usize) { return option::Option[str]::Some("25"); }
     if steps == (40 as usize) { return option::Option[str]::Some("40"); }
@@ -108,7 +109,7 @@ fn _validate_multi_image(
     match _step_name(request.steps) {
         option::Option::Some(_) => {}
         option::Option::None => {
-            control::diagnose(observer, "Unsupported step count; choose 3, 4, 8, 25, or 40.");
+            control::diagnose(observer, "Unsupported step count; choose 3, 4, 6, 8, 25, or 40.");
             return GenerateStatus::InvalidArgument;
         }
     }
@@ -147,7 +148,7 @@ fn _validate_multi_image_sized(
     match _step_name(request.steps) {
         option::Option::Some(_) => {}
         option::Option::None => {
-            control::diagnose(observer, "Unsupported step count; choose 3, 4, 8, 25, or 40.");
+            control::diagnose(observer, "Unsupported step count; choose 3, 4, 6, 8, 25, or 40.");
             return GenerateStatus::InvalidArgument;
         }
     }
@@ -191,7 +192,7 @@ fn _validate(
     match _step_name(request.steps) {
         option::Option::Some(_) => {}
         option::Option::None => {
-            control::diagnose(observer, "Unsupported step count; choose 3, 4, 8, 25, or 40.");
+            control::diagnose(observer, "Unsupported step count; choose 3, 4, 6, 8, 25, or 40.");
             return GenerateStatus::InvalidArgument;
         }
     }

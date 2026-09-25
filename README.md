@@ -464,13 +464,30 @@ original entry points produce square output (`pixels` 512 or 1024). The C+
 and `generate-multi-image-sized` CLI command accept rectangular output within
 the same 1 MP area limit; the C ABI remains square-only for now. All accept
 1-10 borrowed image paths and take the same step counts as
-text-to-image generation: 3, 4, 8, 25, or 40. The pack's `shift_terminal`
+text-to-image generation: 3, 4, 6, 8, 25, or 40. The pack's `shift_terminal`
 metadata selects the schedule, so a distilled pack runs its own few-step
 schedule. The CLI accepts `pack` in place of a step count to use the pack's
-`steps` metadata. One and two steps are truncated prefixes of the 40-step
+`steps` metadata. One and two steps are truncated prefixes of the pack's
 schedule; they remain available to `test-multi-image-transformer` as K/V-cache
 smokes, but the engine refuses to write a PNG from them because the latent is
 still mostly noise.
+
+Multiple references already share one vision/VAE weight load, and the
+transformer packs their rows into one joint prefill. The encoders run images
+serially, but parallelizing them can save only part of conditioning time; the
+denoising steps depend on one another. For the 736x1280 Viggle v0.2.1 two-image
+hat edit, a profiling-only two-step ablation found flash attention responsible
+for much of the extra prefill work. The block-causal flash kernel now skips
+entire key tiles that are invisible to all eight queries in a group. In two
+adjacent baseline/pruned comparisons, prefill GPU time changed from
+43.53 to 37.94 s and from 63.14 to 52.24 s, while the cached step was
+essentially unchanged. The large drift between pairs prevents an end-to-end
+speed claim. The six-step pruned output was byte-identical to the unpruned PNG
+(SHA-256 `686939c6d20371e7742ae5943f91454a05c5188e067463e8b2b45ad6985cdefa`).
+`QI_DISABLE_FLASH_TILE_PRUNING=1` restores the previous kernel behavior.
+`benchmark-multi-image-sized PACKED MODEL_DIR - PROMPT SEED 1|2 WIDTH HEIGHT IMAGE...`
+is a transformer-only diagnostic that accepts `QI_PROFILE_SKIP=attention`;
+it does not write an image.
 
 With the adopted Viggle 4-step pack (`pack` steps), two 512-area references
 (a red circle and a yellow/green block layout) and seed 1301 produced a
@@ -1496,6 +1513,18 @@ Inspect a shard, optionally filtering tensor names:
   so the result is retained strictly as a speed baseline. Exact command,
   binary identity, timings, and host conditions are in
   `benchmarks/m1-max-stable-diffusion-cpp-1024-40.json`.
+- With the same sd.cpp binary and 1024x1024, 40-step, cache-off command, replacing
+  only the diffusion checkpoint with Unsloth's 14.23 GB F16 GGUF took **984.34
+  seconds process wall** (16:24.34) on AC power. Its internal timer was 983.24
+  seconds: 59.08 seconds for text conditioning, 904.76 seconds for sampling,
+  and 19.26 seconds for VAE decode. That is 22.02 seconds (2.2%) less process
+  time than the BF16/F32 safetensors run above, and 18.14 seconds (2.0%) less
+  sampling time. This is one run under different background conditions, not a
+  demonstrated format speedup. The GGUF contained only the diffusion
+  transformer; the same separate Qwen text-encoder shards and VAE safetensors
+  were still loaded. The run reported 17.45 GB maximum RSS, 43.76 GB peak
+  footprint, and zero swaps. Exact paths, hashes, command, and timings are in
+  `benchmarks/m1-max-stable-diffusion-cpp-gguf-f16-1024-40.json`.
 - As an external Apple-Silicon baseline, the locally downloaded
   `mlx-community/Qwen-Image-2.1-MLX-4bit` snapshot `4db4e8c` took
   **36.48 seconds end to end on repeat** for the same blue-teapot prompt at
@@ -2453,7 +2482,7 @@ and multiple-of-32 rule. The seed field also filters typed or pasted input to
 ASCII digits. It shares a row with a checkbox labeled Random, which disables
 manual entry without erasing its value. Each generation with Random checked
 draws a new unsigned 64-bit seed.
-Steps use a native picker containing the supported 3, 4, 8, 25, and
+Steps use a native picker containing the supported 3, 4, 6, 8, 25, and
 40-step choices. The compact + button sits beside the reference-image count;
 the thumbnail strip is hidden when empty. A new image appears first and the
 strip returns to the left so it is immediately visible. Each local-file
@@ -2524,3 +2553,53 @@ breaking the existing synchronous CLI or C ABI. The worker uses no Facet or
 AppKit calls; the GUI drains events on the main thread and stages state updates
 there. Mock-worker tests cover progress, elapsed time,
 per-request cancellation, and a subsequent request without running inference.
+
+### Viggle v0.2.1 LoRA (six-step alternative)
+
+The newer Viggle v0.2.1 adapter is supported **alongside**, not in place of,
+the original four-step full-fine-tune and the 40-step base pack. The selected
+`qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack` contains the unchanged base
+FP16 transformer and declares `schedule=viggle-v0.2.1-6`,
+`lora=viggle-v0.2.1-r256`, `steps=6`, and `shift_terminal=none`. It requires
+`Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors` in the **same
+folder**. The GUI checks for this sidecar and switches its Steps picker to 6
+when this pack is chosen. The processor, text-encoder shards, and VAE must also
+remain in their usual subfolders beside the pack.
+
+The adapter's 227 A/B pairs are validated for BF16 dtype and exact rank-256
+shapes. They are copied once to Metal and converted there to FP16; each
+affected transformer/timestep projection applies `base(x) + B(A(x))` at
+inference rather than expanding or merging the adapter into base weights.
+The six raw sigma nodes are `[1, 0.9375, 0.875, 0.75, 0.5, 0.25]`, shifted
+for the target token count, followed by zero. For 832×1248, the shifted nodes
+match a pinned Diffusers calculation. No CFG or Cache-DiT was used in the
+comparison below.
+
+The Eiffel edit used the same pre-resized 832×1248 reference,
+prompt `change weather to storm`, and seed 42 across packs. On this M1 Max,
+the new native six-step result took **129.453 s** from input preparation
+through PNG completion (7.264 s conditioning, 119.644 s transformer, 2.366 s
+VAE, 0.125 s PNG). Its tower silhouette, platforms, and lattice remained
+coherent, unlike the older four-step full-fine-tune's deformation. The old
+four-step run took 78.415 s but failed this quality case; the 40-step base
+run took 745.104 s. Thus v0.2.1 is **5.76× faster than base** here, but
+**1.65× slower than the malformed four-step run**. Viggle's hosted demo showed
+lightning/rain and reported 4.36 s on a remote GPU; its latency is not
+comparable to this laptop, and the native output is not pixel-identical.
+An additional 1024×1024 six-step text-to-image smoke exercised the streamed
+weights and graph/steel attention path and produced a coherent red balloon
+in **75.974 s** end to end; this is not a matched base-model benchmark.
+
+**Conditioned-prefill MPS safety (2026-09-25).** A 736×1280 portrait edit
+with one reference produced 7,379 joint prefill rows. MPS's one-shot FP16
+QKV multiply returned a non-finite row even though direct-FP16 and
+FP32-staged paths supplied byte-identical, finite FP16 input. Tiling only QKV
+did not suffice: the MLP gate multiply also became non-finite. The runtime now
+uses at most 4,096 rows per base-model MPS multiplication for conditioned
+prefills without graph attention. It retains direct FP16 activations and does
+not add a command-buffer split; text-only and graph-attention paths keep their
+previous matrix selection. The corrected portrait completed in **111.04 s**
+end to end and produced a PNG byte-identical to the 118.31 s FP32-staged
+fallback. A 512×512 text-only regression and the 832×1248 Eiffel edit were
+also byte-identical to their pre-change PNGs. These are correctness checks,
+not a controlled speed comparison.

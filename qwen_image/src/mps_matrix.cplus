@@ -200,12 +200,12 @@ fn create(
 
 // Encodes a large row-major FP16 x FP16 -> FP32 multiplication in bounded
 // row slices. MPSMatrix produced partial non-finite output for the 2048x2048
-// prefill (16,384 image rows plus text) on the M1 Max. Single operations up to
-// 8,192 rows are measured clean: the 1024 prefill (about 4,130 rows) and the
-// 1536x1024 and 1984x1024 prefills (about 6,170 and 7,970 rows) all produce
-// finite steps and correct images. Taller matrices use 4096-row slices. Weight
-// rows are shared by every slice, while input/output offsets advance through
-// their contiguous row-major buffers.
+// prefill (16,384 image rows plus text) on the M1 Max. The 736x1280 image-edit
+// prefill (7,379 joint rows) also produced non-finite QKV output despite a
+// byte-identical, finite FP16 input. Conditioned prefill callers force
+// 4,096-row slices for base-model multiplies, while other measured paths retain
+// their original MPS kernel selection. Weight rows are shared by every slice;
+// input/output offsets advance through contiguous row-major buffers.
 fn encode_row_tiled(
     device: metal::Device,
     command_buffer: metal::CommandBuffer,
@@ -219,6 +219,7 @@ fn encode_row_tiled(
     columns: usize,
     inner: usize,
     tile_rows: usize = 4096 as usize,
+    force_tiles: bool = false,
 ) -> bool {
     if rows == (0 as usize) || columns == (0 as usize)
         || inner == (0 as usize) || tile_rows == (0 as usize) {
@@ -226,7 +227,9 @@ fn encode_row_tiled(
     }
     // Preserve the single operation at the measured shapes above; slicing
     // would change MPS kernel selection, and with it the 1024 output bits.
-    let bounded_rows: usize = if rows <= (8192 as usize) { rows } else { tile_rows };
+    let bounded_rows: usize = if rows <= (8192 as usize) && !force_tiles {
+        rows
+    } else { tile_rows };
     var row: usize = 0 as usize;
     while row < rows {
         let remaining: usize = rows -% row;

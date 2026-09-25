@@ -5,6 +5,7 @@ import "./metal_primitives" as metrics;
 import "./mmap_macos" as mapped;
 import "./mps_graph_attention" as graph_attention;
 import "./mps_matrix" as mps;
+import "./lora" as lora;
 import "./packed_model" as packed;
 import "./random" as random;
 import "./scheduler" as flow;
@@ -133,6 +134,7 @@ struct FlashAttentionParams {
     padded_key_rows: u32,
     query_position_offset: u32,
     block_causal: u32,
+    prune_masked_tiles: u32,
 }
 
 #[repr(C)]
@@ -217,6 +219,7 @@ struct MpsWorkspace {
     half_input: metal::Buffer,
     half_weight: metal::Buffer,
     direct_half_activations: bool,
+    force_row_tiling: bool,
     // MLX steel attention for the 1024 cached (unmasked) shape; see
     // create_steel_attention_pipeline.
     steel_attention: metal::ComputePipelineState,
@@ -224,6 +227,28 @@ struct MpsWorkspace {
     steel_causal_attention: metal::ComputePipelineState,
     use_steel_attention: bool,
     steel_key_rows: usize,
+    lora: LoraRuntime,
+}
+
+struct LoraRuntime {
+    active: bool,
+    device: metal::Device,
+    opaque file: *safetensors::File,
+    storage: metal::Buffer,
+    rank_fp32: metal::Buffer,
+    rank_fp16: metal::Buffer,
+    output_fp32: metal::Buffer,
+    input_fp16: metal::Buffer,
+    conversion_pipeline: metal::ComputePipelineState,
+    add_pipeline: metal::ComputePipelineState,
+}
+
+#[repr(C)]
+struct LoraAddParams {
+    rows: u32,
+    columns: u32,
+    output_stride: u32,
+    output_offset: u32,
 }
 
 struct CacheDiffResult {
@@ -649,6 +674,90 @@ fn encode_mps_input_conversion(
     );
 }
 
+fn encode_lora(
+    command_buffer: metal::CommandBuffer,
+    runtime: LoraRuntime,
+    weight_name: str,
+    input: metal::Buffer,
+    input_offset: u64,
+    output: metal::Buffer,
+    output_stride: usize,
+    output_offset: usize,
+    rows: usize,
+    columns: usize,
+    inner: usize,
+) -> bool {
+    if !runtime.active { return true; }
+    guard let option::Option[lora::Pair]::Some(pair) = lora::pair(
+        *runtime.file, weight_name, columns as u64, inner as u64,
+    ) else {
+        io::eprintln("trajectory: missing LoRA pair for ${weight_name}");
+        return false;
+    };
+    if !mps::encode_row_tiled(
+        runtime.device, command_buffer,
+        input, input_offset, runtime.storage, pair.a_offset,
+        runtime.rank_fp32, 0 as u64, rows, lora::RANK as usize, inner,
+    ) { return false; }
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(convert_encoder) =
+        command_buffer.compute_command_encoder() else { return false; };
+    let convert_owner: OwnedObjc = OwnedObjc::new(rt::retain(convert_encoder.raw()));
+    encode_mps_input_conversion(
+        convert_encoder, runtime.conversion_pipeline, runtime.rank_fp32,
+        runtime.rank_fp16, rows, lora::RANK as usize,
+    );
+    metal::CommandEncoder::from_raw(convert_encoder.raw()).end_encoding();
+    if !mps::encode_row_tiled(
+        runtime.device, command_buffer,
+        runtime.rank_fp16, 0 as u64, runtime.storage, pair.b_offset,
+        runtime.output_fp32, 0 as u64, rows, columns, lora::RANK as usize,
+    ) { return false; }
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(add_encoder) =
+        command_buffer.compute_command_encoder() else { return false; };
+    let add_owner: OwnedObjc = OwnedObjc::new(rt::retain(add_encoder.raw()));
+    var params: LoraAddParams = LoraAddParams {
+        rows: rows as u32, columns: columns as u32,
+        output_stride: output_stride as u32, output_offset: output_offset as u32,
+    };
+    add_encoder.set_compute_pipeline_state(runtime.add_pipeline);
+    add_encoder.set_buffer(runtime.output_fp32, 0 as u64, 0 as u64);
+    add_encoder.set_buffer(output, 0 as u64, 1 as u64);
+    add_encoder.set_bytes(#addr_of(params) as *u8, #size_of::[LoraAddParams]() as u64, 2 as u64);
+    add_encoder.dispatch_threads(
+        metal::Size { width: (rows *% columns) as u64, height: 1 as u64, depth: 1 as u64 },
+        metal::Size { width: runtime.add_pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+    );
+    metal::CommandEncoder::from_raw(add_encoder.raw()).end_encoding();
+    return true;
+}
+
+fn dispatch_lora_global(
+    queue: metal::CommandQueue,
+    runtime: LoraRuntime,
+    weight_name: str,
+    input: metal::Buffer,
+    output: metal::Buffer,
+    rows: usize,
+    columns: usize,
+    inner: usize,
+) -> bool {
+    if !runtime.active { return true; }
+    guard let option::Option[metal::CommandBuffer]::Some(command_buffer) =
+        queue.command_buffer() else { return false; };
+    let command_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+    guard let option::Option[metal::ComputeCommandEncoder]::Some(convert_encoder) =
+        command_buffer.compute_command_encoder() else { return false; };
+    let convert_owner: OwnedObjc = OwnedObjc::new(rt::retain(convert_encoder.raw()));
+    encode_mps_input_conversion(convert_encoder, runtime.conversion_pipeline,
+        input, runtime.input_fp16, rows, inner);
+    metal::CommandEncoder::from_raw(convert_encoder.raw()).end_encoding();
+    if !encode_lora(command_buffer, runtime, weight_name, runtime.input_fp16,
+        0 as u64, output, columns, 0 as usize, rows, columns, inner) { return false; }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    return true;
+}
+
 fn encode_mps_weight_conversion(
     encoder: metal::ComputeCommandEncoder,
     workspace: MpsWorkspace,
@@ -1056,6 +1165,9 @@ fn dispatch_flash_attention(
         padded_key_rows: padded_key_rows as u32,
         query_position_offset: query_position_offset as u32,
         block_causal: if block_causal { 1 as u32 } else { 0 as u32 },
+        prune_masked_tiles: if !env::has_var("QI_DISABLE_FLASH_TILE_PRUNING") {
+            1 as u32
+        } else { 0 as u32 },
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(query, 0 as u64, 0 as u64);
@@ -1601,6 +1713,9 @@ fn encode_flash_attention(
         padded_key_rows: padded_key_rows as u32,
         query_position_offset: query_position_offset as u32,
         block_causal: 1 as u32,
+        prune_masked_tiles: if !env::has_var("QI_DISABLE_FLASH_TILE_PRUNING") {
+            1 as u32
+        } else { 0 as u32 },
     };
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(query, 0 as u64, 0 as u64);
@@ -3254,6 +3369,7 @@ fn encode_mps_mlp_runtime_block(
     graph_prefill_attention: *graph_attention::Attention,
     graph_cached_attention: *graph_attention::Attention,
     graph_mask: metal::Buffer,
+    block_index: usize = 0 as usize,
 ) -> bool {
     let gate_weight_buffer: metal::Buffer = if weights.gate.scheme == PACKED_SCHEME_FP16 {
         weights.gate.storage
@@ -3317,6 +3433,15 @@ fn encode_mps_mlp_runtime_block(
         && weights.v.scheme == PACKED_SCHEME_FP16
         && weights.k.weights_offset == weights.q.weights_offset + matrix_bytes
         && weights.v.weights_offset == weights.k.weights_offset + matrix_bytes;
+    if mps_workspace.lora.active && (!mps_qkv
+        || weights.attention_output.scheme != PACKED_SCHEME_FP16
+        || weights.gate.scheme != PACKED_SCHEME_FP16
+        || weights.projected.scheme != PACKED_SCHEME_FP16
+        || weights.mlp_output.scheme != PACKED_SCHEME_FP16) {
+        io::eprintln("trajectory: Viggle adapter requires the FP16 transformer path");
+        return false;
+    }
+    let lora_prefix: text::Text = "transformer_blocks.${block_index}.";
     if mps_qkv {
         guard let option::Option[metal::ComputeCommandEncoder]::Some(norm_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
@@ -3348,13 +3473,31 @@ fn encode_mps_mlp_runtime_block(
                 metal::CommandEncoder::from_raw(conversion_encoder.raw());
             conversion_command_encoder.end_encoding();
         }
+        // MPS can return non-finite rows on conditioned prefills around 7,379
+        // rows even with a finite FP16 input. Tile base-model GEMMs there.
         if !profile_skips("qkv") && !mps::encode_row_tiled(
             mps_workspace.device, command_buffer,
             mps_workspace.half_input, 0 as u64,
             weights.q.storage, weights.q.weights_offset,
             workspace.gate, 0 as u64,
-            rows, MLP_WIDTH, WIDTH,
+            rows, MLP_WIDTH, WIDTH, 4096 as usize, mps_workspace.force_row_tiling,
         ) { return false; }
+        if mps_workspace.lora.active {
+            let q_name: text::Text = "${lora_prefix}attn.to_q.weight";
+            let k_name: text::Text = "${lora_prefix}attn.to_k.weight";
+            let v_name: text::Text = "${lora_prefix}attn.to_v.weight";
+            if !encode_lora(command_buffer, mps_workspace.lora, q_name.view(),
+                mps_workspace.half_input, 0 as u64, workspace.gate,
+                (3 as usize) *% WIDTH, 0 as usize, rows, WIDTH, WIDTH)
+                || !encode_lora(command_buffer, mps_workspace.lora, k_name.view(),
+                    mps_workspace.half_input, 0 as u64, workspace.gate,
+                    (3 as usize) *% WIDTH, WIDTH, rows, WIDTH, WIDTH)
+                || !encode_lora(command_buffer, mps_workspace.lora, v_name.view(),
+                    mps_workspace.half_input, 0 as u64, workspace.gate,
+                    (3 as usize) *% WIDTH, (2 as usize) *% WIDTH, rows, WIDTH, WIDTH) {
+                return false;
+            }
+        }
     }
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(attention_encoder) =
@@ -3410,7 +3553,7 @@ fn encode_mps_mlp_runtime_block(
             if mps_qkv { (2 as usize) *% WIDTH } else { 0 as usize },
         );
         encode_buffer_barrier(attention_encoder);
-        if !use_graph_attention {
+        if !use_graph_attention && !profile_skips("attention") {
             encode_flash_attention(
                 attention_encoder, pipelines.attention, workspace.query_rope,
                 workspace.key, workspace.attended, workspace.projected,
@@ -3443,7 +3586,7 @@ fn encode_mps_mlp_runtime_block(
             pipelines.attention_queries_per_group,
         );
     }
-    if !use_graph_attention && !mps_attention_output {
+    if !use_graph_attention && !mps_attention_output && !mps_workspace.lora.active {
         encode_post_attention(
             attention_encoder, pipelines, mps_workspace, weights, workspace, hidden, rows,
             #addr_of(params),
@@ -3452,6 +3595,26 @@ fn encode_mps_mlp_runtime_block(
     let attention_command_encoder: metal::CommandEncoder =
         metal::CommandEncoder::from_raw(attention_encoder.raw());
     attention_command_encoder.end_encoding();
+    if mps_workspace.lora.active && !use_graph_attention {
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(base_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let base_owner: OwnedObjc = OwnedObjc::new(rt::retain(base_encoder.raw()));
+        encode_weighted_linear(base_encoder, pipelines, workspace.attended,
+            weights.attention_output, workspace.attention_projected, WIDTH, WIDTH, rows);
+        encode_mps_input_conversion(base_encoder, mps_workspace.input_pipeline,
+            workspace.attended, mps_workspace.lora.input_fp16, rows, WIDTH);
+        metal::CommandEncoder::from_raw(base_encoder.raw()).end_encoding();
+        let attention_name: text::Text = "${lora_prefix}attn.to_out.0.weight";
+        if !encode_lora(command_buffer, mps_workspace.lora, attention_name.view(),
+            mps_workspace.lora.input_fp16, 0 as u64, workspace.attention_projected,
+            WIDTH, 0 as usize, rows, WIDTH, WIDTH) { return false; }
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(epilogue_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let epilogue_owner: OwnedObjc = OwnedObjc::new(rt::retain(epilogue_encoder.raw()));
+        encode_post_attention_epilogue(epilogue_encoder, pipelines, mps_workspace,
+            workspace, hidden, rows, #addr_of(params));
+        metal::CommandEncoder::from_raw(epilogue_encoder.raw()).end_encoding();
+    }
 
     // Large shapes can use steel attention, which writes FP16 output directly
     // where the attention-output GEMMs read it. Cached steps: 4096 image
@@ -3531,6 +3694,7 @@ fn encode_mps_mlp_runtime_block(
                 weights.attention_output.storage, weights.attention_output.weights_offset,
                 workspace.attention_projected, 0 as u64,
                 attention_output_text_rows, WIDTH, WIDTH,
+                4096 as usize, mps_workspace.force_row_tiling,
             ) { return false; }
         }
         if !profile_skips("attnout") && !mps::encode_row_tiled(
@@ -3541,7 +3705,14 @@ fn encode_mps_mlp_runtime_block(
             workspace.attention_projected,
             (attention_output_text_rows *% WIDTH *% (4 as usize)) as u64,
             rows -% attention_output_text_rows, WIDTH, WIDTH,
+            4096 as usize, mps_workspace.force_row_tiling,
         ) { return false; }
+        if mps_workspace.lora.active {
+            let attention_name: text::Text = "${lora_prefix}attn.to_out.0.weight";
+            if !encode_lora(command_buffer, mps_workspace.lora, attention_name.view(),
+                mps_workspace.half_input, 0 as u64, workspace.attention_projected,
+                WIDTH, 0 as usize, rows, WIDTH, WIDTH) { return false; }
+        }
         guard let option::Option[metal::ComputeCommandEncoder]::Some(epilogue_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
         let epilogue_encoder_owner: OwnedObjc =
@@ -3553,7 +3724,7 @@ fn encode_mps_mlp_runtime_block(
         let epilogue_command_encoder: metal::CommandEncoder =
             metal::CommandEncoder::from_raw(epilogue_encoder.raw());
         epilogue_command_encoder.end_encoding();
-    } else if use_graph_attention {
+    } else if use_graph_attention && !mps_workspace.lora.active {
         guard let option::Option[metal::ComputeCommandEncoder]::Some(post_attention_encoder) =
             command_buffer.compute_command_encoder() else { return false; };
         let post_attention_encoder_owner: OwnedObjc =
@@ -3565,6 +3736,25 @@ fn encode_mps_mlp_runtime_block(
         let post_attention_command_encoder: metal::CommandEncoder =
             metal::CommandEncoder::from_raw(post_attention_encoder.raw());
         post_attention_command_encoder.end_encoding();
+    } else if use_graph_attention && mps_workspace.lora.active {
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(base_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let base_owner: OwnedObjc = OwnedObjc::new(rt::retain(base_encoder.raw()));
+        encode_weighted_linear(base_encoder, pipelines, workspace.attended,
+            weights.attention_output, workspace.attention_projected, WIDTH, WIDTH, rows);
+        encode_mps_input_conversion(base_encoder, mps_workspace.input_pipeline,
+            workspace.attended, mps_workspace.lora.input_fp16, rows, WIDTH);
+        metal::CommandEncoder::from_raw(base_encoder.raw()).end_encoding();
+        let attention_name: text::Text = "${lora_prefix}attn.to_out.0.weight";
+        if !encode_lora(command_buffer, mps_workspace.lora, attention_name.view(),
+            mps_workspace.lora.input_fp16, 0 as u64, workspace.attention_projected,
+            WIDTH, 0 as usize, rows, WIDTH, WIDTH) { return false; }
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(epilogue_encoder) =
+            command_buffer.compute_command_encoder() else { return false; };
+        let epilogue_owner: OwnedObjc = OwnedObjc::new(rt::retain(epilogue_encoder.raw()));
+        encode_post_attention_epilogue(epilogue_encoder, pipelines, mps_workspace,
+            workspace, hidden, rows, #addr_of(params));
+        metal::CommandEncoder::from_raw(epilogue_encoder.raw()).end_encoding();
     }
 
     if weights.gate.scheme == PACKED_SCHEME_INT4_ROTATED
@@ -3629,7 +3819,7 @@ fn encode_mps_mlp_runtime_block(
         mps_workspace.half_input, 0 as u64,
         gate_weight_buffer, gate_weight_offset,
         workspace.gate, 0 as u64,
-        rows, MLP_WIDTH, WIDTH,
+        rows, MLP_WIDTH, WIDTH, 4096 as usize, mps_workspace.force_row_tiling,
     ) { return false; }
 
     if weights.projected.scheme != PACKED_SCHEME_FP16 {
@@ -3650,8 +3840,20 @@ fn encode_mps_mlp_runtime_block(
         mps_workspace.half_input, 0 as u64,
         projected_weight_buffer, projected_weight_offset,
         workspace.projected, 0 as u64,
-        rows, MLP_WIDTH, WIDTH,
+        rows, MLP_WIDTH, WIDTH, 4096 as usize, mps_workspace.force_row_tiling,
     ) { return false; }
+    if mps_workspace.lora.active {
+        let gate_name: text::Text = "${lora_prefix}img_mlp.gate_layer.weight";
+        let projected_name: text::Text = "${lora_prefix}img_mlp.proj.weight";
+        if !encode_lora(command_buffer, mps_workspace.lora, gate_name.view(),
+            mps_workspace.half_input, 0 as u64, workspace.gate,
+            MLP_WIDTH, 0 as usize, rows, MLP_WIDTH, WIDTH)
+            || !encode_lora(command_buffer, mps_workspace.lora, projected_name.view(),
+                mps_workspace.half_input, 0 as u64, workspace.projected,
+                MLP_WIDTH, 0 as usize, rows, MLP_WIDTH, WIDTH) {
+            return false;
+        }
+    }
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(swiglu_encoder) =
         command_buffer.compute_command_encoder() else { return false; };
@@ -3686,8 +3888,14 @@ fn encode_mps_mlp_runtime_block(
         mps_workspace.half_input, 0 as u64,
         output_weight_buffer, output_weight_offset,
         workspace.mlp_projected, 0 as u64,
-        rows, WIDTH, MLP_WIDTH,
+        rows, WIDTH, MLP_WIDTH, 4096 as usize, mps_workspace.force_row_tiling,
     ) { return false; }
+    if mps_workspace.lora.active {
+        let output_name: text::Text = "${lora_prefix}img_mlp.out.weight";
+        if !encode_lora(command_buffer, mps_workspace.lora, output_name.view(),
+            mps_workspace.half_input, 0 as u64, workspace.mlp_projected,
+            WIDTH, 0 as usize, rows, WIDTH, MLP_WIDTH) { return false; }
+    }
 
     guard let option::Option[metal::ComputeCommandEncoder]::Some(residual_encoder) =
         command_buffer.compute_command_encoder() else { return false; };
@@ -3744,6 +3952,7 @@ fn execute_mps_mlp_runtime_block(
         active_command_buffer, pipelines, mps_workspace, weights, workspace, hidden, output, rows,
         cache_mode, cache_copy_pipeline, cache_key, cache_value, cache_offset, prefix_rows,
         use_graph_attention, graph_prefill_attention, graph_cached_attention, graph_mask,
+        block_index,
     ) { return option::Option[f64]::None; }
     let encode_wall_ms: i64 = time::now_millis() - block_wall_start_ms;
     active_command_buffer.commit();
@@ -6118,6 +6327,36 @@ fn run_conditioned_trajectory_sized_to_host(
     );
 }
 
+// Benchmark-only conditioned trajectory. A null output permits profiling
+// ablations without presenting the resulting latent as a generated image.
+fn benchmark_conditioned_trajectory_sized(
+    packed_path: str,
+    text_input: *f32,
+    text_rows: usize,
+    prompt_image_mask: *u8,
+    condition_latents: *f32,
+    condition_rows: usize,
+    condition_shapes: *LatentShape,
+    condition_count: usize,
+    seed: u64,
+    image_width: usize,
+    image_height: usize,
+    requested_steps: str,
+) -> i32 {
+    if text_input.is_null() || prompt_image_mask.is_null()
+        || condition_latents.is_null() || condition_shapes.is_null()
+        || condition_count == (0 as usize) {
+        return 2;
+    }
+    return run_trajectory_packed_impl(
+        packed_path, requested_steps, "", 0 as *f32, text_input, text_rows, seed,
+        true, false, false, 0.0f64, image_width, false, 0 as *f32,
+        0.0f32, 1.0f32, false, false, image_width, image_height,
+        condition_latents, condition_rows, prompt_image_mask, condition_shapes,
+        condition_count,
+    );
+}
+
 fn run_prompt_trajectory_cache_dit_1024_to_host(
     packed_path: str,
     text_input: *f32,
@@ -6377,6 +6616,16 @@ fn pack_shift_terminal(packed_path: str) -> u32 {
     };
 }
 
+fn pack_viggle_v021_schedule(packed_path: str) -> bool {
+    return match packed::read_metadata(packed_path) {
+        packed::MetadataResult::Ok(metadata) => match metadata.get("schedule") {
+            option::Option[str]::Some(value) => value == "viggle-v0.2.1-6",
+            option::Option[str]::None => false,
+        },
+        packed::MetadataResult::Err(_message) => false,
+    };
+}
+
 // One log line identifying the pack by its metadata, since the fixed header
 // names the base snapshot for every pack, fine-tunes included.
 fn print_pack_identity(packed_path: str) {
@@ -6420,6 +6669,7 @@ fn print_trajectory_switches(
     let enable_weight_ring: str = env_switch("QI_ENABLE_WEIGHT_RING");
     let steel: str = env_switch("QI_DISABLE_STEEL_ATTENTION");
     let flash: str = env_switch("QI_DISABLE_FLASH_ATTENTION");
+    let flash_tile_pruning: str = env_switch("QI_DISABLE_FLASH_TILE_PRUNING");
     let steel_prefill: str = env_switch("QI_STEEL_PREFILL");
     let sigma_spacing: str = env_switch("QI_TAYLOR_SIGMA_SPACING");
     let full_final_step: str = env_switch("QI_TAYLOR_FULL_FINAL_STEP");
@@ -6427,7 +6677,7 @@ fn print_trajectory_switches(
     let cached_block: str = env_switch("QI_PROFILE_CACHED_BLOCK");
     let validate_blocks: str = env_switch("QI_VALIDATE_TRAJECTORY_BLOCKS");
     let validate_diff: str = env_switch("QI_VALIDATE_GPU_CACHE_DIFF");
-    io::println("trajectory switches: shift_terminal=${shift_terminal_name} shift_terminal_source=${shift_terminal_source} profile_skip=${profile_skip} disable_mps_attention_output=${mps_attention_output} disable_mpsgraph_attention=${mpsgraph_attention} disable_direct_fp16_activations=${direct_fp16} disable_pack_pread=${pack_pread} enable_weight_ring=${enable_weight_ring} disable_weight_ring=${weight_ring} disable_steel_attention=${steel} disable_flash_attention=${flash} steel_prefill=${steel_prefill} cache_dit_warmup=${warmup_name} taylor_sigma_spacing=${sigma_spacing} taylor_full_final_step=${full_final_step} taylor_early_cap3=${early_cap3} profile_cached_block=${cached_block} validate_trajectory_blocks=${validate_blocks} validate_gpu_cache_diff=${validate_diff}");
+    io::println("trajectory switches: shift_terminal=${shift_terminal_name} shift_terminal_source=${shift_terminal_source} profile_skip=${profile_skip} disable_mps_attention_output=${mps_attention_output} disable_mpsgraph_attention=${mpsgraph_attention} disable_direct_fp16_activations=${direct_fp16} disable_pack_pread=${pack_pread} enable_weight_ring=${enable_weight_ring} disable_weight_ring=${weight_ring} disable_steel_attention=${steel} disable_flash_attention=${flash} disable_flash_tile_pruning=${flash_tile_pruning} steel_prefill=${steel_prefill} cache_dit_warmup=${warmup_name} taylor_sigma_spacing=${sigma_spacing} taylor_full_final_step=${full_final_step} taylor_early_cap3=${early_cap3} profile_cached_block=${cached_block} validate_trajectory_blocks=${validate_blocks} validate_gpu_cache_diff=${validate_diff}");
 }
 
 // Largest target latent grid (2048x2048 pixels) the trajectory allocates
@@ -6485,6 +6735,8 @@ fn run_trajectory_packed_impl(
         step_limit = 3 as usize;
     } else if requested_steps == "4" {
         step_limit = 4 as usize;
+    } else if requested_steps == "6" {
+        step_limit = 6 as usize;
     } else if requested_steps == "8" {
         step_limit = 8 as usize;
     } else if requested_steps == "13" {
@@ -6494,7 +6746,7 @@ fn run_trajectory_packed_impl(
     } else if requested_steps == "40" {
         step_limit = 40 as usize;
     } else {
-        io::eprintln("trajectory: steps must be 1, 2, 3, 4, 8, 13, 25, or 40");
+        io::eprintln("trajectory: steps must be 1, 2, 3, 4, 6, 8, 13, 25, or 40");
         return 2;
     }
     let text_rows: usize = if native_inputs { native_text_rows } else { 22 as usize };
@@ -6539,6 +6791,12 @@ fn run_trajectory_packed_impl(
         return 2;
     }
     let stretch_terminal: bool = !no_shift_override && pack_shift != PACK_SHIFT_TERMINAL_NONE;
+    let viggle_v021_schedule: bool = pack_viggle_v021_schedule(packed_path);
+    if viggle_v021_schedule && step_limit != (6 as usize)
+        && !(final_latent.is_null() && step_limit <= (2 as usize)) {
+        io::eprintln("trajectory: Viggle v0.2.1 requires its exact six-step schedule");
+        return 2;
+    }
     let shift_terminal_source: str = if pack_shift != PACK_SHIFT_TERMINAL_UNSET {
         "pack"
     } else if no_shift_override { "env" } else { "default" };
@@ -6588,7 +6846,11 @@ fn run_trajectory_packed_impl(
     let schedule_steps: usize = if step_limit <= (2 as usize) {
         40 as usize
     } else { step_limit };
-    let schedule_ok: bool = if bottleneck_shift > 0.0f32 {
+    let schedule_ok: bool = if viggle_v021_schedule {
+        flow::fill_viggle_v021_schedule(
+            target_rows, #addr_of(sigmas[0]), #addr_of(timesteps[0]),
+        )
+    } else if bottleneck_shift > 0.0f32 {
         flow::fill_bottleneck_schedule(
             schedule_steps,
             bottleneck_shift,
@@ -6658,6 +6920,8 @@ fn run_trajectory_packed_impl(
     guard let option::Option[OwnedObjc]::Some(q4_expand_owner) = pipeline(device, library, "qi_q4_weight_to_half") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(q4_direct_owner) = pipeline(device, library, "qi_block_q4_direct_half4_16x32") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(q4_repack_owner) = pipeline(device, library, "qi_q4_repack_direct") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(lora_convert_owner) = pipeline(device, library, "qi_lora_bf16_to_half") else { return 1; };
+    guard let option::Option[OwnedObjc]::Some(lora_add_owner) = pipeline(device, library, "qi_lora_add") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(norm_owner) = pipeline(device, library, "qi_block_layernorm_modulate") else { return 1; };
     guard let option::Option[OwnedObjc]::Some(qk_owner) = pipeline(device, library, "qi_block_qk_norm_rope") else { return 1; };
     // The flash kernel bounds query tails and padded keys and applies the same
@@ -6751,6 +7015,53 @@ fn run_trajectory_packed_impl(
     let cache_relative_l1_partials_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_relative_l1_partials_owner.raw());
     let cache_relative_l1_finish_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(cache_relative_l1_finish_owner.raw());
     let metal_pipeline_wall_ms: i64 = time::now_millis() - metal_pipeline_start_ms;
+
+    var adapter_file: safetensors::File = safetensors::inactive_file();
+    if viggle_v021_schedule {
+        let adapter_path: text::Text = lora::path_beside_pack(packed_path);
+        adapter_file = match safetensors::load(adapter_path.view()) {
+            safetensors::LoadResult::Ok(file) => file,
+            safetensors::LoadResult::Err(error) => {
+                io::eprintln("trajectory: could not load Viggle adapter ${adapter_path}: ${error.name()}");
+                return 1;
+            }
+        };
+        if !lora::validate_viggle_v021_r256(adapter_file) {
+            io::eprintln("trajectory: Viggle v0.2.1 adapter has unexpected tensors or shapes");
+            return 1;
+        }
+    }
+    let adapter_buffer: metal::Buffer = if viggle_v021_schedule {
+        guard let option::Option[metal::Buffer]::Some(buffer) = device.new_buffer_with_bytes(
+            adapter_file.mapping_pointer(), adapter_file.mapping_length() as u64,
+            metal::resource_options_m_t_l_resource_storage_mode_shared,
+        ) else {
+            io::eprintln("trajectory: could not allocate adapter GPU buffer");
+            return 1;
+        };
+        buffer
+    } else { metal::Buffer::from_raw(0 as *u8) };
+    let adapter_buffer_owner: OwnedObjc = OwnedObjc::new(
+        if viggle_v021_schedule { adapter_buffer.raw() } else { 0 as *u8 },
+    );
+    if viggle_v021_schedule {
+        guard let option::Option[metal::CommandBuffer]::Some(command_buffer) = queue.command_buffer() else { return 1; };
+        let command_buffer_owner: OwnedObjc = OwnedObjc::new(rt::retain(command_buffer.raw()));
+        guard let option::Option[metal::ComputeCommandEncoder]::Some(encoder) = command_buffer.compute_command_encoder() else { return 1; };
+        let encoder_owner: OwnedObjc = OwnedObjc::new(rt::retain(encoder.raw()));
+        let count: u32 = (adapter_file.data_byte_count() / (2 as u64)) as u32;
+        let convert_pipeline: metal::ComputePipelineState = metal::ComputePipelineState::from_raw(lora_convert_owner.raw());
+        encoder.set_compute_pipeline_state(convert_pipeline);
+        encoder.set_buffer(adapter_buffer, adapter_file.data_offset(), 0 as u64);
+        encoder.set_bytes(#addr_of(count) as *u8, #size_of::[u32]() as u64, 1 as u64);
+        encoder.dispatch_threads(
+            metal::Size { width: count as u64, height: 1 as u64, depth: 1 as u64 },
+            metal::Size { width: convert_pipeline.thread_execution_width(), height: 1 as u64, depth: 1 as u64 },
+        );
+        metal::CommandEncoder::from_raw(encoder.raw()).end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
 
     let storage_and_weights_start_ms: i64 = time::now_millis();
     let ring_wanted: bool = (target_rows >= (4096 as usize) || env::has_var("QI_ENABLE_WEIGHT_RING"))
@@ -7117,6 +7428,11 @@ fn run_trajectory_packed_impl(
         2 as u64
     } else { (MLP_WIDTH *% WIDTH *% (2 as usize)) as u64 };
     guard let option::Option[metal::Buffer]::Some(mps_half_weight) = new_buffer(device, mps_half_weight_bytes) else { return 1; }; let mps_half_weight_owner: OwnedObjc = OwnedObjc::new(mps_half_weight.raw());
+    let lora_scratch_rows: usize = if viggle_v021_schedule { rows } else { 1 as usize };
+    guard let option::Option[metal::Buffer]::Some(lora_rank_fp32) = new_buffer(device, (lora_scratch_rows *% (lora::RANK as usize) *% (4 as usize)) as u64) else { return 1; }; let lora_rank_fp32_owner: OwnedObjc = OwnedObjc::new(lora_rank_fp32.raw());
+    guard let option::Option[metal::Buffer]::Some(lora_rank_fp16) = new_buffer(device, (lora_scratch_rows *% (lora::RANK as usize) *% (2 as usize)) as u64) else { return 1; }; let lora_rank_fp16_owner: OwnedObjc = OwnedObjc::new(lora_rank_fp16.raw());
+    guard let option::Option[metal::Buffer]::Some(lora_output_fp32) = new_buffer(device, (lora_scratch_rows *% (4 as usize) *% WIDTH *% (4 as usize)) as u64) else { return 1; }; let lora_output_fp32_owner: OwnedObjc = OwnedObjc::new(lora_output_fp32.raw());
+    guard let option::Option[metal::Buffer]::Some(lora_input_fp16) = new_buffer(device, (lora_scratch_rows *% WIDTH *% (2 as usize)) as u64) else { return 1; }; let lora_input_fp16_owner: OwnedObjc = OwnedObjc::new(lora_input_fp16.raw());
     // The steel kernel needs the MPS attention-output path (which reads its
     // FP16 output) and the 4096-row cached shape.
     let steel_wanted: bool = use_graph_attention && weight_file.all_block_matrices_fp16()
@@ -7160,10 +7476,23 @@ fn run_trajectory_packed_impl(
         half_input: mps_half_input,
         half_weight: mps_half_weight,
         direct_half_activations: direct_half_activations,
+        force_row_tiling: conditioned && !use_graph_attention,
         steel_attention: metal::ComputePipelineState::from_raw(steel_attention_owner.raw()),
         steel_causal_attention: metal::ComputePipelineState::from_raw(steel_causal_owner.raw()),
         use_steel_attention: use_steel_attention,
         steel_key_rows: rows,
+        lora: LoraRuntime {
+            active: viggle_v021_schedule,
+            device: device,
+            file: #addr_of(adapter_file),
+            storage: adapter_buffer,
+            rank_fp32: lora_rank_fp32,
+            rank_fp16: lora_rank_fp16,
+            output_fp32: lora_output_fp32,
+            input_fp16: lora_input_fp16,
+            conversion_pipeline: mps_input_pipeline,
+            add_pipeline: metal::ComputePipelineState::from_raw(lora_add_owner.raw()),
+        },
     };
     guard let option::Option[metal::Buffer]::Some(final_scale) = new_buffer(device, ((2 as usize) *% WIDTH *% #size_of::[f32]()) as u64) else { return 1; }; let final_scale_owner: OwnedObjc = OwnedObjc::new(final_scale.raw());
     guard let option::Option[metal::Buffer]::Some(final_normalized) = new_buffer(device, activation_bytes) else { return 1; }; let final_normalized_owner: OwnedObjc = OwnedObjc::new(final_normalized.raw());
@@ -7234,6 +7563,9 @@ fn run_trajectory_packed_impl(
         queue, pipelines, time_projection, time_1_weight, time_hidden,
         WIDTH, 256 as usize, conditioning_rows,
     ) else { return 1; };
+    if !dispatch_lora_global(queue, mps_workspace.lora,
+        "time_text_embed.timestep_embedder.linear_1.weight",
+        time_projection, time_hidden, conditioning_rows, WIDTH, 256 as usize) { return 1; }
     conditioning_precompute_ms = conditioning_precompute_ms + time_1_ms;
     params.width = WIDTH as u32;
     guard let option::Option[f64]::Some(time_silu_ms) = dispatch_1d(
@@ -7245,6 +7577,9 @@ fn run_trajectory_packed_impl(
         queue, pipelines, time_activated_hidden, time_2_weight, time_embedding,
         WIDTH, WIDTH, conditioning_rows,
     ) else { return 1; };
+    if !dispatch_lora_global(queue, mps_workspace.lora,
+        "time_text_embed.timestep_embedder.linear_2.weight",
+        time_activated_hidden, time_embedding, conditioning_rows, WIDTH, WIDTH) { return 1; }
     conditioning_precompute_ms = conditioning_precompute_ms + time_2_ms;
     guard let option::Option[f64]::Some(activated_time_ms) = dispatch_1d(
         queue, silu_pipeline, time_embedding, dummy, activated_time, dummy, dummy, dummy,
@@ -7255,6 +7590,9 @@ fn run_trajectory_packed_impl(
         queue, pipelines, activated_time, modulation_weight, modulation_table,
         (4 as usize) *% WIDTH, WIDTH, conditioning_rows,
     ) else { return 1; };
+    if !dispatch_lora_global(queue, mps_workspace.lora, "modulation.1.weight",
+        activated_time, modulation_table, conditioning_rows,
+        (4 as usize) *% WIDTH, WIDTH) { return 1; }
     conditioning_precompute_ms = conditioning_precompute_ms + modulation_ms;
     guard let option::Option[f64]::Some(final_scale_ms) = dispatch_weighted_linear_scalar(
         queue, pipelines, activated_time, final_scale_weight, final_scale_table,
@@ -7400,7 +7738,7 @@ fn run_trajectory_packed_impl(
                     cache_copy_pipeline, cache_key_arena, cache_value_arena, cache_offset,
                     prefix_rows,
                     use_graph_attention, #addr_of(graph_prefill_attention),
-                    #addr_of(graph_cached_attention), graph_mask,
+                    #addr_of(graph_cached_attention), graph_mask, block,
                 ) { return 1; }
                 block_command_buffer.commit();
                 weight_ring.committed(global_block, block_command_buffer);
@@ -7421,7 +7759,7 @@ fn run_trajectory_packed_impl(
                     cache_copy_pipeline, cache_key_arena, cache_value_arena, cache_offset,
                     prefix_rows,
                     use_graph_attention, #addr_of(graph_prefill_attention),
-                    #addr_of(graph_cached_attention), graph_mask,
+                    #addr_of(graph_cached_attention), graph_mask, block,
                 ) { return 1; }
             } else {
                 let block_result: option::Option[f64] = execute_mps_mlp_runtime_block(

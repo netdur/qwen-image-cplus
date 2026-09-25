@@ -173,6 +173,30 @@ fn fill_schedule(
     }
 }
 
+// Viggle v0.2.1 keeps the four training nodes and splits the highest-noise
+// segment into three. These are raw nodes: apply Qwen's resolution-dependent
+// shift before sampling, and do not stretch the final model evaluation.
+fn fill_viggle_v021_schedule(
+    image_sequence_length: usize,
+    sigmas: *f32,
+    timesteps: *f32,
+) -> bool {
+    if sigmas.is_null() || timesteps.is_null() { return false; }
+    let raw: [f32; 6] = [
+        1.0f32, 0.9375f32, 0.875f32, 0.75f32, 0.5f32, 0.25f32,
+    ];
+    let mu: f32 = calculate_shift(image_sequence_length);
+    var index: usize = 0 as usize;
+    while index < (6 as usize) {
+        let shifted: f32 = exponential_time_shift(mu, raw[index]);
+        sigmas[index] = shifted;
+        timesteps[index] = shifted * TRAIN_TIMESTEPS;
+        index = index +% (1 as usize);
+    }
+    sigmas[6] = 0.0f32;
+    return true;
+}
+
 // Diffusers performs the Euler arithmetic in FP32, then casts the result back
 // to model_output.dtype. Qwen-Image-2.1 runs the transformer in BF16, so every
 // trajectory step must round here before the next model evaluation.
@@ -226,6 +250,27 @@ fn qwen_1024_schedule_matches_pinned_reference_points() {
             assert endpoint == 0.0f32;
         }
         ScheduleResult::Err(_error) => { assert false; }
+    }
+}
+
+#[test]
+fn viggle_v021_schedule_matches_pinned_diffusers_at_832x1248() {
+    var sigmas: [f32; 7] = [0.0f32; 7];
+    var timesteps: [f32; 6] = [0.0f32; 6];
+    assert fill_viggle_v021_schedule(
+        4056 as usize, #addr_of(sigmas[0]), #addr_of(timesteps[0]),
+    );
+    let expected: [f32; 7] = [
+        1.0f32, 0.96769154f32, 0.93323278f32, 0.85694492f32,
+        0.66630769f32, 0.39961249f32, 0.0f32,
+    ];
+    var index: usize = 0 as usize;
+    while index < (7 as usize) {
+        assert close(sigmas[index], expected[index], 0.000001f32);
+        if index < (6 as usize) {
+            assert close(timesteps[index], expected[index] * TRAIN_TIMESTEPS, 0.0001f32);
+        }
+        index = index +% (1 as usize);
     }
 }
 

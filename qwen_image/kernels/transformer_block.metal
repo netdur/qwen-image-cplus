@@ -36,6 +36,7 @@ struct FlashAttentionParams {
     uint padded_key_rows;
     uint query_position_offset;
     uint block_causal;
+    uint prune_masked_tiles;
 };
 
 struct FlashPrepareParams {
@@ -60,6 +61,34 @@ struct BlockParams {
 
 inline float qi_bf16(ushort bits) {
     return as_type<float>(uint(bits) << 16);
+}
+
+struct LoraAddParams {
+    uint rows;
+    uint columns;
+    uint output_stride;
+    uint output_offset;
+};
+
+kernel void qi_lora_bf16_to_half(
+    device ushort *values [[buffer(0)]],
+    constant uint &count [[buffer(1)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) {
+        values[index] = as_type<ushort>(half(qi_bf16(values[index])));
+    }
+}
+
+kernel void qi_lora_add(
+    device const float *delta [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant LoraAddParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < params.rows * params.columns) {
+        const uint row = index / params.columns;
+        const uint column = index % params.columns;
+        output[row * params.output_stride + params.output_offset + column] += delta[index];
+    }
 }
 
 inline float qi_dense_weight(ushort bits, uint weight_mode) {
@@ -2185,9 +2214,22 @@ kernel void qi_block_attention_flash128(
     float maximums[2] = { -INFINITY, -INFINITY };
     float denominators[2] = { 0.0f, 0.0f };
     const float scale = rsqrt(float(head_dimension));
+    const uint last_query_row = min(
+        query_group_base + queries_per_group - 1,
+        params.query_rows - 1) + params.query_position_offset;
 
     for (uint key_base = 0; key_base < params.padded_key_rows;
             key_base += keys_per_tile) {
+        // Image IDs occupy contiguous blocks in the joint layout. Once a key
+        // tile lies beyond this query group's last row, only that last row's
+        // image block can still be visible to any query in the group.
+        if (params.prune_masked_tiles != 0 && params.block_causal != 0
+            && key_base > last_query_row
+            && (key_base >= params.key_rows
+                || image_ids[last_query_row] < 0
+                || image_ids[key_base] != image_ids[last_query_row])) {
+            continue;
+        }
         // Q.K^T: each SIMD group produces two 8-key stripes for all 8 queries.
         device const half *key_tile =
             key + (key_base * heads + head) * head_dimension

@@ -2318,6 +2318,13 @@ fn parse_decimal_usize(value: str) -> option::Option[usize] {
 }
 
 // Returns an error message for an invalid known key, or an empty Text.
+fn metadata_value_is(metadata: Metadata, key: str, expected: str) -> bool {
+    return match metadata.get(key) {
+        option::Option[str]::Some(value) => value == expected,
+        option::Option[str]::None => false,
+    };
+}
+
 fn validate_known_metadata(metadata: Metadata) -> text::Text {
     match metadata.get("base") {
         option::Option[str]::Some(value) => {
@@ -2343,9 +2350,9 @@ fn validate_known_metadata(metadata: Metadata) -> text::Text {
             };
             // Only the counts generate-1024 can run; anything else would be
             // refused at generation time.
-            if !(steps == (3 as usize) || steps == (4 as usize) || steps == (8 as usize)
+            if !(steps == (3 as usize) || steps == (4 as usize) || steps == (6 as usize) || steps == (8 as usize)
                 || steps == (25 as usize) || steps == (40 as usize)) {
-                return "steps must be 3, 4, 8, 25, or 40, got ${value}";
+                return "steps must be 3, 4, 6, 8, 25, or 40, got ${value}";
             }
         }
         option::Option[str]::None => {}
@@ -2354,6 +2361,31 @@ fn validate_known_metadata(metadata: Metadata) -> text::Text {
         option::Option[str]::Some(value) => {
             if value != "0.02" && value != "none" {
                 return "shift_terminal must be 0.02 or none, got ${value}";
+            }
+        }
+        option::Option[str]::None => {}
+    }
+    match metadata.get("schedule") {
+        option::Option[str]::Some(value) => {
+            if value != "viggle-v0.2.1-6" {
+                return "schedule must be viggle-v0.2.1-6, got ${value}";
+            }
+            if !metadata_value_is(metadata, "steps", "6")
+                || !metadata_value_is(metadata, "shift_terminal", "none")
+                || !metadata_value_is(metadata, "kind", "distilled")
+                || !metadata_value_is(metadata, "lora", "viggle-v0.2.1-r256") {
+                return "schedule=viggle-v0.2.1-6 requires kind=distilled, steps=6, shift_terminal=none, and lora=viggle-v0.2.1-r256";
+            }
+        }
+        option::Option[str]::None => {}
+    }
+    match metadata.get("lora") {
+        option::Option[str]::Some(value) => {
+            if value != "viggle-v0.2.1-r256" {
+                return "lora must be viggle-v0.2.1-r256, got ${value}";
+            }
+            if !metadata_value_is(metadata, "schedule", "viggle-v0.2.1-6") {
+                return "lora=viggle-v0.2.1-r256 requires schedule=viggle-v0.2.1-6";
             }
         }
         option::Option[str]::None => {}
@@ -2674,6 +2706,14 @@ fn metadata_rejects_invalid_blocks() {
     }
     // Only step counts generate-1024 can run are accepted.
     match parse_metadata("steps=6\n") {
+        MetadataResult::Ok(_m) => {}
+        MetadataResult::Err(_message) => { assert false; }
+    }
+    match parse_metadata("kind=distilled\nsteps=6\nshift_terminal=none\nschedule=viggle-v0.2.1-6\nlora=viggle-v0.2.1-r256\n") {
+        MetadataResult::Ok(_m) => {}
+        MetadataResult::Err(_message) => { assert false; }
+    }
+    match parse_metadata("kind=distilled\nsteps=6\nshift_terminal=none\nschedule=viggle-v0.2.1-6\n") {
         MetadataResult::Ok(_m) => { assert false; }
         MetadataResult::Err(_message) => {}
     }

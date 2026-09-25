@@ -90,6 +90,14 @@ struct File {
     _data_start: u64,
 }
 
+fn inactive_file() -> File {
+    return File {
+        _mapping: mapped::inactive_mapped_file(),
+        _tensors: vec::new::[TensorInfo](),
+        _data_start: 0 as u64,
+    };
+}
+
 // A borrowed view into a mapped Safetensors payload. The owning `File` must
 // outlive this value. Dimensions are copied so callers never retain pointers
 // into the parser's metadata vectors.
@@ -104,6 +112,10 @@ struct TensorData {
 }
 
 impl File {
+    fn data_offset(this) -> u64 {
+        return this._data_start;
+    }
+
     fn mapping_pointer(this) -> *u8 {
         return this._mapping.pointer();
     }

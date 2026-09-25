@@ -4,7 +4,10 @@ import "facet/elements" as ui;
 import "facet/component" as component;
 import "facet/label" as label;
 import "facet/mount" as mount;
+import "facet/popup" as popup;
 import "facet_runtime/runtime" as runtime;
+import "qwen_image/lora" as lora;
+import "qwen_image/packed_model" as packed;
 import "stdlib/option" as option;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
@@ -60,7 +63,34 @@ fn is_model_file(path: str) -> bool {
     }
     guard let option::Option[text::Text]::Some(root) = model_root_for_pack(path)
         else { return false; };
-    return has_support_files(root.view());
+    if !has_support_files(root.view()) { return false; }
+    if is_viggle_v021_pack(path) {
+        let adapter: text::Text = lora::path_beside_pack(path);
+        return file_drop::is_regular_file(adapter.view());
+    }
+    return true;
+}
+
+fn is_viggle_v021_pack(path: str) -> bool {
+    return match packed::read_metadata(path) {
+        packed::MetadataResult::Ok(metadata) => match metadata.get("schedule") {
+            option::Option[str]::Some(value) => value == "viggle-v0.2.1-6",
+            option::Option::None => false,
+        },
+        packed::MetadataResult::Err(_message) => false,
+    };
+}
+
+fn select_pack_steps(path: str) {
+    if !is_viggle_v021_pack(path) { return; }
+    let _saved: bool = preferences::save_steps(6 as i64);
+    match popup::find("settings:steps") {
+        option::Option[popup::Popup]::Some(field) => {
+            let _field: popup::Popup = field.set_selected_index(
+                preferences::step_index(6 as i64));
+        }
+        option::Option::None => {}
+    }
 }
 
 fn selected_name(path: str) -> text::Text {
@@ -132,6 +162,7 @@ impl ModelSelection {
                     return;
                 }
                 if !preferences::save_model_path(path.view()) { return; }
+                select_pack_steps(path.view());
                 this.path = path;
                 this.error = text::new();
                 this.refresh();
@@ -144,6 +175,7 @@ impl ModelSelection {
         if !is_model_file(path.view()) { return false; }
         if !commit { return true; }
         if !preferences::save_model_path(path.view()) { return false; }
+        select_pack_steps(path.view());
         this.path = path.clone();
         this.error = text::new();
         this.refresh();

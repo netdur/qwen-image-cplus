@@ -86,6 +86,7 @@ fn encode_images(
         if shapes.append(shape) != status::Status::Ok
             || image_token_counts.append(shape.vision_tokens) != status::Status::Ok
             || images.append(image) != status::Status::Ok {
+            io::eprintln("multimodal conditioning: could not store decoded reference image");
             return option::Option[Encoded]::None;
         }
         vision_rows = vision_rows +% shape.vision_tokens;
@@ -95,13 +96,13 @@ fn encode_images(
 
     guard let option::Option[vec::Vec[f32]]::Some(vision) = host_buffers::zeroed_f32(
         vision_rows *% WIDTH,
-    ) else { return option::Option[Encoded]::None; };
+    ) else { io::eprintln("multimodal conditioning: could not allocate vision buffer"); return option::Option[Encoded]::None; };
     guard let option::Option[vec::Vec[f32]]::Some(deepstack) = host_buffers::zeroed_f32(
         DEEPSTACK_LAYERS *% vision_rows *% WIDTH,
-    ) else { return option::Option[Encoded]::None; };
+    ) else { io::eprintln("multimodal conditioning: could not allocate DeepStack buffer"); return option::Option[Encoded]::None; };
     guard let option::Option[vec::Vec[f32]]::Some(condition_latents) = host_buffers::zeroed_f32(
         condition_rows *% LATENT_CHANNELS,
-    ) else { return option::Option[Encoded]::None; };
+    ) else { io::eprintln("multimodal conditioning: could not allocate condition latents"); return option::Option[Encoded]::None; };
 
     let shape_values: *conditioning::Shape = #slice_ptr(shapes.as_slice());
     let image_values: *image_input::Image = #slice_ptr(images.as_slice());
@@ -324,6 +325,7 @@ fn run_multi_image_transformer(
     observer: control::Observer = control::none(),
     output_width: usize = 0 as usize,
     output_height: usize = 0 as usize,
+    benchmark_only: bool = false,
 ) -> i32 {
     if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
         return 3;
@@ -344,12 +346,12 @@ fn run_multi_image_transformer(
     }
     let smoke_steps: bool = requested_steps == "1" || requested_steps == "2";
     if !(smoke_steps || requested_steps == "3" || requested_steps == "4"
-        || requested_steps == "8" || requested_steps == "25" || requested_steps == "40") {
-        io::eprintln("multi-image transformer: steps must be 1, 2, 3, 4, 8, 25, or 40");
+        || requested_steps == "6" || requested_steps == "8" || requested_steps == "25" || requested_steps == "40") {
+        io::eprintln("multi-image transformer: steps must be 1, 2, 3, 4, 6, 8, 25, or 40");
         return 2;
     }
     if smoke_steps && output_path.count() > (0 as usize) {
-        io::eprintln("multi-image transformer: ${requested_steps} steps is a truncated smoke trajectory; generating a PNG needs 3, 4, 8, 25, or 40");
+        io::eprintln("multi-image transformer: ${requested_steps} steps is a truncated smoke trajectory; generating a PNG needs 3, 4, 6, 8, 25, or 40");
         return 2;
     }
     let started_ms: i64 = time::now_millis();
@@ -393,6 +395,26 @@ fn run_multi_image_transformer(
         encoded.condition_rows *% LATENT_CHANNELS,
     );
     let transformer_start_ms: i64 = time::now_millis();
+    if benchmark_only {
+        let result: i32 = transformer::benchmark_conditioned_trajectory_sized(
+            packed_path,
+            #slice_ptr(encoded.prompt_embeddings.as_slice()),
+            encoded.prompt_rows,
+            #slice_ptr(encoded.prompt_image_mask.as_slice()),
+            #slice_ptr(encoded.condition_latents.as_slice()),
+            encoded.condition_rows,
+            #slice_ptr(shapes.as_slice()),
+            image_count,
+            seed,
+            width,
+            height,
+            requested_steps,
+        );
+        io::println(
+            "multi-image benchmark: images=${image_count} output=${width}x${height} steps=${requested_steps} transformer_wall_ms=${time::now_millis() - transformer_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        );
+        return result;
+    }
     let result: i32 = transformer::run_conditioned_trajectory_sized_to_host(
         packed_path,
         #slice_ptr(encoded.prompt_embeddings.as_slice()),

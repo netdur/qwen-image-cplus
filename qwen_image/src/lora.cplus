@@ -1,0 +1,116 @@
+import "./safetensors" as safetensors;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+const VIGGLE_V021_R256_FILE: str =
+    "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors";
+const RANK: u64 = 256 as u64;
+const WIDTH: u64 = 4096 as u64;
+const MLP_WIDTH: u64 = 12288 as u64;
+
+struct Pair {
+    a_offset: u64,
+    b_offset: u64,
+    input: u64,
+    output: u64,
+}
+
+fn path_beside_pack(packed_path: str) -> text::Text {
+    var index: usize = packed_path.count();
+    while index > (0 as usize) {
+        index = index -% (1 as usize);
+        match packed_path.byte_at(index) {
+            option::Option[u8]::Some(byte) => {
+                if byte == (47 as u8) {
+                    guard let option::Option[str]::Some(directory) =
+                        packed_path.slice(0 as usize, index +% (1 as usize)) else {
+                        return text::from_str(VIGGLE_V021_R256_FILE);
+                    };
+                    return "${directory}${VIGGLE_V021_R256_FILE}";
+                }
+            }
+            option::Option[u8]::None => {}
+        }
+    }
+    return text::from_str(VIGGLE_V021_R256_FILE);
+}
+
+fn pair(
+    file: safetensors::File,
+    base_weight_name: str,
+    output: u64,
+    input: u64,
+) -> option::Option[Pair] {
+    if base_weight_name.count() < (7 as usize) {
+        return option::Option[Pair]::None;
+    }
+    guard let option::Option[str]::Some(stem) = base_weight_name.slice(
+        0 as usize, base_weight_name.count() -% (7 as usize),
+    ) else { return option::Option[Pair]::None; };
+    let a_name: text::Text = "transformer.${stem}.lora_A.weight";
+    let b_name: text::Text = "transformer.${stem}.lora_B.weight";
+    guard let option::Option[safetensors::TensorData]::Some(a) =
+        file.tensor(a_name.view()) else { return option::Option[Pair]::None; };
+    guard let option::Option[safetensors::TensorData]::Some(b) =
+        file.tensor(b_name.view()) else { return option::Option[Pair]::None; };
+    if a.dtype != safetensors::DType::BF16 || b.dtype != safetensors::DType::BF16
+        || a.rank != (2 as usize) || b.rank != (2 as usize)
+        || a.dimensions[0] != RANK || a.dimensions[1] != input
+        || b.dimensions[0] != output || b.dimensions[1] != RANK
+        || a.byte_length != RANK *% input *% (2 as u64)
+        || b.byte_length != output *% RANK *% (2 as u64) {
+        return option::Option[Pair]::None;
+    }
+    return option::Option[Pair]::Some(Pair {
+        a_offset: a.file_offset,
+        b_offset: b.file_offset,
+        input: input,
+        output: output,
+    });
+}
+
+fn validate_viggle_v021_r256(file: safetensors::File) -> bool {
+    if file.tensor_count() != (454 as usize)
+        || file.dtype_count(safetensors::DType::BF16) != (454 as usize) {
+        return false;
+    }
+    if !has_pair(file, "modulation.1.weight", (4 as u64) *% WIDTH, WIDTH)
+        || !has_pair(file, "time_text_embed.timestep_embedder.linear_1.weight", WIDTH, 256 as u64)
+        || !has_pair(file, "time_text_embed.timestep_embedder.linear_2.weight", WIDTH, WIDTH) {
+        return false;
+    }
+    let suffixes: [str; 7] = [
+        "attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight",
+        "attn.to_out.0.weight", "img_mlp.gate_layer.weight",
+        "img_mlp.proj.weight", "img_mlp.out.weight",
+    ];
+    var block: usize = 0 as usize;
+    while block < (32 as usize) {
+        var index: usize = 0 as usize;
+        while index < (7 as usize) {
+            let name: text::Text = "transformer_blocks.${block}.${suffixes[index]}";
+            let output: u64 = if index == (4 as usize) || index == (5 as usize) {
+                MLP_WIDTH
+            } else { WIDTH };
+            let input: u64 = if index == (6 as usize) { MLP_WIDTH } else { WIDTH };
+            if !has_pair(file, name.view(), output, input) { return false; }
+            index = index +% (1 as usize);
+        }
+        block = block +% (1 as usize);
+    }
+    return true;
+}
+
+fn has_pair(file: safetensors::File, name: str, output: u64, input: u64) -> bool {
+    return match pair(file, name, output, input) {
+        option::Option[Pair]::Some(_pair) => true,
+        option::Option[Pair]::None => false,
+    };
+}
+
+#[test]
+fn adapter_path_follows_the_selected_pack() {
+    assert path_beside_pack("models/viggle.qipack").view()
+        == "models/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors";
+    assert path_beside_pack("viggle.qipack").view() == VIGGLE_V021_R256_FILE;
+}

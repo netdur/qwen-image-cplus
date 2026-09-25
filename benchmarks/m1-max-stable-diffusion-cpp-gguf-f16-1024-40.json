@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-25",
+  "machine": "Apple M1 Max, 32 GB unified memory",
+  "power": "AC power, battery charging at about 83% at start",
+  "model": {
+    "diffusion": "unsloth/Qwen-Image-2.1-GGUF",
+    "diffusion_snapshot": "2c31ccd392b367a6637841a143813320a02dff55",
+    "diffusion_file": "qwen-image-2.1-F16.gguf",
+    "diffusion_file_bytes": 14230275808,
+    "diffusion_file_sha256": "8aa239e5ddb28d4641942231396d7171da41ad305ea401dd92a7d6410bde798d",
+    "text_encoder_and_vae": "Qwen/Qwen-Image-2.1",
+    "text_encoder_and_vae_snapshot": "b3179ad355be050328e483a9dfdd9e60cd62adfa"
+  },
+  "runtime": {
+    "repository": "stable-diffusion.cpp",
+    "commit": "6dcb5bb",
+    "binary": "/Users/adel/Workspace/stable-diffusion.cpp/build/bin/sd-cli",
+    "binary_sha256": "085f2b99a92a70dba204062ed32ec4899be8d197d6b2ec5ab3f78e943de20fa3",
+    "local_patch": "map text_encoders.llm.model.language_model. to text_encoders.llm.model. for Qwen-Image-2.1",
+    "cache_mode": "disabled",
+    "filesystem_cache": "GGUF was downloaded and SHA256-hashed before the run; exact cache residency was not measured"
+  },
+  "case": {
+    "prompt": "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+    "seed": 1301,
+    "width": 1024,
+    "height": 1024,
+    "steps": 40,
+    "cfg_scale": 1.0,
+    "sampler": "euler",
+    "diffusion_flash_attention": true,
+    "offload_to_cpu": true,
+    "scheduler": "Flux",
+    "scheduler_mu": 1.15,
+    "weight_types": {
+      "diffusion_f16_tensors": 261,
+      "diffusion_bf16_tensors": 4,
+      "text_encoder_bf16_tensors": 750,
+      "vae_f32_tensors": 238
+    }
+  },
+  "command": [
+    "/usr/bin/time", "-l", "./build/bin/sd-cli",
+    "--diffusion-model", "$GGUF_SNAP/qwen-image-2.1-F16.gguf",
+    "--llm", "$QWEN_SNAP/text_encoder/model.safetensors.index.json",
+    "--vae", "$QWEN_SNAP/vae/diffusion_pytorch_model.safetensors",
+    "-p", "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET', bold geometric lettering.",
+    "-W", "1024", "-H", "1024", "--steps", "40", "--cfg-scale", "1.0",
+    "--sampling-method", "euler", "-s", "1301", "--diffusion-fa",
+    "--offload-to-cpu", "-v", "-o", "/tmp/sdcpp-gguf-f16-1024-40.png"
+  ],
+  "timing_seconds": {
+    "process_wall": 984.34,
+    "generate_image": 983.24,
+    "text_conditioning": 59.08,
+    "text_tensor_load": 16.34,
+    "text_stage_to_metal": 42.46,
+    "sampling": 904.76,
+    "transformer_tensor_load": 14.52,
+    "transformer_stage_to_metal": 27.66,
+    "vae_decode": 19.26,
+    "vae_tensor_load": 1.01,
+    "vae_stage_to_metal": 0.05
+  },
+  "memory": {
+    "maximum_resident_set_bytes": 17446240256,
+    "peak_memory_footprint_bytes": 43763613136,
+    "page_faults": 1526,
+    "swaps": 0,
+    "reported_total_parameter_mb": 29751.86
+  },
+  "artifact": {
+    "path": "/tmp/sdcpp-gguf-f16-1024-40.png",
+    "bytes": 3085397,
+    "sha256": "6d77ad9a8e27d5b69cc6f0905577a945299c8e0f97c145dcf87fb803b04c117b"
+  },
+  "comparison": {
+    "reference": "benchmarks/m1-max-stable-diffusion-cpp-1024-40.json",
+    "process_wall_seconds_less": 22.02,
+    "process_wall_percent_less": 2.19,
+    "sampling_seconds_less": 18.14,
+    "sampling_percent_less": 1.97
+  },
+  "interpretation": "The F16 GGUF supplies only the diffusion transformer. Text encoder and VAE remain separate. One run was 2.2% shorter than the earlier BF16/F32 safetensors run, but differing background conditions and a single sample do not establish a format speedup."
+}

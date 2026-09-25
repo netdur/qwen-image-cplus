@@ -32,9 +32,10 @@ impl OutputOptions {
         var choices: vocab::TextList = vocab::TextList::new();
         let _a: status::Status = choices.add("3");
         let _b: status::Status = choices.add("4");
-        let _c: status::Status = choices.add("8");
-        let _d: status::Status = choices.add("25");
-        let _e: status::Status = choices.add("40");
+        let _c: status::Status = choices.add("6");
+        let _d: status::Status = choices.add("8");
+        let _e: status::Status = choices.add("25");
+        let _f: status::Status = choices.add("40");
         return choices;
     }
 
