@@ -4,6 +4,7 @@ import "facet/screen" as screen;
 import "stdlib/status" as status;
 import "./screens/generation" as generation;
 import "./screens/settings" as settings;
+import "qwen_image/generation_worker" as _;
 
 fn run() -> i32 {
     agent::enable();

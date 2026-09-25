@@ -1,0 +1,35 @@
+enum Phase {
+    Preparing,
+    EncodingReferences,
+    EncodingText,
+    Denoising,
+    Decoding,
+    WritingPng,
+}
+
+struct Progress {
+    phase: Phase,
+    completed_steps: usize,
+    total_steps: usize,
+}
+
+struct Observer {
+    callback: fn(Progress, *u8) -> bool,
+    opaque context: *u8,
+}
+
+fn none() -> Observer {
+    return Observer {
+        callback: 0 as fn(Progress, *u8) -> bool,
+        context: 0 as *u8,
+    };
+}
+
+fn report(observer: Observer, phase: Phase, completed_steps: usize, total_steps: usize) -> bool {
+    if observer.callback.is_null() { return true; }
+    return observer.callback(Progress {
+        phase: phase,
+        completed_steps: completed_steps,
+        total_steps: total_steps,
+    }, observer.context);
+}

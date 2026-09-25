@@ -1,6 +1,8 @@
 import "foundation/foundation" as foundation;
 import "objc/bridge" as bridge;
+import "stdlib/fs" as fs;
 import "stdlib/option" as option;
+import "stdlib/result" as result;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
 
@@ -10,6 +12,9 @@ struct GenerationPreferences {
     steps: i64,
     seed: text::Text,
     random_seed: bool,
+    cache_mode: i64,
+    cache_threshold: i64,
+    output_folder: text::Text,
 }
 
 fn store() -> foundation::UserDefaults {
@@ -24,6 +29,32 @@ fn valid_dimension(value: i64) -> bool {
 fn valid_steps(value: i64) -> bool {
     return value == (3 as i64) || value == (4 as i64) ||
         value == (8 as i64) || value == (25 as i64) || value == (40 as i64);
+}
+
+fn valid_cache_mode(value: i64) -> bool {
+    return value >= (0 as i64) && value <= (3 as i64);
+}
+
+fn valid_cache_threshold(value: i64) -> bool {
+    return value >= (0 as i64) && value <= (4 as i64);
+}
+
+fn cache_threshold_value(mode: i64, choice: i64) -> f64 {
+    if mode == (1 as i64) { return 0.0f64; }
+    return match choice {
+        1 => 0.12f64,
+        2 => 0.14f64,
+        3 => 0.16f64,
+        4 => 0.24f64,
+        _ => if mode == (3 as i64) { 0.16f64 } else { 0.24f64 },
+    };
+}
+
+fn valid_output_folder(path: str) -> bool {
+    if !path.has_prefix("/") { return false; }
+    guard let result::Result[fs::Metadata, result::IoError]::Ok(info) =
+        fs::metadata(path) else { return false; };
+    return info.is_dir;
 }
 
 fn valid_seed(value: str) -> bool {
@@ -69,10 +100,20 @@ fn load_from(defaults: foundation::UserDefaults) -> GenerationPreferences {
     let stored_width: i64 = defaults.integer_for_key("generation.width");
     let stored_height: i64 = defaults.integer_for_key("generation.height");
     let stored_steps: i64 = defaults.integer_for_key("generation.steps");
+    let stored_cache_mode: i64 = defaults.integer_for_key("generation.cache_mode");
+    let stored_cache_threshold: i64 =
+        defaults.integer_for_key("generation.cache_threshold");
     var seed: text::Text = text::from_str("1301");
     match defaults.string_for_key("generation.seed") {
         option::Option[text::Text]::Some(value) => {
             if valid_seed(value.view()) { seed = value; }
+        }
+        option::Option::None => {}
+    }
+    var output_folder: text::Text = text::new();
+    match defaults.string_for_key("generation.output_folder") {
+        option::Option[text::Text]::Some(value) => {
+            if valid_output_folder(value.view()) { output_folder = value; }
         }
         option::Option::None => {}
     }
@@ -82,10 +123,28 @@ fn load_from(defaults: foundation::UserDefaults) -> GenerationPreferences {
         steps: if valid_steps(stored_steps) { stored_steps } else { 40 as i64 },
         seed: seed,
         random_seed: defaults.bool_for_key("generation.random_seed"),
+        cache_mode: if valid_cache_mode(stored_cache_mode) {
+            stored_cache_mode
+        } else { 0 as i64 },
+        cache_threshold: if valid_cache_threshold(stored_cache_threshold) {
+            stored_cache_threshold
+        } else { 0 as i64 },
+        output_folder: output_folder,
     };
 }
 
 fn load() -> GenerationPreferences { return load_from(store()); }
+
+fn output_folder_for(saved: GenerationPreferences) -> text::Text {
+    if saved.output_folder.count() == (0 as usize) {
+        return text::from_str("/tmp");
+    }
+    return saved.output_folder.clone();
+}
+
+fn effective_output_folder() -> text::Text {
+    return output_folder_for(load());
+}
 
 fn save_dimensions_to(defaults: foundation::UserDefaults,
 width: str, height: str) -> bool {
@@ -125,6 +184,42 @@ fn save_random_seed_to(defaults: foundation::UserDefaults, value: bool) {
 
 fn save_random_seed(value: bool) { save_random_seed_to(store(), value); }
 
+fn save_cache_mode_to(defaults: foundation::UserDefaults, value: i64) -> bool {
+    if !valid_cache_mode(value) { return false; }
+    defaults.set_integer(value, for_key: "generation.cache_mode");
+    return true;
+}
+
+fn save_cache_mode(value: i64) -> bool {
+    return save_cache_mode_to(store(), value);
+}
+
+fn save_cache_threshold_to(defaults: foundation::UserDefaults, value: i64) -> bool {
+    if !valid_cache_threshold(value) { return false; }
+    defaults.set_integer(value, for_key: "generation.cache_threshold");
+    return true;
+}
+
+fn save_cache_threshold(value: i64) -> bool {
+    return save_cache_threshold_to(store(), value);
+}
+
+fn save_output_folder_to(defaults: foundation::UserDefaults, path: str) -> bool {
+    if !valid_output_folder(path) { return false; }
+    defaults.set_object(bridge::nsstring(path), for_key: "generation.output_folder");
+    return true;
+}
+
+fn save_output_folder(path: str) -> bool {
+    return save_output_folder_to(store(), path);
+}
+
+fn reset_output_folder_to(defaults: foundation::UserDefaults) {
+    defaults.remove_object_for_key("generation.output_folder");
+}
+
+fn reset_output_folder() { reset_output_folder_to(store()); }
+
 fn load_model_path_from(defaults: foundation::UserDefaults) -> option::Option[text::Text] {
     return defaults.string_for_key("generation.model_path");
 }
@@ -154,6 +249,9 @@ fn generation_preferences_round_trip_and_validate() {
     defaults.remove_object_for_key("generation.seed");
     defaults.remove_object_for_key("generation.random_seed");
     defaults.remove_object_for_key("generation.model_path");
+    defaults.remove_object_for_key("generation.cache_mode");
+    defaults.remove_object_for_key("generation.cache_threshold");
+    defaults.remove_object_for_key("generation.output_folder");
 
     let initial: GenerationPreferences = load_from(defaults);
     assert initial.width == (512 as i64);
@@ -161,6 +259,14 @@ fn generation_preferences_round_trip_and_validate() {
     assert initial.steps == (40 as i64);
     assert initial.seed.view() == "1301";
     assert !initial.random_seed;
+    assert initial.cache_mode == (0 as i64);
+    assert initial.cache_threshold == (0 as i64);
+    assert initial.output_folder.count() == (0 as usize);
+    assert output_folder_for(initial).view() == "/tmp";
+    assert cache_threshold_value(2 as i64, 0 as i64) == 0.24f64;
+    assert cache_threshold_value(3 as i64, 0 as i64) == 0.16f64;
+    assert cache_threshold_value(3 as i64, 1 as i64) == 0.12f64;
+    assert cache_threshold_value(1 as i64, 4 as i64) == 0.0f64;
     match load_model_path_from(defaults) {
         option::Option::None => {}
         option::Option::Some(_) => { assert false; }
@@ -173,6 +279,12 @@ fn generation_preferences_round_trip_and_validate() {
     assert save_seed_to(defaults, "18446744073709551615");
     assert !save_seed_to(defaults, "18446744073709551616");
     save_random_seed_to(defaults, true);
+    assert save_cache_mode_to(defaults, 3 as i64);
+    assert !save_cache_mode_to(defaults, 4 as i64);
+    assert save_cache_threshold_to(defaults, 4 as i64);
+    assert !save_cache_threshold_to(defaults, 5 as i64);
+    assert save_output_folder_to(defaults, "/private/tmp");
+    assert !save_output_folder_to(defaults, "/tmp/not-a-real-output-folder");
     assert save_model_path_to(defaults, "/tmp/example.qipack");
     assert !save_model_path_to(defaults, "");
 
@@ -182,6 +294,10 @@ fn generation_preferences_round_trip_and_validate() {
     assert saved.steps == (8 as i64);
     assert saved.seed.view() == "18446744073709551615";
     assert saved.random_seed;
+    assert saved.cache_mode == (3 as i64);
+    assert saved.cache_threshold == (4 as i64);
+    assert saved.output_folder.view() == "/private/tmp";
+    assert output_folder_for(saved).view() == "/private/tmp";
     match load_model_path_from(defaults) {
         option::Option[text::Text]::Some(path) => {
             assert path.view() == "/tmp/example.qipack";
@@ -191,8 +307,15 @@ fn generation_preferences_round_trip_and_validate() {
     assert step_index(saved.steps) == (2 as i64);
     assert step_value(2 as i64) == (8 as i64);
 
+    reset_output_folder_to(defaults);
+    assert load_from(defaults).output_folder.count() == (0 as usize);
+
     defaults.set_integer(17 as i64, for_key: "generation.width");
     defaults.set_integer(7 as i64, for_key: "generation.steps");
+    defaults.set_integer(7 as i64, for_key: "generation.cache_mode");
+    defaults.set_integer(7 as i64, for_key: "generation.cache_threshold");
+    defaults.set_object(bridge::nsstring("/missing/output-folder"),
+    for_key: "generation.output_folder");
     defaults.set_object(bridge::nsstring("18446744073709551616"),
     for_key: "generation.seed");
     let repaired: GenerationPreferences = load_from(defaults);
@@ -200,6 +323,9 @@ fn generation_preferences_round_trip_and_validate() {
     assert repaired.height == (1024 as i64);
     assert repaired.steps == (40 as i64);
     assert repaired.seed.view() == "1301";
+    assert repaired.cache_mode == (0 as i64);
+    assert repaired.cache_threshold == (0 as i64);
+    assert repaired.output_folder.count() == (0 as usize);
 
     defaults.remove_object_for_key("generation.width");
     defaults.remove_object_for_key("generation.height");
@@ -207,4 +333,7 @@ fn generation_preferences_round_trip_and_validate() {
     defaults.remove_object_for_key("generation.seed");
     defaults.remove_object_for_key("generation.random_seed");
     defaults.remove_object_for_key("generation.model_path");
+    defaults.remove_object_for_key("generation.cache_mode");
+    defaults.remove_object_for_key("generation.cache_threshold");
+    defaults.remove_object_for_key("generation.output_folder");
 }

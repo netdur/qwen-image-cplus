@@ -9,15 +9,42 @@ import "facet/mount" as mount;
 import "facet/scroll" as scroll;
 import "facet/vocabulary" as vocab;
 import "facet_runtime/runtime" as runtime;
+import "events/events" as events;
 import "stdlib/option" as option;
+import "stdlib/fs" as fs;
 import "stdlib/status" as status;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
+import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 import "../file_drop" as file_drop;
+import "../current_image" as current_image;
 import "./style" as style;
 
-struct References { paths: vec::Vec[text::Text], opaque drop_view: *u8 }
+extern fn getpid() -> i32;
+
+struct References {
+    paths: vec::Vec[text::Text],
+    opaque drop_view: *u8,
+    edit_sub: events::SignalSubscription[text::Text],
+}
+
+static SNAPSHOT: vec::Vec[text::Text] = #zero::[vec::Vec[text::Text]]();
+
+fn snapshot() -> vec::Vec[text::Text] {
+    var paths: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var index: usize = 0 as usize;
+    while index < SNAPSHOT.count() {
+        match SNAPSHOT.at_ptr(index) {
+            option::Option[*text::Text]::Some(path) => {
+                let _added: status::Status = paths.append({ (*path).clone() });
+            }
+            option::Option::None => {}
+        }
+        index = index +% (1 as usize);
+    }
+    return paths;
+}
 
 fn has_image_extension(path: str) -> bool {
     let lower: text::Text = path.to_text().lowercased();
@@ -35,7 +62,11 @@ fn is_image_file(path: str) -> bool {
 
 impl References {
     fn new() -> References {
-        return References { paths: vec::new::[text::Text](), drop_view: 0 as *u8 };
+        return References {
+            paths: vec::new::[text::Text](),
+            drop_view: 0 as *u8,
+            edit_sub: events::SignalSubscription[text::Text]::none(),
+        };
     }
 
     fn remove_button(ref this, index: usize) -> core::Node {
@@ -126,6 +157,17 @@ impl References {
     }
 
     fn refresh(ref this) {
+        SNAPSHOT = vec::new::[text::Text]();
+        var snapshot_index: usize = 0 as usize;
+        while snapshot_index < this.paths.count() {
+            match this.paths.at_ptr(snapshot_index) {
+                option::Option[*text::Text]::Some(path) => {
+                    let _added: status::Status = SNAPSHOT.append({ (*path).clone() });
+                }
+                option::Option::None => {}
+            }
+            snapshot_index = snapshot_index +% (1 as usize);
+        }
         match label::find("references:count") {
             option::Option[label::Label]::Some(found) => {
                 let _found: label::Label =
@@ -209,6 +251,18 @@ impl References {
         let _removed: option::Option[text::Text] = this.paths.remove(index);
         this.refresh();
     }
+
+    fn on_edit_current(ref this, path: text::Text) {
+        if this.paths.count() >= (10 as usize) {
+            runtime::alert("Reference limit reached",
+            "Remove a reference image before editing this image.", "OK");
+            return;
+        }
+        if !this.on_dropped_path(path, true) {
+            runtime::alert("Image unavailable",
+            "The generated image could not be added to references.", "OK");
+        }
+    }
 }
 
 impl References: component::Component {
@@ -234,6 +288,7 @@ impl References: component::Component {
 impl References: component::Lifecycle {
     fn on_attach(ref this, why: component::Attach) {
         if why != component::Attach::Mount { return; }
+        this.edit_sub = current_image::watch_edit(this.on_edit_current);
         this.refresh();
         match mount::find("references:card") {
             option::Option[*core::Node]::Some(card) => {
@@ -247,6 +302,8 @@ impl References: component::Lifecycle {
     }
     fn on_detach(ref this, why: component::Detach) {
         if why != component::Detach::Unmount { return; }
+        SNAPSHOT = vec::new::[text::Text]();
+        let _cancelled: bool = this.edit_sub.cancel();
         file_drop::clear(this.drop_view);
         this.drop_view = 0 as *u8;
     }
@@ -266,4 +323,24 @@ fn image_drop_accepts_supported_extensions_only() {
     assert has_image_extension("/tmp/photo.heic");
     assert !has_image_extension("/tmp/image.txt");
     assert !is_image_file("/nonexistent/image.png");
+}
+
+#[test]
+fn edit_current_image_adds_it_to_the_reference_strip() {
+    let path: text::Text =
+        "/tmp/qwen-image-gui-edit-${getpid()}-${time::now_millis()}.png";
+    let _written = fs::write_string(path.view(), "png bytes");
+    var references: References = References::new();
+    references.edit_sub = current_image::watch_edit(references.on_edit_current);
+    assert current_image::set_png(path.view());
+    assert current_image::edit();
+    assert references.paths.count() == (1 as usize);
+    match references.paths.at_ptr(0 as usize) {
+        option::Option[*text::Text]::Some(first) => {
+            assert { (*first).view() } == path.view();
+        }
+        option::Option::None => { assert false; }
+    }
+    current_image::clear();
+    let _removed = fs::remove_file(path.view());
 }

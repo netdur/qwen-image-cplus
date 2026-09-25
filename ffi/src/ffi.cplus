@@ -145,6 +145,7 @@ export extern fn qi_generate_to_png(request: *QiGenerateRequest) -> QiStatus {
         api::GenerateStatus::Ok => QiStatus::Ok,
         api::GenerateStatus::InvalidArgument => QiStatus::InvalidArgument,
         api::GenerateStatus::Failed => QiStatus::GenerationFailed,
+        api::GenerateStatus::Cancelled => QiStatus::GenerationFailed,
     };
 }
 
@@ -193,6 +194,7 @@ export extern fn qi_generate_multi_image_to_png(
         api::GenerateStatus::Ok => QiStatus::Ok,
         api::GenerateStatus::InvalidArgument => QiStatus::InvalidArgument,
         api::GenerateStatus::Failed => QiStatus::GenerationFailed,
+        api::GenerateStatus::Cancelled => QiStatus::GenerationFailed,
     };
 }
 

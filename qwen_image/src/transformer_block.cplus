@@ -1,4 +1,5 @@
 import "./host_buffers" as host_buffers;
+import "./generation_control" as control;
 import "./cpu_ops" as cpu;
 import "./metal_primitives" as metrics;
 import "./mmap_macos" as mapped;
@@ -5956,6 +5957,7 @@ fn run_prompt_trajectory_cache_dit_256_to_host(
     final_latent: *f32,
     threshold: f64 = 0.12f64,
     requested_steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null()
         || !cache_dit_threshold_is_supported(threshold) {
@@ -5974,6 +5976,7 @@ fn run_prompt_trajectory_cache_dit_256_to_host(
         false,
         true,
         threshold,
+        observer: observer,
     );
 }
 
@@ -6029,6 +6032,7 @@ fn run_prompt_trajectory_sized_to_host(
     fixture_directory: str = "tests/fixtures/trajectory_256_fp32",
     q4_eager_expand: bool = false,
     q4_direct_packed: bool = false,
+    observer: control::Observer = control::none(),
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null() {
         io::eprintln("trajectory: sized prompt handoff received a null buffer");
@@ -6055,6 +6059,7 @@ fn run_prompt_trajectory_sized_to_host(
         q4_direct_packed,
         image_width,
         image_height,
+        observer: observer,
     );
 }
 
@@ -6075,6 +6080,7 @@ fn run_conditioned_trajectory_sized_to_host(
     image_width: usize,
     image_height: usize,
     requested_steps: str = "1",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     if text_input.is_null() || prompt_image_mask.is_null()
         || condition_latents.is_null() || condition_shapes.is_null()
@@ -6108,6 +6114,7 @@ fn run_conditioned_trajectory_sized_to_host(
         prompt_image_mask,
         condition_shapes,
         condition_count,
+        observer: observer,
     );
 }
 
@@ -6119,6 +6126,7 @@ fn run_prompt_trajectory_cache_dit_1024_to_host(
     final_latent: *f32,
     threshold: f64 = 0.12f64,
     requested_steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null()
         || !cache_dit_threshold_is_supported(threshold) {
@@ -6138,6 +6146,7 @@ fn run_prompt_trajectory_cache_dit_1024_to_host(
         true,
         threshold,
         1024 as usize,
+        observer: observer,
     );
 }
 
@@ -6149,6 +6158,7 @@ fn run_prompt_trajectory_taylorseer_1024_to_host(
     final_latent: *f32,
     threshold: f64 = 0.24f64,
     requested_steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     if text_input.is_null() || final_latent.is_null()
         || !(threshold == 0.12f64 || threshold == 0.24f64) {
@@ -6169,6 +6179,7 @@ fn run_prompt_trajectory_taylorseer_1024_to_host(
         threshold,
         1024 as usize,
         true,
+        observer: observer,
     );
 }
 
@@ -6451,7 +6462,11 @@ fn run_trajectory_packed_impl(
     native_prompt_image_mask: *u8 = 0 as *u8,
     native_condition_shapes: *LatentShape = 0 as *LatentShape,
     native_condition_count: usize = 0 as usize,
+    observer: control::Observer = control::none(),
 ) -> i32 {
+    if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
+        return 3;
+    }
     if taylorseer_enabled && !cache_dit_enabled {
         io::eprintln("trajectory: TaylorSeer requires Cache-DiT");
         return 2;
@@ -7242,6 +7257,9 @@ fn run_trajectory_packed_impl(
         "trajectory conditioning: rows=${conditioning_rows} gpu_ms=${conditioning_precompute_ms} batched_steps=${step_limit}",
     );
     var step: usize = 0 as usize;
+    if !control::report(observer, control::Phase::Denoising, step, step_limit) {
+        return 3;
+    }
     while step < step_limit {
         let step_pool_pointer: *u8 = rt::alloc_init(#str_ptr("NSAutoreleasePool\0"));
         if step_pool_pointer.is_null() { return 1; }
@@ -7667,6 +7685,9 @@ fn run_trajectory_packed_impl(
             all_ok = finite("trajectory latent step ${completed_step}", latents, latent_count) && all_ok;
         }
         step = step +% (1 as usize);
+        if !control::report(observer, control::Phase::Denoising, step, step_limit) {
+            return 3;
+        }
     }
     if !final_latent.is_null() {
         let latent_values: *f32 = latents.contents() as *f32;

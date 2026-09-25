@@ -2,35 +2,125 @@ import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
 import "facet/component" as component;
+import "facet/image" as image;
+import "facet/label" as label;
+import "facet/mount" as mount;
 import "facet/vocabulary" as vocab;
+import "events/events" as events;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "../current_image" as current_image;
+import "../generation_session" as generation_session;
 import "./style" as style;
 
-struct Preview { _shell: u8 }
+struct Preview {
+    output_sub: events::SignalSubscription[current_image::Change],
+    session_sub: events::SignalSubscription[generation_session::Change],
+}
 
 impl Preview {
-    fn new() -> Preview { return Preview { _shell: 0 as u8 }; }
+    fn new() -> Preview {
+        return Preview {
+            output_sub: events::SignalSubscription[current_image::Change]::none(),
+            session_sub: events::SignalSubscription[generation_session::Change]::none(),
+        };
+    }
+
+    fn output_image(this) -> core::Node {
+        var picture: core::Node = ui::image("", key: "preview:image",
+            fit: vocab::ImageFit::AspectFit)
+            .width_percent(100.0f64)
+            .height_percent(100.0f64);
+        core::set_shown(#addr_of(picture), false);
+        return picture;
+    }
 
     fn empty_canvas(this) -> core::Node {
         var canvas: core::Node = @ui {
-            column(key: "preview:canvas") {
-                label("✦", key: "preview:icon", font_size: 56.0f64,
-                text_color: vocab::Color::ink(0.30f64))
-                label("Your image will appear here", key: "preview:empty",
-                font_size: 19.0f64,
-                font_weight: vocab::FontWeight::Semibold,
-                text_color: vocab::Color::ink(0.80f64))
-                style::secondary("A quiet canvas for the finished image.",
-                "preview:hint")
+            zstack(key: "preview:canvas") {
+                this.output_image()
+                column(key: "preview:empty-state") {
+                    label("✦", key: "preview:icon", font_size: 48.0f64,
+                    text_color: vocab::Color::ink(0.30f64))
+                    label("Your image will appear here", key: "preview:empty",
+                    font_size: 18.0f64,
+                    font_weight: vocab::FontWeight::Semibold,
+                    text_color: vocab::Color::ink(0.80f64))
+                    style::secondary("Start with a prompt and a model.",
+                    "preview:hint")
+                }
+                .width_percent(100.0f64)
+                .height_percent(100.0f64)
+                .align(flex::Align::Center)
+                .justify(flex::Justify::Center)
+                .gap(8.0f64)
             }
             .grow(1.0f64)
             .shrink(1.0f64)
             .align(flex::Align::Center)
             .justify(flex::Justify::Center)
-            .gap(10.0f64)
+            .gap(8.0f64)
         };
         canvas.set_background_color(vocab::Color::sunken());
-        canvas.set_corner_radius(vocab::Corners::all(16.0f64));
+        canvas.set_corner_radius(vocab::Corners::all(14.0f64));
         return canvas;
+    }
+
+    fn refresh(this) {
+        let available: bool = current_image::has_image();
+        match current_image::path() {
+            option::Option::Some(path) => {
+                match image::find("preview:image") {
+                    option::Option[image::Image]::Some(found) => {
+                        let _found: image::Image = found.set_source(path.view());
+                    }
+                    option::Option::None => {}
+                }
+            }
+            option::Option::None => {}
+        }
+        match mount::find("preview:image") {
+            option::Option[*core::Node]::Some(picture) => {
+                core::set_shown(picture, available);
+                if available { core::relayout(picture); }
+            }
+            option::Option::None => {}
+        }
+        match mount::find("preview:empty-state") {
+            option::Option[*core::Node]::Some(empty) => {
+                core::set_shown(empty, !available);
+                if !available { core::relayout(empty); }
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_output(ref this, _change: current_image::Change) {
+        this.refresh();
+    }
+
+    fn refresh_status(this) {
+        let state = generation_session::status_text();
+        match label::find("preview:state") {
+            option::Option[label::Label]::Some(found) => {
+                let _found: label::Label = found.set_text(state.view());
+            }
+            option::Option::None => {}
+        }
+        let elapsed: i64 = generation_session::elapsed_seconds();
+        let elapsed_label: text::Text = if elapsed == (0 as i64)
+            && !generation_session::busy() { "—".to_text() } else { "${elapsed} s" };
+        match label::find("preview:elapsed") {
+            option::Option[label::Label]::Some(found) => {
+                let _found: label::Label = found.set_text(elapsed_label.view());
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_session(ref this, _change: generation_session::Change) {
+        this.refresh_status();
     }
 }
 
@@ -38,30 +128,38 @@ impl Preview: component::Component {
     fn build(ref this) -> core::Node {
         let content: core::Node = @ui {
             column(key: "preview:panel") {
-                hstack {
-                    style::title("Preview", "preview:title")
+                this.empty_canvas()
+                hstack(key: "preview:status-bar") {
+                    style::caption("STATUS", "preview:status-label")
+                    style::secondary("Waiting to generate", "preview:state")
                     spacer().grow(1.0f64)
-                    style::caption("NO OUTPUT YET", "preview:state")
+                    style::caption("ELAPSED", "preview:elapsed-label")
+                    style::secondary("—", "preview:elapsed")
                 }
                 .align(flex::Align::Center)
-                this.empty_canvas()
-                hstack {
-                    style::secondary("PNG output", "preview:format")
-                    spacer().grow(1.0f64)
-                    style::secondary("Nothing generated yet", "preview:footer")
-                }
+                .gap(10.0f64)
             }
             .grow(1.0f64)
             .shrink(1.0f64)
-            .gap(16.0f64)
+            .gap(18.0f64)
         };
-        return style::card(content).grow(1.0f64).shrink(1.0f64);
+        return content;
     }
 }
 
 impl Preview: component::Lifecycle {
-    fn on_attach(ref this, _why: component::Attach) {}
-    fn on_detach(ref this, _why: component::Detach) {}
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        this.output_sub = current_image::watch(this.on_output);
+        this.session_sub = generation_session::watch(this.on_session);
+        this.refresh();
+        this.refresh_status();
+    }
+    fn on_detach(ref this, why: component::Detach) {
+        if why != component::Detach::Unmount { return; }
+        let _cancelled: bool = this.output_sub.cancel();
+        let _session_cancelled: bool = this.session_sub.cancel();
+    }
 }
 
 impl Preview: core::IntoNode {

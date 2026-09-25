@@ -12,11 +12,13 @@ facet         = "*"
 facet_runtime = "*"
 flex_layout   = "*"
 events        = "*"
+qwen_image    = "*"
 
 [macos.dependencies]
 facet_appkit = "*"
 appkit       = "*"
 foundation   = "*"
+metal        = "*"
 objc         = "*"
 quartzcore   = "*"
 webkit       = "*"

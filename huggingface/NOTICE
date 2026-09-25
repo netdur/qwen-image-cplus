@@ -19,7 +19,11 @@ The four-step distilled pack was converted from the full transformer in:
   Viggle/Qwen-Image-2.1-viggle-turbo
   Revision bafc91e4cc934f5fb1406b22496a0bed9b99c548
 
+The processor, text-encoder, and VAE files are unmodified copies from:
+
+  Qwen/Qwen-Image-2.1
+  Revision b3179ad355be050328e483a9dfdd9e60cd62adfa
+
 The distilled model was created and published by Viggle under the Qwen
 Research License. The QIPACK conversion was produced by the
 qwen-image-cplus project.
-

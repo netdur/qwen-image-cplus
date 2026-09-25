@@ -18,7 +18,7 @@
   },
   "artifacts": [
     {
-      "path": "base/qwen-image-2.1-fp16-v4.qipack",
+      "path": "qwen-image-2.1-fp16-v4.qipack",
       "local_source": "models/qwen-image-2.1-all-fp16-v4.qipack",
       "bytes": 14230327296,
       "sha256": "9fe30bcae5678c6e21618d48d9f058fc150ed5b71b7534e5283bb7a05c163750",
@@ -36,7 +36,7 @@
       "verification": "structural validation and exact source round-trip passed"
     },
     {
-      "path": "distilled/qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack",
+      "path": "qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack",
       "local_source": "models/qwen-image-2.1-viggle-turbo-EXPERIMENT-fp16-v4.qipack",
       "bytes": 14230327296,
       "sha256": "d05edecbf9d3e7b03b0e708ae41da5370d5fe245f1d3b5f6775aef18f18857d1",
@@ -54,6 +54,47 @@
       },
       "verification": "structural validation and exact source round-trip passed"
     }
+  ],
+  "support_source": {
+    "repository": "Qwen/Qwen-Image-2.1",
+    "revision": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+    "modifications": "none"
+  },
+  "support_files": [
+    {
+      "path": "processor/vocab.json",
+      "bytes": 2776833,
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    },
+    {
+      "path": "processor/merges.txt",
+      "bytes": 1671853,
+      "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+    },
+    {
+      "path": "text_encoder/model-00001-of-00004.safetensors",
+      "bytes": 4998056552,
+      "sha256": "dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f"
+    },
+    {
+      "path": "text_encoder/model-00002-of-00004.safetensors",
+      "bytes": 4915962464,
+      "sha256": "9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42"
+    },
+    {
+      "path": "text_encoder/model-00003-of-00004.safetensors",
+      "bytes": 4915962496,
+      "sha256": "8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e"
+    },
+    {
+      "path": "text_encoder/model-00004-of-00004.safetensors",
+      "bytes": 2704357976,
+      "sha256": "5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd"
+    },
+    {
+      "path": "vae/diffusion_pytorch_model.safetensors",
+      "bytes": 1350989512,
+      "sha256": "a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417"
+    }
   ]
 }
-

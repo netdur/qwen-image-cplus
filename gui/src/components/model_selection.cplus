@@ -12,15 +12,55 @@ import "../file_drop" as file_drop;
 import "../preferences" as preferences;
 import "./style" as style;
 
-struct ModelSelection { path: text::Text, opaque drop_view: *u8 }
+struct ModelSelection {
+    path: text::Text,
+    error: text::Text,
+    opaque drop_view: *u8,
+}
 
 fn has_model_extension(path: str) -> bool {
     let lower: text::Text = path.to_text().lowercased();
     return lower.view().has_suffix(".qipack");
 }
 
+fn model_root_for_pack(path: str) -> option::Option[text::Text] {
+    guard let option::Option[usize]::Some(index) = path.rfind("/") else {
+        return option::Option[text::Text]::None;
+    };
+    if index == (0 as usize) {
+        return option::Option[text::Text]::Some(text::from_str("/"));
+    }
+    return match path.slice(0 as usize, index) {
+        option::Option[str]::Some(root) =>
+        option::Option[text::Text]::Some(text::from_str(root)),
+        option::Option::None => option::Option[text::Text]::None,
+    };
+}
+
+fn has_support_files(root: str) -> bool {
+    let vocabulary: text::Text = "${root}/processor/vocab.json";
+    let merges: text::Text = "${root}/processor/merges.txt";
+    let text_1: text::Text = "${root}/text_encoder/model-00001-of-00004.safetensors";
+    let text_2: text::Text = "${root}/text_encoder/model-00002-of-00004.safetensors";
+    let text_3: text::Text = "${root}/text_encoder/model-00003-of-00004.safetensors";
+    let text_4: text::Text = "${root}/text_encoder/model-00004-of-00004.safetensors";
+    let vae: text::Text = "${root}/vae/diffusion_pytorch_model.safetensors";
+    return file_drop::is_regular_file(vocabulary.view())
+        && file_drop::is_regular_file(merges.view())
+        && file_drop::is_regular_file(text_1.view())
+        && file_drop::is_regular_file(text_2.view())
+        && file_drop::is_regular_file(text_3.view())
+        && file_drop::is_regular_file(text_4.view())
+        && file_drop::is_regular_file(vae.view());
+}
+
 fn is_model_file(path: str) -> bool {
-    return file_drop::is_regular_file(path) && has_model_extension(path);
+    if !file_drop::is_regular_file(path) || !has_model_extension(path) {
+        return false;
+    }
+    guard let option::Option[text::Text]::Some(root) = model_root_for_pack(path)
+        else { return false; };
+    return has_support_files(root.view());
 }
 
 fn selected_name(path: str) -> text::Text {
@@ -45,11 +85,19 @@ impl ModelSelection {
             option::Option[text::Text]::Some(saved) => saved,
             option::Option::None => text::new(),
         };
-        return ModelSelection { path: path, drop_view: 0 as *u8 };
+        let error: text::Text = if path.count() > (0 as usize)
+            && !is_model_file(path.view()) {
+            text::from_str("Model folder is missing required files")
+        } else { text::new() };
+        return ModelSelection {
+            path: path, error: error, drop_view: 0 as *u8,
+        };
     }
 
     fn selected_label(this) -> core::Node {
-        let name: text::Text = selected_name(this.path.view());
+        let name: text::Text = if this.error.count() > (0 as usize) {
+            this.error.clone()
+        } else { selected_name(this.path.view()) };
         var display: core::Node = style::secondary(name.view(), "model:selected");
         if this.path.count() > (0 as usize) {
             core::set_tooltip(#addr_of(display), this.path.view());
@@ -58,7 +106,9 @@ impl ModelSelection {
     }
 
     fn refresh(this) {
-        let name: text::Text = selected_name(this.path.view());
+        let name: text::Text = if this.error.count() > (0 as usize) {
+            this.error.clone()
+        } else { selected_name(this.path.view()) };
         match label::find("model:selected") {
             option::Option[label::Label]::Some(display) => {
                 let _display: label::Label = display.set_text(name.view());
@@ -76,9 +126,14 @@ impl ModelSelection {
     fn on_choose(ref this, _sender: *u8) {
         match runtime::choose_file() {
             option::Option[text::Text]::Some(path) => {
-                if !is_model_file(path.view()) { return; }
+                if !is_model_file(path.view()) {
+                    this.error = text::from_str("Model folder is missing required files");
+                    this.refresh();
+                    return;
+                }
                 if !preferences::save_model_path(path.view()) { return; }
                 this.path = path;
+                this.error = text::new();
                 this.refresh();
             }
             option::Option::None => {}
@@ -90,6 +145,7 @@ impl ModelSelection {
         if !commit { return true; }
         if !preferences::save_model_path(path.view()) { return false; }
         this.path = path.clone();
+        this.error = text::new();
         this.refresh();
         return true;
     }
@@ -155,4 +211,18 @@ fn model_drop_accepts_qipack_extension_only() {
     assert has_model_extension("/tmp/model.QIPACK");
     assert !has_model_extension("/tmp/model.safetensors");
     assert !is_model_file("/nonexistent/model.qipack");
+}
+
+#[test]
+fn model_root_is_the_pack_parent_folder() {
+    match model_root_for_pack("/models/qwen-image.qipack") {
+        option::Option[text::Text]::Some(root) => {
+            assert root.view() == "/models";
+        }
+        option::Option::None => { assert false; }
+    }
+    match model_root_for_pack("qwen-image.qipack") {
+        option::Option::None => {}
+        option::Option::Some(_) => { assert false; }
+    }
 }

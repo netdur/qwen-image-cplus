@@ -2,26 +2,212 @@ import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
 import "facet/component" as component;
+import "facet/button" as button;
+import "facet/mount" as mount;
+import "facet/popup" as popup;
 import "facet/scroll" as scroll;
+import "facet/text_area" as text_area;
+import "facet/text_field" as text_field;
 import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "events/events" as events;
+import "qwen_image/api" as api;
+import "qwen_image/generation_worker" as worker;
+import "stdlib/fs" as fs;
 import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
+import "../generation_session" as generation_session;
+import "../preferences" as preferences;
 import "./style" as style;
 import "./prompt" as prompt;
 import "./references" as references;
 import "./output_options" as output_options;
 import "./model_selection" as model_selection;
 
-struct Compose { _shell: u8 }
+extern fn getpid() -> i32;
+extern fn arc4random() -> u32;
+
+static NEXT_OUTPUT: u64 = 1 as u64;
+
+struct Compose {
+    session_sub: events::SignalSubscription[generation_session::Change],
+}
 
 impl Compose {
-    fn new() -> Compose { return Compose { _shell: 0 as u8 }; }
+    fn new() -> Compose {
+        return Compose {
+            session_sub: events::SignalSubscription[generation_session::Change]::none(),
+        };
+    }
 
-    fn create_button(this) -> core::Node {
+    fn create_button(ref this) -> core::Node {
         var action: core::Node = ui::icon_button("sparkles",
         key: "compose:create", bordered: true,
+        on_clicked: this.on_create,
         corner_radius: vocab::Corners::all(10.0f64));
-        core::set_enabled(#addr_of(action), false);
+        core::set_accessibility_label(#addr_of(action), "Create image");
         return action.width(36.0f64).height(36.0f64);
+    }
+
+    fn cancel_button(ref this) -> core::Node {
+        var action: core::Node = ui::button("Cancel", key: "compose:cancel",
+            bordered: true, on_click: this.on_cancel)
+            .width(72.0f64).height(36.0f64);
+        core::set_shown(#addr_of(action), false);
+        return action;
+    }
+
+    fn refresh(this) {
+        let running: bool = generation_session::busy();
+        match mount::find("compose:create") {
+            option::Option[*core::Node]::Some(node) => {
+                core::set_enabled(node, !running);
+            }
+            option::Option::None => {}
+        }
+        match mount::find("compose:cancel") {
+            option::Option[*core::Node]::Some(node) => {
+                core::set_shown(node, running);
+                core::relayout(node);
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_session(ref this, _change: generation_session::Change) {
+        this.refresh();
+    }
+
+    fn next_output_path(this, folder: str) -> text::Text {
+        loop {
+            let nonce: u64 = NEXT_OUTPUT;
+            NEXT_OUTPUT = NEXT_OUTPUT +% (1 as u64);
+            let path: text::Text =
+                "${folder}/qwen-image-${time::now_millis()}-${getpid()}-${nonce}.png";
+            match fs::metadata(path.view()) {
+                result::Result::Ok(_) => {}
+                result::Result::Err(_) => { return path; }
+            }
+        }
+    }
+
+    fn parse_seed(this, value: str) -> u64 {
+        var seed: u64 = 0 as u64;
+        var index: usize = 0 as usize;
+        while index < value.count() {
+            let digit: u64 = match value.byte_at(index) {
+                option::Option[u8]::Some(byte) => (byte -% (48 as u8)) as u64,
+                option::Option::None => 0 as u64,
+            };
+            seed = seed *% (10 as u64) +% digit;
+            index = index +% (1 as usize);
+        }
+        return seed;
+    }
+
+    fn on_create(ref this, _sender: *u8) {
+        guard let option::Option[text_area::TextArea]::Some(prompt_field) =
+            text_area::find("prompt:input") else { return; };
+        let prompt_text: str = prompt_field.text();
+        if prompt_text.count() == (0 as usize) {
+            runtime::alert("Prompt needed", "Write a prompt before creating an image.", "OK");
+            return;
+        }
+        guard let option::Option[text::Text]::Some(pack) =
+            preferences::load_model_path() else {
+            runtime::alert("Model needed", "Select a model file first.", "OK");
+            return;
+        };
+        if !model_selection::is_model_file(pack.view()) {
+            runtime::alert("Model unavailable",
+                "The selected model or its support files are missing.", "OK");
+            return;
+        }
+        guard let option::Option[text::Text]::Some(model_root) =
+            model_selection::model_root_for_pack(pack.view()) else { return; };
+        guard let option::Option[text_field::TextField]::Some(width_field) =
+            text_field::find("settings:width") else { return; };
+        guard let option::Option[text_field::TextField]::Some(height_field) =
+            text_field::find("settings:height") else { return; };
+        guard let option::Option[i64]::Some(width) = width_field.text().to_i64()
+            else { return; };
+        guard let option::Option[i64]::Some(height) = height_field.text().to_i64()
+            else { return; };
+        if !preferences::valid_dimension(width) || !preferences::valid_dimension(height) {
+            runtime::alert("Unsupported size",
+                "Use width and height of at least 256, in multiples of 32.", "OK");
+            return;
+        }
+        guard let option::Option[popup::Popup]::Some(steps_field) =
+            popup::find("settings:steps") else { return; };
+        let steps: i64 = preferences::step_value(steps_field.selected_index());
+        if width == (256 as i64) && height == (256 as i64)
+            && steps != (25 as i64) && steps != (40 as i64) {
+            runtime::alert("Unsupported step count",
+                "256 × 256 generation requires 25 or 40 steps.", "OK");
+            return;
+        }
+        let saved: preferences::GenerationPreferences = preferences::load();
+        let images = references::snapshot();
+        let cache: api::CacheMode = match saved.cache_mode {
+            2 => api::CacheMode::TaylorSeer,
+            3 => api::CacheMode::CacheDiT,
+            _ => api::CacheMode::None,
+        };
+        if images.count() > (0 as usize) &&
+            (width != height ||
+             (width != (512 as i64) && width != (1024 as i64)) ||
+             cache != api::CacheMode::None) {
+            runtime::alert("Unsupported reference settings",
+                "References require 512 or 1024 square output with cache off.", "OK");
+            return;
+        }
+        if cache != api::CacheMode::None &&
+            (width != height ||
+             (width != (256 as i64) && width != (1024 as i64)) ||
+             (width == (256 as i64) && cache == api::CacheMode::TaylorSeer)) {
+            runtime::alert("Unsupported cache settings",
+                "This cache mode is unavailable for the selected size.", "OK");
+            return;
+        }
+        let seed: u64 = if saved.random_seed {
+            (arc4random() as u64) *% (4294967296 as u64)
+                +% (arc4random() as u64)
+        } else {
+            guard let option::Option[text_field::TextField]::Some(seed_field) =
+                text_field::find("settings:seed") else { return; };
+            if !preferences::valid_seed(seed_field.text()) {
+                runtime::alert("Invalid seed", "Enter a valid whole-number seed.", "OK");
+                return;
+            }
+            this.parse_seed(seed_field.text())
+        };
+        let folder: text::Text = preferences::effective_output_folder();
+        let request: worker::Request = worker::Request {
+            packed_path: pack,
+            model_root: model_root,
+            output_path: this.next_output_path(folder.view()),
+            prompt: prompt_text.to_text(),
+            image_paths: images,
+            width: width as usize,
+            height: height as usize,
+            steps: steps as usize,
+            seed: seed,
+            cache: cache,
+            cache_threshold: preferences::cache_threshold_value(
+                saved.cache_mode, saved.cache_threshold),
+        };
+        if !generation_session::start(request) {
+            runtime::alert("Could not start generation",
+                "The generation worker is unavailable or already busy.", "OK");
+        }
+    }
+
+    fn on_cancel(ref this, _sender: *u8) {
+        let _cancelled: bool = generation_session::cancel();
     }
 }
 
@@ -32,6 +218,7 @@ impl Compose: component::Component {
                 hstack {
                     style::title("Create", "compose:title")
                     spacer().grow(1.0f64)
+                    this.cancel_button()
                     this.create_button()
                 }
                 .align(flex::Align::Center)
@@ -65,8 +252,15 @@ impl Compose: component::Component {
 }
 
 impl Compose: component::Lifecycle {
-    fn on_attach(ref this, _why: component::Attach) {}
-    fn on_detach(ref this, _why: component::Detach) {}
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        this.session_sub = generation_session::watch(this.on_session);
+        this.refresh();
+    }
+    fn on_detach(ref this, why: component::Detach) {
+        if why != component::Detach::Unmount { return; }
+        let _cancelled: bool = this.session_sub.cancel();
+    }
 }
 
 impl Compose: core::IntoNode {

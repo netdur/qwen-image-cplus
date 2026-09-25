@@ -5,6 +5,7 @@
 // denoiser's image prefix. DeepStack features are layer-major across images.
 
 import "./image_conditioning" as conditioning;
+import "./generation_control" as control;
 import "./image_input" as image_input;
 import "./host_buffers" as host_buffers;
 import "./image_output" as image_output;
@@ -44,6 +45,7 @@ fn encode_images(
     image_paths: *str,
     image_count: usize,
     output_resolution: usize = 512 as usize,
+    observer: control::Observer = control::none(),
 ) -> option::Option[Encoded] {
     if !conditioning::reference_count_supported(image_count) {
         io::eprintln("multimodal conditioning: reference image count must be 1 through 10");
@@ -66,6 +68,9 @@ fn encode_images(
         vec::Vec[image_input::Image]::with_capacity(image_count);
     var image_index: usize = 0 as usize;
     while image_index < image_count {
+        if !control::report(observer, control::Phase::EncodingReferences, image_index, image_count) {
+            return option::Option[Encoded]::None;
+        }
         let input_start_ms: i64 = time::now_millis();
         guard let option::Option[image_input::Image]::Some(image) =
             image_input::load_resized(image_paths[image_index], output_resolution) else {
@@ -135,6 +140,9 @@ fn encode_images(
         image_index = image_index +% (1 as usize);
     }
     let vision_start_ms: i64 = time::now_millis();
+    if !control::report(observer, control::Phase::EncodingReferences, image_count, image_count) {
+        return option::Option[Encoded]::None;
+    }
     if vision_encoder::encode_batch_to_host(
         model_root, #slice_ptr(vision_inputs.as_slice()), image_count,
     ) != (0 as i32) { return option::Option[Encoded]::None; }
@@ -150,6 +158,9 @@ fn encode_images(
     vae_ms = time::now_millis() - vae_start_ms;
 
     let text_start_ms: i64 = time::now_millis();
+    if !control::report(observer, control::Phase::EncodingText, 0 as usize, 0 as usize) {
+        return option::Option[Encoded]::None;
+    }
     guard let option::Option[vec::Vec[u32]]::Some(tokens) =
         tokenizer::tokenize_full_prompt_with_images(
             model_root, prompt, #slice_ptr(image_token_counts.as_slice()), image_count,
@@ -300,7 +311,11 @@ fn run_multi_image_transformer(
     output_path: str = "",
     seed: u64 = 1301 as u64,
     output_resolution: usize = 512 as usize,
+    observer: control::Observer = control::none(),
 ) -> i32 {
+    if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
+        return 3;
+    }
     if output_resolution != (512 as usize) && output_resolution != (1024 as usize) {
         io::eprintln("multi-image transformer: output resolution must be 512 or 1024");
         return 2;
@@ -317,8 +332,13 @@ fn run_multi_image_transformer(
     }
     let started_ms: i64 = time::now_millis();
     guard let option::Option[Encoded]::Some(encoded) = encode_images(
-        model_root, prompt, image_paths, image_count, output_resolution,
-    ) else { return 1; };
+        model_root, prompt, image_paths, image_count, output_resolution, observer,
+    ) else {
+        if !control::report(observer, control::Phase::EncodingReferences, 0 as usize, image_count) {
+            return 3;
+        }
+        return 1;
+    };
     var shapes: vec::Vec[transformer::LatentShape] =
         vec::Vec[transformer::LatentShape]::with_capacity(image_count);
     let condition_shapes: *conditioning::Shape = #slice_ptr(encoded.shapes.as_slice());
@@ -362,11 +382,13 @@ fn run_multi_image_transformer(
         output_resolution,
         output_resolution,
         requested_steps,
+        observer,
     );
     let transformer_ms: i64 = time::now_millis() - transformer_start_ms;
     host_buffers::dump_f32(
         "final_latent.f32", #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
     );
+    if result == (3 as i32) { return 3; }
     if result != (0 as i32) || !finite_nonzero(
         #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
     ) {
@@ -374,6 +396,9 @@ fn run_multi_image_transformer(
         return 1;
     }
     if output_path.count() > (0 as usize) {
+        if !control::report(observer, control::Phase::Decoding, 0 as usize, 0 as usize) {
+            return 3;
+        }
         guard let option::Option[vec::Vec[f32]]::Some(decoded) = host_buffers::zeroed_f32(
             output_resolution *% output_resolution *% (4 as usize),
         ) else { return 1; };
@@ -397,6 +422,9 @@ fn run_multi_image_transformer(
         }
         let vae_ms: i64 = time::now_millis() - vae_start_ms;
         let output_start_ms: i64 = time::now_millis();
+        if !control::report(observer, control::Phase::WritingPng, 0 as usize, 0 as usize) {
+            return 3;
+        }
         if !image_output::write_png_sized(
             #slice_ptr(decoded.as_slice()), output_path, output_resolution, output_resolution,
         ) {

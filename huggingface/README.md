@@ -20,16 +20,26 @@ tags:
 [`qwen-image-cplus`](https://github.com/netdur/qwen-image-cplus), a native C+
 and Metal Qwen-Image-2.1 inference runtime for Apple Silicon.
 
-This repository contains converted transformer weights, not a complete
-Qwen-Image pipeline. The processor, text encoder, VAE, tokenizer, and scheduler
-files still come from the pinned upstream Qwen snapshot.
+This repository contains the converted transformer weights and the unmodified
+processor, text encoder, and VAE files needed by `qwen-image-cplus`. All files
+come from the pinned upstream Qwen snapshot except the distilled transformer,
+which comes from the pinned Viggle snapshot. The runtime provides the scheduler.
 
 ## Files
 
 | File | Source | Default generation policy | SHA-256 |
 | --- | --- | --- | --- |
-| `base/qwen-image-2.1-fp16-v4.qipack` | `Qwen/Qwen-Image-2.1` at `b3179ad355be050328e483a9dfdd9e60cd62adfa` | 40 steps, TaylorSeer | `9fe30bcae5678c6e21618d48d9f058fc150ed5b71b7534e5283bb7a05c163750` |
-| `distilled/qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack` | `Viggle/Qwen-Image-2.1-viggle-turbo` at `bafc91e4cc934f5fb1406b22496a0bed9b99c548` | 4 steps, no cache, unstretched schedule | `d05edecbf9d3e7b03b0e708ae41da5370d5fe245f1d3b5f6775aef18f18857d1` |
+| `qwen-image-2.1-fp16-v4.qipack` | `Qwen/Qwen-Image-2.1` at `b3179ad355be050328e483a9dfdd9e60cd62adfa` | 40 steps, TaylorSeer | `9fe30bcae5678c6e21618d48d9f058fc150ed5b71b7534e5283bb7a05c163750` |
+| `qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack` | `Viggle/Qwen-Image-2.1-viggle-turbo` at `bafc91e4cc934f5fb1406b22496a0bed9b99c548` | 4 steps, no cache, unstretched schedule | `d05edecbf9d3e7b03b0e708ae41da5370d5fe245f1d3b5f6775aef18f18857d1` |
+
+Both packs share `processor/vocab.json`, `processor/merges.txt`, four
+`text_encoder/model-*.safetensors` shards, and
+`vae/diffusion_pytorch_model.safetensors` in this repository's root directory.
+Their sizes and checksums are recorded in `manifest.json`. The files remain in
+those paths when downloaded, so selecting either root-level QIPACK in the GUI
+also locates its support files. One 14.23 GB pack plus the 18.89 GB shared
+support files requires about 33.12 GB of local storage. “7B” describes the
+transformer's parameter count, not the complete pipeline's size in bytes.
 
 The distilled file is specifically the Viggle v0.1 four-step full transformer,
 not its LoRA and not the newer v0.2.1 six-step release.
@@ -45,7 +55,6 @@ round-trip verification against their source tensors.
 
 - macOS 14 or newer on Apple Silicon
 - [`qwen-image-cplus`](https://github.com/netdur/qwen-image-cplus) v0.0.1 or newer
-- A local copy of the non-transformer files from the pinned Qwen snapshot
 
 The runtime has been tested on an M1 Max with 32 GB unified memory. Lower-memory
 machines have not yet been validated. Generation at 1024x1024 is supported;
@@ -53,21 +62,11 @@ the model's native 2048x2048 path is not yet supported by this runtime.
 
 ## Download
 
-Install the Hugging Face CLI, accept any upstream license terms, and download
-this repository:
+Install the Hugging Face CLI, accept the model license, and download this
+repository into one directory:
 
 ```sh
-hf download netdur/Qwen-Image-2.1-QIPACK --local-dir models/qipack
-```
-
-Then download the remaining pipeline components without duplicating the
-upstream transformer:
-
-```sh
-hf download Qwen/Qwen-Image-2.1 \
-  --revision b3179ad355be050328e483a9dfdd9e60cd62adfa \
-  --exclude "transformer/*" \
-  --local-dir models/qwen-image-2.1-support
+hf download netdur/Qwen-Image-2.1-QIPACK --local-dir models
 ```
 
 ## Use
@@ -76,8 +75,8 @@ Base model, using the pack's 40-step TaylorSeer defaults:
 
 ```sh
 qwen-image-cplus generate-1024 \
-  models/qipack/base/qwen-image-2.1-fp16-v4.qipack \
-  models/qwen-image-2.1-support \
+  models/qwen-image-2.1-fp16-v4.qipack \
+  models \
   output.png \
   "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET'" \
   1301
@@ -87,8 +86,8 @@ Four-step distilled model:
 
 ```sh
 qwen-image-cplus generate-1024 \
-  models/qipack/distilled/qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack \
-  models/qwen-image-2.1-support \
+  models/qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack \
+  models \
   output.png \
   "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET'" \
   1301
@@ -120,4 +119,3 @@ distilled source model was created by Viggle and is separately attributed in
 
 The runtime source code has its own MIT license; that license does not replace
 or relax the model license.
-

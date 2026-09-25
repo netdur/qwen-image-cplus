@@ -2,26 +2,69 @@ import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
 import "facet/component" as component;
+import "facet/button" as button;
 import "facet/screen" as screen;
 import "facet/split" as split;
 import "facet/text_area" as text_area;
 import "facet/vocabulary" as vocab;
 import "facet/window_chrome" as _;
 import "facet_runtime/runtime" as runtime;
+import "events/events" as events;
 import "appkit/appkit" as ak;
+import "foundation/foundation" as foundation;
 import "stdlib/option" as option;
+import "stdlib/fs" as fs;
+import "stdlib/result" as result;
 import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 import "../components/style" as style;
 import "../components/compose" as compose;
 import "../components/preview" as preview;
+import "../current_image" as current_image;
 
-struct Generation { did_initial_focus: bool }
+extern fn getpid() -> i32;
+
+fn copy_png_to(source: str, destination: str) -> bool {
+    if source == destination { return true; }
+    guard let option::Option[foundation::Data]::Some(data) =
+        foundation::Data::data_with_contents_of_file(source) else { return false; };
+    return data.write_to_file(destination, true);
+}
+
+struct Generation {
+    did_initial_focus: bool,
+    output_sub: events::SignalSubscription[current_image::Change],
+}
 
 impl Generation {
-    fn new() -> Generation { return Generation { did_initial_focus: false }; }
+    fn new() -> Generation {
+        return Generation {
+            did_initial_focus: false,
+            output_sub: events::SignalSubscription[current_image::Change]::none(),
+        };
+    }
 
-    fn header(this) -> core::Node {
+    fn edit_button(ref this) -> core::Node {
+        var action: core::Node = ui::button("Edit", key: "generation:edit",
+            bordered: true, corner_radius: vocab::Corners::all(8.0f64),
+            font_size: 13.0f64, on_click: this.on_edit)
+            .width(68.0f64).height(32.0f64);
+        core::set_enabled(#addr_of(action), current_image::has_image());
+        return action;
+    }
+
+    fn save_button(ref this) -> core::Node {
+        var action: core::Node = ui::button("Save", key: "generation:save",
+            bordered: true, corner_radius: vocab::Corners::all(8.0f64),
+            font_size: 13.0f64, on_click: this.on_save)
+            .width(68.0f64).height(32.0f64);
+        core::set_enabled(#addr_of(action), current_image::has_image());
+        return action;
+    }
+
+    fn header(ref this) -> core::Node {
         return @ui {
             hstack(key: "generation:header") {
                 column {
@@ -31,16 +74,61 @@ impl Generation {
                     style::secondary("Local image studio", "brand:subtitle")
                 }
                 .gap(2.0f64)
-                spacer().grow(1.0f64)
-                style::caption("INTERFACE PREVIEW", "header:state")
+                .window_drag()
+                spacer().grow(1.0f64).window_drag()
+                this.edit_button()
+                this.save_button()
             }
             .align(flex::Align::Center)
             .gap(13.0f64)
             .height(64.0f64)
             .shrink(0.0f64)
             .padding_edge(flex::Edge::Horizontal, 24.0f64)
-            .window_drag()
         };
+    }
+
+    fn refresh_actions(this) {
+        let available: bool = current_image::has_image();
+        match button::find("generation:edit") {
+            option::Option[button::Button]::Some(found) => {
+                let _found: button::Button = found.set_enabled(available);
+            }
+            option::Option::None => {}
+        }
+        match button::find("generation:save") {
+            option::Option[button::Button]::Some(found) => {
+                let _found: button::Button = found.set_enabled(available);
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_output(ref this, _change: current_image::Change) {
+        this.refresh_actions();
+    }
+
+    fn on_edit(ref this, _sender: *u8) {
+        let _sent: bool = current_image::edit();
+    }
+
+    fn on_save(ref this, _sender: *u8) {
+        guard let option::Option[text::Text]::Some(source) =
+            current_image::path() else { return; };
+        let panel: ak::SavePanel = ak::SavePanel::save_panel();
+        panel.set_title("Save Image");
+        panel.set_prompt("Save");
+        panel.set_name_field_string_value("Qwen Image.png");
+        var types: vec::Vec[text::Text] = vec::new::[text::Text]();
+        let _added: status::Status = types.append("png".to_text());
+        panel.set_allowed_file_types(types);
+        if panel.run_modal() != (1 as i64) { return; }
+        guard let option::Option[ak::URL]::Some(url) = panel.u_r_l() else { return; };
+        guard let option::Option[text::Text]::Some(destination) =
+            foundation::URL::from_raw(url.raw()).path() else { return; };
+        if !copy_png_to(source.view(), destination.view()) {
+            runtime::alert("Could not save image",
+            "The image could not be copied to the chosen location.", "OK");
+        }
     }
 
     fn on_menu_settings(this, _sender: *u8) {
@@ -83,9 +171,6 @@ impl Generation: component::Component {
                     this.header()
                     column(key: "generation:preview-body") {
                         preview::preview()
-                        style::secondary(
-                            "Inputs are editable · generation is not connected",
-                            "status:message")
                     }
                     .grow(1.0f64)
                     .shrink(1.0f64)
@@ -106,6 +191,11 @@ impl Generation: component::Component {
 
 impl Generation: component::Lifecycle {
     fn on_attach(ref this, why: component::Attach) {
+        if why == component::Attach::Mount {
+            this.output_sub = current_image::watch(this.on_output);
+            this.refresh_actions();
+            return;
+        }
         if why != component::Attach::Active || this.did_initial_focus { return; }
         match text_area::find("prompt:input") {
             option::Option[text_area::TextArea]::Some(input) => {
@@ -129,7 +219,10 @@ impl Generation: component::Lifecycle {
             option::Option::None => {}
         }
     }
-    fn on_detach(ref this, _why: component::Detach) {}
+    fn on_detach(ref this, why: component::Detach) {
+        if why != component::Detach::Unmount { return; }
+        let _cancelled: bool = this.output_sub.cancel();
+    }
 }
 
 impl Generation: screen::Screen {
@@ -145,4 +238,24 @@ impl Generation: screen::Screen {
 
 fn boxed() -> screen::ScreenBox {
     return screen::screen_box::[Generation](Generation::new());
+}
+
+#[test]
+fn save_copy_replaces_destination_without_changing_output() {
+    let nonce: text::Text = "${getpid()}-${time::now_millis()}";
+    let source: text::Text = "/tmp/qwen-image-gui-save-${nonce}-source.png";
+    let destination: text::Text = "/tmp/qwen-image-gui-save-${nonce}-destination.png";
+    let _source_written = fs::write_string(source, "new png bytes");
+    let _destination_written = fs::write_string(destination, "old bytes");
+    assert copy_png_to(source, destination);
+    match fs::read_to_string(destination) {
+        result::Result::Ok(value) => { assert value.view() == "new png bytes"; }
+        result::Result::Err(_) => { assert false; }
+    }
+    match fs::read_to_string(source) {
+        result::Result::Ok(value) => { assert value.view() == "new png bytes"; }
+        result::Result::Err(_) => { assert false; }
+    }
+    let _removed_source = fs::remove_file(source);
+    let _removed_destination = fs::remove_file(destination);
 }

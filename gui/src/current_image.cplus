@@ -1,0 +1,104 @@
+import "events/events" as events;
+import "stdlib/option" as option;
+import "stdlib/fs" as fs;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
+import "./file_drop" as file_drop;
+
+struct Change { available: bool }
+
+struct CurrentImage {
+    path: text::Text,
+    changes: events::Signal[Change],
+    edits: events::Signal[text::Text],
+    live: bool,
+}
+
+static CURRENT: CurrentImage = #zero::[CurrentImage]();
+
+extern fn getpid() -> i32;
+
+fn ensure() {
+    if CURRENT.live { return; }
+    CURRENT.path = text::new();
+    CURRENT.changes = events::Signal[Change]::new();
+    CURRENT.edits = events::Signal[text::Text]::new();
+    CURRENT.live = true;
+}
+
+fn has_image() -> bool {
+    ensure();
+    return CURRENT.path.count() > (0 as usize);
+}
+
+fn path() -> option::Option[text::Text] {
+    ensure();
+    if CURRENT.path.count() == (0 as usize) {
+        return option::Option[text::Text]::None;
+    }
+    return option::Option[text::Text]::Some(CURRENT.path.clone());
+}
+
+fn set_png(path_value: str) -> bool {
+    let lower: text::Text = path_value.to_text().lowercased();
+    if !lower.view().has_suffix(".png") || !file_drop::is_regular_file(path_value) {
+        return false;
+    }
+    ensure();
+    CURRENT.path = path_value.to_text();
+    CURRENT.changes.emit(Change { available: true });
+    return true;
+}
+
+fn clear() {
+    ensure();
+    CURRENT.path = text::new();
+    CURRENT.changes.emit(Change { available: false });
+}
+
+fn edit() -> bool {
+    ensure();
+    if CURRENT.path.count() == (0 as usize) { return false; }
+    CURRENT.edits.emit(CURRENT.path.clone());
+    return true;
+}
+
+fn watch(f: fn(Change, *u8), ctx: *u8 = 0 as *u8)
+        -> events::SignalSubscription[Change] {
+    ensure();
+    return CURRENT.changes.on(f, ctx: ctx);
+}
+
+fn watch_edit(f: fn(text::Text, *u8), ctx: *u8 = 0 as *u8)
+        -> events::SignalSubscription[text::Text] {
+    ensure();
+    return CURRENT.edits.on(f, ctx: ctx);
+}
+
+struct EditCapture { count: usize, path: text::Text }
+
+fn capture_edit(path_value: text::Text, raw: *u8) {
+    let capture: *EditCapture = raw as *EditCapture;
+    { (*capture).count = (*capture).count +% (1 as usize); }
+    { (*capture).path = path_value.clone(); }
+}
+
+#[test]
+fn current_png_enables_edit_and_delivers_the_path() {
+    let path_value: text::Text =
+        "/tmp/qwen-image-gui-current-${getpid()}-${time::now_millis()}.png";
+    let _written = fs::write_string(path_value.view(), "png bytes");
+    clear();
+    var capture: EditCapture = EditCapture { count: 0 as usize, path: text::new() };
+    let subscription = watch_edit(capture_edit, #addr_of(capture) as *u8);
+    assert !edit();
+    assert set_png(path_value.view());
+    assert has_image();
+    assert edit();
+    assert capture.count == (1 as usize);
+    assert capture.path.view() == path_value.view();
+    clear();
+    assert !has_image();
+    let _removed = fs::remove_file(path_value.view());
+}

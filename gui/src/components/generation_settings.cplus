@@ -1,0 +1,185 @@
+import "flex_layout/flex_layout" as flex;
+import "facet/facet" as core;
+import "facet/elements" as ui;
+import "facet/component" as component;
+import "facet/label" as label;
+import "facet/popup" as popup;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "../preferences" as preferences;
+import "./style" as style;
+
+struct GenerationSettings { _shell: u8 }
+
+impl GenerationSettings {
+    fn new() -> GenerationSettings {
+        return GenerationSettings { _shell: 0 as u8 };
+    }
+
+    fn cache_modes(this) -> vocab::TextList {
+        var choices: vocab::TextList = vocab::TextList::new();
+        let _default: status::Status = choices.add("Model default");
+        let _off: status::Status = choices.add("Off");
+        let _taylorseer: status::Status = choices.add("TaylorSeer");
+        let _cache_dit: status::Status = choices.add("Cache-DiT");
+        return choices;
+    }
+
+    fn thresholds(this) -> vocab::TextList {
+        var choices: vocab::TextList = vocab::TextList::new();
+        let _default: status::Status = choices.add("Recommended");
+        let _low: status::Status = choices.add("0.12");
+        let _middle_low: status::Status = choices.add("0.14");
+        let _middle_high: status::Status = choices.add("0.16");
+        let _high: status::Status = choices.add("0.24");
+        return choices;
+    }
+
+    fn set_threshold_enabled(ref this, mode: i64) {
+        match popup::find("settings:cache-threshold") {
+            option::Option[popup::Popup]::Some(field) => {
+                let _field: popup::Popup = field.set_enabled(mode != (1 as i64));
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_cache_mode_changed(ref this, _sender: *u8) {
+        match popup::find("settings:cache-mode") {
+            option::Option[popup::Popup]::Some(field) => {
+                let mode: i64 = field.selected_index();
+                if preferences::save_cache_mode(mode) {
+                    this.set_threshold_enabled(mode);
+                }
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_threshold_changed(ref this, _sender: *u8) {
+        match popup::find("settings:cache-threshold") {
+            option::Option[popup::Popup]::Some(field) => {
+                let _saved: bool =
+                    preferences::save_cache_threshold(field.selected_index());
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn folder_label(this, path: str) -> text::Text {
+        if path.count() == (0 as usize) {
+            return text::from_str("/tmp (default)");
+        }
+        return text::from_str(path);
+    }
+
+    fn refresh_folder(ref this) {
+        let saved: preferences::GenerationPreferences = preferences::load();
+        let name: text::Text = this.folder_label(saved.output_folder.view());
+        match label::find("settings:output-folder:path") {
+            option::Option[label::Label]::Some(display) => {
+                let _display: label::Label = display.set_text(name.view());
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_choose_folder(ref this, _sender: *u8) {
+        match runtime::choose_directory() {
+            option::Option[text::Text]::Some(path) => {
+                if preferences::save_output_folder(path.view()) {
+                    this.refresh_folder();
+                }
+            }
+            option::Option::None => {}
+        }
+    }
+
+    fn on_use_temporary(ref this, _sender: *u8) {
+        preferences::reset_output_folder();
+        this.refresh_folder();
+    }
+}
+
+impl GenerationSettings: component::Component {
+    fn build(ref this) -> core::Node {
+        let saved: preferences::GenerationPreferences = preferences::load();
+        let folder: text::Text = this.folder_label(saved.output_folder.view());
+        return @ui {
+            column(key: "settings:generation") {
+                style::card(@ui {
+                    column(key: "settings:cache") {
+                        style::caption("CACHE", "settings:cache:title")
+                        hstack {
+                            column {
+                                style::secondary("Mode", "settings:cache-mode:label")
+                                popup("Cache mode", key: "settings:cache-mode",
+                                items: this.cache_modes(),
+                                selected_index: saved.cache_mode,
+                                on_selected_index_changed: this.on_cache_mode_changed)
+                            }
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .gap(8.0f64)
+                            column {
+                                style::secondary("Threshold", "settings:cache-threshold:label")
+                                popup("Cache threshold", key: "settings:cache-threshold",
+                                items: this.thresholds(),
+                                selected_index: saved.cache_threshold,
+                                on_selected_index_changed: this.on_threshold_changed)
+                            }
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .gap(8.0f64)
+                        }
+                        .gap(16.0f64)
+                        style::secondary(
+                            "Recommended: 0.24 for TaylorSeer, 0.16 for Cache-DiT.",
+                            "settings:cache:hint")
+                    }
+                    .gap(12.0f64)
+                })
+                style::card(@ui {
+                    column(key: "settings:output-folder") {
+                        style::caption("OUTPUT PNG FOLDER", "settings:output-folder:title")
+                        style::secondary(folder.view(), "settings:output-folder:path")
+                        hstack {
+                            ui::text_button("Choose Folder…",
+                            key: "settings:output-folder:choose",
+                            on_click: this.on_choose_folder)
+                            ui::text_button("Use Temporary Folder",
+                            key: "settings:output-folder:temporary",
+                            on_click: this.on_use_temporary)
+                        }
+                        .align(flex::Align::Center)
+                        .gap(12.0f64)
+                    }
+                    .gap(12.0f64)
+                })
+            }
+            .gap(16.0f64)
+        };
+    }
+}
+
+impl GenerationSettings: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        let saved: preferences::GenerationPreferences = preferences::load();
+        this.set_threshold_enabled(saved.cache_mode);
+    }
+    fn on_detach(ref this, _why: component::Detach) {}
+}
+
+impl GenerationSettings: core::IntoNode {
+    fn into_node(take this) -> core::Node {
+        return component::child::[GenerationSettings](this);
+    }
+}
+
+fn generation_settings() -> GenerationSettings {
+    return GenerationSettings::new();
+}

@@ -1,4 +1,5 @@
 import "./image_output" as image_output;
+import "./generation_control" as control;
 import "./mmap_macos" as mapped;
 import "./qwen3vl_text" as qwen3vl_text;
 import "./tokenizer" as tokenizer;
@@ -292,8 +293,12 @@ fn run_native_impl(
     q4_direct_packed: bool = false,
     output_width: usize = 0 as usize,
     output_height: usize = 0 as usize,
+    observer: control::Observer = control::none(),
 ) -> i32 {
     let pipeline_wall_start_ms: i64 = time::now_millis();
+    if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
+        return 3;
+    }
     guard let option::Option[vec::Vec[u32]]::Some(full_tokens) =
         tokenizer::tokenize_full_prompt(model_root, prompt) else {
         return 1;
@@ -317,6 +322,7 @@ fn run_native_impl(
         q4_direct_packed,
         output_width,
         output_height,
+        observer,
     );
 }
 
@@ -350,6 +356,7 @@ fn run_native_tokens_impl(
     q4_direct_packed: bool = false,
     output_width: usize = 0 as usize,
     output_height: usize = 0 as usize,
+    observer: control::Observer = control::none(),
 ) -> i32 {
     let image_width: usize = if output_width == (0 as usize) { pixels } else { output_width };
     let image_height: usize = if output_height == (0 as usize) { pixels } else { output_height };
@@ -385,6 +392,9 @@ fn run_native_tokens_impl(
     }
     var text_rows: usize = 0 as usize;
     io::println("pipeline: phase=text prompt_tokens=${expected_text_rows}");
+    if !control::report(observer, control::Phase::EncodingText, 0 as usize, 0 as usize) {
+        return 3;
+    }
     if qwen3vl_text::encode_tokens_to_host(
         model_root,
         #slice_ptr(full_tokens.as_slice()),
@@ -400,6 +410,9 @@ fn run_native_tokens_impl(
         return 1;
     }
     io::println("pipeline timing: text_wall_ms=${time::now_millis() - text_wall_start_ms}");
+    if !control::report(observer, control::Phase::Denoising, 0 as usize, 0 as usize) {
+        return 3;
+    }
 
     let latent_width: usize = image_width / (16 as usize);
     let latent_height: usize = image_height / (16 as usize);
@@ -433,6 +446,7 @@ fn run_native_tokens_impl(
                 #slice_ptr(latent.as_slice()),
                 cache_dit_threshold,
                 steps,
+                observer,
             )
         } else {
             transformer::run_prompt_trajectory_cache_dit_1024_to_host(
@@ -443,6 +457,7 @@ fn run_native_tokens_impl(
                 #slice_ptr(latent.as_slice()),
                 cache_dit_threshold,
                 steps,
+                observer,
             )
         }
     } else if image_width == (256 as usize) && image_height == (256 as usize) && bottleneck {
@@ -462,6 +477,7 @@ fn run_native_tokens_impl(
             #slice_ptr(latent.as_slice()),
             cache_dit_threshold,
             steps,
+            observer,
         )
     } else {
         transformer::run_prompt_trajectory_sized_to_host(
@@ -477,10 +493,11 @@ fn run_native_tokens_impl(
             "tests/fixtures/trajectory_256_fp32",
             q4_eager_expand,
             q4_direct_packed,
+            observer,
         )
     };
     if transformer_status != (0 as i32) {
-        return 1;
+        return transformer_status;
     }
     io::println("pipeline timing: transformer_wall_ms=${time::now_millis() - transformer_wall_start_ms}");
 
@@ -492,6 +509,9 @@ fn run_native_tokens_impl(
         value_index = value_index +% (1 as usize);
     }
     io::println("pipeline: phase=vae model=${model_root}");
+    if !control::report(observer, control::Phase::Decoding, 0 as usize, 0 as usize) {
+        return 3;
+    }
     let vae_wall_start_ms: i64 = time::now_millis();
     let decode_status: i32 = if image_width == (1024 as usize) && image_height == (1024 as usize) {
         vae::decode_1024_from_host(
@@ -524,6 +544,9 @@ fn run_native_tokens_impl(
         return 1;
     }
     io::println("pipeline timing: vae_wall_ms=${time::now_millis() - vae_wall_start_ms}");
+    if !control::report(observer, control::Phase::WritingPng, 0 as usize, 0 as usize) {
+        return 3;
+    }
     let image_wall_start_ms: i64 = time::now_millis();
     let write_ok: bool = if validate_reference {
         image_output::write_png_and_compare(
@@ -624,10 +647,12 @@ fn generate_256(
     prompt: str,
     seed: u64 = 1101 as u64,
     steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 256 as usize,
         false, false, false, false, 0.0f64, steps,
+        observer: observer,
     );
 }
 
@@ -639,10 +664,12 @@ fn generate_256_cache_dit(
     seed: u64 = 1101 as u64,
     threshold: f64 = 0.12f64,
     steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 256 as usize,
         false, true, false, false, threshold, steps,
+        observer: observer,
     );
 }
 
@@ -666,10 +693,12 @@ fn generate_1024(
     prompt: str,
     seed: u64 = 1101 as u64,
     steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
         false, false, false, false, 0.0f64, steps,
+        observer: observer,
     );
 }
 
@@ -682,11 +711,13 @@ fn generate_sized(
     image_height: usize,
     seed: u64 = 1101 as u64,
     steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, image_width,
         false, false, false, false, 0.0f64, steps, false, false,
         image_width, image_height,
+        observer,
     );
 }
 
@@ -714,10 +745,12 @@ fn generate_1024_cache_dit(
     seed: u64 = 1101 as u64,
     threshold: f64 = 0.12f64,
     steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
         false, true, false, false, threshold, steps,
+        observer: observer,
     );
 }
 
@@ -729,10 +762,12 @@ fn generate_1024_taylorseer(
     seed: u64 = 1101 as u64,
     threshold: f64 = 0.24f64,
     steps: str = "40",
+    observer: control::Observer = control::none(),
 ) -> i32 {
     return run_native_impl(
         packed_path, model_root, output_path, prompt, seed, 1024 as usize,
         false, true, true, false, threshold, steps,
+        observer: observer,
     );
 }
 

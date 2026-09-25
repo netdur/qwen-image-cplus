@@ -6,8 +6,10 @@
 // added behind this module later without changing the C ABI entry module.
 
 import "./pipeline" as pipeline;
+import "./generation_control" as control;
 import "./multimodal_conditioning" as multimodal_conditioning;
 import "stdlib/option" as option;
+import "stdlib/vec" as vec;
 
 enum CacheMode {
     None,
@@ -19,6 +21,7 @@ enum GenerateStatus {
     Ok,
     InvalidArgument,
     Failed,
+    Cancelled,
 }
 
 struct GenerateRequest {
@@ -144,10 +147,14 @@ fn _validate(request: GenerateRequest) -> GenerateStatus {
 fn _from_pipeline_status(status: i32) -> GenerateStatus {
     if status == (0 as i32) { return GenerateStatus::Ok; }
     if status == (2 as i32) { return GenerateStatus::InvalidArgument; }
+    if status == (3 as i32) { return GenerateStatus::Cancelled; }
     return GenerateStatus::Failed;
 }
 
-fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
+fn generate_to_png(
+    request: GenerateRequest,
+    observer: control::Observer = control::none(),
+) -> GenerateStatus {
     let validation: GenerateStatus = _validate(request);
     if validation != GenerateStatus::Ok { return validation; }
     guard let option::Option[str]::Some(steps) = _step_name(request.steps) else {
@@ -165,6 +172,7 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
                 request.prompt,
                 request.seed,
                 steps,
+                observer,
             ),
             CacheMode::CacheDiT => pipeline::generate_256_cache_dit(
                 request.packed_path,
@@ -174,6 +182,7 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
                 request.seed,
                 request.cache_threshold,
                 steps,
+                observer,
             ),
             CacheMode::TaylorSeer => 2,
         }
@@ -186,6 +195,7 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
                 request.prompt,
                 request.seed,
                 steps,
+                observer,
             ),
             CacheMode::TaylorSeer => pipeline::generate_1024_taylorseer(
                 request.packed_path,
@@ -195,6 +205,7 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
                 request.seed,
                 request.cache_threshold,
                 steps,
+                observer,
             ),
             CacheMode::CacheDiT => pipeline::generate_1024_cache_dit(
                 request.packed_path,
@@ -204,6 +215,7 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
                 request.seed,
                 request.cache_threshold,
                 steps,
+                observer,
             ),
         }
     } else {
@@ -216,12 +228,16 @@ fn generate_to_png(request: GenerateRequest) -> GenerateStatus {
             height,
             request.seed,
             steps,
+            observer,
         )
     };
     return _from_pipeline_status(status);
 }
 
-fn generate_multi_image_to_png(request: MultiImageGenerateRequest) -> GenerateStatus {
+fn generate_multi_image_to_png(
+    request: MultiImageGenerateRequest,
+    observer: control::Observer = control::none(),
+) -> GenerateStatus {
     let validation: GenerateStatus = _validate_multi_image(request);
     if validation != GenerateStatus::Ok { return validation; }
     guard let option::Option[str]::Some(steps) = _step_name(request.steps) else {
@@ -238,8 +254,49 @@ fn generate_multi_image_to_png(request: MultiImageGenerateRequest) -> GenerateSt
             request.output_path,
             request.seed,
             request.pixels,
+            observer,
         ),
     );
+}
+
+fn _cancel_immediately(_progress: control::Progress, _context: *u8) -> bool {
+    return false;
+}
+
+#[test]
+fn observer_cancels_both_api_paths_before_model_io() {
+    let observer: control::Observer = control::Observer {
+        callback: _cancel_immediately,
+        context: 0 as *u8,
+    };
+    let request: GenerateRequest = GenerateRequest {
+        packed_path: "absent.qipack",
+        model_root: "absent-model",
+        output_path: "unused.png",
+        prompt: "test",
+        pixels: 256 as usize,
+        steps: 25 as usize,
+        seed: 1 as u64,
+        cache: CacheMode::None,
+        cache_threshold: 0.0f64,
+        width: 0 as usize,
+        height: 0 as usize,
+    };
+    assert generate_to_png(request, observer) == GenerateStatus::Cancelled;
+    var paths: vec::Vec[str] = vec::new::[str]();
+    let _added = paths.append("absent.png");
+    let multi: MultiImageGenerateRequest = MultiImageGenerateRequest {
+        packed_path: "absent.qipack",
+        model_root: "absent-model",
+        output_path: "unused.png",
+        prompt: "test",
+        image_paths: #slice_ptr(paths.as_slice()),
+        image_count: 1 as usize,
+        pixels: 512 as usize,
+        steps: 25 as usize,
+        seed: 1 as u64,
+    };
+    assert generate_multi_image_to_png(multi, observer) == GenerateStatus::Cancelled;
 }
 
 #[test]

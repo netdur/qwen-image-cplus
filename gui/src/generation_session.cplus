@@ -1,0 +1,140 @@
+import "qwen_image/api" as api;
+import "qwen_image/generation_control" as control;
+import "qwen_image/generation_worker" as worker;
+import "facet/services" as services;
+import "events/events" as events;
+import "stdlib/box" as box;
+import "stdlib/channel" as channel;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "./current_image" as current_image;
+
+struct Change { value: i32 }
+
+struct Session {
+    worker: box::Box[worker::Service],
+    ready: bool,
+    id: u64,
+    started_at: f64,
+    elapsed_ms: f64,
+    output_path: text::Text,
+    state: text::Text,
+    timer: services::Cancellable,
+    changes: events::Signal[Change],
+}
+
+static SESSION: Session = #zero::[Session]();
+
+fn ensure() -> bool {
+    if SESSION.ready { return true; }
+    guard let option::Option[worker::Service]::Some(service) = worker::start()
+        else { return false; };
+    guard let option::Option[box::Box[worker::Service]]::Some(owned) =
+        box::new::[worker::Service](service) else { return false; };
+    SESSION.worker = owned;
+    SESSION.ready = true;
+    SESSION.id = 0 as u64;
+    SESSION.elapsed_ms = 0.0f64;
+    SESSION.output_path = text::new();
+    SESSION.state = "Waiting to generate".to_text();
+    SESSION.timer = services::Cancellable::none();
+    SESSION.changes = events::Signal[Change]::new();
+    return true;
+}
+
+fn notify() { SESSION.changes.emit(Change { value: 1 as i32 }); }
+
+fn busy() -> bool {
+    if !ensure() { return false; }
+    return SESSION.id != (0 as u64);
+}
+
+fn status_text() -> text::Text {
+    if !ensure() { return "Worker unavailable".to_text(); }
+    return SESSION.state.clone();
+}
+
+fn elapsed_seconds() -> i64 {
+    if !ensure() { return 0 as i64; }
+    let elapsed: f64 = if busy() {
+        (worker::clock_seconds() - SESSION.started_at) * 1000.0f64
+    } else { SESSION.elapsed_ms };
+    return (elapsed / 1000.0f64) as i64;
+}
+
+fn watch(f: fn(Change, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[Change] {
+    if !ensure() { return events::SignalSubscription[Change]::none(); }
+    return SESSION.changes.on(f, ctx: ctx);
+}
+
+fn start(take request: worker::Request) -> bool {
+    if !ensure() || busy() { return false; }
+    let output: text::Text = request.output_path.clone();
+    let started: f64 = worker::clock_seconds();
+    guard let option::Option[u64]::Some(id) =
+        { (*SESSION.worker.ptr()).submit(request, started) } else { return false; };
+    SESSION.id = id;
+    SESSION.started_at = started;
+    SESSION.elapsed_ms = 0.0f64;
+    SESSION.output_path = output;
+    SESSION.state = "Preparing".to_text();
+    notify();
+    SESSION.timer = services::after(0.1f64, tick, 0 as *u8);
+    return true;
+}
+
+fn cancel() -> bool {
+    if !busy() || !{ (*SESSION.worker.ptr()).cancel(SESSION.id) } { return false; }
+    SESSION.state = "Cancelling…".to_text();
+    notify();
+    return true;
+}
+
+fn progress_text(progress: control::Progress) -> text::Text {
+    return match progress.phase {
+        control::Phase::Preparing => "Preparing".to_text(),
+        control::Phase::EncodingReferences => "Encoding references".to_text(),
+        control::Phase::EncodingText => "Encoding prompt".to_text(),
+        control::Phase::Denoising =>
+            "Denoising ${progress.completed_steps} / ${progress.total_steps}".to_text(),
+        control::Phase::Decoding => "Decoding image".to_text(),
+        control::Phase::WritingPng => "Writing PNG".to_text(),
+    };
+}
+
+fn finished(result: api::GenerateStatus, elapsed_ms: f64) {
+    SESSION.id = 0 as u64;
+    SESSION.elapsed_ms = elapsed_ms;
+    SESSION.state = match result {
+        api::GenerateStatus::Ok => if current_image::set_png(SESSION.output_path.view()) {
+            "Finished".to_text()
+        } else { "PNG could not be opened".to_text() },
+        api::GenerateStatus::Cancelled => "Cancelled".to_text(),
+        api::GenerateStatus::InvalidArgument => "Unsupported settings".to_text(),
+        api::GenerateStatus::Failed => "Generation failed".to_text(),
+    };
+    notify();
+}
+
+fn tick(_ctx: *u8) {
+    if !busy() { return; }
+    loop {
+        match { (*SESSION.worker.ptr()).try_event() } {
+            channel::TryReceiveResult::Value(worker::Event::Progress(id, progress)) => {
+                if id == SESSION.id && SESSION.state.view() != "Cancelling…" {
+                    SESSION.state = progress_text(progress);
+                    notify();
+                }
+            }
+            channel::TryReceiveResult::Value(worker::Event::Finished(id, result, elapsed)) => {
+                if id == SESSION.id { finished(result, elapsed); }
+            }
+            _other => { break; }
+        }
+    }
+    if busy() {
+        notify();
+        SESSION.timer = services::after(0.1f64, tick, 0 as *u8);
+    }
+}

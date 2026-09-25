@@ -39,16 +39,38 @@ lib/libqwen_image.dylib
 ### Model files
 
 Model weights are intentionally not part of the Homebrew archive. The runtime
-expects a QIPACK transformer and the corresponding Qwen-Image-2.1 snapshot at
-paths supplied to the CLI or library request. Keeping models separate makes
-application upgrades small and lets applications manage their own model
-storage.
+expects a QIPACK transformer and its Qwen-Image-2.1 support files at paths
+supplied to the CLI or library request. Keeping models separate makes
+application upgrades small and lets applications manage their own model storage.
 
 The QIPACK files are published at
 [`netdur/Qwen-Image-2.1-QIPACK`](https://huggingface.co/netdur/Qwen-Image-2.1-QIPACK).
 Their model card, Qwen license, required attribution, and artifact manifest
 live in [`huggingface/`](huggingface/README.md) so the published metadata stays
 versioned with the runtime.
+
+Download both packs and their shared support files into one folder with
+`hf download netdur/Qwen-Image-2.1-QIPACK --local-dir models`.
+
+For the GUI, the selected QIPACK's parent directory is the model root. Keep
+the supporting files alongside the pack in this layout; multiple packs can
+share the same supporting files:
+
+```text
+models/
+  chosen-model.qipack
+  processor/vocab.json
+  processor/merges.txt
+  text_encoder/model-00001-of-00004.safetensors
+  text_encoder/model-00002-of-00004.safetensors
+  text_encoder/model-00003-of-00004.safetensors
+  text_encoder/model-00004-of-00004.safetensors
+  vae/diffusion_pytorch_model.safetensors
+```
+
+The CLI and C/C+ APIs still take the QIPACK path and model root separately;
+they may point to the same directory. The local `models/` directory is ignored
+by Git and is not included in the Homebrew archive.
 
 ## Pinned reference
 
@@ -2388,6 +2410,17 @@ split edge; its content, rather than the viewport, supplies left padding and a
 right-side gutter so cards do not sit underneath the overlay scrollbar.
 The Settings window remains a simpler standalone screen with the default
 safe-area inset.
+The main pane is a single flexible canvas rather than a card nested inside
+another card. Its header keeps the app identity; the canvas fills the remaining
+space and centers one empty-state message. A narrow footer reserves status and
+elapsed-time readouts for generation, without pretending an image exists yet.
+Edit and Save sit at the far right of the header. Both stay disabled until a
+PNG is published as the current image on the UI thread. The current-image
+module then shows it in the canvas and enables both actions: Edit inserts that
+file at the front of the reference strip (subject to the ten-image limit), and
+Save opens a native save dialog and writes an atomic copy to the chosen path.
+The original generated file is not moved or renamed. The generation worker is
+not yet connected to this current-image module.
 
 The prompt is an editable text area with no placeholder. It receives focus on
 the generation window's first activation, but later activations do not steal
@@ -2408,26 +2441,50 @@ thumbnail fills its card, with a white × on a dark circular backing at the
 top-left. The backing provides contrast against pale images, where a shadow
 alone was insufficient. At ten images the + button is disabled. These are
 local window inputs only: no model loads or inference runs, and the preview
-remains empty. The Settings window opens from the native menu and remains a
-placeholder. Width, height, steps, Random mode, and the last valid manual seed
-persist through macOS UserDefaults in the stable
+remains empty. The Settings window opens from the native menu and contains
+persistent cache mode (Model default, Off, TaylorSeer, or Cache-DiT), cache
+threshold (Recommended, 0.12, 0.14, 0.16, or 0.24), and output PNG folder
+controls. Recommended resolves to 0.24 for TaylorSeer and 0.16 for Cache-DiT.
+The output folder uses `/tmp` when none has been chosen, and the window has a
+button to restore that default. These settings are not connected to inference
+yet. Width, height, steps, Random mode, and the last valid manual seed persist
+through macOS UserDefaults in the stable
 `dev.netdur.qwen-image-cplus.preferences` domain. The GUI accepts only supported
 steps, dimensions of at least 256 in multiples of 32, and decimal seeds within
 the unsigned 64-bit range when loading or saving. The manual seed is stored as a
 string to preserve that full range; incomplete or invalid edits never replace
 the last valid saved value. The Model card opens a native file picker, displays
 the selected file name, and saves its full path in the same preferences domain;
-it does not load the model yet. The Reference Images and Model cards also accept
-Finder file drops anywhere on their surfaces. Both routes validate real local
-files: references accept common image extensions and stop at ten, while the
-model card accepts a `.qipack` file and persists its path. A multi-image drop
+it does not load the model yet. Selection requires the tokenizer, four
+text-encoder shards, and VAE file in subdirectories beside the QIPACK; an
+incomplete saved selection shows a warning. The Reference Images and Model
+cards also accept Finder file drops anywhere on their surfaces. Both routes
+validate real local files: references accept common image extensions and stop
+at ten, while the model card accepts a `.qipack` only when those supporting
+files are present beside it, and then persists its path. A multi-image drop
 keeps the Finder order at the front of the thumbnail strip. Unsupported files
 are ignored. Facet's built-in drop gesture currently carries plain text only,
 so `gui/src/file_drop.cplus` adds an AppKit file-URL destination to the two
 existing card views; it does not replace their click controls. Drop handlers
 are cleared when their components unmount. Prompt text and reference images
 remain session-only.
-When inference is connected, expensive work must run in a background service:
-stage worker results separately, then apply them on the UI thread. A
-window-lifetime component should not own an inference job that must survive
-closing that window.
+The generation worker now exists in `qwen_image/src/generation_worker.cplus`,
+but the GUI controls are not wired to it yet. A single long-lived thread accepts
+an owned request through a typed channel, executes the native API, and sends
+typed progress and completion events back through another channel. The caller
+passes a monotonic timestamp captured at the Create click to `submit`; the
+completion event reports elapsed milliseconds through PNG completion. The
+service accepts one generation at a time, and `cancel(request_id)` marks only
+that request. The observer checks the mark at phase boundaries and after each
+denoising step, so cancellation is cooperative and may take up to the current
+model operation to finish. It does not interrupt a Metal command buffer, VAE
+decode, or PNG write mid-operation. Dropping the service closes its command
+channel; it does not forcibly terminate an in-flight request.
+
+The native API's optional observer is passed through text-to-image and
+multi-image paths. It reports preparation, reference/text encoding, denoising
+step counts, VAE decoding, and PNG writing, and can return `Cancelled` without
+breaking the existing synchronous CLI or C ABI. The worker uses no Facet or
+AppKit calls; the eventual GUI integration must drain events on the main thread
+and stage state updates there. Mock-worker tests cover progress, elapsed time,
+per-request cancellation, and a subsequent request without running inference.

@@ -1,0 +1,335 @@
+import "./api" as api;
+import "./generation_control" as control;
+import "foundation/foundation" as foundation;
+import "stdlib/channel" as channel;
+import "stdlib/mutex" as mutex;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/thread" as thread;
+import "stdlib/vec" as vec;
+
+struct Request {
+    packed_path: text::Text,
+    model_root: text::Text,
+    output_path: text::Text,
+    prompt: text::Text,
+    image_paths: vec::Vec[text::Text],
+    width: usize,
+    height: usize,
+    steps: usize,
+    seed: u64,
+    cache: api::CacheMode,
+    cache_threshold: f64,
+}
+
+enum Event {
+    Progress(u64, control::Progress),
+    Finished(u64, api::GenerateStatus, f64),
+}
+
+enum Command {
+    Run(Request, u64, f64),
+}
+
+struct State {
+    next_id: u64,
+    active_id: u64,
+    cancelled_id: u64,
+}
+
+struct Service {
+    commands: channel::Channel[Command],
+    events: channel::Channel[Event],
+    state: mutex::Mutex[State],
+}
+
+struct WorkerInput {
+    commands: channel::Channel[Command],
+    events: channel::Channel[Event],
+    state: mutex::Mutex[State],
+    execute: fn(Request, control::Observer) -> api::GenerateStatus,
+}
+
+struct ObserverContext {
+    events: channel::Channel[Event],
+    state: mutex::Mutex[State],
+    id: u64,
+}
+
+fn clock_seconds() -> f64 {
+    return foundation::ProcessInfo::process_info().system_uptime();
+}
+
+fn _report(progress: control::Progress, raw: *u8) -> bool {
+    let context: *ObserverContext = raw as *ObserverContext;
+    let current: State = { (*context).state.lock().value() };
+    if current.cancelled_id == { (*context).id } { return false; }
+    let _sent: status::Status = { (*context).events.send(Event::Progress((*context).id, progress)) };
+    return true;
+}
+
+fn _execute_native(request: Request, observer: control::Observer) -> api::GenerateStatus {
+    if request.image_paths.count() == (0 as usize) {
+        return api::generate_to_png(api::GenerateRequest {
+            packed_path: request.packed_path.view(),
+            model_root: request.model_root.view(),
+            output_path: request.output_path.view(),
+            prompt: request.prompt.view(),
+            pixels: request.width,
+            steps: request.steps,
+            seed: request.seed,
+            cache: request.cache,
+            cache_threshold: request.cache_threshold,
+            width: request.width,
+            height: request.height,
+        }, observer);
+    }
+    if request.cache != api::CacheMode::None || request.width != request.height {
+        return api::GenerateStatus::InvalidArgument;
+    }
+    var paths: vec::Vec[str] = vec::Vec[str]::with_capacity(request.image_paths.count());
+    var index: usize = 0 as usize;
+    while index < request.image_paths.count() {
+        match request.image_paths.at_ptr(index) {
+            option::Option[*text::Text]::Some(path) => {
+                if paths.append({ (*path).view() }) != status::Status::Ok {
+                    return api::GenerateStatus::Failed;
+                }
+            }
+            option::Option::None => { return api::GenerateStatus::Failed; }
+        }
+        index = index +% (1 as usize);
+    }
+    return api::generate_multi_image_to_png(api::MultiImageGenerateRequest {
+        packed_path: request.packed_path.view(),
+        model_root: request.model_root.view(),
+        output_path: request.output_path.view(),
+        prompt: request.prompt.view(),
+        image_paths: #slice_ptr(paths.as_slice()),
+        image_count: paths.count(),
+        pixels: request.width,
+        steps: request.steps,
+        seed: request.seed,
+    }, observer);
+}
+
+fn _run(take input: WorkerInput) -> i32 {
+    loop {
+        match input.commands.receive() {
+            channel::ReceiveResult::Value(command) => {
+                match command {
+                    Command::Run(request, id, started_at) => {
+                        let context: ObserverContext = ObserverContext {
+                            events: input.events.clone(),
+                            state: input.state.clone(),
+                            id: id,
+                        };
+                        let observer: control::Observer = control::Observer {
+                            callback: _report,
+                            context: #addr_of(context) as *u8,
+                        };
+                        let result: api::GenerateStatus = input.execute(request, observer);
+                        let elapsed_ms: f64 = (clock_seconds() - started_at) * 1000.0f64;
+                        var state = input.state.lock();
+                        let current: State = state.value();
+                        state.set(State {
+                            next_id: current.next_id,
+                            active_id: 0 as u64,
+                            cancelled_id: 0 as u64,
+                        });
+                        let _sent: status::Status = input.events.send(Event::Finished(
+                            id, result, elapsed_ms,
+                        ));
+                    }
+                }
+            }
+            channel::ReceiveResult::Closed => { return 0; }
+            channel::ReceiveResult::Cancelled => { return 0; }
+        }
+    }
+}
+
+fn start() -> option::Option[Service] {
+    return start_with(_execute_native);
+}
+
+fn start_with(
+    execute: fn(Request, control::Observer) -> api::GenerateStatus,
+) -> option::Option[Service] {
+    guard let option::Option[channel::Channel[Command]]::Some(commands) =
+        channel::new::[Command]() else { return option::Option[Service]::None; };
+    guard let option::Option[channel::Channel[Event]]::Some(events) =
+        channel::new::[Event]() else { return option::Option[Service]::None; };
+    guard let option::Option[mutex::Mutex[State]]::Some(state) = mutex::new::[State](State {
+        next_id: 1 as u64,
+        active_id: 0 as u64,
+        cancelled_id: 0 as u64,
+    }) else { return option::Option[Service]::None; };
+    let input: WorkerInput = WorkerInput {
+        commands: commands.clone(),
+        events: events.clone(),
+        state: state.clone(),
+        execute: execute,
+    };
+    let _worker = thread::spawn_with::[WorkerInput, i32](input, _run);
+    return option::Option[Service]::Some(Service {
+        commands: commands,
+        events: events,
+        state: state,
+    });
+}
+
+impl Service {
+    fn submit(this, take request: Request, started_at: f64) -> option::Option[u64] {
+        var state = this.state.lock();
+        let current: State = state.value();
+        if current.active_id != (0 as u64) { return option::Option[u64]::None; }
+        let id: u64 = current.next_id;
+        state.set(State {
+            next_id: id +% (1 as u64),
+            active_id: id,
+            cancelled_id: 0 as u64,
+        });
+        if this.commands.send(Command::Run(request, id, started_at)) != status::Status::Ok {
+            state.set(current);
+            return option::Option[u64]::None;
+        }
+        return option::Option[u64]::Some(id);
+    }
+
+    fn cancel(this, id: u64) -> bool {
+        var state = this.state.lock();
+        let current: State = state.value();
+        if id == (0 as u64) || current.active_id != id { return false; }
+        state.set(State {
+            next_id: current.next_id,
+            active_id: current.active_id,
+            cancelled_id: id,
+        });
+        return true;
+    }
+
+    fn try_event(this) -> channel::TryReceiveResult[Event] {
+        return this.events.try_receive();
+    }
+
+    fn busy(this) -> bool {
+        return this.state.lock().value().active_id != (0 as u64);
+    }
+
+    fn drop(ref this) {
+        this.commands.close();
+    }
+}
+
+fn _test_request() -> Request {
+    return Request {
+        packed_path: "model.qipack".to_text(),
+        model_root: "models".to_text(),
+        output_path: "unused.png".to_text(),
+        prompt: "test".to_text(),
+        image_paths: vec::new::[text::Text](),
+        width: 256 as usize,
+        height: 256 as usize,
+        steps: 3 as usize,
+        seed: 1 as u64,
+        cache: api::CacheMode::None,
+        cache_threshold: 0.0f64,
+    };
+}
+
+fn _mock_execute(request: Request, observer: control::Observer) -> api::GenerateStatus {
+    let _unused: usize = request.steps;
+    if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
+        return api::GenerateStatus::Cancelled;
+    }
+    let started: f64 = clock_seconds();
+    while clock_seconds() - started < 0.02f64 {}
+    if !control::report(observer, control::Phase::Denoising, 1 as usize, 3 as usize) {
+        return api::GenerateStatus::Cancelled;
+    }
+    return api::GenerateStatus::Ok;
+}
+
+#[test]
+fn worker_reports_progress_completion_and_elapsed_without_inference() {
+    guard let option::Option[Service]::Some(service) = start_with(_mock_execute) else {
+        assert false;
+        return;
+    };
+    guard let option::Option[u64]::Some(id) = service.submit(_test_request(), clock_seconds()) else {
+        assert false;
+        return;
+    };
+    assert service.busy();
+    match service.submit(_test_request(), clock_seconds()) {
+        option::Option::None => {}
+        option::Option::Some(_) => { assert false; }
+    }
+    match service.events.receive() {
+        channel::ReceiveResult::Value(Event::Progress(event_id, progress)) => {
+            assert event_id == id;
+            assert progress.phase == control::Phase::Preparing;
+        }
+        _other => { assert false; }
+    }
+    match service.events.receive() {
+        channel::ReceiveResult::Value(Event::Progress(event_id, progress)) => {
+            assert event_id == id;
+            assert progress.completed_steps == (1 as usize);
+            assert progress.total_steps == (3 as usize);
+        }
+        _other => { assert false; }
+    }
+    match service.events.receive() {
+        channel::ReceiveResult::Value(Event::Finished(event_id, result, elapsed_ms)) => {
+            assert event_id == id;
+            assert result == api::GenerateStatus::Ok;
+            assert elapsed_ms >= 0.0f64;
+        }
+        _other => { assert false; }
+    }
+    assert !service.busy();
+}
+
+#[test]
+fn worker_cancel_is_scoped_to_one_request() {
+    guard let option::Option[Service]::Some(service) = start_with(_mock_execute) else {
+        assert false;
+        return;
+    };
+    guard let option::Option[u64]::Some(id) = service.submit(_test_request(), clock_seconds()) else {
+        assert false;
+        return;
+    };
+    assert service.cancel(id);
+    assert !service.cancel(id +% (1 as u64));
+    loop {
+        match service.events.receive() {
+            channel::ReceiveResult::Value(Event::Finished(event_id, result, _elapsed)) => {
+                assert event_id == id;
+                assert result == api::GenerateStatus::Cancelled;
+                break;
+            }
+            channel::ReceiveResult::Value(Event::Progress(_, _)) => {}
+            _other => { assert false; break; }
+        }
+    }
+    guard let option::Option[u64]::Some(next_id) = service.submit(_test_request(), clock_seconds()) else {
+        assert false;
+        return;
+    };
+    assert next_id != id;
+    loop {
+        match service.events.receive() {
+            channel::ReceiveResult::Value(Event::Finished(event_id, result, _elapsed)) => {
+                assert event_id == next_id;
+                assert result == api::GenerateStatus::Ok;
+                break;
+            }
+            channel::ReceiveResult::Value(Event::Progress(_, _)) => {}
+            _other => { assert false; break; }
+        }
+    }
+}
