@@ -1,0 +1,215 @@
+// Shape contract for Qwen-Image-2.1 reference images.
+//
+// Diffusers resizes every condition image to approximately
+// `output_resolution * output_resolution` pixels while preserving its aspect
+// ratio and rounding both sides to a multiple of 32. The same resized pixels
+// feed Qwen3-VL and the VAE, but the two consumers use different token grids:
+// the vision tower merges each 2x2 group of 16px patches, while the VAE keeps
+// one 64-channel latent for every 16x16 pixel tile.
+
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+
+const MAX_REFERENCE_IMAGES: usize = 10;
+const ALIGNMENT: usize = 32;
+const PATCH_SIZE: usize = 16;
+const VISION_MERGE_SIZE: usize = 2;
+const IMAGE_PAD_TOKEN: u32 = 151655;
+
+struct Shape {
+    width: usize,
+    height: usize,
+    vision_grid_width: usize,
+    vision_grid_height: usize,
+    vision_tokens: usize,
+    latent_tokens: usize,
+}
+
+fn reference_count_supported(count: usize) -> bool {
+    return count >= (1 as usize) && count <= MAX_REFERENCE_IMAGES;
+}
+
+// Python's round(), used by the pinned Diffusers helper, resolves exact halves
+// to the nearest even integer. Keep that behavior explicit because C round()
+// resolves halves away from zero.
+fn round_nonnegative_even(value: f64) -> usize {
+    let floor_value: f64 = value.floor();
+    var integer: usize = floor_value as usize;
+    let fraction: f64 = value - floor_value;
+    if fraction > 0.5f64
+        || (fraction == 0.5f64 && integer % (2 as usize) != (0 as usize)) {
+        integer = integer +% (1 as usize);
+    }
+    return integer;
+}
+
+fn calculate_shape(
+    source_width: usize,
+    source_height: usize,
+    output_resolution: usize = 512 as usize,
+) -> option::Option[Shape] {
+    if source_width == (0 as usize) || source_height == (0 as usize)
+        || output_resolution < ALIGNMENT {
+        return option::Option[Shape]::None;
+    }
+    let ratio: f64 = source_width as f64 / source_height as f64;
+    let target_area: f64 = output_resolution as f64 * output_resolution as f64;
+    let raw_width: f64 = (target_area * ratio).sqrt();
+    let raw_height: f64 = raw_width / ratio;
+    let width: usize = round_nonnegative_even(raw_width / ALIGNMENT as f64) *% ALIGNMENT;
+    let height: usize = round_nonnegative_even(raw_height / ALIGNMENT as f64) *% ALIGNMENT;
+    if width == (0 as usize) || height == (0 as usize) {
+        return option::Option[Shape]::None;
+    }
+    let grid_width: usize = width / PATCH_SIZE;
+    let grid_height: usize = height / PATCH_SIZE;
+    let merge_area: usize = VISION_MERGE_SIZE *% VISION_MERGE_SIZE;
+    return option::Option[Shape]::Some(Shape {
+        width: width,
+        height: height,
+        vision_grid_width: grid_width,
+        vision_grid_height: grid_height,
+        vision_tokens: grid_width *% grid_height / merge_area,
+        latent_tokens: grid_width *% grid_height,
+    });
+}
+
+// Reproduces Qwen3-VL's image-aware MRoPE positions for one unpadded prompt.
+// Text runs advance all three axes one token at a time. An image-pad run uses
+// a 2D merged patch grid and advances the following text by the larger spatial
+// side rather than by the image's token count.
+fn fill_language_positions(
+    token_ids: *u32,
+    token_count: usize,
+    shapes: *Shape,
+    image_count: usize,
+    positions: *u32,
+) -> bool {
+    if token_ids.is_null() || positions.is_null()
+        || (image_count > (0 as usize) && shapes.is_null())
+        || image_count > MAX_REFERENCE_IMAGES {
+        return false;
+    }
+    var current_position: usize = 0 as usize;
+    var token: usize = 0 as usize;
+    var image: usize = 0 as usize;
+    while token < token_count {
+        let image_run: bool = token_ids[token] == IMAGE_PAD_TOKEN;
+        var run_end: usize = token +% (1 as usize);
+        while run_end < token_count
+            && (token_ids[run_end] == IMAGE_PAD_TOKEN) == image_run {
+            run_end = run_end +% (1 as usize);
+        }
+        if !image_run {
+            var row: usize = token;
+            while row < run_end {
+                let value: u32 = (current_position +% (row -% token)) as u32;
+                positions[row *% (3 as usize)] = value;
+                positions[row *% (3 as usize) +% (1 as usize)] = value;
+                positions[row *% (3 as usize) +% (2 as usize)] = value;
+                row = row +% (1 as usize);
+            }
+            current_position = current_position +% (run_end -% token);
+        } else {
+            if image >= image_count { return false; }
+            let shape: Shape = shapes[image];
+            let merged_height: usize = shape.vision_grid_height / VISION_MERGE_SIZE;
+            let merged_width: usize = shape.vision_grid_width / VISION_MERGE_SIZE;
+            if run_end -% token != merged_height *% merged_width {
+                return false;
+            }
+            var row: usize = token;
+            while row < run_end {
+                let spatial: usize = row -% token;
+                positions[row *% (3 as usize)] = current_position as u32;
+                positions[row *% (3 as usize) +% (1 as usize)] =
+                    (current_position +% spatial / merged_width) as u32;
+                positions[row *% (3 as usize) +% (2 as usize)] =
+                    (current_position +% spatial % merged_width) as u32;
+                row = row +% (1 as usize);
+            }
+            let largest_side: usize = if merged_height > merged_width {
+                merged_height
+            } else { merged_width };
+            current_position = current_position +% largest_side;
+            image = image +% (1 as usize);
+        }
+        token = run_end;
+    }
+    return image == image_count;
+}
+
+#[test]
+fn square_512_condition_shape_matches_both_model_grids() {
+    guard let option::Option[Shape]::Some(shape) = calculate_shape(
+        512 as usize, 512 as usize,
+    ) else { assert false; return; };
+    assert shape.width == (512 as usize);
+    assert shape.height == (512 as usize);
+    assert shape.vision_grid_width == (32 as usize);
+    assert shape.vision_grid_height == (32 as usize);
+    assert shape.vision_tokens == (256 as usize);
+    assert shape.latent_tokens == (1024 as usize);
+}
+
+#[test]
+fn rectangular_condition_shape_follows_official_area_rounding() {
+    guard let option::Option[Shape]::Some(shape) = calculate_shape(
+        1024 as usize, 512 as usize,
+    ) else { assert false; return; };
+    assert shape.width == (736 as usize);
+    assert shape.height == (352 as usize);
+    assert shape.vision_tokens == (253 as usize);
+    assert shape.latent_tokens == (1012 as usize);
+}
+
+#[test]
+fn official_reference_image_limit_is_enforced() {
+    assert !reference_count_supported(0 as usize);
+    assert reference_count_supported(1 as usize);
+    assert reference_count_supported(10 as usize);
+    assert !reference_count_supported(11 as usize);
+}
+
+#[test]
+fn language_positions_keep_adjacent_images_as_separate_grids() {
+    var tokens: [u32; 10] = [
+        1 as u32, 2 as u32,
+        IMAGE_PAD_TOKEN, IMAGE_PAD_TOKEN, IMAGE_PAD_TOKEN, IMAGE_PAD_TOKEN,
+        3 as u32,
+        IMAGE_PAD_TOKEN, IMAGE_PAD_TOKEN,
+        4 as u32,
+    ];
+    guard let option::Option[Shape]::Some(first) = calculate_shape(
+        64 as usize, 64 as usize, 64 as usize,
+    ) else { assert false; return; };
+    guard let option::Option[Shape]::Some(second) = calculate_shape(
+        64 as usize, 32 as usize, 48 as usize,
+    ) else { assert false; return; };
+    var shapes: [Shape; 2] = [first, second];
+    var positions: [u32; 30] = [0 as u32; 30];
+    assert fill_language_positions(
+        #addr_of(tokens[0]), 10 as usize,
+        #addr_of(shapes[0]), 2 as usize,
+        #addr_of(positions[0]),
+    );
+    // Text before the first image.
+    assert positions[0] == (0 as u32) && positions[1] == (0 as u32)
+        && positions[2] == (0 as u32);
+    assert positions[3] == (1 as u32) && positions[4] == (1 as u32)
+        && positions[5] == (1 as u32);
+    // First image is a 2x2 merged grid starting at position 2.
+    assert positions[6] == (2 as u32) && positions[7] == (2 as u32)
+        && positions[8] == (2 as u32);
+    assert positions[15] == (2 as u32) && positions[16] == (3 as u32)
+        && positions[17] == (3 as u32);
+    // Text resumes at 4; the second 1x2 image starts at 5; final text at 7.
+    assert positions[18] == (4 as u32) && positions[19] == (4 as u32)
+        && positions[20] == (4 as u32);
+    assert positions[21] == (5 as u32) && positions[22] == (5 as u32)
+        && positions[23] == (5 as u32);
+    assert positions[24] == (5 as u32) && positions[25] == (5 as u32)
+        && positions[26] == (6 as u32);
+    assert positions[27] == (7 as u32) && positions[28] == (7 as u32)
+        && positions[29] == (7 as u32);
+}

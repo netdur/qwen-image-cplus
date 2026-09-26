@@ -116,3 +116,60 @@ extern "C" int qi_cuda_malloc_host(void **pointer, unsigned long long bytes) {
 extern "C" int qi_cuda_free_host(void *pointer) {
     return (int)cudaFreeHost(pointer);
 }
+
+// head_norm_rope_half_kernel with Qwen3-VL's interleaved M-RoPE: frequency
+// pair i takes its position from axis H when i % 3 == 1 and W when i % 3 == 2
+// (both only for i < 60, the [24, 20, 20] sections), else from T. positions:
+// [rows, 3] (t, h, w).
+__global__ void head_norm_mrope_kernel(float *x, const float *weight, int rows, int heads, float theta,
+                                       const int *positions) {
+    const int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int lane = threadIdx.x % 32;
+    if (warp_global >= rows * heads) return;
+    const int row = warp_global / heads;
+    float *head = x + (size_t)warp_global * 128;
+    float values[4];
+    float squares = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        values[i] = head[lane + 32 * i];
+        squares += values[i] * values[i];
+    }
+    for (int offset = 16; offset > 0; offset /= 2) squares += __shfl_xor_sync(0xffffffffu, squares, offset);
+    const float inverse = rsqrtf(squares / 128.0f + 1e-6f);
+    for (int i = 0; i < 4; ++i) values[i] = values[i] * inverse * weight[lane + 32 * i];
+    for (int pair = 0; pair < 2; ++pair) {
+        const int index = lane + 32 * pair;
+        const int axis = index < 60 && index % 3 == 1 ? 1 : (index < 60 && index % 3 == 2 ? 2 : 0);
+        const float position = (float)positions[row * 3 + axis];
+        const float inverse_frequency = 1.0f / powf(theta, (float)(2 * index) / 128.0f);
+        const float angle = position * inverse_frequency;
+        const float cosine = cosf(angle), sine = sinf(angle);
+        const float first = values[pair], second = values[pair + 2];
+        head[index] = first * cosine - second * sine;
+        head[index + 64] = second * cosine + first * sine;
+    }
+}
+
+extern "C" int qi_text_head_norm_mrope(float *x, const float *weight, int rows, int heads, float theta,
+                                       const int *positions) {
+    const unsigned long long threads = (unsigned long long)rows * heads * 32;
+    head_norm_mrope_kernel<<<blocks_for(threads, 256), 256>>>(x, weight, rows, heads, theta, positions);
+    return (int)cudaGetLastError();
+}
+
+__global__ void scatter_rows_kernel(float *target, const float *source, const int *indices, int width, int accumulate,
+                                    unsigned long long count) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const unsigned long long row = i / width;
+    const int column = (int)(i % width);
+    float *cell = target + (size_t)indices[row] * width + column;
+    *cell = accumulate ? *cell + source[i] : source[i];
+}
+
+// target[indices[r], :] = source[r, :] (or += with `accumulate`) for r < rows.
+extern "C" int qi_scatter_rows(float *target, const float *source, const int *indices, int rows, int width, int accumulate) {
+    const unsigned long long count = (unsigned long long)rows * width;
+    scatter_rows_kernel<<<blocks_for(count, 256), 256>>>(target, source, indices, width, accumulate, count);
+    return (int)cudaGetLastError();
+}

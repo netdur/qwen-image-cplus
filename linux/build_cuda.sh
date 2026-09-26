@@ -18,6 +18,12 @@ for source in "$source_dir"/*.cu; do
     "$cuda_home/bin/nvcc" -O3 -arch="$arch" -std=c++17 -Xcompiler -fPIC -c "$source" -o "$object"
     objects="$objects $object"
 done
+# Host-side C helpers (image decoding and resampling).
+for source in "$here"/qwen_image/native/*.c; do
+    object="$output_dir/$(basename "$source" .c).o"
+    cc -O2 -fPIC -c "$source" -o "$object"
+    objects="$objects $object"
+done
 rm -f "$output_dir/libqwen_image_cuda.a"
 # shellcheck disable=SC2086
 ar rcs "$output_dir/libqwen_image_cuda.a" $objects

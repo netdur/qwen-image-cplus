@@ -27,6 +27,9 @@ extern fn qi_lseek(fd: i32, offset: i64, whence: i32) -> i64;
 
 const IM_START: u32 = 151644 as u32;
 const IM_END: u32 = 151645 as u32;
+const VISION_START: u32 = 151652 as u32;
+const VISION_END: u32 = 151653 as u32;
+const IMAGE_PAD: u32 = 151655 as u32;
 const SYSTEM_PREFIX_TOKENS: usize = 14;
 const SYSTEM_TEXT: str = "system\nComprehend and analyze the provided prompt.";
 
@@ -429,6 +432,70 @@ fn encode_full_prompt(tokenizer: Tokenizer, prompt: str) -> option::Option[vec::
     return option::Option[vec::Vec[u32]]::Some(full);
 }
 
+// The image-conditioned template of QwenImage21Pipeline, with each image's
+// `<|image_pad|>` expanded to its vision-token count (as the processor does).
+fn encode_full_prompt_with_images(
+    tokenizer: Tokenizer,
+    prompt: str,
+    image_token_counts: *usize,
+    image_count: usize,
+) -> option::Option[vec::Vec[u32]] {
+    if image_token_counts.is_null() || image_count == (0 as usize)
+        || image_count > (10 as usize) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    var full: vec::Vec[u32] = vec::new::[u32]();
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, SYSTEM_TEXT, full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_END);
+    if !encode_ordinary(tokenizer, "\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, "user\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+
+    var image: usize = 0 as usize;
+    while image < image_count {
+        // Later labels keep their leading space in the same pre-token run:
+        // the reference tokenizes " <image2>" as " <", "image", "2", ">",
+        // not as a separate " " followed by "<".
+        let label: text::Text = if image == (0 as usize) {
+            "<image${image +% (1 as usize)}>"
+        } else { " <image${image +% (1 as usize)}>" };
+        if !encode_ordinary(tokenizer, label.view(), full) {
+            return option::Option[vec::Vec[u32]]::None;
+        }
+        full.append(VISION_START);
+        let image_tokens: usize = image_token_counts[image];
+        if image_tokens == (0 as usize) { return option::Option[vec::Vec[u32]]::None; }
+        var token: usize = 0 as usize;
+        while token < image_tokens {
+            if full.append(IMAGE_PAD) != status::Status::Ok {
+                return option::Option[vec::Vec[u32]]::None;
+            }
+            token = token +% (1 as usize);
+        }
+        full.append(VISION_END);
+        image = image +% (1 as usize);
+    }
+    if !encode_with_specials(tokenizer, prompt, full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_END);
+    if !encode_ordinary(tokenizer, "\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    full.append(IM_START);
+    if !encode_ordinary(tokenizer, "assistant\n", full) {
+        return option::Option[vec::Vec[u32]]::None;
+    }
+    return option::Option[vec::Vec[u32]]::Some(full);
+}
+
 fn encode_prompt(tokenizer: Tokenizer, prompt: str) -> option::Option[vec::Vec[u32]] {
     guard let option::Option[vec::Vec[u32]]::Some(full) = encode_full_prompt(tokenizer, prompt) else {
         return option::Option[vec::Vec[u32]]::None;
@@ -450,6 +517,20 @@ fn tokenize_full_prompt(model_root: str, prompt: str) -> option::Option[vec::Vec
         return option::Option[vec::Vec[u32]]::None;
     };
     return encode_full_prompt(tokenizer, prompt);
+}
+
+fn tokenize_full_prompt_with_images(
+    model_root: str,
+    prompt: str,
+    image_token_counts: *usize,
+    image_count: usize,
+) -> option::Option[vec::Vec[u32]] {
+    guard let LoadResult::Ok(tokenizer) = load(model_root) else LoadResult::Err {
+        return option::Option[vec::Vec[u32]]::None;
+    };
+    return encode_full_prompt_with_images(
+        tokenizer, prompt, image_token_counts, image_count,
+    );
 }
 
 // Checks every case in tests/fixtures/tokenizer against the pinned

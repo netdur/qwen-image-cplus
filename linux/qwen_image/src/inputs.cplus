@@ -26,39 +26,84 @@ fn f32_bits(value: f32) -> u32 {
 // Text advances one shared position on all three axes; the image freezes the
 // frame at the next position and centres its grid on zero.
 fn rope_table(text_rows: usize, height: usize, width: usize, output: *f32) {
-    let rows: usize = text_rows +% height *% width;
     var row: usize = 0 as usize;
-    while row < rows {
-        var positions: [i64; 3] = [0 as i64; 3];
-        if row < text_rows {
-            positions = [row as i64, row as i64, row as i64];
-        } else {
-            let image_index: usize = row -% text_rows;
-            let h: usize = image_index / width;
-            let w: usize = image_index % width;
-            positions = [
-                text_rows as i64,
-                (h as i64) - ((height -% height / (2 as usize)) as i64),
-                (w as i64) - ((width -% width / (2 as usize)) as i64),
-            ];
-        }
-        var pair: usize = 0 as usize;
-        var axis: usize = 0 as usize;
-        while axis < (3 as usize) {
-            let dimension: usize = if axis == (0 as usize) { 16 as usize } else { 56 as usize };
-            var index: usize = 0 as usize;
-            while index < dimension / (2 as usize) {
-                let frequency: f32 = 1.0f32 / qi_powf(10000.0f32, ((2 as usize *% index) as f32) / (dimension as f32));
-                let angle: f32 = (positions[axis] as f32) * frequency;
-                output[row *% (128 as usize) +% pair] = qi_cosf(angle);
-                output[row *% (128 as usize) +% (64 as usize) +% pair] = qi_sinf(angle);
-                pair = pair +% (1 as usize);
-                index = index +% (1 as usize);
-            }
-            axis = axis +% (1 as usize);
-        }
+    while row < text_rows {
+        rope_row([row as i64, row as i64, row as i64], output + row *% (128 as usize));
         row = row +% (1 as usize);
     }
+    let _position: usize = rope_block(text_rows, height, width, output + text_rows *% (128 as usize));
+}
+
+// Writes one row: 64 cosines then 64 sines over the (frame 8, height 28,
+// width 28) frequency pairs, in FP32 as the reference does.
+fn rope_row(positions: [i64; 3], output: *f32) {
+    var pair: usize = 0 as usize;
+    var axis: usize = 0 as usize;
+    while axis < (3 as usize) {
+        let dimension: usize = if axis == (0 as usize) { 16 as usize } else { 56 as usize };
+        var index: usize = 0 as usize;
+        while index < dimension / (2 as usize) {
+            let frequency: f32 = 1.0f32 / qi_powf(10000.0f32, ((2 as usize *% index) as f32) / (dimension as f32));
+            let angle: f32 = (positions[axis] as f32) * frequency;
+            output[pair] = qi_cosf(angle);
+            output[(64 as usize) +% pair] = qi_sinf(angle);
+            pair = pair +% (1 as usize);
+            index = index +% (1 as usize);
+        }
+        axis = axis +% (1 as usize);
+    }
+}
+
+// Writes a height x width image block at frame `position` with its grid
+// centred on zero; returns the position after it (position + max side).
+fn rope_block(position: usize, height: usize, width: usize, output: *f32) -> usize {
+    var index: usize = 0 as usize;
+    while index < height *% width {
+        let h: usize = index / width;
+        let w: usize = index % width;
+        rope_row([
+            position as i64,
+            (h as i64) - ((height -% height / (2 as usize)) as i64),
+            (w as i64) - ((width -% width / (2 as usize)) as i64),
+        ], output + index *% (128 as usize));
+        index = index +% (1 as usize);
+    }
+    return position +% (if height > width { height } else { width });
+}
+
+// QwenImage21Rope for an image-conditioned sequence, in the transformer's
+// joint row order: the prompt's text rows with each run of image-pad rows
+// (image_pad[r] != 0) replaced by that condition image's latent block
+// (heights[i] x widths[i], one pad row per 2 x 2 latents), then the target
+// block. Returns the number of rows written, or 0 when the pad runs do not
+// match the blocks.
+fn rope_table_conditioned(image_pad: *u8, prompt_rows: usize, heights: *usize, widths: *usize, blocks: usize,
+                          target_height: usize, target_width: usize, output: *f32) -> usize {
+    var position: usize = 0 as usize;
+    var written: usize = 0 as usize;
+    var block: usize = 0 as usize;
+    var row: usize = 0 as usize;
+    while row < prompt_rows {
+        if image_pad[row] == (0 as u8) {
+            rope_row([position as i64, position as i64, position as i64], output + written *% (128 as usize));
+            position = position +% (1 as usize);
+            written = written +% (1 as usize);
+            row = row +% (1 as usize);
+        } else {
+            if block >= blocks { return 0 as usize; }
+            let slots: usize = heights[block] *% widths[block] / (4 as usize);
+            var end: usize = row;
+            while end < prompt_rows && image_pad[end] != (0 as u8) && end -% row < slots { end = end +% (1 as usize); }
+            if end -% row != slots { return 0 as usize; }
+            position = rope_block(position, heights[block], widths[block], output + written *% (128 as usize));
+            written = written +% heights[block] *% widths[block];
+            block = block +% (1 as usize);
+            row = end;
+        }
+    }
+    if block != blocks { return 0 as usize; }
+    let _end: usize = rope_block(position, target_height, target_width, output + written *% (128 as usize));
+    return written +% target_height *% target_width;
 }
 
 enum NoiseDtype {

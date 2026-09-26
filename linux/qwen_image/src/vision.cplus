@@ -1,0 +1,475 @@
+// Qwen3-VL vision tower on CUDA (condition images for image editing).
+//
+// 27 blocks of width 1152 (16 heads of 72, gelu-tanh MLP 4304, LayerNorm eps
+// 1e-6); patches are 3 x 2 x 16 x 16 pixels embedded by a linear map, plus a
+// learned 48 x 48 position table resampled bilinearly (align_corners) to the
+// patch grid, and a 2D axial rotary (theta 1e4) over (row, column). Patches
+// arrive in 2 x 2 merge-group order, so each merger reads four consecutive
+// rows as one 4608-wide token: the final merger normalizes per patch (1152)
+// and the three DeepStack mergers (after blocks 8, 16, 24) after the shuffle
+// (4608); both then run fc1, erf GELU, fc2 to 4096.
+//
+// All 1.2 GB of BF16 weights stay resident while the images are encoded; each
+// matrix is expanded to FP32 for SGEMM.
+
+import "./cuda" as cuda;
+import "./int4_pack" as pack;
+import "./text_encoder" as text_encoder;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/str" as _;
+import "stdlib/string_map" as string_map;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+#[link_name = "close"]
+extern fn qi_close(fd: i32) -> i32;
+#[link_name = "qi_layer_norm_affine"]
+extern fn qi_layer_norm_affine(x: *f32, weight: *f32, bias: *f32, out: *f32, rows: i32, width: i32) -> i32;
+#[link_name = "qi_add_bias_rows"]
+extern fn qi_add_bias_rows(y: *f32, bias: *f32, rows: i32, width: i32) -> i32;
+#[link_name = "qi_gelu_erf"]
+extern fn qi_gelu_erf(x: *f32, count: u64) -> i32;
+#[link_name = "qi_vision_rope"]
+extern fn qi_vision_rope(qkv: *f32, table: *f32, tokens: i32, heads: i32, head_dim: i32) -> i32;
+#[link_name = "qi_vision_attention"]
+extern fn qi_vision_attention(qkv: *f32, out: *f32, scores: *f32, tokens: i32, heads: i32, head_dim: i32) -> i32;
+#[link_name = "qi_gather4_add"]
+extern fn qi_gather4_add(hidden: *f32, table: *u8, indices: *i32, weights: *f32, rows: i32, width: i32) -> i32;
+#[link_name = "qi_vae_add"]
+extern fn qi_add(y: *f32, x: *f32, count: u64) -> i32;
+
+const HIDDEN: usize = 1152;
+const HEADS: usize = 16;
+const HEAD_DIM: usize = 72;
+const MLP: usize = 4304;
+const DEPTH: usize = 27;
+const MERGED: usize = 4608;
+const OUT: usize = 4096;
+const PATCH_VALUES: usize = 1536;
+const TABLE_SIDE: usize = 48;
+const ROPE_THETA: f32 = 10000.0f32;
+const GLOBAL_TENSORS: usize = 27;
+const BLOCK_TENSORS: usize = 12;
+
+fn ok(result: i32, what: str) -> bool {
+    if result != (0 as i32) {
+        io::eprintln("cuda vision: ${what} failed (cuda status ${result})");
+        return false;
+    }
+    return true;
+}
+
+fn merger_suffix(index: usize) -> str {
+    return if index == (0 as usize) { "norm.weight" }
+        else if index == (1 as usize) { "norm.bias" }
+        else if index == (2 as usize) { "linear_fc1.weight" }
+        else if index == (3 as usize) { "linear_fc1.bias" }
+        else if index == (4 as usize) { "linear_fc2.weight" }
+        else { "linear_fc2.bias" };
+}
+
+fn block_suffix(index: usize) -> str {
+    return if index == (0 as usize) { "norm1.weight" }
+        else if index == (1 as usize) { "norm1.bias" }
+        else if index == (2 as usize) { "norm2.weight" }
+        else if index == (3 as usize) { "norm2.bias" }
+        else if index == (4 as usize) { "attn.qkv.weight" }
+        else if index == (5 as usize) { "attn.qkv.bias" }
+        else if index == (6 as usize) { "attn.proj.weight" }
+        else if index == (7 as usize) { "attn.proj.bias" }
+        else if index == (8 as usize) { "mlp.linear_fc1.weight" }
+        else if index == (9 as usize) { "mlp.linear_fc1.bias" }
+        else if index == (10 as usize) { "mlp.linear_fc2.weight" }
+        else { "mlp.linear_fc2.bias" };
+}
+
+// Name of vision tensor `index` in [0, 27 + 27 * 12).
+fn tensor_name(index: usize) -> text::Text {
+    if index == (0 as usize) { return "model.visual.patch_embed.proj.weight"; }
+    if index == (1 as usize) { return "model.visual.patch_embed.proj.bias"; }
+    if index == (2 as usize) { return "model.visual.pos_embed.weight"; }
+    if index < (9 as usize) { return "model.visual.merger.${merger_suffix(index -% (3 as usize))}"; }
+    if index < GLOBAL_TENSORS {
+        let local: usize = index -% (9 as usize);
+        return "model.visual.deepstack_merger_list.${local / (6 as usize)}.${merger_suffix(local % (6 as usize))}";
+    }
+    let local: usize = index -% GLOBAL_TENSORS;
+    return "model.visual.blocks.${local / BLOCK_TENSORS}.${block_suffix(local % BLOCK_TENSORS)}";
+}
+
+struct Vision {
+    offsets: string_map::StringMap[u64],
+    weights: cuda::DeviceBuffer,
+}
+
+fn load(model_root: str) -> option::Option[Vision] {
+    var shards: vec::Vec[text_encoder::Shard] = vec::Vec[text_encoder::Shard]::with_capacity(4 as usize);
+    var shard_index: usize = 1 as usize;
+    while shard_index <= (4 as usize) {
+        let path: text::Text = "${model_root}/text_encoder/model-0000${shard_index}-of-00004.safetensors";
+        guard let option::Option[text_encoder::Shard]::Some(shard) = text_encoder::open_shard(path.view()) else { return option::Option[Vision]::None; };
+        if shards.append(shard) != status::Status::Ok { return option::Option[Vision]::None; }
+        shard_index = shard_index +% (1 as usize);
+    }
+    let result: option::Option[Vision] = load_from(shards);
+    var index: usize = 0 as usize;
+    while index < shards.count() {
+        match shards.at_ptr(index) {
+            option::Option::Some(shard) => { let _closed: i32 = qi_close((*shard).fd); }
+            option::Option::None => {}
+        }
+        index = index +% (1 as usize);
+    }
+    return result;
+}
+
+fn load_from(shards: vec::Vec[text_encoder::Shard]) -> option::Option[Vision] {
+    let count: usize = GLOBAL_TENSORS +% DEPTH *% BLOCK_TENSORS;
+    var offsets: string_map::StringMap[u64] = string_map::new::[u64]();
+    var total: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < count {
+        let name: text::Text = tensor_name(index);
+        guard let option::Option[text_encoder::Location]::Some(location) = text_encoder::locate(shards, name.view()) else {
+            return option::Option[Vision]::None;
+        };
+        if offsets.insert(name, total) != status::Status::Ok { return option::Option[Vision]::None; }
+        total = total +% ((location.bytes +% (255 as u64)) / (256 as u64)) *% (256 as u64);
+        index = index +% (1 as usize);
+    }
+    guard let option::Option[cuda::DeviceBuffer]::Some(weights) = cuda::DeviceBuffer::allocate(total) else {
+        io::eprintln("cuda vision: could not allocate ${total} bytes of weights");
+        return option::Option[Vision]::None;
+    };
+    guard let option::Option[cuda::PinnedBuffer]::Some(staging) = cuda::PinnedBuffer::allocate(67108864 as u64) else { return option::Option[Vision]::None; };
+    index = 0 as usize;
+    while index < count {
+        let name: text::Text = tensor_name(index);
+        guard let option::Option[text_encoder::Location]::Some(location) = text_encoder::locate(shards, name.view()) else {
+            return option::Option[Vision]::None;
+        };
+        guard let option::Option[*text_encoder::Shard]::Some(shard) = shards.at_ptr(location.shard) else { return option::Option[Vision]::None; };
+        guard let option::Option[u64]::Some(destination) = offsets.get(name.view()) else { return option::Option[Vision]::None; };
+        var written: u64 = 0 as u64;
+        while written < location.bytes {
+            let amount: u64 = if location.bytes -% written < staging.bytes { location.bytes -% written } else { staging.bytes };
+            if !pack::read_exact((*shard).fd, staging.pointer, amount as usize, location.offset +% written)
+                || cuda::upload(weights.pointer + (destination +% written) as usize, staging.pointer, amount) != (0 as i32) {
+                return option::Option[Vision]::None;
+            }
+            written = written +% amount;
+        }
+        index = index +% (1 as usize);
+    }
+    return option::Option[Vision]::Some(Vision { offsets: offsets, weights: weights });
+}
+
+fn tensor(vision: Vision, name: str) -> *u8 {
+    return match vision.offsets.get(name) {
+        option::Option::Some(offset) => vision.weights.pointer + offset as usize,
+        option::Option::None => {
+            io::eprintln("cuda vision: missing tensor ${name}");
+            0 as *u8
+        }
+    };
+}
+
+// Scratch for `tokens` patches of one image.
+struct Work {
+    hidden: cuda::DeviceBuffer,
+    normed: cuda::DeviceBuffer,
+    qkv: cuda::DeviceBuffer,
+    attended: cuda::DeviceBuffer,
+    mlp: cuda::DeviceBuffer,
+    merged: cuda::DeviceBuffer,
+    scores: cuda::DeviceBuffer,
+    matrix: cuda::DeviceBuffer,
+    vector_a: cuda::DeviceBuffer,
+    vector_b: cuda::DeviceBuffer,
+    table: cuda::DeviceBuffer,
+    taps: cuda::DeviceBuffer,
+    tap_weights: cuda::DeviceBuffer,
+}
+
+fn floats(count: usize) -> option::Option[cuda::DeviceBuffer] {
+    return cuda::DeviceBuffer::allocate((count *% (4 as usize)) as u64);
+}
+
+fn allocate_work(tokens: usize) -> option::Option[Work] {
+    guard let option::Option[cuda::DeviceBuffer]::Some(hidden) = floats(tokens *% HIDDEN) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(normed) = floats(tokens *% HIDDEN) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(qkv) = floats(tokens *% HIDDEN *% (3 as usize)) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(attended) = floats(tokens *% (if PATCH_VALUES > HIDDEN { PATCH_VALUES } else { HIDDEN })) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(mlp) = floats(tokens *% MLP) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(merged) = floats(tokens *% HIDDEN) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(scores) = floats(tokens *% tokens) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(matrix) = floats(MERGED *% MERGED) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(vector_a) = floats(MERGED) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(vector_b) = floats(MERGED) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(table) = floats(tokens *% HEAD_DIM *% (2 as usize)) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(taps) = floats(tokens *% (4 as usize)) else { return option::Option[Work]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(tap_weights) = floats(tokens *% (4 as usize)) else { return option::Option[Work]::None; };
+    return option::Option[Work]::Some(Work {
+        hidden: hidden, normed: normed, qkv: qkv, attended: attended, mlp: mlp, merged: merged, scores: scores,
+        matrix: matrix, vector_a: vector_a, vector_b: vector_b, table: table, taps: taps, tap_weights: tap_weights,
+    });
+}
+
+// y[rows, n] = x[rows, k] . W^T + b for the BF16 `${prefix}.weight` / `.bias`.
+fn linear(vision: Vision, ref work: Work, prefix: str, x: *f32, y: *f32, rows: usize, n: usize, k: usize) -> bool {
+    let weight_name: text::Text = "${prefix}.weight";
+    let bias_name: text::Text = "${prefix}.bias";
+    let weight: *u8 = tensor(vision, weight_name.view());
+    let bias: *u8 = tensor(vision, bias_name.view());
+    if weight.is_null() || bias.is_null() { return false; }
+    let matrix: *f32 = work.matrix.pointer as *f32;
+    let vector: *f32 = work.vector_a.pointer as *f32;
+    return ok(cuda::bf16_to_f32(weight, matrix, (n *% k) as u64), "weight expansion")
+        && ok(cuda::linear_f32(x, matrix, y, rows as i32, n as i32, k as i32, 0 as i32), prefix)
+        && ok(cuda::bf16_to_f32(bias, vector, n as u64), "bias expansion")
+        && ok(qi_add_bias_rows(y, vector, rows as i32, n as i32), "bias");
+}
+
+fn layer_norm(vision: Vision, ref work: Work, prefix: str, x: *f32, y: *f32, rows: usize, width: usize) -> bool {
+    let weight_name: text::Text = "${prefix}.weight";
+    let bias_name: text::Text = "${prefix}.bias";
+    let weight: *u8 = tensor(vision, weight_name.view());
+    let bias: *u8 = tensor(vision, bias_name.view());
+    if weight.is_null() || bias.is_null() { return false; }
+    let a: *f32 = work.vector_a.pointer as *f32;
+    let b: *f32 = work.vector_b.pointer as *f32;
+    return ok(cuda::bf16_to_f32(weight, a, width as u64), "norm weight")
+        && ok(cuda::bf16_to_f32(bias, b, width as u64), "norm bias")
+        && ok(qi_layer_norm_affine(x, a, b, y, rows as i32, width as i32), prefix);
+}
+
+// Merger `prefix` over `tokens` patches (tokens / 4 outputs) into `output`
+// (device, [tokens / 4, 4096]). Reads work.hidden.
+fn merge(vision: Vision, ref work: Work, prefix: str, postshuffle: bool, tokens: usize, output: *f32) -> bool {
+    let groups: usize = tokens / (4 as usize);
+    let norm_name: text::Text = "${prefix}.norm";
+    let fc1: text::Text = "${prefix}.linear_fc1";
+    let fc2: text::Text = "${prefix}.linear_fc2";
+    let hidden: *f32 = work.hidden.pointer as *f32;
+    let normed: *f32 = work.normed.pointer as *f32;
+    let merged: *f32 = work.merged.pointer as *f32;
+    let normalized: bool = if postshuffle {
+        layer_norm(vision, work, norm_name.view(), hidden, normed, groups, MERGED)
+    } else {
+        layer_norm(vision, work, norm_name.view(), hidden, normed, tokens, HIDDEN)
+    };
+    return normalized
+        && linear(vision, work, fc1.view(), normed, merged, groups, MERGED, MERGED)
+        && ok(qi_gelu_erf(merged, (groups *% MERGED) as u64), "merger gelu")
+        && linear(vision, work, fc2.view(), merged, output, groups, OUT, MERGED);
+}
+
+// Row and column of patch `index` in 2 x 2 merge-group order.
+fn patch_row(index: usize, grid_w: usize) -> usize {
+    let groups_w: usize = grid_w / (2 as usize);
+    return index / ((4 as usize) *% groups_w) *% (2 as usize) +% (index / (2 as usize)) % (2 as usize);
+}
+
+fn patch_column(index: usize, grid_w: usize) -> usize {
+    let groups_w: usize = grid_w / (2 as usize);
+    return (index / (4 as usize)) % groups_w *% (2 as usize) +% index % (2 as usize);
+}
+
+// Bilinear (align_corners) taps into the 48-wide table for position `index`
+// on an axis of `size` patches: (floor tap, weight) and (next tap, weight).
+struct AxisTaps {
+    first: usize,
+    second: usize,
+    first_weight: f32,
+    second_weight: f32,
+}
+
+fn axis_taps(index: usize, size: usize) -> AxisTaps {
+    let denominator: usize = if size > (1 as usize) { size -% (1 as usize) } else { 1 as usize };
+    let source: f32 = index as f32 * ((TABLE_SIDE -% (1 as usize)) as f32) / denominator as f32;
+    let floor_value: f32 = source.floor();
+    let base: usize = floor_value as usize;
+    let last: usize = TABLE_SIDE -% (1 as usize);
+    let first_distance: f32 = (source - floor_value).abs();
+    let second_distance: f32 = (source - floor_value - 1.0f32).abs();
+    let first_weight: f32 = if 1.0f32 - first_distance > 0.0f32 { 1.0f32 - first_distance } else { 0.0f32 };
+    let second_weight: f32 = if 1.0f32 - second_distance > 0.0f32 { 1.0f32 - second_distance } else { 0.0f32 };
+    return AxisTaps {
+        first: if base > last { last } else { base },
+        second: if base +% (1 as usize) > last { last } else { base +% (1 as usize) },
+        first_weight: first_weight,
+        second_weight: second_weight,
+    };
+}
+
+// Host tables for one image: position-embedding taps and weights [tokens, 4],
+// rotary cos | sin [tokens, 144].
+fn prepare_tables(ref work: Work, grid_h: usize, grid_w: usize) -> bool {
+    let tokens: usize = grid_h *% grid_w;
+    guard let option::Option[pack::Buffer]::Some(taps) = pack::Buffer::allocate(tokens *% (16 as usize)) else { return false; };
+    guard let option::Option[pack::Buffer]::Some(weights) = pack::Buffer::allocate(tokens *% (16 as usize)) else { return false; };
+    guard let option::Option[pack::Buffer]::Some(table) = pack::Buffer::allocate(tokens *% HEAD_DIM *% (8 as usize)) else { return false; };
+    let tap_values: *i32 = taps.pointer as *i32;
+    let weight_values: *f32 = weights.pointer as *f32;
+    let table_values: *f32 = table.pointer as *f32;
+    var inverse_frequency: [f32; 18] = [0.0f32; 18];
+    var j: usize = 0 as usize;
+    while j < (18 as usize) {
+        // As the reference: theta ** (2j / 36) in FP32.
+        let exponent: f32 = ((2 as usize) *% j) as f32 / 36.0f32;
+        inverse_frequency[j] = 1.0f32 / ROPE_THETA.powf(exponent);
+        j = j +% (1 as usize);
+    }
+    var index: usize = 0 as usize;
+    while index < tokens {
+        let row: usize = patch_row(index, grid_w);
+        let column: usize = patch_column(index, grid_w);
+        let h: AxisTaps = axis_taps(row, grid_h);
+        let w: AxisTaps = axis_taps(column, grid_w);
+        let base: usize = index *% (4 as usize);
+        tap_values[base] = (h.first *% TABLE_SIDE +% w.first) as i32;
+        tap_values[base +% (1 as usize)] = (h.first *% TABLE_SIDE +% w.second) as i32;
+        tap_values[base +% (2 as usize)] = (h.second *% TABLE_SIDE +% w.first) as i32;
+        tap_values[base +% (3 as usize)] = (h.second *% TABLE_SIDE +% w.second) as i32;
+        weight_values[base] = h.first_weight * w.first_weight;
+        weight_values[base +% (1 as usize)] = h.first_weight * w.second_weight;
+        weight_values[base +% (2 as usize)] = h.second_weight * w.first_weight;
+        weight_values[base +% (3 as usize)] = h.second_weight * w.second_weight;
+        // Angles: [row * f (18) | column * f (18)] twice.
+        let cosine: *f32 = table_values + index *% HEAD_DIM *% (2 as usize);
+        let sine: *f32 = cosine + HEAD_DIM;
+        var d: usize = 0 as usize;
+        while d < HEAD_DIM {
+            let slot: usize = d % (36 as usize);
+            let position: f32 = if slot < (18 as usize) { row as f32 } else { column as f32 };
+            let angle: f32 = position * inverse_frequency[slot % (18 as usize)];
+            cosine[d] = angle.cos();
+            sine[d] = angle.sin();
+            d = d +% (1 as usize);
+        }
+        index = index +% (1 as usize);
+    }
+    return work.taps.upload(taps.pointer, taps.length as u64)
+        && work.tap_weights.upload(weights.pointer, weights.length as u64)
+        && work.table.upload(table.pointer, table.length as u64);
+}
+
+// Encodes one image's patches ([grid_h * grid_w, 1536], host, merge-group
+// order) into `embeddings` [tokens / 4, 4096] and the three DeepStack layers
+// at `deepstack + layer * deepstack_stride` floats (host); the stride defaults
+// to one image's rows.
+fn encode(vision: Vision, patches: *f32, grid_h: usize, grid_w: usize, embeddings: *f32, deepstack: *f32,
+          deepstack_stride: usize = 0 as usize) -> bool {
+    let tokens: usize = grid_h *% grid_w;
+    let groups: usize = tokens / (4 as usize);
+    let stride: usize = if deepstack_stride == (0 as usize) { groups *% OUT } else { deepstack_stride };
+    guard let option::Option[Work]::Some(allocated) = allocate_work(tokens) else {
+        io::eprintln("cuda vision: could not allocate activations for ${tokens} patches");
+        return false;
+    };
+    var work: Work = allocated;
+    guard let option::Option[cuda::DeviceBuffer]::Some(output) = floats(groups *% OUT) else { return false; };
+    if !prepare_tables(work, grid_h, grid_w) { return false; }
+    let hidden: *f32 = work.hidden.pointer as *f32;
+    let normed: *f32 = work.normed.pointer as *f32;
+    let qkv: *f32 = work.qkv.pointer as *f32;
+    let attended: *f32 = work.attended.pointer as *f32;
+    let mlp: *f32 = work.mlp.pointer as *f32;
+    let pos_table: *u8 = tensor(vision, "model.visual.pos_embed.weight");
+    if pos_table.is_null()
+        || !work.attended.upload(patches as *u8, (tokens *% PATCH_VALUES *% (4 as usize)) as u64)
+        || !linear(vision, work, "model.visual.patch_embed.proj", attended, hidden, tokens, HIDDEN, PATCH_VALUES)
+        || !ok(qi_gather4_add(hidden, pos_table, work.taps.pointer as *i32, work.tap_weights.pointer as *f32, tokens as i32,
+            HIDDEN as i32), "position embedding") {
+        return false;
+    }
+    var deepstack_index: usize = 0 as usize;
+    var block: usize = 0 as usize;
+    while block < DEPTH {
+        let prefix: text::Text = "model.visual.blocks.${block}";
+        let norm1: text::Text = "${prefix.view()}.norm1";
+        let norm2: text::Text = "${prefix.view()}.norm2";
+        let qkv_name: text::Text = "${prefix.view()}.attn.qkv";
+        let proj: text::Text = "${prefix.view()}.attn.proj";
+        let fc1: text::Text = "${prefix.view()}.mlp.linear_fc1";
+        let fc2: text::Text = "${prefix.view()}.mlp.linear_fc2";
+        if !layer_norm(vision, work, norm1.view(), hidden, normed, tokens, HIDDEN)
+            || !linear(vision, work, qkv_name.view(), normed, qkv, tokens, HIDDEN *% (3 as usize), HIDDEN)
+            || !ok(qi_vision_rope(qkv, work.table.pointer as *f32, tokens as i32, HEADS as i32, HEAD_DIM as i32), "rope")
+            || !ok(qi_vision_attention(qkv, attended, work.scores.pointer as *f32, tokens as i32, HEADS as i32, HEAD_DIM as i32), "attention")
+            || !linear(vision, work, proj.view(), attended, normed, tokens, HIDDEN, HIDDEN)
+            || !ok(qi_add(hidden, normed, (tokens *% HIDDEN) as u64), "attention residual")
+            || !layer_norm(vision, work, norm2.view(), hidden, normed, tokens, HIDDEN)
+            || !linear(vision, work, fc1.view(), normed, mlp, tokens, MLP, HIDDEN)
+            || !ok(cuda::gelu_tanh(mlp, mlp, (tokens *% MLP) as u64), "gelu")
+            || !linear(vision, work, fc2.view(), mlp, normed, tokens, HIDDEN, MLP)
+            || !ok(qi_add(hidden, normed, (tokens *% HIDDEN) as u64), "mlp residual") {
+            return false;
+        }
+        if block == (8 as usize) || block == (16 as usize) || block == (24 as usize) {
+            let merger: text::Text = "model.visual.deepstack_merger_list.${deepstack_index}";
+            if !merge(vision, work, merger.view(), true, tokens, output.pointer as *f32)
+                || !output.download((deepstack + deepstack_index *% stride) as *u8, (groups *% OUT *% (4 as usize)) as u64) {
+                return false;
+            }
+            deepstack_index = deepstack_index +% (1 as usize);
+        }
+        block = block +% (1 as usize);
+    }
+    return merge(vision, work, "model.visual.merger", false, tokens, output.pointer as *f32)
+        && output.download(embeddings as *u8, (groups *% OUT *% (4 as usize)) as u64);
+}
+
+// Encodes pixel_values.f32 ([grid_h * grid_w, 1536]) and writes
+// vision_embeds.f32 and deepstack_0..2.f32 into `directory`.
+fn encode_file(model_root: str, patches_path: str, grid_h: usize, grid_w: usize, directory: str) -> i32 {
+    let tokens: usize = grid_h *% grid_w;
+    let groups: usize = tokens / (4 as usize);
+    guard let option::Option[pack::Buffer]::Some(patches) = read_host(patches_path, tokens *% PATCH_VALUES *% (4 as usize)) else { return 1; };
+    guard let option::Option[pack::Buffer]::Some(embeddings) = pack::Buffer::allocate(groups *% OUT *% (4 as usize)) else { return 1; };
+    guard let option::Option[pack::Buffer]::Some(deepstack) = pack::Buffer::allocate((3 as usize) *% groups *% OUT *% (4 as usize)) else { return 1; };
+    guard let option::Option[Vision]::Some(vision) = load(model_root) else { return 1; };
+    if !encode(vision, patches.pointer as *f32, grid_h, grid_w, embeddings.pointer as *f32, deepstack.pointer as *f32) {
+        return 1;
+    }
+    let stride: usize = groups *% OUT *% (4 as usize);
+    let embeds_path: text::Text = "${directory}/vision_embeds.f32";
+    if !write_host(embeds_path.view(), embeddings.pointer, embeddings.length) { return 1; }
+    var index: usize = 0 as usize;
+    while index < (3 as usize) {
+        let path: text::Text = "${directory}/deepstack_${index}.f32";
+        if !write_host(path.view(), deepstack.pointer + index *% stride, stride) { return 1; }
+        index = index +% (1 as usize);
+    }
+    io::println("cuda vision: ${tokens} patches -> ${groups} tokens; wrote ${directory}");
+    return 0;
+}
+
+#[link_name = "open"]
+extern fn qi_open(path: *u8, flags: i32, mode: i32) -> i32;
+
+fn read_host(path: str, bytes: usize) -> option::Option[pack::Buffer] {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[pack::Buffer]::None; };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) { return option::Option[pack::Buffer]::None; }
+    guard let option::Option[pack::Buffer]::Some(buffer) = pack::Buffer::allocate(bytes) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[pack::Buffer]::None;
+    };
+    let read: bool = pack::read_exact(fd, buffer.pointer, bytes, 0 as u64);
+    let _closed: i32 = qi_close(fd);
+    if !read { return option::Option[pack::Buffer]::None; }
+    return option::Option[pack::Buffer]::Some(buffer);
+}
+
+fn write_host(path: str, data: *u8, bytes: usize) -> bool {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return false; };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0x241 as i32, 420 as i32);
+    if fd < (0 as i32) { return false; }
+    let written: bool = pack::write_exact(fd, data, bytes, 0 as u64);
+    let _closed: i32 = qi_close(fd);
+    return written;
+}

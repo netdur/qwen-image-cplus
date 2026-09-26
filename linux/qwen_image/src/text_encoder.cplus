@@ -1,4 +1,4 @@
-// Qwen3-VL language model (Qwen-Image-2.1 text encoder) on CUDA, text-only.
+// Qwen3-VL language model (Qwen-Image-2.1 text encoder) on CUDA.
 //
 // 36 decoder layers, width 4096, 32 query / 8 key-value heads of 128,
 // SwiGLU 12288, RMSNorm eps 1e-6, per-head Q/K RMSNorm, RoPE theta 5e6. The
@@ -8,8 +8,14 @@
 // Weights stay BF16 in the four safetensors shards. Each layer is read into
 // pinned memory, uploaded to one device slot, expanded to FP32 per matrix, and
 // run with FP32 SGEMM; only the prompt's embedding rows are read.
+//
+// With condition images (`Multimodal`), the vision tower's rows replace the
+// <|image_pad|> embeddings, RoPE takes 3-axis positions with the interleaved
+// [24, 20, 20] M-RoPE sections, and the DeepStack features are added to the
+// image rows after decoder layers 0, 1 and 2.
 
 import "./cuda" as cuda;
+import "./image_conditioning" as conditioning;
 import "./int4_pack" as pack;
 import "stdlib/io" as io;
 import "stdlib/option" as option;
@@ -23,8 +29,14 @@ import "stdlib/thread" as thread;
 extern fn qi_open(path: *u8, flags: i32, mode: i32) -> i32;
 #[link_name = "close"]
 extern fn qi_close(fd: i32) -> i32;
+#[link_name = "memcpy"]
+extern fn qi_memcpy(destination: *u8, source: *u8, bytes: usize) -> *u8;
 #[link_name = "qi_text_head_norm_rope"]
 extern fn qi_text_head_norm_rope(x: *f32, weight: *f32, rows: i32, heads: i32, theta: f32, position_offset: i32) -> i32;
+#[link_name = "qi_text_head_norm_mrope"]
+extern fn qi_text_head_norm_mrope(x: *f32, weight: *f32, rows: i32, heads: i32, theta: f32, positions: *i32) -> i32;
+#[link_name = "qi_scatter_rows"]
+extern fn qi_scatter_rows(target: *f32, source: *f32, indices: *i32, rows: i32, width: i32, accumulate: i32) -> i32;
 #[link_name = "qi_text_attention"]
 extern fn qi_text_attention(q: *f32, k: *f32, v: *f32, out: *f32, tokens: i32, q_heads: i32, kv_heads: i32) -> i32;
 #[link_name = "qi_round_bf16"]
@@ -47,6 +59,8 @@ const SYSTEM_TOKENS: usize = 14;
 const TENSORS_PER_LAYER: usize = 11;
 const READ_WORKERS: usize = 8;
 const READ_CHUNK: u64 = 8388608;
+const IMAGE_PAD: i32 = 151655;
+const DEEPSTACK_LAYERS: usize = 3;
 
 fn ok(result: i32, what: str) -> bool {
     if result != (0 as i32) {
@@ -250,6 +264,21 @@ struct Options {
     bf16_boundaries: bool,
 }
 
+// Condition-image inputs (host). All null for a text-only prompt.
+struct Multimodal {
+    // [count, 3] (t, h, w) M-RoPE positions.
+    opaque positions: *u32,
+    // [vision_rows, 4096], one row per <|image_pad|> token in order.
+    opaque vision: *f32,
+    // [3, vision_rows, 4096].
+    opaque deepstack: *f32,
+    vision_rows: usize,
+}
+
+fn text_only() -> Multimodal {
+    return Multimodal { positions: 0 as *u32, vision: 0 as *f32, deepstack: 0 as *f32, vision_rows: 0 as usize };
+}
+
 fn device_floats(count: usize) -> option::Option[cuda::DeviceBuffer] {
     return cuda::DeviceBuffer::allocate((count *% (4 as usize)) as u64);
 }
@@ -268,7 +297,7 @@ fn linear(slot: *u8, offset: u64, scratch: *f32, x: *f32, y: *f32, tokens: usize
 
 // Encodes `count` token IDs and writes the last decoder layer's output for
 // tokens [SYSTEM_TOKENS, count) as FP32 [count - 14, 4096] to `output` (host).
-fn encode(model_root: str, ids: *i32, count: usize, options: Options, output: *f32) -> bool {
+fn encode(model_root: str, ids: *i32, count: usize, options: Options, output: *f32, inputs: Multimodal = text_only()) -> bool {
     if count <= SYSTEM_TOKENS {
         io::eprintln("cuda text encoder: the prompt template needs more than ${SYSTEM_TOKENS} tokens");
         return false;
@@ -281,7 +310,7 @@ fn encode(model_root: str, ids: *i32, count: usize, options: Options, output: *f
         if shards.append(shard) != status::Status::Ok { return false; }
         shard_index = shard_index +% (1 as usize);
     }
-    let result: bool = encode_with(shards, ids, count, options, output);
+    let result: bool = encode_with(shards, ids, count, options, output, inputs);
     var index: usize = 0 as usize;
     while index < shards.count() {
         match shards.at_ptr(index) {
@@ -293,7 +322,7 @@ fn encode(model_root: str, ids: *i32, count: usize, options: Options, output: *f
     return result;
 }
 
-fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Options, output: *f32) -> bool {
+fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Options, output: *f32, inputs: Multimodal) -> bool {
     // Layer layout: the 11 tensors packed back to back in the slot.
     var offsets: [u64; 11] = [0 as u64; 11];
     var layer_bytes: u64 = 0 as u64;
@@ -359,6 +388,45 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
         return false;
     }
 
+    // Condition images: image-row indices, the vision rows and DeepStack
+    // features on the device, and the 3-axis positions.
+    let multimodal: bool = !inputs.positions.is_null();
+    let vision_rows: usize = inputs.vision_rows;
+    let visual_floats: usize = if multimodal { vision_rows *% WIDTH } else { 1 as usize };
+    guard let option::Option[cuda::DeviceBuffer]::Some(visual) = device_floats(visual_floats *% ((1 as usize) +% DEEPSTACK_LAYERS)) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(image_rows) = device_floats(if multimodal { vision_rows } else { 1 as usize }) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(positions) = device_floats(if multimodal { count *% (3 as usize) } else { 1 as usize }) else { return false; };
+    if multimodal {
+        guard let option::Option[pack::Buffer]::Some(rows_host) = pack::Buffer::allocate(vision_rows *% (4 as usize)) else { return false; };
+        let row_values: *i32 = rows_host.pointer as *i32;
+        var found: usize = 0 as usize;
+        var token: usize = 0 as usize;
+        while token < count {
+            if ids[token] == IMAGE_PAD {
+                if found == vision_rows { break; }
+                row_values[found] = token as i32;
+                found = found +% (1 as usize);
+            }
+            token = token +% (1 as usize);
+        }
+        if found != vision_rows || inputs.vision.is_null() || inputs.deepstack.is_null() {
+            io::eprintln("cuda text encoder: ${found} image tokens for ${vision_rows} vision rows");
+            return false;
+        }
+        let v: *f32 = visual.pointer as *f32;
+        if !image_rows.upload(rows_host.pointer, rows_host.length as u64)
+            || !positions.upload(inputs.positions as *u8, (count *% (12 as usize)) as u64)
+            || cuda::upload(v as *u8, inputs.vision as *u8, (vision_rows *% WIDTH *% (4 as usize)) as u64) != (0 as i32)
+            || cuda::upload((v + vision_rows *% WIDTH) as *u8, inputs.deepstack as *u8,
+                (DEEPSTACK_LAYERS *% vision_rows *% WIDTH *% (4 as usize)) as u64) != (0 as i32)
+            || !round_bf16(options, v, ((1 as usize) +% DEEPSTACK_LAYERS) *% vision_rows *% WIDTH)
+            || !ok(qi_scatter_rows(hidden.pointer as *f32, v, image_rows.pointer as *i32, vision_rows as i32, WIDTH as i32,
+                0 as i32), "vision rows") {
+            return false;
+        }
+    }
+    let position_values: *i32 = positions.pointer as *i32;
+
     let h: *f32 = hidden.pointer as *f32;
     let n: *f32 = normed.pointer as *f32;
     let w: *f32 = scratch.pointer as *f32;
@@ -393,9 +461,9 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
             || !round_bf16(options, k.pointer as *f32, count *% KV_WIDTH)
             || !round_bf16(options, v.pointer as *f32, count *% KV_WIDTH)
             || !ok(cuda::bf16_to_f32(s + offsets[4] as usize, vector, 128 as u64), "q norm weight")
-            || !ok(qi_text_head_norm_rope(q.pointer as *f32, vector, count as i32, Q_HEADS as i32, ROPE_THETA, 0 as i32), "q norm")
+            || !head_norm_rope(q.pointer as *f32, vector, count, Q_HEADS, multimodal, position_values)
             || !ok(cuda::bf16_to_f32(s + offsets[5] as usize, vector, 128 as u64), "k norm weight")
-            || !ok(qi_text_head_norm_rope(k.pointer as *f32, vector, count as i32, KV_HEADS as i32, ROPE_THETA, 0 as i32), "k norm")
+            || !head_norm_rope(k.pointer as *f32, vector, count, KV_HEADS, multimodal, position_values)
             || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
             || !round_bf16(options, k.pointer as *f32, count *% KV_WIDTH)
             || !ok(qi_text_attention(q.pointer as *f32, k.pointer as *f32, v.pointer as *f32, attended.pointer as *f32,
@@ -422,11 +490,27 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
             let _joined: bool = finish_read(reading);
             return false;
         }
+        if multimodal && layer < DEEPSTACK_LAYERS {
+            let features: *f32 = (visual.pointer as *f32) + ((1 as usize) +% layer) *% vision_rows *% WIDTH;
+            if !ok(qi_scatter_rows(h, features, image_rows.pointer as *i32, vision_rows as i32, WIDTH as i32, 1 as i32), "deepstack")
+                || !round_bf16(options, h, count *% WIDTH) {
+                let _joined: bool = finish_read(reading);
+                return false;
+            }
+        }
         layer = layer +% (1 as usize);
     }
     let kept: usize = count -% SYSTEM_TOKENS;
     return cuda::synchronize()
         && cuda::download(output as *u8, (h + SYSTEM_TOKENS *% WIDTH) as *u8, (kept *% WIDTH *% (4 as usize)) as u64) == (0 as i32);
+}
+
+// Per-head Q/K norm and RoPE: 1D positions for text, M-RoPE with images.
+fn head_norm_rope(x: *f32, weight: *f32, rows: usize, heads: usize, multimodal: bool, positions: *i32) -> bool {
+    if multimodal {
+        return ok(qi_text_head_norm_mrope(x, weight, rows as i32, heads as i32, ROPE_THETA, positions), "head norm (m-rope)");
+    }
+    return ok(qi_text_head_norm_rope(x, weight, rows as i32, heads as i32, ROPE_THETA, 0 as i32), "head norm");
 }
 
 struct TokenIds {
@@ -467,5 +551,86 @@ fn encode_file(model_root: str, ids_path: str, bf16_boundaries: bool, output_pat
     let _closed: i32 = qi_close(fd);
     if !written { return 1; }
     io::println("cuda text encoder: ${ids.count} tokens, wrote ${kept} rows to ${output_path}");
+    return 0;
+}
+
+fn read_file(path: str, bytes: usize) -> option::Option[pack::Buffer] {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[pack::Buffer]::None; };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) {
+        io::eprintln("cuda text encoder: could not open ${path}");
+        return option::Option[pack::Buffer]::None;
+    }
+    guard let option::Option[pack::Buffer]::Some(buffer) = pack::Buffer::allocate(bytes) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[pack::Buffer]::None;
+    };
+    let read: bool = pack::read_exact(fd, buffer.pointer, bytes, 0 as u64);
+    let _closed: i32 = qi_close(fd);
+    if !read { return option::Option[pack::Buffer]::None; }
+    return option::Option[pack::Buffer]::Some(buffer);
+}
+
+fn write_file(path: str, data: *u8, bytes: usize) -> bool {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return false; };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0x241 as i32, 420 as i32);
+    if fd < (0 as i32) { return false; }
+    let written: bool = pack::write_exact(fd, data, bytes, 0 as u64);
+    let _closed: i32 = qi_close(fd);
+    return written;
+}
+
+// Encodes a one-image edit prompt: IDs from `ids_path`, the image's vision
+// rows and DeepStack features (vision_embeds.f32, deepstack_N.f32) from
+// `vision_directory` for a grid_h x grid_w patch grid. Writes the prompt rows
+// to `output_path` and the M-RoPE positions ([count, 3]) beside it.
+fn encode_edit_file(model_root: str, ids_path: str, vision_directory: str, grid_h: usize, grid_w: usize, bf16_boundaries: bool,
+                    output_path: str) -> i32 {
+    guard let option::Option[TokenIds]::Some(ids) = read_ids(ids_path) else { return 1; };
+    if ids.count <= SYSTEM_TOKENS { return 1; }
+    var shape: conditioning::Shape = conditioning::Shape {
+        width: grid_w *% (16 as usize),
+        height: grid_h *% (16 as usize),
+        vision_grid_width: grid_w,
+        vision_grid_height: grid_h,
+        vision_tokens: grid_w *% grid_h / (4 as usize),
+        latent_tokens: grid_w *% grid_h,
+    };
+    let vision_rows: usize = shape.vision_tokens;
+    guard let option::Option[pack::Buffer]::Some(positions) = pack::Buffer::allocate(ids.count *% (12 as usize)) else { return 1; };
+    if !conditioning::fill_language_positions(ids.buffer.pointer as *u32, ids.count, #addr_of(shape), 1 as usize,
+            positions.pointer as *u32) {
+        io::eprintln("cuda text encoder: the IDs do not match a ${grid_h}x${grid_w} image");
+        return 1;
+    }
+    let rows_bytes: usize = vision_rows *% WIDTH *% (4 as usize);
+    let embeds_path: text::Text = "${vision_directory}/vision_embeds.f32";
+    guard let option::Option[pack::Buffer]::Some(vision) = read_file(embeds_path.view(), rows_bytes) else { return 1; };
+    guard let option::Option[pack::Buffer]::Some(deepstack) = pack::Buffer::allocate(DEEPSTACK_LAYERS *% rows_bytes) else { return 1; };
+    var layer: usize = 0 as usize;
+    while layer < DEEPSTACK_LAYERS {
+        let path: text::Text = "${vision_directory}/deepstack_${layer}.f32";
+        guard let option::Option[pack::Buffer]::Some(features) = read_file(path.view(), rows_bytes) else { return 1; };
+        let _copied: *u8 = qi_memcpy(deepstack.pointer + layer *% rows_bytes, features.pointer, rows_bytes);
+        layer = layer +% (1 as usize);
+    }
+    let kept: usize = ids.count -% SYSTEM_TOKENS;
+    guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(kept *% WIDTH *% (4 as usize)) else { return 1; };
+    let inputs: Multimodal = Multimodal {
+        positions: positions.pointer as *u32,
+        vision: vision.pointer as *f32,
+        deepstack: deepstack.pointer as *f32,
+        vision_rows: vision_rows,
+    };
+    if !encode(model_root, ids.buffer.pointer as *i32, ids.count, Options { bf16_boundaries: bf16_boundaries }, result.pointer as *f32,
+            inputs) {
+        return 1;
+    }
+    let positions_path: text::Text = "${output_path}.positions.i32";
+    if !write_file(output_path, result.pointer, result.length)
+        || !write_file(positions_path.view(), positions.pointer, positions.length) {
+        return 1;
+    }
+    io::println("cuda text encoder: ${ids.count} tokens (${vision_rows} image), wrote ${kept} rows to ${output_path}");
     return 0;
 }

@@ -25,9 +25,11 @@ __global__ void add_bias_kernel(float *y, const float *bias, int channels, int p
     if (i < (unsigned long long)channels * pixels) y[i] += bias[i / pixels];
 }
 
-// y[out, H, W] = conv(x[in, H, W], w[out, in, k, k]) + bias, zero padding k/2.
-extern "C" int qi_vae_conv2d(const float *x, const float *weights, const float *bias, float *y,
-                             int in_channels, int out_channels, int height, int width, int kernel) {
+// y[out, H', W'] = conv(x[in, H, W], w[out, in, k, k]) + bias with symmetric
+// zero padding `pad` and stride `stride`; H' = (H + 2 pad - k) / stride + 1.
+extern "C" int qi_vae_conv2d_strided(const float *x, const float *weights, const float *bias, float *y,
+                                     int in_channels, int out_channels, int height, int width, int kernel,
+                                     int stride, int pad) {
     if (cudnn == nullptr && cudnnCreate(&cudnn) != CUDNN_STATUS_SUCCESS) return (int)cudaErrorInitializationError;
     cudnnTensorDescriptor_t input, output;
     cudnnFilterDescriptor_t filter;
@@ -37,11 +39,12 @@ extern "C" int qi_vae_conv2d(const float *x, const float *weights, const float *
     cudnnCreateFilterDescriptor(&filter);
     cudnnCreateConvolutionDescriptor(&convolution);
     int status = 0;
-    const int pad = kernel / 2;
+    const int out_height = (height + 2 * pad - kernel) / stride + 1;
+    const int out_width = (width + 2 * pad - kernel) / stride + 1;
     if (cudnnSetTensor4dDescriptor(input, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, in_channels, height, width) ||
-        cudnnSetTensor4dDescriptor(output, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, out_channels, height, width) ||
+        cudnnSetTensor4dDescriptor(output, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, out_channels, out_height, out_width) ||
         cudnnSetFilter4dDescriptor(filter, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, out_channels, in_channels, kernel, kernel) ||
-        cudnnSetConvolution2dDescriptor(convolution, pad, pad, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT)) {
+        cudnnSetConvolution2dDescriptor(convolution, pad, pad, stride, stride, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT)) {
         status = (int)cudaErrorInvalidValue;
     }
     cudnnConvolutionFwdAlgoPerf_t choices[8];
@@ -77,8 +80,75 @@ extern "C" int qi_vae_conv2d(const float *x, const float *weights, const float *
     cudnnDestroyTensorDescriptor(output);
     cudnnDestroyTensorDescriptor(input);
     if (status != 0) return status;
-    const int pixels = height * width;
+    const int pixels = out_height * out_width;
     add_bias_kernel<<<blocks_for((unsigned long long)out_channels * pixels, 256), 256>>>(y, bias, out_channels, pixels);
+    return (int)cudaGetLastError();
+}
+
+// Same-size convolution: stride 1, zero padding k/2.
+extern "C" int qi_vae_conv2d(const float *x, const float *weights, const float *bias, float *y,
+                             int in_channels, int out_channels, int height, int width, int kernel) {
+    return qi_vae_conv2d_strided(x, weights, bias, y, in_channels, out_channels, height, width, kernel, 1, kernel / 2);
+}
+
+// y[c, H + 1, W + 1] = x[c, H, W] with one zero row below and one zero column
+// to the right (the encoder downsampler's ZeroPad2d((0, 1, 0, 1))).
+__global__ void pad_bottom_right_kernel(const float *x, float *y, int height, int width, unsigned long long count) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int padded_width = width + 1;
+    const int column = (int)(i % padded_width);
+    const int row = (int)((i / padded_width) % (height + 1));
+    const unsigned long long channel = i / ((unsigned long long)padded_width * (height + 1));
+    y[i] = row < height && column < width ? x[(channel * height + row) * width + column] : 0.0f;
+}
+
+extern "C" int qi_vae_pad_bottom_right(const float *x, float *y, int channels, int height, int width) {
+    const unsigned long long count = (unsigned long long)channels * (height + 1) * (width + 1);
+    pad_bottom_right_kernel<<<blocks_for(count, 256), 256>>>(x, y, height, width, count);
+    return (int)cudaGetLastError();
+}
+
+// Encoder AvgDown3D shortcut for a single frame, added into y[out, H/f, W/f].
+// Channels, time and space fold as (c, t, sh, sw) into in * f_t * f_s^2 values
+// that are averaged in consecutive groups; with f_t = 2 the one frame is
+// front-padded, so the t = 0 entries are zeros.
+__global__ void avg_down_add_kernel(float *y, const float *x, int in_channels, int out_channels, int height, int width,
+                                    int factor_t, int factor_s) {
+    const int out_height = height / factor_s, out_width = width / factor_s;
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i >= (unsigned long long)out_channels * out_height * out_width) return;
+    const int w = (int)(i % out_width), h = (int)((i / out_width) % out_height), o = (int)(i / ((unsigned long long)out_width * out_height));
+    const int factor = factor_t * factor_s * factor_s;
+    const int group = in_channels * factor / out_channels;
+    float sum = 0.0f;
+    for (int g = 0; g < group; ++g) {
+        const int flat = o * group + g;
+        const int c = flat / factor, rem = flat % factor;
+        const int t = rem / (factor_s * factor_s), sh = (rem / factor_s) % factor_s, sw = rem % factor_s;
+        if (t == factor_t - 1) sum += x[((size_t)c * height + h * factor_s + sh) * width + w * factor_s + sw];
+    }
+    y[i] += sum / (float)group;
+}
+
+extern "C" int qi_vae_avg_down_add(float *y, const float *x, int in_channels, int out_channels, int height, int width,
+                                   int factor_t, int factor_s) {
+    const unsigned long long count = (unsigned long long)out_channels * (height / factor_s) * (width / factor_s);
+    avg_down_add_kernel<<<blocks_for(count, 256), 256>>>(y, x, in_channels, out_channels, height, width, factor_t, factor_s);
+    return (int)cudaGetLastError();
+}
+
+// quant_conv output [128, N] to packed, normalized condition latents [N, 64]:
+// the posterior mean (first 64 channels), (z - mean) / std.
+__global__ void pack_latents_kernel(const float *z, const float *mean, const float *std, float *latents, int pixels) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels * 64) return;
+    const int p = i / 64, c = i % 64;
+    latents[i] = (z[(size_t)c * pixels + p] - mean[c]) / std[c];
+}
+
+extern "C" int qi_vae_pack_latents(const float *z, const float *mean, const float *std, float *latents, int pixels) {
+    pack_latents_kernel<<<blocks_for((unsigned long long)pixels * 64, 256), 256>>>(z, mean, std, latents, pixels);
     return (int)cudaGetLastError();
 }
 

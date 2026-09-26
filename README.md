@@ -29,6 +29,21 @@ downloaded separately.
 
 ![Qwen Image app showing the prompt, reference-image controls, output settings, and preview](docs/images/qwen-image-gui.png)
 
+## Linux CUDA numbers
+
+Hardware: NVIDIA RTX 2060 (6 GB, sm_75), PCIe gen3 x8, Linux, CUDA 12.6.
+Model: Viggle Qwen-Image-2.1 turbo v0.1, 4 steps, seed 1301.
+GGUF: Diffusers 80c7ed2 + Torch 2.14 with the Q4_K_M GGUF transformer.
+Ours: C+ / CUDA engine with the W4A4 (H256, g64, clip, v6) QIPACK.
+
+| Task | Size | GGUF Q4_K_M | Ours W4A4 |
+| --- | --- | ---: | ---: |
+| Text to image | 512×512 | ~39–45 s | ~8.8 s |
+| Text to image | 1024×1024 | ~74.5 s | ~23.5 s |
+| Image edit (1 image) | 512×512 | ~76.3 s | ~12.2 s |
+
+End to end, fresh process, warm file cache. Details in [nums.md](nums.md).
+
 ## Install
 
 Requires macOS 14 or newer on Apple Silicon. Homebrew installs prebuilt

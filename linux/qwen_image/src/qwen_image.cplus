@@ -16,3 +16,6 @@ import "./inputs" as _;
 import "./unicode" as _;
 import "./tokenizer" as _;
 import "./png" as _;
+import "./image_conditioning" as _;
+import "./image_input" as _;
+import "./vision" as _;

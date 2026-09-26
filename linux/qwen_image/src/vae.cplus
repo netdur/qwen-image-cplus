@@ -28,6 +28,16 @@ extern fn qi_lseek(fd: i32, offset: i64, whence: i32) -> i64;
 #[link_name = "qi_vae_conv2d"]
 extern fn qi_vae_conv2d(x: *f32, weights: *f32, bias: *f32, y: *f32, in_channels: i32, out_channels: i32,
     height: i32, width: i32, kernel: i32) -> i32;
+#[link_name = "qi_vae_conv2d_strided"]
+extern fn qi_vae_conv2d_strided(x: *f32, weights: *f32, bias: *f32, y: *f32, in_channels: i32, out_channels: i32,
+    height: i32, width: i32, kernel: i32, stride: i32, pad: i32) -> i32;
+#[link_name = "qi_vae_pad_bottom_right"]
+extern fn qi_vae_pad_bottom_right(x: *f32, y: *f32, channels: i32, height: i32, width: i32) -> i32;
+#[link_name = "qi_vae_avg_down_add"]
+extern fn qi_vae_avg_down_add(y: *f32, x: *f32, in_channels: i32, out_channels: i32, height: i32, width: i32,
+    factor_t: i32, factor_s: i32) -> i32;
+#[link_name = "qi_vae_pack_latents"]
+extern fn qi_vae_pack_latents(z: *f32, mean: *f32, std: *f32, latents: *f32, pixels: i32) -> i32;
 #[link_name = "qi_vae_rms_norm"]
 extern fn qi_vae_rms_norm(x: *f32, gamma: *f32, y: *f32, channels: i32, pixels: i32, silu: i32) -> i32;
 #[link_name = "qi_vae_upsample2x"]
@@ -93,19 +103,20 @@ fn json_u64(value: json::Value) -> u64 {
     };
 }
 
-fn load_weights(path: str) -> option::Option[Weights] {
+// Loads the decoder tensors, or with `encoder` set the encoder's.
+fn load_weights(path: str, encoder: bool = false) -> option::Option[Weights] {
     guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[Weights]::None; };
     let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
     if fd < (0 as i32) {
         io::eprintln("cuda vae: could not open ${path}");
         return option::Option[Weights]::None;
     }
-    let result: option::Option[Weights] = load_weights_from(fd);
+    let result: option::Option[Weights] = load_weights_from(fd, encoder);
     let _closed: i32 = qi_close(fd);
     return result;
 }
 
-fn load_weights_from(fd: i32) -> option::Option[Weights] {
+fn load_weights_from(fd: i32, encoder: bool) -> option::Option[Weights] {
     var length_bytes: [u8; 8] = [0 as u8; 8];
     if !pack::read_exact(fd, #addr_of(length_bytes[0]), 8 as usize, 0 as u64) { return option::Option[Weights]::None; }
     var header_bytes: u64 = 0 as u64;
@@ -122,13 +133,16 @@ fn load_weights_from(fd: i32) -> option::Option[Weights] {
         return option::Option[Weights]::None;
     };
     let data_start: u64 = (8 as u64) +% header_bytes;
-    // First pass: sizes and packed offsets of the decoder tensors.
+    // First pass: sizes and packed offsets of the selected tensors.
     var offsets: string_map::StringMap[u64] = string_map::new::[u64]();
     var total: u64 = 0 as u64;
     index = 0 as usize;
     while index < root.item_count() {
         guard let option::Option[text::Text]::Some(name) = root.key(at: index) else { return option::Option[Weights]::None; };
-        if name.view().has_prefix("decoder.") || name.view().has_prefix("post_quant_conv.") {
+        let selected: bool = if encoder {
+            name.view().has_prefix("encoder.") || name.view().has_prefix("quant_conv.")
+        } else { name.view().has_prefix("decoder.") || name.view().has_prefix("post_quant_conv.") };
+        if selected {
             guard let option::Option[json::Value]::Some(entry) = root.object_value(at: index) else { return option::Option[Weights]::None; };
             guard let option::Option[json::Value]::Some(range) = entry.value(for_key: "data_offsets") else { return option::Option[Weights]::None; };
             guard let option::Option[json::Value]::Some(first) = range.item(at: 0 as usize) else { return option::Option[Weights]::None; };
@@ -361,5 +375,157 @@ fn decode_file(vae_path: str, latents_path: str, latent_side: usize, output_path
     if !decode(weights, scratch, latents.pointer as *f32, latent_side, latent_side, rgba.pointer) { return 1; }
     guard let option::Option[usize]::Some(bytes) = png::write_rgba(rgba.pointer, side, side, output_path) else { return 1; };
     io::println("cuda vae: wrote ${output_path} (${side}x${side}, ${bytes} bytes)");
+    return 0;
+}
+
+// MARK: - Encoder
+
+// Encoder (condition images), first frame only. Graph (diffusers
+// QwenImage21Encoder3d, is_residual): conv_in (3x3, 4 -> 96) -> five residual
+// down blocks (96, 192, 384, 768, 768 channels; blocks 0-3 halve each side
+// with a bottom/right zero pad and a stride-2 3x3 conv, plus the AvgDown3D
+// shortcut of the block input) -> mid block -> RMSNorm + SiLU -> conv_out
+// (3x3, 768 -> 128) -> quant_conv (1x1). The condition latents are the
+// posterior mean, normalized and packed as [pixels, 64]. For one frame every
+// causal convolution is a plain 2D one and the temporal convolutions never run.
+
+// Five buffers of 96 * P floats (P = input pixels), the widest tensor; `t` is
+// padded for the downsampler input and `scores` holds the mid attention.
+struct EncoderScratch {
+    x: cuda::DeviceBuffer,
+    a: cuda::DeviceBuffer,
+    b: cuda::DeviceBuffer,
+    t: cuda::DeviceBuffer,
+    u: cuda::DeviceBuffer,
+    scores: cuda::DeviceBuffer,
+}
+
+fn allocate_encoder_scratch(height: usize, width: usize) -> option::Option[EncoderScratch] {
+    let floats: usize = (96 as usize) *% height *% width;
+    let padded: usize = (96 as usize) *% (height +% (1 as usize)) *% (width +% (1 as usize));
+    let mid_pixels: usize = height *% width / (256 as usize);
+    guard let option::Option[cuda::DeviceBuffer]::Some(x) = cuda::DeviceBuffer::allocate((floats *% (4 as usize)) as u64) else { return option::Option[EncoderScratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(a) = cuda::DeviceBuffer::allocate((floats *% (4 as usize)) as u64) else { return option::Option[EncoderScratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(b) = cuda::DeviceBuffer::allocate((floats *% (4 as usize)) as u64) else { return option::Option[EncoderScratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(t) = cuda::DeviceBuffer::allocate((padded *% (4 as usize)) as u64) else { return option::Option[EncoderScratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(u) = cuda::DeviceBuffer::allocate((floats *% (4 as usize)) as u64) else { return option::Option[EncoderScratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(scores) = cuda::DeviceBuffer::allocate((mid_pixels *% mid_pixels *% (4 as usize)) as u64) else { return option::Option[EncoderScratch]::None; };
+    return option::Option[EncoderScratch]::Some(EncoderScratch { x: x, a: a, b: b, t: t, u: u, scores: scores });
+}
+
+// Encodes `image` ([4, height, width] in [-1, 1], device) into packed,
+// normalized latents [height / 16 * width / 16, 64] (device).
+fn encode(weights: Weights, ref scratch: EncoderScratch, image: *f32, height: usize, width: usize, latents: *f32) -> bool {
+    var x: *f32 = scratch.x.pointer as *f32;
+    var a: *f32 = scratch.a.pointer as *f32;
+    let b: *f32 = scratch.b.pointer as *f32;
+    let t: *f32 = scratch.t.pointer as *f32;
+    let u: *f32 = scratch.u.pointer as *f32;
+    var h: usize = height;
+    var w: usize = width;
+    if !conv(weights, "encoder.conv_in", image, x, 4 as usize, 96 as usize, h, w, 3 as usize) { return false; }
+    var in_channels: usize = 96 as usize;
+    var block: usize = 0 as usize;
+    while block < (5 as usize) {
+        let out_channels: usize = if block == (0 as usize) { 96 as usize }
+            else if block == (1 as usize) { 192 as usize }
+            else if block == (2 as usize) { 384 as usize }
+            else { 768 as usize };
+        let prefix: text::Text = "encoder.down_blocks.${block}";
+        let r0: text::Text = "${prefix.view()}.resnets.0";
+        let r1: text::Text = "${prefix.view()}.resnets.1";
+        let resample: text::Text = "${prefix.view()}.downsampler.resample.1";
+        // x (the block input) stays intact for the shortcut; r0 x -> a, r1 a -> b.
+        if !residual(weights, r0.view(), x, a, t, u, in_channels, out_channels, h, w)
+            || !residual(weights, r1.view(), a, b, t, u, out_channels, out_channels, h, w) {
+            return false;
+        }
+        if block < (4 as usize) {
+            // Pad b -> t, stride-2 conv t -> a, then a += AvgDown3D(x).
+            let factor_t: usize = if block == (0 as usize) { 1 as usize } else { 2 as usize };
+            let weight_name: text::Text = "${resample.view()}.weight";
+            let bias_name: text::Text = "${resample.view()}.bias";
+            let rw: *f32 = tensor(weights, weight_name.view());
+            let rb: *f32 = tensor(weights, bias_name.view());
+            if rw.is_null() || rb.is_null()
+                || !ok(qi_vae_pad_bottom_right(b, t, out_channels as i32, h as i32, w as i32), "pad")
+                || !ok(qi_vae_conv2d_strided(t, rw, rb, a, out_channels as i32, out_channels as i32, (h +% (1 as usize)) as i32,
+                    (w +% (1 as usize)) as i32, 3 as i32, 2 as i32, 0 as i32), resample.view())
+                || !ok(qi_vae_avg_down_add(a, x, in_channels as i32, out_channels as i32, h as i32, w as i32, factor_t as i32,
+                    2 as i32), "avg down") {
+                return false;
+            }
+            h = h / (2 as usize);
+            w = w / (2 as usize);
+        } else {
+            // No downsampler: identity shortcut.
+            if !ok(cuda::copy(a as *u8, b as *u8, (out_channels *% h *% w *% (4 as usize)) as u64), "copy")
+                || !ok(qi_vae_add(a, x, (out_channels *% h *% w) as u64), "block shortcut") {
+                return false;
+            }
+        }
+        // The block output (a) becomes the next input.
+        let previous: *f32 = x;
+        x = a;
+        a = previous;
+        in_channels = out_channels;
+        block = block +% (1 as usize);
+    }
+    let pixels: usize = h *% w;
+    let channels: usize = 768 as usize;
+    // Mid block: residual x -> a; attention (norm a -> t, qkv t -> u,
+    // attention u -> t, proj t -> b, b += a); residual b -> x.
+    if !residual(weights, "encoder.mid_block.resnets.0", x, a, t, u, channels, channels, h, w)
+        || !norm(weights, "encoder.mid_block.attentions.0.norm.gamma", a, t, channels, pixels, false)
+        || !conv(weights, "encoder.mid_block.attentions.0.to_qkv", t, u, channels, channels *% (3 as usize), h, w, 1 as usize)
+        || !ok(qi_vae_attention(u, t, scratch.scores.pointer as *f32, channels as i32, pixels as i32), "encoder attention")
+        || !conv(weights, "encoder.mid_block.attentions.0.proj", t, b, channels, channels, h, w, 1 as usize)
+        || !ok(qi_vae_add(b, a, (channels *% pixels) as u64), "attention residual")
+        || !residual(weights, "encoder.mid_block.resnets.1", b, x, t, u, channels, channels, h, w) {
+        return false;
+    }
+    var mean: [f32; 64] = latents_mean();
+    var std: [f32; 64] = latents_std();
+    // Head: norm + SiLU x -> t, conv_out t -> u, quant_conv u -> a, pack.
+    return norm(weights, "encoder.norm_out.gamma", x, t, channels, pixels, true)
+        && conv(weights, "encoder.conv_out", t, u, channels, 128 as usize, h, w, 3 as usize)
+        && conv(weights, "quant_conv", u, a, 128 as usize, 128 as usize, h, w, 1 as usize)
+        && cuda::upload(b as *u8, #addr_of(mean[0]) as *u8, 256 as u64) == (0 as i32)
+        && cuda::upload((b + (64 as usize)) as *u8, #addr_of(std[0]) as *u8, 256 as u64) == (0 as i32)
+        && ok(qi_vae_pack_latents(a, b, b + (64 as usize), latents, pixels as i32), "pack latents");
+}
+
+// Encodes a [4, height, width] FP32 file (tools/dump_oracle_edit.py
+// vae_input.f32) and writes the packed latents as raw FP32.
+fn encode_file(vae_path: str, image_path: str, height: usize, width: usize, output_path: str) -> i32 {
+    let floats: usize = (4 as usize) *% height *% width;
+    guard let option::Option[text::CString]::Some(c_image) = pack::with_c_path(image_path) else { return 1; };
+    let fd: i32 = qi_open(c_image.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) { return 1; }
+    guard let option::Option[pack::Buffer]::Some(host) = pack::Buffer::allocate(floats *% (4 as usize)) else { return 1; };
+    let read: bool = pack::read_exact(fd, host.pointer, host.length, 0 as u64);
+    let _closed: i32 = qi_close(fd);
+    if !read { return 1; }
+    guard let option::Option[cuda::DeviceBuffer]::Some(image) = cuda::DeviceBuffer::allocate(host.length as u64) else { return 1; };
+    if !image.upload(host.pointer, host.length as u64) { return 1; }
+    guard let option::Option[Weights]::Some(weights) = load_weights(vae_path, true) else { return 1; };
+    guard let option::Option[EncoderScratch]::Some(allocated) = allocate_encoder_scratch(height, width) else {
+        io::eprintln("cuda vae: could not allocate encoder scratch");
+        return 1;
+    };
+    var scratch: EncoderScratch = allocated;
+    let pixels: usize = height *% width / (256 as usize);
+    let bytes: usize = pixels *% LATENT_CHANNELS *% (4 as usize);
+    guard let option::Option[cuda::DeviceBuffer]::Some(latents) = cuda::DeviceBuffer::allocate(bytes as u64) else { return 1; };
+    if !encode(weights, scratch, image.pointer as *f32, height, width, latents.pointer as *f32) || !cuda::synchronize() { return 1; }
+    guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(bytes) else { return 1; };
+    if !latents.download(result.pointer, bytes as u64) { return 1; }
+    guard let option::Option[text::CString]::Some(c_output) = pack::with_c_path(output_path) else { return 1; };
+    let out_fd: i32 = qi_open(c_output.as_ptr(), 0x241 as i32, 420 as i32);
+    if out_fd < (0 as i32) { return 1; }
+    let written: bool = pack::write_exact(out_fd, result.pointer, result.length, 0 as u64);
+    let _out_closed: i32 = qi_close(out_fd);
+    if !written { return 1; }
+    io::println("cuda vae: encoded ${width}x${height} into ${pixels} latents; wrote ${output_path}");
     return 0;
 }

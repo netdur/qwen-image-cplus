@@ -14,9 +14,10 @@ json   = "*"
 [build]
 prebuild = false
 
-# CUDA kernels built by linux/build_cuda.sh. The package is Linux-only today;
+# CUDA kernels and native/*.c helpers built by linux/build_cuda.sh; libjpeg
+# (libjpeg-turbo) decodes condition JPEGs. The package is Linux-only today;
 # the section keeps the link inputs out of any other platform.
 [linux.link]
-libs          = ["cudart", "cublas", ":libcudnn.so.8", "stdc++"]
+libs          = ["cudart", "cublas", ":libcudnn.so.8", "jpeg", "stdc++"]
 search-paths  = ["${CUDA_HOME:-/usr/local/cuda}/lib64"]
 extra-objects = ["cuda/target/libqwen_image_cuda.a"]
