@@ -36,6 +36,10 @@ const BLOCKS: usize = 32;
 const GLOBALS: usize = 9;
 const ROW_ALIGN: usize = 128;
 const MODULATION_WIDTH: usize = 16384;
+// FP32 scratch for one expanded BF16/FP16 matrix; larger ones run in row slices.
+const WEIGHT_SCRATCH_FLOATS: usize = 16777216;
+// Device memory left free beyond the resident pack before choosing to stream.
+const STREAM_HEADROOM: u64 = 536870912;
 // Attention runs over query chunks of at most this many rows against all
 // keys, so scores stay bounded (32 heads x 1024 x keys) at any resolution.
 const ATTENTION_CHUNK: usize = 1024;
@@ -122,6 +126,9 @@ struct Model {
     slot: cuda::DeviceBuffer,
     slot_block: usize,
     slot_base: u64,
+    // INT4 blocks kept in pinned host memory when streamed; empty otherwise.
+    host_blocks: cuda::PinnedBuffer,
+    host_base: u64,
     // FP32 expansion of one BF16/FP16 matrix, and of one norm vector.
     weight_scratch: cuda::DeviceBuffer,
     vector_scratch: cuda::DeviceBuffer,
@@ -148,7 +155,11 @@ impl Model {
     }
 }
 
-fn load(path: str, mode: WeightMode) -> option::Option[Model] {
+// With `auto_stream`, an INT4 pack stays resident only when the free device
+// memory covers it plus STREAM_HEADROOM; otherwise its blocks are copied to
+// pinned host memory and uploaded one at a time as they run. The FP16 pack is
+// always streamed, from the file.
+fn load(path: str, mode: WeightMode, auto_stream: bool = false) -> option::Option[Model] {
     guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else {
         return option::Option[Model]::None;
     };
@@ -192,10 +203,9 @@ fn load(path: str, mode: WeightMode) -> option::Option[Model] {
         index = index +% (1 as usize);
     }
     let first_block: u64 = (*((records.pointer as *pack::PackedRecord) + GLOBALS)).weights_offset;
-    let resident_end: u64 = match mode {
-        WeightMode::Fp16Streamed => first_block,
-        _ => header.file_bytes,
-    };
+    let streamed: bool = mode == WeightMode::Fp16Streamed
+        || (auto_stream && cuda::free_memory() < header.file_bytes -% header.data_offset +% STREAM_HEADROOM);
+    let resident_end: u64 = if streamed { first_block } else { header.file_bytes };
     guard let option::Option[cuda::DeviceBuffer]::Some(resident) = cuda::DeviceBuffer::allocate(resident_end -% header.data_offset) else {
         io::eprintln("cuda transformer: could not allocate ${resident_end -% header.data_offset} resident bytes");
         let _closed: i32 = qi_close(fd);
@@ -203,7 +213,7 @@ fn load(path: str, mode: WeightMode) -> option::Option[Model] {
     };
     // Largest block span for the streamed slot; one byte otherwise.
     var slot_bytes: u64 = 1 as u64;
-    if mode == WeightMode::Fp16Streamed {
+    if streamed {
         var block: usize = 0 as usize;
         while block < BLOCKS {
             let start: u64 = (*((records.pointer as *pack::PackedRecord) + block_record(block, 0 as usize))).weights_offset;
@@ -218,8 +228,21 @@ fn load(path: str, mode: WeightMode) -> option::Option[Model] {
         let _closed: i32 = qi_close(fd);
         return option::Option[Model]::None;
     };
+    let host_bytes: u64 = if streamed && mode != WeightMode::Fp16Streamed { header.file_bytes -% first_block } else { 1 as u64 };
+    guard let option::Option[cuda::PinnedBuffer]::Some(host_blocks) = cuda::PinnedBuffer::allocate(host_bytes) else {
+        io::eprintln("cuda transformer: could not pin ${host_bytes} bytes for streamed blocks");
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Model]::None;
+    };
+    if host_bytes > (1 as u64) && !pack::read_exact(fd, host_blocks.pointer, host_bytes as usize, first_block) {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Model]::None;
+    }
+    if streamed {
+        io::println("cuda transformer: streaming blocks (${free_megabytes()} MB free on the device)");
+    }
     guard let option::Option[cuda::DeviceBuffer]::Some(weight_scratch) = cuda::DeviceBuffer::allocate(
-        (MODULATION_WIDTH *% WIDTH *% (4 as usize)) as u64,
+        (WEIGHT_SCRATCH_FLOATS *% (4 as usize)) as u64,
     ) else {
         let _closed: i32 = qi_close(fd);
         return option::Option[Model]::None;
@@ -239,6 +262,8 @@ fn load(path: str, mode: WeightMode) -> option::Option[Model] {
         slot: slot,
         slot_block: BLOCKS,
         slot_base: 0 as u64,
+        host_blocks: host_blocks,
+        host_base: first_block,
         weight_scratch: weight_scratch,
         vector_scratch: vector_scratch,
     };
@@ -247,6 +272,10 @@ fn load(path: str, mode: WeightMode) -> option::Option[Model] {
         return option::Option[Model]::None;
     }
     return option::Option[Model]::Some(model);
+}
+
+fn free_megabytes() -> u64 {
+    return cuda::free_memory() / (1048576 as u64);
 }
 
 // Reads [start, end) of the pack and uploads it to `device` in 64 MiB chunks.
@@ -278,7 +307,14 @@ fn device_address(ref model: Model, offset: u64) -> *u8 {
     }
     if model.slot_block != block {
         let start: u64 = model.block_start(block);
-        if !upload_range(model.fd, start, model.block_end(block), model.slot.pointer) {
+        let end: u64 = model.block_end(block);
+        let from_host: bool = model.host_blocks.bytes > (1 as u64);
+        let uploaded: bool = if from_host {
+            cuda::upload(model.slot.pointer, model.host_blocks.pointer + (start -% model.host_base) as usize, end -% start) == (0 as i32)
+        } else {
+            upload_range(model.fd, start, end, model.slot.pointer)
+        };
+        if !uploaded {
             io::eprintln("cuda transformer: streaming block ${block} failed");
             return 0 as *u8;
         }
@@ -375,15 +411,26 @@ fn linear(ref model: Model, ref work: Work, index: usize, input: *f32, output: *
     let weights: *u8 = device_address(model, record.weights_offset);
     if weights.is_null() { return false; }
     if record.scheme == (0 as u32) || record.scheme == (1 as u32) {
-        let elements: u64 = (n *% k) as u64;
-        let converted: i32 = if record.scheme == (0 as u32) {
-            cuda::bf16_to_f32(weights, model.weight_scratch.pointer as *f32, elements)
-        } else {
-            cuda::f16_to_f32(weights, model.weight_scratch.pointer as *f32, elements)
-        };
-        return ok(converted, "weight expansion")
-            && ok(cuda::linear_f32(input, model.weight_scratch.pointer as *f32, output,
-                rows as i32, n as i32, k as i32, 0 as i32), "fp32 linear");
+        // Expand WEIGHT_SCRATCH_FLOATS worth of weight rows at a time.
+        let slice_rows: usize = if n *% k <= WEIGHT_SCRATCH_FLOATS { n } else { WEIGHT_SCRATCH_FLOATS / k };
+        var first_row: usize = 0 as usize;
+        while first_row < n {
+            let count: usize = if n -% first_row < slice_rows { n -% first_row } else { slice_rows };
+            let source: *u8 = weights + first_row *% k *% (2 as usize);
+            let elements: u64 = (count *% k) as u64;
+            let converted: i32 = if record.scheme == (0 as u32) {
+                cuda::bf16_to_f32(source, model.weight_scratch.pointer as *f32, elements)
+            } else {
+                cuda::f16_to_f32(source, model.weight_scratch.pointer as *f32, elements)
+            };
+            if !ok(converted, "weight expansion")
+                || !ok(cuda::linear_f32_strided(input, model.weight_scratch.pointer as *f32, output + first_row,
+                    rows as i32, count as i32, k as i32, n as i32), "fp32 linear") {
+                return false;
+            }
+            first_row = first_row +% count;
+        }
+        return true;
     }
     let scales: *u8 = device_address(model, record.scales_offset);
     if record.scheme == (6 as u32) {

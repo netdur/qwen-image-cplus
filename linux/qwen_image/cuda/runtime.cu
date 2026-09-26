@@ -52,3 +52,11 @@ extern "C" int qi_cuda_axpy(float *y, const float *x, float a, unsigned long lon
     axpy_kernel<<<(unsigned)((count + 255) / 256), 256>>>(y, x, a, count);
     return (int)cudaGetLastError();
 }
+
+extern "C" int qi_cuda_memory(unsigned long long *free_bytes, unsigned long long *total_bytes) {
+    size_t free_value = 0, total_value = 0;
+    cudaError_t status = cudaMemGetInfo(&free_value, &total_value);
+    *free_bytes = free_value;
+    *total_bytes = total_value;
+    return (int)status;
+}

@@ -105,14 +105,19 @@ fn denoise(pack_path: str, mode: transformer::WeightMode, embeddings: *f32, text
         || !latents.upload(latents_host as *u8, (image_rows *% LATENT *% (4 as usize)) as u64) {
         return 1;
     }
-    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode) else { return 1; };
-    var model: transformer::Model = loaded;
+    // Activations first, so the pack streams its blocks when what is left
+    // cannot hold it.
     guard let option::Option[transformer::Work]::Some(allocated) = transformer::allocate_work(
         if image_rows > text_rows { image_rows } else { text_rows }, text_rows +% image_rows) else {
         control::diagnose(observer, "Not enough GPU memory for the transformer activations at this size.");
         return 1;
     };
     var work: transformer::Work = allocated;
+    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true) else {
+        control::diagnose(observer, "Could not load the transformer pack.");
+        return 1;
+    };
+    var model: transformer::Model = loaded;
     guard let option::Option[transformer::PrefixCache]::Some(computed) = transformer::prefix(model, work, embeddings, text_rows, rope.pointer as *f32) else {
         return 1;
     };

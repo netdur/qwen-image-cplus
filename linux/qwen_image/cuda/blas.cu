@@ -129,3 +129,11 @@ extern "C" int qi_attention_f16(const float *q, const float *k, const float *v, 
         out, CUDA_R_32F, width, 128, heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return blas_status(status);
 }
+
+// y[M, n] (row stride ldy) = x[M,K] . W[n,K]^T, FP32; for computing an output
+// in column slices when the full weight does not fit in scratch.
+extern "C" int qi_linear_f32_strided(const float *x, const float *weights, float *y, int m, int n, int k, int ldy) {
+    if (int status = ensure_handle()) return status;
+    const float one = 1.0f, zero = 0.0f;
+    return blas_status(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &one, weights, k, x, k, &zero, y, ldy));
+}
