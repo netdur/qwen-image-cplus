@@ -1,6 +1,9 @@
 # Numbers
 
-RTX 2060 (6 GB), Linux, 512×512, seed 1301.
+RTX 2060 (6 GB), Linux, seed 1301, prompt
+`a travel poster with the headline "CASABLANCA" and the tagline "MEET ME AT SUNSET"`.
+
+## 512×512
 
 | Runtime | Model | Quant | Steps | Prompt | ~Speed (end to end) |
 | --- | --- | --- | ---: | --- | ---: |
@@ -22,3 +25,14 @@ input, FP16 tensor-core attention, and the 256-deep W4A4 GEMM (W4A4, warm
 cache): text 3.3 s, transformer 3.8 s (0.65 s per step), VAE + PNG 1.4 s,
 8.75-8.86 s end to end. Command: `linux/dev/target/release/qwen_image_dev generate PACK models
 OUT.png PROMPT 512 512 1301 4`.
+
+## 1024×1024
+
+| Runtime | Model | Quant | Steps | ~Speed (end to end) |
+| --- | --- | --- | ---: | ---: |
+| Diffusers oracle (80c7ed2, Torch 2.14) | Viggle turbo v0.1 | GGUF Q4_K_M, FP16 compute; VAE tiling (untiled FP32 decode runs out of memory) | 4 | ~74.5 s (78.5 s process wall) |
+| C+ / CUDA engine (linux/) | Viggle turbo v0.1 | W4A4 H256 g64 clip v6, blocks streamed from pinned memory with overlapped uploads | 4 | ~23.5 s |
+
+Oracle phases: load 4.8 s, text 19.9 s, denoise 32.2 s (about 8 s per step),
+VAE 9.5 s. Engine phases: text 3.3 s, transformer 16.1 s (3.3-3.4 s per step),
+VAE + PNG 3.7 s (untiled FP32). Both render both strings exactly.

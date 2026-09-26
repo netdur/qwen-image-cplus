@@ -86,6 +86,8 @@ def main() -> None:
                         help="GGUF dequantization and activation dtype for the transformer")
     parser.add_argument("--text-dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--vae-dtype", choices=DTYPES, default="float32")
+    parser.add_argument("--vae-tiling", action="store_true",
+                        help="decode with the VAE's tiled decoder (needed at 1024x1024 on 6 GB)")
     parser.add_argument("--json", type=Path)
     arguments = parser.parse_args()
 
@@ -108,6 +110,8 @@ def main() -> None:
     # host memory, and the prompt is encoded before denoising. The transformer
     # and VAE then each move to the GPU only while they run.
     stream_text_encoder(pipe.text_encoder)
+    if arguments.vae_tiling:
+        pipe.vae.enable_tiling()
     phases["load"] = synchronized() - started
 
     torch.cuda.reset_peak_memory_stats()
@@ -188,6 +192,7 @@ def main() -> None:
         "compute_dtype": arguments.compute_dtype,
         "text_dtype": arguments.text_dtype,
         "vae_dtype": arguments.vae_dtype,
+        "vae_tiling": arguments.vae_tiling,
         "phases_seconds": phases,
         "denoise_steps_seconds": steps,
         "denoise_seconds": sum(steps),
