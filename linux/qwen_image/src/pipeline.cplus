@@ -113,7 +113,7 @@ fn denoise(pack_path: str, mode: transformer::WeightMode, embeddings: *f32, text
         return 1;
     };
     var work: transformer::Work = allocated;
-    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true) else {
+    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true, transformer::cache_bytes(text_rows)) else {
         control::diagnose(observer, "Could not load the transformer pack.");
         return 1;
     };

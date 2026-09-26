@@ -166,10 +166,10 @@ impl Model {
 }
 
 // With `auto_stream`, an INT4 pack stays resident only when the free device
-// memory covers it plus STREAM_HEADROOM; otherwise its blocks are copied to
+// memory covers it plus STREAM_HEADROOM plus `reserve` (the prefix cache); otherwise its blocks are copied to
 // pinned host memory and uploaded one at a time as they run. The FP16 pack is
 // always streamed, from the file.
-fn load(path: str, mode: WeightMode, auto_stream: bool = false) -> option::Option[Model] {
+fn load(path: str, mode: WeightMode, auto_stream: bool = false, reserve: u64 = 0 as u64) -> option::Option[Model] {
     guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else {
         return option::Option[Model]::None;
     };
@@ -214,7 +214,7 @@ fn load(path: str, mode: WeightMode, auto_stream: bool = false) -> option::Optio
     }
     let first_block: u64 = (*((records.pointer as *pack::PackedRecord) + GLOBALS)).weights_offset;
     let streamed: bool = mode == WeightMode::Fp16Streamed
-        || (auto_stream && cuda::free_memory() < header.file_bytes -% header.data_offset +% STREAM_HEADROOM);
+        || (auto_stream && cuda::free_memory() < header.file_bytes -% header.data_offset +% STREAM_HEADROOM +% reserve);
     let resident_end: u64 = if streamed { first_block } else { header.file_bytes };
     guard let option::Option[cuda::DeviceBuffer]::Some(resident) = cuda::DeviceBuffer::allocate(resident_end -% header.data_offset) else {
         io::eprintln("cuda transformer: could not allocate ${resident_end -% header.data_offset} resident bytes");
@@ -301,6 +301,11 @@ fn load(path: str, mode: WeightMode, auto_stream: bool = false) -> option::Optio
         return option::Option[Model]::None;
     }
     return option::Option[Model]::Some(model);
+}
+
+// Bytes of FP16 prefix keys plus values for `rows` prefix rows over all blocks.
+fn cache_bytes(rows: usize) -> u64 {
+    return (BLOCKS *% rows *% WIDTH *% (2 as usize) *% (2 as usize)) as u64;
 }
 
 fn free_megabytes() -> u64 {
@@ -418,8 +423,6 @@ struct Work {
     projected: cuda::DeviceBuffer,
     gate: cuda::DeviceBuffer,
     up: cuda::DeviceBuffer,
-    joint_k: cuda::DeviceBuffer,
-    joint_v: cuda::DeviceBuffer,
     codes: cuda::DeviceBuffer,
     code_scales: cuda::DeviceBuffer,
     halves: cuda::DeviceBuffer,
@@ -446,8 +449,6 @@ fn allocate_work(rows_needed: usize, keys: usize) -> option::Option[Work] {
     guard let option::Option[cuda::DeviceBuffer]::Some(projected) = device_floats(rows *% WIDTH) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(gate) = device_floats(rows *% MLP) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(up) = device_floats(rows *% MLP) else { return option::Option[Work]::None; };
-    guard let option::Option[cuda::DeviceBuffer]::Some(joint_k) = device_floats(keys *% WIDTH) else { return option::Option[Work]::None; };
-    guard let option::Option[cuda::DeviceBuffer]::Some(joint_v) = device_floats(keys *% WIDTH) else { return option::Option[Work]::None; };
     let chunk: usize = if rows < ATTENTION_CHUNK { rows } else { ATTENTION_CHUNK };
     guard let option::Option[cuda::DeviceBuffer]::Some(codes) = cuda::DeviceBuffer::allocate((rows *% MLP / (2 as usize)) as u64) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(code_scales) = cuda::DeviceBuffer::allocate((rows *% MLP / (64 as usize) *% (2 as usize)) as u64) else { return option::Option[Work]::None; };
@@ -462,7 +463,7 @@ fn allocate_work(rows_needed: usize, keys: usize) -> option::Option[Work] {
     let _zeroed: i32 = cuda::zero(hidden.pointer, hidden.bytes);
     return option::Option[Work]::Some(Work {
         rows: rows, keys: keys, hidden: hidden, normed: normed, q: q, k: k, v: v, attended: attended,
-        projected: projected, gate: gate, up: up, joint_k: joint_k, joint_v: joint_v,
+        projected: projected, gate: gate, up: up, 
         codes: codes, code_scales: code_scales, halves: halves, attention_halves: attention_halves, time: time, time_hidden: time_hidden,
         modulation: modulation, final_scale: final_scale, timesteps: timesteps,
     });
@@ -536,18 +537,20 @@ fn condition(ref model: Model, ref work: Work, timestep: f32) -> bool {
 // [prefix_keys cached rows from cache_k/cache_v | this call's own rows];
 // `rope_offset` is the RoPE row of the first row here, and query rows whose
 // global index is below `causal_rows` see only earlier keys.
+// cache_k/cache_v: the prefix's FP16 keys and values for this block (prefix_keys
+// rows); store_k/store_v: where a prefix pass writes its own FP16 keys/values.
 fn block(ref model: Model, ref work: Work, index: usize, rows: usize, valid_rows: usize, split: usize,
-         rope: *f32, rope_offset: usize, cache_k: *f32, cache_v: *f32, prefix_keys: usize,
-         causal_rows: usize, store_k: *f32, store_v: *f32) -> bool {
+         rope: *f32, rope_offset: usize, cache_k: *u8, cache_v: *u8, prefix_keys: usize,
+         causal_rows: usize, store_k: *u8, store_v: *u8, visible_keys: *i32 = 0 as *i32) -> bool {
     return begin_block(model, index)
         && block_body(model, work, index, rows, valid_rows, split, rope, rope_offset, cache_k, cache_v, prefix_keys,
-            causal_rows, store_k, store_v)
+            causal_rows, store_k, store_v, visible_keys)
         && end_block(model, index);
 }
 
 fn block_body(ref model: Model, ref work: Work, index: usize, rows: usize, valid_rows: usize, split: usize,
-         rope: *f32, rope_offset: usize, cache_k: *f32, cache_v: *f32, prefix_keys: usize,
-         causal_rows: usize, store_k: *f32, store_v: *f32) -> bool {
+         rope: *f32, rope_offset: usize, cache_k: *u8, cache_v: *u8, prefix_keys: usize,
+         causal_rows: usize, store_k: *u8, store_v: *u8, visible_keys: *i32) -> bool {
     let modulation: *f32 = work.modulation.pointer as *f32;
     let stride: i32 = MODULATION_WIDTH as i32;
     let hidden: *f32 = work.hidden.pointer as *f32;
@@ -570,46 +573,42 @@ fn block_body(ref model: Model, ref work: Work, index: usize, rows: usize, valid
     if norm_k.is_null() || !ok(cuda::head_norm_rope(k, norm_k, rope, rope_offset as i32, valid_rows as i32, HEADS as i32), "k norm") {
         return false;
     }
-    let joint_k: *f32 = work.joint_k.pointer as *f32;
-    let joint_v: *f32 = work.joint_v.pointer as *f32;
-    let width: i32 = WIDTH as i32;
-    if prefix_keys != (0 as usize) {
-        if !ok(cuda::copy_rows(joint_k, width, cache_k, width, prefix_keys as i32, width), "key cache")
-            || !ok(cuda::copy_rows(joint_v, width, cache_v, width, prefix_keys as i32, width), "value cache") {
-            return false;
-        }
-    }
-    let own_k: *f32 = joint_k + prefix_keys *% WIDTH;
-    let own_v: *f32 = joint_v + prefix_keys *% WIDTH;
-    if !ok(cuda::copy_rows(own_k, width, k, width, valid_rows as i32, width), "keys")
-        || !ok(cuda::copy_rows(own_v, width, v, width, valid_rows as i32, width), "values") {
-        return false;
-    }
-    if !store_k.is_null() {
-        if !ok(cuda::copy_rows(store_k, width, k, width, valid_rows as i32, width), "store keys")
-            || !ok(cuda::copy_rows(store_v, width, v, width, valid_rows as i32, width), "store values") {
-            return false;
-        }
-    }
     let attended: *f32 = work.attended.pointer as *f32;
     let projected: *f32 = work.projected.pointer as *f32;
     let gate: *f32 = work.gate.pointer as *f32;
     let up: *f32 = work.up.pointer as *f32;
-    // FP16 K and V once per block; attention_halves holds them, then the
-    // per-chunk Q and scores.
+    // attention_halves: FP16 keys and values for [prefix | own rows], then the
+    // per-chunk Q and scores. Cached prefix rows are already FP16; this call's
+    // rows convert once and, in a prefix pass, are stored for later steps.
+    let width: i32 = WIDTH as i32;
+    let half_row: usize = WIDTH *% (2 as usize);
     let k_half: *u8 = work.attention_halves.pointer;
-    let v_half: *u8 = k_half + keys *% WIDTH *% (2 as usize);
-    let chunk_scratch: *u8 = v_half + keys *% WIDTH *% (2 as usize);
-    if !ok(cuda::to_half(joint_k, k_half, (keys *% WIDTH) as u64), "keys to half")
-        || !ok(cuda::to_half(joint_v, v_half, (keys *% WIDTH) as u64), "values to half") {
+    let v_half: *u8 = k_half + keys *% half_row;
+    let chunk_scratch: *u8 = v_half + keys *% half_row;
+    let own_bytes: u64 = (valid_rows *% half_row) as u64;
+    if prefix_keys != (0 as usize) {
+        let prefix_bytes: u64 = (prefix_keys *% half_row) as u64;
+        if !ok(cuda::copy(k_half, cache_k, prefix_bytes), "key cache") || !ok(cuda::copy(v_half, cache_v, prefix_bytes), "value cache") {
+            return false;
+        }
+    }
+    let own_k: *u8 = k_half + prefix_keys *% half_row;
+    let own_v: *u8 = v_half + prefix_keys *% half_row;
+    if !ok(cuda::to_half(k, own_k, (valid_rows *% WIDTH) as u64), "keys to half")
+        || !ok(cuda::to_half(v, own_v, (valid_rows *% WIDTH) as u64), "values to half") {
         return false;
+    }
+    if !store_k.is_null() {
+        if !ok(cuda::copy(store_k, own_k, own_bytes), "store keys") || !ok(cuda::copy(store_v, own_v, own_bytes), "store values") {
+            return false;
+        }
     }
     var chunk_start: usize = 0 as usize;
     while chunk_start < valid_rows {
         let chunk_rows: usize = if valid_rows -% chunk_start < ATTENTION_CHUNK { valid_rows -% chunk_start } else { ATTENTION_CHUNK };
         if !ok(cuda::attention_half(q + chunk_start *% WIDTH, k_half, v_half, attended + chunk_start *% WIDTH,
                 chunk_scratch, chunk_rows as i32, keys as i32, HEADS as i32,
-                (rope_offset +% chunk_start) as i32, causal_rows as i32), "attention") {
+                (rope_offset +% chunk_start) as i32, causal_rows as i32, visible_keys), "attention") {
             return false;
         }
         chunk_start = chunk_start +% chunk_rows;
@@ -630,7 +629,7 @@ fn block_body(ref model: Model, ref work: Work, index: usize, rows: usize, valid
 
 // MARK: - Text prefix and denoising step
 
-// Cached text K and V for every block: [BLOCKS, text_rows, WIDTH] each.
+// Cached prefix K and V for every block, FP16: [BLOCKS, text_rows, WIDTH] each.
 struct PrefixCache {
     text_rows: usize,
     k: cuda::DeviceBuffer,
@@ -641,10 +640,10 @@ struct PrefixCache {
 // attention) and returns their per-block keys and values.
 fn prefix(ref model: Model, ref work: Work, text_embeddings: *f32, text_rows: usize, rope: *f32) -> option::Option[PrefixCache] {
     let rows: usize = round_rows(text_rows);
-    guard let option::Option[cuda::DeviceBuffer]::Some(cache_k) = device_floats(BLOCKS *% text_rows *% WIDTH) else {
+    guard let option::Option[cuda::DeviceBuffer]::Some(cache_k) = cuda::DeviceBuffer::allocate(cache_bytes(text_rows) / (2 as u64)) else {
         return option::Option[PrefixCache]::None;
     };
-    guard let option::Option[cuda::DeviceBuffer]::Some(cache_v) = device_floats(BLOCKS *% text_rows *% WIDTH) else {
+    guard let option::Option[cuda::DeviceBuffer]::Some(cache_v) = cuda::DeviceBuffer::allocate(cache_bytes(text_rows) / (2 as u64)) else {
         return option::Option[PrefixCache]::None;
     };
     let hidden: *f32 = work.hidden.pointer as *f32;
@@ -668,15 +667,134 @@ fn prefix(ref model: Model, ref work: Work, text_embeddings: *f32, text_rows: us
     }
     var index: usize = 0 as usize;
     while index < BLOCKS {
-        let store_k: *f32 = (cache_k.pointer as *f32) + index *% text_rows *% WIDTH;
-        let store_v: *f32 = (cache_v.pointer as *f32) + index *% text_rows *% WIDTH;
-        if !block(model, work, index, rows, text_rows, rows, rope, 0 as usize, 0 as *f32, 0 as *f32,
+        let store_k: *u8 = cache_k.pointer + index *% text_rows *% WIDTH *% (2 as usize);
+        let store_v: *u8 = cache_v.pointer + index *% text_rows *% WIDTH *% (2 as usize);
+        if !block(model, work, index, rows, text_rows, rows, rope, 0 as usize, 0 as *u8, 0 as *u8,
                 0 as usize, text_rows, store_k, store_v) {
             return option::Option[PrefixCache]::None;
         }
         index = index +% (1 as usize);
     }
     return option::Option[PrefixCache]::Some(PrefixCache { text_rows: text_rows, k: cache_k, v: cache_v });
+}
+
+// Image-conditioned prefix. `prompt` holds the text encoder's rows ([prompt_rows,
+// 4096] host) and `image_pad` marks which of them are image placeholders; each
+// placeholder expands to four rows filled, in order, with the packed condition
+// latents ([condition_rows, 64] host). The joint prefix is built on the device
+// in that order and run with the block-causal mask: text rows see earlier
+// rows, condition rows also see the rest of their own image block. Returns the
+// per-block keys and values of all prefix rows (cache.text_rows = prefix rows).
+fn prefix_conditioned(ref model: Model, ref work: Work, prompt: *f32, image_pad: *u8, prompt_rows: usize,
+                      condition_latents: *f32, condition_rows: usize, rope: *f32) -> option::Option[PrefixCache] {
+    var pad_rows: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < prompt_rows {
+        if image_pad[index] != (0 as u8) { pad_rows = pad_rows +% (1 as usize); }
+        index = index +% (1 as usize);
+    }
+    if pad_rows *% (4 as usize) != condition_rows {
+        io::eprintln("cuda transformer: ${pad_rows} image placeholders do not cover ${condition_rows} condition rows");
+        return option::Option[PrefixCache]::None;
+    }
+    let prefix_rows: usize = prompt_rows -% pad_rows +% condition_rows;
+    let text_padded: usize = round_rows(prompt_rows);
+    let condition_padded: usize = round_rows(condition_rows);
+    let rows: usize = round_rows(prefix_rows);
+    if text_padded > work.rows || condition_padded > work.rows || rows > work.rows {
+        io::eprintln("cuda transformer: prefix of ${prefix_rows} rows exceeds the activation buffers");
+        return option::Option[PrefixCache]::None;
+    }
+    guard let option::Option[cuda::DeviceBuffer]::Some(cache_k) = cuda::DeviceBuffer::allocate(cache_bytes(prefix_rows) / (2 as u64)) else {
+        io::eprintln("cuda transformer: could not allocate the ${prefix_rows}-row prefix key cache");
+        return option::Option[PrefixCache]::None;
+    };
+    guard let option::Option[cuda::DeviceBuffer]::Some(cache_v) = cuda::DeviceBuffer::allocate(cache_bytes(prefix_rows) / (2 as u64)) else {
+        io::eprintln("cuda transformer: could not allocate the ${prefix_rows}-row prefix value cache");
+        return option::Option[PrefixCache]::None;
+    };
+    let hidden: *f32 = work.hidden.pointer as *f32;
+    let normed: *f32 = work.normed.pointer as *f32;
+    let scratch_q: *f32 = work.q.pointer as *f32;
+    let scratch_k: *f32 = work.k.pointer as *f32;
+    let scratch_v: *f32 = work.v.pointer as *f32;
+    // Text rows: txt_in over every prompt row (placeholder rows are discarded).
+    if !ok(cuda::zero(work.normed.pointer, (text_padded *% WIDTH *% (4 as usize)) as u64), "zero")
+        || !work.normed.upload(prompt as *u8, (prompt_rows *% WIDTH *% (4 as usize)) as u64) {
+        return option::Option[PrefixCache]::None;
+    }
+    let text_norm: *f32 = vector(model, TEXT_NORM);
+    if text_norm.is_null()
+        || !ok(cuda::rms_norm(normed, text_norm, 1.0f32, scratch_q, text_padded as i32, WIDTH as i32), "text norm") {
+        return option::Option[PrefixCache]::None;
+    }
+    if !linear(model, work, TXT_IN, scratch_q, scratch_k, text_padded)
+        || !ok(cuda::gelu_tanh(scratch_k, scratch_k, (text_padded *% WIDTH) as u64), "gelu")
+        || !linear(model, work, TXT_OUT, scratch_k, scratch_v, text_padded) {
+        return option::Option[PrefixCache]::None;
+    }
+    // Condition rows: img_in over the packed latents, into k.
+    if !ok(cuda::zero(work.q.pointer, (condition_padded *% WIDTH *% (4 as usize)) as u64), "zero")
+        || !work.q.upload(condition_latents as *u8, (condition_rows *% LATENT *% (4 as usize)) as u64)
+        || !linear(model, work, IMG_IN, scratch_q, scratch_k, condition_padded) {
+        return option::Option[PrefixCache]::None;
+    }
+    // Assemble the joint prefix into hidden and the visible-key count per row.
+    guard let option::Option[pack::Buffer]::Some(visible_host) = pack::Buffer::allocate(prefix_rows *% (4 as usize)) else {
+        return option::Option[PrefixCache]::None;
+    };
+    let visible: *i32 = visible_host.pointer as *i32;
+    if !ok(cuda::zero(work.hidden.pointer, (rows *% WIDTH *% (4 as usize)) as u64), "zero") {
+        return option::Option[PrefixCache]::None;
+    }
+    let width: i32 = WIDTH as i32;
+    var joint: usize = 0 as usize;
+    var next_condition: usize = 0 as usize;
+    index = 0 as usize;
+    while index < prompt_rows {
+        if image_pad[index] == (0 as u8) {
+            if !ok(cuda::copy_rows(hidden + joint *% WIDTH, width, scratch_v + index *% WIDTH, width, 1 as i32, width), "text row") {
+                return option::Option[PrefixCache]::None;
+            }
+            visible[joint] = (joint +% (1 as usize)) as i32;
+            joint = joint +% (1 as usize);
+            index = index +% (1 as usize);
+        } else {
+            // A run of placeholders is one image block of 4 * run rows.
+            var run: usize = 0 as usize;
+            while index +% run < prompt_rows && image_pad[index +% run] != (0 as u8) { run = run +% (1 as usize); }
+            let block_rows: usize = run *% (4 as usize);
+            if !ok(cuda::copy_rows(hidden + joint *% WIDTH, width, scratch_k + next_condition *% WIDTH, width,
+                    block_rows as i32, width), "condition rows") {
+                return option::Option[PrefixCache]::None;
+            }
+            var row: usize = 0 as usize;
+            while row < block_rows {
+                visible[joint +% row] = (joint +% block_rows) as i32;
+                row = row +% (1 as usize);
+            }
+            joint = joint +% block_rows;
+            next_condition = next_condition +% block_rows;
+            index = index +% run;
+        }
+    }
+    guard let option::Option[cuda::DeviceBuffer]::Some(visible_device) = cuda::DeviceBuffer::allocate((prefix_rows *% (4 as usize)) as u64) else {
+        return option::Option[PrefixCache]::None;
+    };
+    if !visible_device.upload(visible_host.pointer, (prefix_rows *% (4 as usize)) as u64) || !condition(model, work, 0.0f32) {
+        return option::Option[PrefixCache]::None;
+    }
+    index = 0 as usize;
+    while index < BLOCKS {
+        let store_k: *u8 = cache_k.pointer + index *% prefix_rows *% WIDTH *% (2 as usize);
+        let store_v: *u8 = cache_v.pointer + index *% prefix_rows *% WIDTH *% (2 as usize);
+        if !block(model, work, index, rows, prefix_rows, rows, rope, 0 as usize, 0 as *u8, 0 as *u8,
+                0 as usize, prefix_rows, store_k, store_v, visible_device.pointer as *i32) {
+            return option::Option[PrefixCache]::None;
+        }
+        index = index +% (1 as usize);
+    }
+    return option::Option[PrefixCache]::Some(PrefixCache { text_rows: prefix_rows, k: cache_k, v: cache_v });
 }
 
 // One velocity prediction for `image_rows` latent rows ([image_rows, 64] FP32
@@ -695,10 +813,10 @@ fn step_device(ref model: Model, ref work: Work, ref cache: PrefixCache, latent:
     }
     var index: usize = 0 as usize;
     while index < BLOCKS {
-        let cache_k: *f32 = (cache.k.pointer as *f32) + index *% cache.text_rows *% WIDTH;
-        let cache_v: *f32 = (cache.v.pointer as *f32) + index *% cache.text_rows *% WIDTH;
+        let cache_k: *u8 = cache.k.pointer + index *% cache.text_rows *% WIDTH *% (2 as usize);
+        let cache_v: *u8 = cache.v.pointer + index *% cache.text_rows *% WIDTH *% (2 as usize);
         if !block(model, work, index, rows, image_rows, 0 as usize, rope, cache.text_rows, cache_k, cache_v,
-                cache.text_rows, cache.text_rows, 0 as *f32, 0 as *f32) {
+                cache.text_rows, cache.text_rows, 0 as *u8, 0 as *u8) {
             return false;
         }
         index = index +% (1 as usize);
@@ -892,6 +1010,69 @@ fn run_oracle_dump(pack_path: str, mode: WeightMode, dump: str, steps: usize, ou
     var cache: PrefixCache = computed;
     let _prefix_synced: bool = cuda::synchronize();
     io::println("text prefix (${text_rows} rows): ${seconds() - started} s");
+    started = seconds();
+    if !denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32) { return 1; }
+    io::println("denoise (${steps} steps, ${image_rows} image rows): ${seconds() - started} s");
+    guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(noise.length) else { return 1; };
+    if !latents.download(result.pointer, noise.length as u64) || !write_floats(output_path, result.pointer, result.length) { return 1; }
+    io::println("total: ${seconds() - process_start} s; wrote ${output_path}");
+    return 0;
+}
+
+// Denoises an image edit from a tools/dump_oracle_edit.py directory
+// (prompt_embeds.f32, image_pad_mask.u8, condition_latents.f32, noise.f32,
+// rope.f32) and writes the final [target_rows, 64] latents.
+fn run_edit_dump(pack_path: str, mode: WeightMode, dump: str, steps: usize, output_path: str) -> i32 {
+    let process_start: f64 = seconds();
+    let prompt_rows: usize = file_floats("${dump}/prompt_embeds.f32") / WIDTH;
+    let condition_rows: usize = file_floats("${dump}/condition_latents.f32") / LATENT;
+    let image_rows: usize = file_floats("${dump}/noise.f32") / LATENT;
+    if prompt_rows == (0 as usize) || condition_rows == (0 as usize) || image_rows == (0 as usize) {
+        io::eprintln("cuda transformer: ${dump} is missing edit inputs");
+        return 1;
+    }
+    guard let option::Option[pack::Buffer]::Some(prompt) = read_floats("${dump}/prompt_embeds.f32", prompt_rows *% WIDTH) else { return 1; };
+    // image_pad_mask.u8 has prompt_rows bytes; read it as prompt_rows / 4 floats' worth of bytes.
+    guard let option::Option[pack::Buffer]::Some(pad) = pack::Buffer::allocate(prompt_rows) else { return 1; };
+    guard let option::Option[text::CString]::Some(c_pad) = pack::with_c_path("${dump}/image_pad_mask.u8") else { return 1; };
+    let pad_fd: i32 = qi_open(c_pad.as_ptr(), 0 as i32, 0 as i32);
+    if pad_fd < (0 as i32) { return 1; }
+    let pad_read: bool = pack::read_exact(pad_fd, pad.pointer, prompt_rows, 0 as u64);
+    let _pad_closed: i32 = qi_close(pad_fd);
+    if !pad_read { return 1; }
+    guard let option::Option[pack::Buffer]::Some(condition_latents) = read_floats("${dump}/condition_latents.f32", condition_rows *% LATENT) else { return 1; };
+    guard let option::Option[pack::Buffer]::Some(noise) = read_floats("${dump}/noise.f32", image_rows *% LATENT) else { return 1; };
+    var pad_rows: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < prompt_rows {
+        if pad.pointer[index] != (0 as u8) { pad_rows = pad_rows +% (1 as usize); }
+        index = index +% (1 as usize);
+    }
+    let prefix_rows: usize = prompt_rows -% pad_rows +% condition_rows;
+    guard let option::Option[pack::Buffer]::Some(rope_host) = read_floats("${dump}/rope.f32", (prefix_rows +% image_rows) *% (128 as usize)) else { return 1; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(rope) = cuda::DeviceBuffer::allocate(rope_host.length as u64) else { return 1; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(latents) = cuda::DeviceBuffer::allocate(noise.length as u64) else { return 1; };
+    if !rope.upload(rope_host.pointer, rope_host.length as u64) || !latents.upload(noise.pointer, noise.length as u64) { return 1; }
+    var started: f64 = seconds();
+    let largest: usize = if prefix_rows > image_rows { prefix_rows } else { image_rows };
+    guard let option::Option[Work]::Some(allocated) = allocate_work(if largest > prompt_rows { largest } else { prompt_rows },
+            prefix_rows +% image_rows) else {
+        io::eprintln("cuda transformer: could not allocate activations");
+        return 1;
+    };
+    var work: Work = allocated;
+    guard let option::Option[Model]::Some(loaded) = load(pack_path, mode, true, cache_bytes(prefix_rows)) else { return 1; };
+    var model: Model = loaded;
+    let _synced: bool = cuda::synchronize();
+    io::println("load: ${seconds() - started} s");
+    started = seconds();
+    guard let option::Option[PrefixCache]::Some(computed) = prefix_conditioned(model, work, prompt.pointer as *f32, pad.pointer,
+            prompt_rows, condition_latents.pointer as *f32, condition_rows, rope.pointer as *f32) else {
+        return 1;
+    };
+    var cache: PrefixCache = computed;
+    let _prefix_synced: bool = cuda::synchronize();
+    io::println("conditioned prefix (${prefix_rows} rows: ${prompt_rows -% pad_rows} text, ${condition_rows} condition): ${seconds() - started} s");
     started = seconds();
     if !denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32) { return 1; }
     io::println("denoise (${steps} steps, ${image_rows} image rows): ${seconds() - started} s");

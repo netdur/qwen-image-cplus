@@ -17,7 +17,8 @@
 
 extern "C" int qi_to_half(const float *source, void *out, unsigned long long count);
 extern "C" int qi_attention_half(const float *q, const void *k_half, const void *v_half, float *out, void *scratch,
-                                 int queries, int keys, int heads, int query_offset, int causal_rows);
+                                 int queries, int keys, int heads, int query_offset, int causal_rows,
+                                 const int *visible_keys);
 extern "C" int qi_attention_f16(const float *q, const float *k, const float *v, float *out, float *scores, void *halves,
                                 int queries, int keys, int heads, int query_offset, int causal_rows);
 
@@ -55,7 +56,7 @@ int main(int argc, char **argv) {
         qi_to_half(v, (char *)kv_half + (size_t)keys * width * 2, (unsigned long long)keys * width);
         for (int c = 0; c < queries; c += chunk)
             qi_attention_half(q + c * width, kv_half, (char *)kv_half + (size_t)keys * width * 2, half_out + c * width,
-                              half_scratch, std::min(chunk, queries - c), keys, heads, text + c, text);
+                              half_scratch, std::min(chunk, queries - c), keys, heads, text + c, text, nullptr);
     };
     run_reference(); run_half();
     cudaDeviceSynchronize();

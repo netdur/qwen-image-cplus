@@ -86,7 +86,7 @@ extern fn qi_linear_f32_strided(x: *f32, weights: *f32, y: *f32, m: i32, n: i32,
 extern fn qi_to_half(source: *f32, out: *u8, count: u64) -> i32;
 #[link_name = "qi_attention_half"]
 extern fn qi_attention_half(q: *f32, k_half: *u8, v_half: *u8, out: *f32, scratch: *u8, queries: i32, keys: i32,
-    heads: i32, query_offset: i32, causal_rows: i32) -> i32;
+    heads: i32, query_offset: i32, causal_rows: i32, visible_keys: *i32) -> i32;
 #[link_name = "qi_attention_f16"]
 extern fn qi_attention_f16(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, halves: *u8, queries: i32, keys: i32,
     heads: i32, query_offset: i32, causal_rows: i32) -> i32;
@@ -131,7 +131,8 @@ fn free_memory() -> u64 {
 }
 
 fn to_half(source: *f32, out: *u8, count: u64) -> i32 { return qi_to_half(source, out, count); }
-fn attention_half(q: *f32, k_half: *u8, v_half: *u8, out: *f32, scratch: *u8, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention_half(q, k_half, v_half, out, scratch, queries, keys, heads, query_offset, causal_rows); }
+// `visible_keys` (device, one per global query row) overrides the causal rule; null keeps it.
+fn attention_half(q: *f32, k_half: *u8, v_half: *u8, out: *f32, scratch: *u8, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32, visible_keys: *i32 = 0 as *i32) -> i32 { return qi_attention_half(q, k_half, v_half, out, scratch, queries, keys, heads, query_offset, causal_rows, visible_keys); }
 fn attention_f16(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, halves: *u8, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention_f16(q, k, v, out, scores, halves, queries, keys, heads, query_offset, causal_rows); }
 fn attention(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention(q, k, v, out, scores, queries, keys, heads, query_offset, causal_rows); }
 

@@ -22,6 +22,7 @@ fn usage() -> i32 {
     io::eprintln("       qwen-image-dev inputs TEXT_ROWS LATENT_SIDE SEED OUTPUT_DIR  (rope.f32, noise_f16.f32, noise_bf16.f32)");
     io::eprintln("       qwen-image-dev tokenizer-fixtures MODEL_ROOT FIXTURE_DIR");
     io::eprintln("       qwen-image-dev generate PACK MODEL_ROOT OUTPUT.png PROMPT WIDTH HEIGHT SEED STEPS");
+    io::eprintln("       qwen-image-dev denoise-edit-dump fp16|w4a16|w4a4 PACK DUMP_DIR STEPS OUTPUT.f32");
     return 2;
 }
 
@@ -55,6 +56,16 @@ fn main() -> i32 {
         guard let option::Option[transformer::WeightMode]::Some(mode) = parse_mode(mode_name.view()) else { return usage(); };
         guard let option::Option[f64]::Some(steps) = steps_text.view().to_f64() else { return usage(); };
         return transformer::run_oracle_dump(pack_path.view(), mode, dump.view(), steps as usize, output.view());
+    }
+    if command.view() == "denoise-edit-dump" {
+        guard let option::Option[text::Text]::Some(mode_name) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(pack_path) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(dump) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(steps_text) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[transformer::WeightMode]::Some(mode) = parse_mode(mode_name.view()) else { return usage(); };
+        guard let option::Option[f64]::Some(steps) = steps_text.view().to_f64() else { return usage(); };
+        return transformer::run_edit_dump(pack_path.view(), mode, dump.view(), steps as usize, output.view());
     }
     if command.view() == "vae-decode" {
         guard let option::Option[text::Text]::Some(vae_path) = env::arg(2 as usize) else { return usage(); };
