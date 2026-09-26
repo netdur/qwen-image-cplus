@@ -2655,3 +2655,24 @@ step fell from 16.2-17.9 s to 11.2-12.0 s. MPS attention-output saved about
 default direct-FP16 path: 137.3 s end to end, against 153-168 s with
 `QI_DISABLE_DIRECT_FP16_ACTIVATIONS=1` earlier. Its image matches that run
 at 48.9 dB, and the hat and pose are unchanged. `cpc test` passes (361).
+
+**Caches on image-conditioned runs (experimental, 2026-09-26).** Conditioned
+trajectories stay uncached by default. `QI_CONDITIONED_CACHE` selects
+`cache-dit-0.12|0.14|0.16|0.24` or `taylorseer-0.12|0.24` for testing. The
+existing Cache-DiT and TaylorSeer code already offsets by the prefix rows,
+and the conditioned layout puts the target block last, so it applies
+unchanged. Base pack, 512×512 edit ("make her wear a hat", seed 1301,
+512×512 input), 40 steps, PSNR against the uncached image:
+
+| Mode | End to end | Cached steps | PSNR |
+| --- | ---: | ---: | ---: |
+| none | 87.4 s | 0 | — |
+| Cache-DiT 0.12 | 37.1 s | 26 | 43.9 dB |
+| Cache-DiT 0.14 | 34.9 s | 27 | 40.1 dB |
+| Cache-DiT 0.16 / 0.24 | 36.5 / 39.4 s | 27 | 39.6 dB (identical images) |
+| TaylorSeer 0.12 | 41.0 s | 26 | 47.3 dB |
+| TaylorSeer 0.24 | 36.0 s | 29 | 37.9 dB |
+
+All six keep the hat, face, tattoo and pose visually unchanged. Cache-DiT
+0.16 and 0.24 cache the same 27 steps because the continuous-cache cap binds
+first. This is one prompt at one size, not a calibration.

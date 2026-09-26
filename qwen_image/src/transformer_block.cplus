@@ -6575,6 +6575,36 @@ fn run_prompt_trajectory_sized_to_host(
 // Runs the native Qwen-Image-2.1 image-conditioned trajectory. Prompt image
 // slots are expanded and replaced by the condition latents according to the
 // official block-causal joint layout; only the final target block is updated.
+// Experimental cache for image-conditioned trajectories. The Cache-DiT and
+// TaylorSeer thresholds were calibrated on text-to-image at 256 and 1024, so
+// conditioned runs stay uncached unless QI_CONDITIONED_CACHE selects
+// cache-dit-0.12|0.14|0.16|0.24 or taylorseer-0.12|0.24.
+struct ConditionedCache {
+    cache_dit: bool,
+    taylorseer: bool,
+    threshold: f64,
+    valid: bool,
+}
+
+fn conditioned_cache() -> ConditionedCache {
+    let value: text::Text = match env::var("QI_CONDITIONED_CACHE") {
+        option::Option[text::Text]::Some(v) => v,
+        option::Option[text::Text]::None => text::from_str("none"),
+    };
+    let choice: str = value.view();
+    if choice == "none" {
+        return ConditionedCache { cache_dit: false, taylorseer: false, threshold: 0.0f64, valid: true };
+    }
+    if choice == "cache-dit-0.12" { return ConditionedCache { cache_dit: true, taylorseer: false, threshold: 0.12f64, valid: true }; }
+    if choice == "cache-dit-0.14" { return ConditionedCache { cache_dit: true, taylorseer: false, threshold: 0.14f64, valid: true }; }
+    if choice == "cache-dit-0.16" { return ConditionedCache { cache_dit: true, taylorseer: false, threshold: 0.16f64, valid: true }; }
+    if choice == "cache-dit-0.24" { return ConditionedCache { cache_dit: true, taylorseer: false, threshold: 0.24f64, valid: true }; }
+    if choice == "taylorseer-0.12" { return ConditionedCache { cache_dit: true, taylorseer: true, threshold: 0.12f64, valid: true }; }
+    if choice == "taylorseer-0.24" { return ConditionedCache { cache_dit: true, taylorseer: true, threshold: 0.24f64, valid: true }; }
+    io::eprintln("trajectory: QI_CONDITIONED_CACHE must be none, cache-dit-0.12|0.14|0.16|0.24, or taylorseer-0.12|0.24");
+    return ConditionedCache { cache_dit: false, taylorseer: false, threshold: 0.0f64, valid: false };
+}
+
 fn run_conditioned_trajectory_sized_to_host(
     packed_path: str,
     text_input: *f32,
@@ -6598,6 +6628,8 @@ fn run_conditioned_trajectory_sized_to_host(
         io::eprintln("trajectory: conditioned handoff received invalid buffers");
         return 2;
     }
+    let cache: ConditionedCache = conditioned_cache();
+    if !cache.valid { return 2; }
     return run_trajectory_packed_impl(
         packed_path,
         requested_steps,
@@ -6608,10 +6640,10 @@ fn run_conditioned_trajectory_sized_to_host(
         seed,
         true,
         false,
-        false,
-        0.0f64,
+        cache.cache_dit,
+        cache.threshold,
         image_width,
-        false,
+        cache.taylorseer,
         0 as *f32,
         0.0f32,
         1.0f32,
@@ -6651,9 +6683,11 @@ fn benchmark_conditioned_trajectory_sized(
         || condition_count == (0 as usize) {
         return 2;
     }
+    let cache: ConditionedCache = conditioned_cache();
+    if !cache.valid { return 2; }
     return run_trajectory_packed_impl(
         packed_path, requested_steps, "", 0 as *f32, text_input, text_rows, seed,
-        true, false, false, 0.0f64, image_width, false, 0 as *f32,
+        true, false, cache.cache_dit, cache.threshold, image_width, cache.taylorseer, 0 as *f32,
         0.0f32, 1.0f32, false, false, image_width, image_height,
         condition_latents, condition_rows, prompt_image_mask, condition_shapes,
         condition_count, preload: preload,
