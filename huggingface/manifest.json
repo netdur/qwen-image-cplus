@@ -53,6 +53,41 @@
         "cache": "none"
       },
       "verification": "structural validation and exact source round-trip passed"
+    },
+    {
+      "path": "qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack",
+      "local_source": "models/qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack",
+      "bytes": 14230327296,
+      "sha256": "be2e72ed75d30234a7f1934502d1d95b10eaedc935de2ce06b926b34e1b7b8b4",
+      "source": {
+        "repository": "Qwen/Qwen-Image-2.1",
+        "revision": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+        "component": "transformer",
+        "modifications": "QIPACK conversion and metadata selecting the Viggle v0.2.1 LoRA"
+      },
+      "generation_defaults": {
+        "kind": "distilled",
+        "steps": 6,
+        "shift_terminal": null,
+        "cache": "none",
+        "schedule": "viggle-v0.2.1-6",
+        "adapter": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors"
+      },
+      "verification": "structural validation and native six-step generation passed"
+    }
+  ],
+  "adapters": [
+    {
+      "path": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors",
+      "local_source": "models/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors",
+      "bytes": 1359147904,
+      "sha256": "2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803",
+      "source": {
+        "repository": "Viggle/Qwen-Image-2.1-viggle-turbo",
+        "revision": "139e9492e6b81e85395877a549ec8f0afbb18f8f",
+        "component": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors"
+      },
+      "modifications": "none"
     }
   ],
   "support_source": {
