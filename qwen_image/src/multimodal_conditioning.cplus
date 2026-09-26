@@ -357,6 +357,10 @@ fn run_multi_image_transformer(
     let started_ms: i64 = time::now_millis();
     let reference_resolution: usize =
         ((width *% height) as f64).sqrt() as usize;
+    // Start the transformer's pack read now; it runs on the SSD while the
+    // encoders below run on the GPU.
+    var preload: transformer::PackPreload =
+        transformer::begin_pack_preload(packed_path, width, height);
     guard let option::Option[Encoded]::Some(encoded) = encode_images(
         model_root, prompt, image_paths, image_count, reference_resolution, observer,
     ) else {
@@ -409,6 +413,7 @@ fn run_multi_image_transformer(
             width,
             height,
             requested_steps,
+            #addr_of(preload),
         );
         io::println(
             "multi-image benchmark: images=${image_count} output=${width}x${height} steps=${requested_steps} transformer_wall_ms=${time::now_millis() - transformer_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
@@ -430,6 +435,7 @@ fn run_multi_image_transformer(
         height,
         requested_steps,
         observer,
+        #addr_of(preload),
     );
     let transformer_ms: i64 = time::now_millis() - transformer_start_ms;
     host_buffers::dump_f32(

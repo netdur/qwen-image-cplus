@@ -91,6 +91,19 @@ kernel void qi_lora_add(
     }
 }
 
+// Forms one merged LoRA weight, W' = half(float(W) + B x A), rounding once,
+// into a separate buffer; the host copies it into the resident pack.
+kernel void qi_lora_merge(
+    device const half *weight [[buffer(0)]],
+    device const float *delta [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    device half *merged [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) {
+        merged[index] = half(float(weight[index]) + delta[index]);
+    }
+}
+
 inline float qi_dense_weight(ushort bits, uint weight_mode) {
     return weight_mode == 1 ? float(as_type<half>(bits)) : qi_bf16(bits);
 }

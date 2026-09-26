@@ -198,6 +198,66 @@ fn create(
     });
 }
 
+// FP16 C[rows, columns] (FP32) = A[rows, inner] x B[inner, columns], both
+// operands row-major with no transpose. Used to form LoRA deltas B x A.
+fn create_nn(
+    device: metal::Device,
+    left_buffer: metal::Buffer,
+    left_offset: u64,
+    right_buffer: metal::Buffer,
+    right_offset: u64,
+    output_buffer: metal::Buffer,
+    output_offset: u64,
+    rows: usize,
+    columns: usize,
+    inner: usize,
+) -> option::Option[Multiplication] {
+    guard let option::Option[OwnedObjc]::Some(left_descriptor) = descriptor(
+        rows, inner, 2 as usize, MPS_DATA_TYPE_FLOAT16,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(right_descriptor) = descriptor(
+        inner, columns, 2 as usize, MPS_DATA_TYPE_FLOAT16,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(output_descriptor) = descriptor(
+        rows, columns, 4 as usize, MPS_DATA_TYPE_FLOAT32,
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(left_matrix) = matrix(
+        left_buffer, left_offset, left_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(right_matrix) = matrix(
+        right_buffer, right_offset, right_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    guard let option::Option[OwnedObjc]::Some(output_matrix) = matrix(
+        output_buffer, output_offset, output_descriptor.raw(),
+    ) else { return option::Option[Multiplication]::None; };
+    let class: *u8 = rt::get_class(#str_ptr("MPSMatrixMultiplication\0"));
+    if class.is_null() { return option::Option[Multiplication]::None; }
+    let allocated: *u8 = rt::msg_id(class, rt::sel(#str_ptr("alloc\0")));
+    if allocated.is_null() { return option::Option[Multiplication]::None; }
+    let kernel_pointer: *u8 = qi_msg_id_id_i8_i8_u64_u64_u64_f64_f64(
+        allocated,
+        rt::sel(#str_ptr("initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:\0")),
+        device.raw(),
+        0 as i8,
+        0 as i8,
+        rows as u64,
+        columns as u64,
+        inner as u64,
+        1.0f64,
+        0.0f64,
+    );
+    if kernel_pointer.is_null() { return option::Option[Multiplication]::None; }
+    return option::Option[Multiplication]::Some(Multiplication {
+        left_descriptor: left_descriptor,
+        right_descriptor: right_descriptor,
+        output_descriptor: output_descriptor,
+        left_matrix: left_matrix,
+        right_matrix: right_matrix,
+        output_matrix: output_matrix,
+        kernel: OwnedObjc::new(kernel_pointer),
+    });
+}
+
 // Encodes a large row-major FP16 x FP16 -> FP32 multiplication in bounded
 // row slices. MPSMatrix produced partial non-finite output for the 2048x2048
 // prefill (16,384 image rows plus text) on the M1 Max. The 736x1280 image-edit

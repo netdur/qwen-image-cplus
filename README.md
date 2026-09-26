@@ -2603,3 +2603,55 @@ end to end and produced a PNG byte-identical to the 118.31 s FP32-staged
 fallback. A 512×512 text-only regression and the 832×1248 Eiffel edit were
 also byte-identical to their pre-change PNGs. These are correctness checks,
 not a controlled speed comparison.
+
+**Six-step edit speed pass (2026-09-26).** Four changes target the
+conditioned edit shapes, which sit below the 4,096-row graph-attention gate
+(736×1280 is 3,680 target rows, 832×1248 is 4,056):
+
+- **LoRA merged once at load.** The 224 per-block A/B pairs are folded into
+  the resident FP16 pack as `half(W + B·A)` (0.63 s GPU), so denoising runs
+  only the base GEMMs. The GPU forms each merged tensor in scratch and the
+  host copies it into the pack. Writing the merged weights straight into the
+  14 GB pack buffer from the GPU made later block GEMMs return NaN tiles
+  intermittently at 832×1248: 9 of 11 two-step runs, even when the kernel
+  wrote back unchanged values. With host copies it passed 4 of 4, and every
+  later run passed too. The three global pairs (timestep embedder,
+  modulation) still run unmerged once per trajectory. Ring-streamed shapes
+  (4,096+ target rows) keep the per-step path. `QI_DISABLE_LORA_MERGE=1`
+  restores it everywhere.
+- **Steel attention on cached steps at any target size.** The MLX kernel is
+  specialized per (target rows, total rows), so it no longer requires exactly
+  4,096 rows. The prefill keeps flash attention. `QI_DISABLE_STEEL_ATTENTION=1`
+  restores flash.
+- **MPS attention-output projection on flash shapes.** It replaces the custom
+  simdgroup GEMM (about 4 TFLOP/s against about 9 for MPS).
+  `QI_DISABLE_MPS_ATTENTION_OUTPUT_FLASH=1` restores the custom kernel.
+- **Setup overlap.** The adapter is read with the pack's 8-way `F_NOCACHE`
+  `pread` (0.27 s for 1.36 GB) instead of faulting in its mapping (about
+  1.3 s saved). For resident-pack shapes, the 14.2 GB pack read starts on a
+  background thread when image conditioning begins. `QI_DISABLE_PACK_PRELOAD=1`
+  restores the sequential read. On this machine, with 5.7 GB of swap in use,
+  the preload competes with the encoders' reads. It moved about 3 s out of
+  transformer setup but slowed conditioning by 0.5-3 s. The preload checks
+  cancellation between 8 MiB read chunks; a failed read releases its buffer
+  before the normal loading path retries.
+
+A failed batched step now reports the Metal command-buffer error instead of
+only a later non-finite latent.
+
+Adjacent full runs on the M1 Max. GPU load from other apps varied, so only
+pairs run back to back are comparable:
+
+| Case | Before | After | PSNR vs before |
+| --- | ---: | ---: | ---: |
+| Eiffel edit 832×1248 | 163.7 s (cached steps 20.2-25.1 s) | **102.3 s** (11.4-12.1 s) | 58.0 dB |
+| Portrait edit 736×1280 | 171.6 s (22.1-24.3 s) | **130.5 s** (14.8-16.2 s) | 58.2 dB |
+| 512×512 text | 31.2 s | 30.2 s | 63.5 dB |
+| 1024 Viggle 4-step text (graph path) | 55.9 s | 57.7 s | byte-identical |
+
+In an interleaved two-step benchmark of the portrait edit, the first cached
+step fell from 16.2-17.9 s to 11.2-12.0 s. MPS attention-output saved about
+1.5 s of the 7,379-row prefill. The two-reference portrait now runs on the
+default direct-FP16 path: 137.3 s end to end, against 153-168 s with
+`QI_DISABLE_DIRECT_FP16_ACTIVATIONS=1` earlier. Its image matches that run
+at 48.9 dB, and the hat and pose are unchanged. `cpc test` passes (361).
