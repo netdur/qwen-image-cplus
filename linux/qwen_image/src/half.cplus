@@ -1,0 +1,90 @@
+// FP16 conversions, round to nearest even. Same algorithm as the macOS
+// engine's cpu_ops, which is not importable here.
+
+fn f32_from_bits(bits: u32) -> f32 {
+    return #bitcast::[f32](bits);
+}
+
+fn f32_bits(value: f32) -> u32 {
+    return #bitcast::[u32](value);
+}
+
+fn to_f32(bits: u16) -> f32 {
+    let sign: u32 = ((bits as u32) & (0x8000 as u32)) << (16 as u32);
+    let exponent: u32 = ((bits as u32) >> (10 as u32)) & (0x1F as u32);
+    var mantissa: u32 = (bits as u32) & (0x03FF as u32);
+    if exponent == (0 as u32) {
+        if mantissa == (0 as u32) {
+            return f32_from_bits(sign);
+        }
+        var unbiased: i32 = 0 -% (14 as i32);
+        while (mantissa & (0x0400 as u32)) == (0 as u32) {
+            mantissa = mantissa << (1 as u32);
+            unbiased = unbiased -% (1 as i32);
+        }
+        mantissa = mantissa & (0x03FF as u32);
+        let normal_exponent: u32 = (unbiased +% (127 as i32)) as u32;
+        return f32_from_bits(sign | (normal_exponent << (23 as u32)) | (mantissa << (13 as u32)));
+    }
+    if exponent == (31 as u32) {
+        return f32_from_bits(sign | (0x7F800000 as u32) | (mantissa << (13 as u32)));
+    }
+    let normal_exponent: u32 = exponent +% (127 as u32) -% (15 as u32);
+    return f32_from_bits(sign | (normal_exponent << (23 as u32)) | (mantissa << (13 as u32)));
+}
+
+fn from_f32(value: f32) -> u16 {
+    let bits: u32 = f32_bits(value);
+    let sign: u32 = (bits >> (16 as u32)) & (0x8000 as u32);
+    let exponent: u32 = (bits >> (23 as u32)) & (0xFF as u32);
+    let mantissa: u32 = bits & (0x7FFFFF as u32);
+    if exponent == (0xFF as u32) {
+        if mantissa == (0 as u32) {
+            return (sign | (0x7C00 as u32)) as u16;
+        }
+        return (sign | (0x7E00 as u32)) as u16;
+    }
+
+    let half_exponent: i32 = exponent as i32 -% (127 as i32) +% (15 as i32);
+    if half_exponent >= (31 as i32) {
+        return (sign | (0x7C00 as u32)) as u16;
+    }
+    if half_exponent <= (0 as i32) {
+        if half_exponent < (0 -% (10 as i32)) {
+            return sign as u16;
+        }
+        let significand: u32 = mantissa | (0x800000 as u32);
+        let shift: u32 = (14 as i32 -% half_exponent) as u32;
+        var rounded: u32 = significand >> shift;
+        let mask: u32 = ((1 as u32) << shift) -% (1 as u32);
+        let remainder: u32 = significand & mask;
+        let halfway: u32 = (1 as u32) << (shift -% (1 as u32));
+        if remainder > halfway || (remainder == halfway && (rounded & (1 as u32)) != (0 as u32)) {
+            rounded = rounded +% (1 as u32);
+        }
+        return (sign | rounded) as u16;
+    }
+
+    var encoded: u32 = sign | ((half_exponent as u32) << (10 as u32)) | (mantissa >> (13 as u32));
+    let remainder: u32 = mantissa & (0x1FFF as u32);
+    if remainder > (0x1000 as u32)
+        || (remainder == (0x1000 as u32) && (encoded & (1 as u32)) != (0 as u32)) {
+        encoded = encoded +% (1 as u32);
+    }
+    return encoded as u16;
+}
+
+fn round_f32(value: f32) -> f32 {
+    return to_f32(from_f32(value));
+}
+
+#[test]
+fn half_round_trip_is_exact_for_representable_values() {
+    assert to_f32(from_f32(1.0f32)) == 1.0f32;
+    assert to_f32(from_f32(0.0f32 - 2.5f32)) == 0.0f32 - 2.5f32;
+    assert to_f32(from_f32(0.000061035156f32)) == 0.000061035156f32;
+    // Smallest subnormal survives; half of it rounds to zero (ties to even).
+    assert from_f32(0.000000059604645f32) == (1 as u16);
+    assert from_f32(0.000000029802322f32) == (0 as u16);
+    assert from_f32(65504.0f32) == (0x7BFF as u16);
+}

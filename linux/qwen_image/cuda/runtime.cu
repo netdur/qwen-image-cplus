@@ -1,0 +1,54 @@
+// C ABI over the CUDA runtime for the C+ engine. Every function returns a
+// cudaError_t value (0 is success) so the C+ side can report failures.
+
+#include <cuda_runtime.h>
+
+extern "C" int qi_cuda_device(char *name, int name_capacity, int *major, int *minor,
+                              unsigned long long *memory_bytes, int *multiprocessors) {
+    cudaDeviceProp prop;
+    cudaError_t status = cudaGetDeviceProperties(&prop, 0);
+    if (status != cudaSuccess) return (int)status;
+    int i = 0;
+    for (; i + 1 < name_capacity && prop.name[i] != '\0'; ++i) name[i] = prop.name[i];
+    if (name_capacity > 0) name[i] = '\0';
+    *major = prop.major;
+    *minor = prop.minor;
+    *memory_bytes = (unsigned long long)prop.totalGlobalMem;
+    *multiprocessors = prop.multiProcessorCount;
+    return 0;
+}
+
+extern "C" int qi_cuda_malloc(void **pointer, unsigned long long bytes) {
+    return (int)cudaMalloc(pointer, (size_t)bytes);
+}
+
+extern "C" int qi_cuda_free(void *pointer) {
+    return (int)cudaFree(pointer);
+}
+
+extern "C" int qi_cuda_upload(void *device, const void *host, unsigned long long bytes) {
+    return (int)cudaMemcpy(device, host, (size_t)bytes, cudaMemcpyHostToDevice);
+}
+
+extern "C" int qi_cuda_download(void *host, const void *device, unsigned long long bytes) {
+    return (int)cudaMemcpy(host, device, (size_t)bytes, cudaMemcpyDeviceToHost);
+}
+
+extern "C" int qi_cuda_synchronize(void) {
+    return (int)cudaDeviceSynchronize();
+}
+
+extern "C" const char *qi_cuda_error_name(int status) {
+    return cudaGetErrorName((cudaError_t)status);
+}
+
+__global__ static void axpy_kernel(float *y, const float *x, float a, unsigned long long count) {
+    unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i < count) y[i] = a * x[i] + y[i];
+}
+
+// Smoke kernel for the build and link path: y = a * x + y on the device.
+extern "C" int qi_cuda_axpy(float *y, const float *x, float a, unsigned long long count) {
+    axpy_kernel<<<(unsigned)((count + 255) / 256), 256>>>(y, x, a, count);
+    return (int)cudaGetLastError();
+}

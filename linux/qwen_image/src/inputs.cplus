@@ -1,0 +1,98 @@
+// Transformer inputs built on the host: the 3-axis RoPE table and the seeded
+// initial latents.
+
+import "./random" as random;
+import "./half" as half;
+import "stdlib/option" as option;
+
+#[link_name = "powf"]
+extern fn qi_powf(base: f32, exponent: f32) -> f32;
+#[link_name = "cosf"]
+extern fn qi_cosf(x: f32) -> f32;
+#[link_name = "sinf"]
+extern fn qi_sinf(x: f32) -> f32;
+
+fn f32_from_bits(bits: u32) -> f32 {
+    return #bitcast::[f32](bits);
+}
+
+fn f32_bits(value: f32) -> u32 {
+    return #bitcast::[u32](value);
+}
+
+// QwenImage21Rope for a text-to-image sequence of `text_rows` text tokens and
+// one height x width target block, written as [text_rows + height * width,
+// 128]: 64 cosines then 64 sines, axes (frame 8, height 28, width 28) pairs.
+// Text advances one shared position on all three axes; the image freezes the
+// frame at the next position and centres its grid on zero.
+fn rope_table(text_rows: usize, height: usize, width: usize, output: *f32) {
+    let rows: usize = text_rows +% height *% width;
+    var row: usize = 0 as usize;
+    while row < rows {
+        var positions: [i64; 3] = [0 as i64; 3];
+        if row < text_rows {
+            positions = [row as i64, row as i64, row as i64];
+        } else {
+            let image_index: usize = row -% text_rows;
+            let h: usize = image_index / width;
+            let w: usize = image_index % width;
+            positions = [
+                text_rows as i64,
+                (h as i64) - ((height -% height / (2 as usize)) as i64),
+                (w as i64) - ((width -% width / (2 as usize)) as i64),
+            ];
+        }
+        var pair: usize = 0 as usize;
+        var axis: usize = 0 as usize;
+        while axis < (3 as usize) {
+            let dimension: usize = if axis == (0 as usize) { 16 as usize } else { 56 as usize };
+            var index: usize = 0 as usize;
+            while index < dimension / (2 as usize) {
+                let frequency: f32 = 1.0f32 / qi_powf(10000.0f32, ((2 as usize *% index) as f32) / (dimension as f32));
+                let angle: f32 = (positions[axis] as f32) * frequency;
+                output[row *% (128 as usize) +% pair] = qi_cosf(angle);
+                output[row *% (128 as usize) +% (64 as usize) +% pair] = qi_sinf(angle);
+                pair = pair +% (1 as usize);
+                index = index +% (1 as usize);
+            }
+            axis = axis +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+}
+
+enum NoiseDtype {
+    Float32,
+    BFloat16,
+    Float16,
+}
+
+fn round_to(value: f32, dtype: NoiseDtype) -> f32 {
+    return match dtype {
+        NoiseDtype::Float32 => value,
+        NoiseDtype::Float16 => half::round_f32(value),
+        NoiseDtype::BFloat16 => {
+            let bits: u32 = f32_bits(value);
+            let rounded: u32 = (bits +% (0x7FFF as u32) +% ((bits >> (16 as u32)) & (1 as u32))) & (0xFFFF0000 as u32);
+            f32_from_bits(rounded)
+        }
+    };
+}
+
+// torch.randn((1, 1, 64, height, width), generator=cpu seed, dtype) packed to
+// [height * width, 64], as the pipeline's prepare_latents does. `scratch` holds
+// 64 * height * width floats.
+fn initial_noise(seed: u64, height: usize, width: usize, dtype: NoiseDtype, scratch: *f32, output: *f32) -> bool {
+    let pixels: usize = height *% width;
+    if !random::torch_randn_f32(scratch, (64 as usize) *% pixels, seed) { return false; }
+    var channel: usize = 0 as usize;
+    while channel < (64 as usize) {
+        var pixel: usize = 0 as usize;
+        while pixel < pixels {
+            output[pixel *% (64 as usize) +% channel] = round_to(scratch[channel *% pixels +% pixel], dtype);
+            pixel = pixel +% (1 as usize);
+        }
+        channel = channel +% (1 as usize);
+    }
+    return true;
+}

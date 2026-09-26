@@ -1,0 +1,471 @@
+// Qwen3-VL language model (Qwen-Image-2.1 text encoder) on CUDA, text-only.
+//
+// 36 decoder layers, width 4096, 32 query / 8 key-value heads of 128,
+// SwiGLU 12288, RMSNorm eps 1e-6, per-head Q/K RMSNorm, RoPE theta 5e6. The
+// pipeline reads the last decoder layer's output (before the final norm) and
+// drops the 14 system-template tokens.
+//
+// Weights stay BF16 in the four safetensors shards. Each layer is read into
+// pinned memory, uploaded to one device slot, expanded to FP32 per matrix, and
+// run with FP32 SGEMM; only the prompt's embedding rows are read.
+
+import "./cuda" as cuda;
+import "./int4_pack" as pack;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+import "stdlib/status" as status;
+import "stdlib/thread" as thread;
+
+#[link_name = "open"]
+extern fn qi_open(path: *u8, flags: i32, mode: i32) -> i32;
+#[link_name = "close"]
+extern fn qi_close(fd: i32) -> i32;
+#[link_name = "qi_text_head_norm_rope"]
+extern fn qi_text_head_norm_rope(x: *f32, weight: *f32, rows: i32, heads: i32, theta: f32, position_offset: i32) -> i32;
+#[link_name = "qi_text_attention"]
+extern fn qi_text_attention(q: *f32, k: *f32, v: *f32, out: *f32, tokens: i32, q_heads: i32, kv_heads: i32) -> i32;
+#[link_name = "qi_round_bf16"]
+extern fn qi_round_bf16(x: *f32, count: u64) -> i32;
+#[link_name = "qi_vae_add"]
+extern fn qi_add(y: *f32, x: *f32, count: u64) -> i32;
+#[link_name = "qi_cuda_malloc_host"]
+extern fn qi_cuda_malloc_host(pointer: **u8, bytes: u64) -> i32;
+#[link_name = "qi_cuda_free_host"]
+extern fn qi_cuda_free_host(pointer: *u8) -> i32;
+
+const WIDTH: usize = 4096;
+const KV_WIDTH: usize = 1024;
+const MLP: usize = 12288;
+const LAYERS: usize = 36;
+const Q_HEADS: usize = 32;
+const KV_HEADS: usize = 8;
+const ROPE_THETA: f32 = 5000000.0f32;
+const SYSTEM_TOKENS: usize = 14;
+const TENSORS_PER_LAYER: usize = 11;
+const READ_WORKERS: usize = 8;
+const READ_CHUNK: u64 = 8388608;
+
+fn ok(result: i32, what: str) -> bool {
+    if result != (0 as i32) {
+        io::eprintln("cuda text encoder: ${what} failed (cuda status ${result})");
+        return false;
+    }
+    return true;
+}
+
+// MARK: - Safetensors shards
+
+struct Shard {
+    fd: i32,
+    header: text::Text,
+    data_start: u64,
+}
+
+struct Location {
+    shard: usize,
+    offset: u64,  // absolute file offset
+    bytes: u64,
+}
+
+fn open_shard(path: str) -> option::Option[Shard] {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[Shard]::None; };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) {
+        io::eprintln("cuda text encoder: could not open ${path}");
+        return option::Option[Shard]::None;
+    }
+    var length_bytes: [u8; 8] = [0 as u8; 8];
+    if !pack::read_exact(fd, #addr_of(length_bytes[0]), 8 as usize, 0 as u64) {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Shard]::None;
+    }
+    var header_bytes: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < (8 as usize) {
+        header_bytes = header_bytes | ((length_bytes[index] as u64) << ((index *% (8 as usize)) as u64));
+        index = index +% (1 as usize);
+    }
+    if header_bytes > (67108864 as u64) {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Shard]::None;
+    }
+    guard let option::Option[pack::Buffer]::Some(json) = pack::Buffer::allocate(header_bytes as usize) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Shard]::None;
+    };
+    if !pack::read_exact(fd, json.pointer, json.length, 8 as u64) {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Shard]::None;
+    }
+    return option::Option[Shard]::Some(Shard {
+        fd: fd,
+        header: text::from_str(#str_from_raw_parts(json.pointer, json.length)),
+        data_start: (8 as u64) +% header_bytes,
+    });
+}
+
+fn parse_number(source: str) -> u64 {
+    var value: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < source.count() {
+        guard let option::Option[u8]::Some(byte) = source.byte_at(index) else { return value; };
+        if byte < (48 as u8) || byte > (57 as u8) { return value; }
+        value = value *% (10 as u64) +% (byte -% (48 as u8)) as u64;
+        index = index +% (1 as usize);
+    }
+    return value;
+}
+
+fn locate(shards: vec::Vec[Shard], name: str) -> option::Option[Location] {
+    let key: text::Text = "\"${name}\":{";
+    var index: usize = 0 as usize;
+    while index < shards.count() {
+        guard let option::Option[*Shard]::Some(shard) = shards.at_ptr(index) else { return option::Option[Location]::None; };
+        let header: str = (*shard).header.view();
+        match header.find(key.view()) {
+            option::Option::Some(at) => {
+                let entry: str = header.drop_first(at +% key.count());
+                guard let option::Option[usize]::Some(offsets) = entry.find("\"data_offsets\":[") else {
+                    return option::Option[Location]::None;
+                };
+                let numbers: str = entry.drop_first(offsets +% (16 as usize));
+                let start: u64 = parse_number(numbers);
+                guard let option::Option[usize]::Some(comma) = numbers.find(",") else { return option::Option[Location]::None; };
+                let end: u64 = parse_number(numbers.drop_first(comma +% (1 as usize)));
+                return option::Option[Location]::Some(Location {
+                    shard: index,
+                    offset: (*shard).data_start +% start,
+                    bytes: end -% start,
+                });
+            }
+            option::Option::None => {}
+        }
+        index = index +% (1 as usize);
+    }
+    io::eprintln("cuda text encoder: missing tensor ${name}");
+    return option::Option[Location]::None;
+}
+
+fn layer_tensor_name(layer: usize, index: usize) -> text::Text {
+    let prefix: text::Text = "model.language_model.layers.${layer}.";
+    let suffix: str = if index == (0 as usize) { "input_layernorm.weight" }
+        else if index == (1 as usize) { "self_attn.q_proj.weight" }
+        else if index == (2 as usize) { "self_attn.k_proj.weight" }
+        else if index == (3 as usize) { "self_attn.v_proj.weight" }
+        else if index == (4 as usize) { "self_attn.q_norm.weight" }
+        else if index == (5 as usize) { "self_attn.k_norm.weight" }
+        else if index == (6 as usize) { "self_attn.o_proj.weight" }
+        else if index == (7 as usize) { "post_attention_layernorm.weight" }
+        else if index == (8 as usize) { "mlp.gate_proj.weight" }
+        else if index == (9 as usize) { "mlp.up_proj.weight" }
+        else { "mlp.down_proj.weight" };
+    return "${prefix.view()}${suffix}";
+}
+
+// MARK: - Layer reads
+
+// Where each of a layer's 11 tensors lives on disk and where it goes in the
+// pinned layer buffer.
+struct ReadPlan {
+    fds: [i32; 11],
+    offsets: [u64; 11],
+    bytes: [u64; 11],
+    destinations: [u64; 11],
+}
+
+struct ReadJob {
+    opaque plan: *ReadPlan,
+    opaque pinned: *u8,
+    worker: usize,
+}
+
+// Each worker reads every READ_WORKERS-th 8 MiB chunk of the layer; the plan
+// and buffer outlive the join.
+impl ReadJob: Send {}
+
+fn read_worker(take job: ReadJob) -> i32 {
+    var chunk_index: usize = 0 as usize;
+    var tensor: usize = 0 as usize;
+    while tensor < TENSORS_PER_LAYER {
+        let bytes: u64 = (*job.plan).bytes[tensor];
+        var position: u64 = 0 as u64;
+        while position < bytes {
+            let amount: u64 = if bytes -% position < READ_CHUNK { bytes -% position } else { READ_CHUNK };
+            if chunk_index % READ_WORKERS == job.worker {
+                if !pack::read_exact((*job.plan).fds[tensor], job.pinned + ((*job.plan).destinations[tensor] +% position) as usize,
+                        amount as usize, (*job.plan).offsets[tensor] +% position) {
+                    return 1;
+                }
+            }
+            chunk_index = chunk_index +% (1 as usize);
+            position = position +% amount;
+        }
+        tensor = tensor +% (1 as usize);
+    }
+    return 0;
+}
+
+fn start_read(plan: *ReadPlan, pinned: *u8, ref handles: vec::Vec[thread::JoinHandle[i32]]) -> bool {
+    var worker: usize = 0 as usize;
+    while worker < READ_WORKERS {
+        let job: ReadJob = ReadJob { plan: plan, pinned: pinned, worker: worker };
+        if handles.append(thread::spawn_with::[ReadJob, i32](job, read_worker)) != status::Status::Ok { return false; }
+        worker = worker +% (1 as usize);
+    }
+    return true;
+}
+
+fn finish_read(ref handles: vec::Vec[thread::JoinHandle[i32]]) -> bool {
+    var ok_all: bool = true;
+    while true {
+        match handles.remove_last() {
+            option::Option::Some(handle) => { if handle.join() != (0 as i32) { ok_all = false; } }
+            option::Option::None => { break; }
+        }
+    }
+    return ok_all;
+}
+
+// MARK: - Encoder
+
+struct PinnedBuffer {
+    opaque pointer: *u8,
+    bytes: u64,
+}
+
+impl PinnedBuffer {
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            let _freed: i32 = qi_cuda_free_host(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+struct Options {
+    // Round activations to BF16 where the reference's BF16 execution does.
+    bf16_boundaries: bool,
+}
+
+fn device_floats(count: usize) -> option::Option[cuda::DeviceBuffer] {
+    return cuda::DeviceBuffer::allocate((count *% (4 as usize)) as u64);
+}
+
+fn round_bf16(options: Options, x: *f32, count: usize) -> bool {
+    if !options.bf16_boundaries { return true; }
+    return ok(qi_round_bf16(x, count as u64), "bf16 rounding");
+}
+
+// FP32 expansion of the BF16 matrix at `offset` in the layer slot, then
+// y[tokens, n] = x[tokens, k] . W^T.
+fn linear(slot: *u8, offset: u64, scratch: *f32, x: *f32, y: *f32, tokens: usize, n: usize, k: usize) -> bool {
+    return ok(cuda::bf16_to_f32(slot + offset as usize, scratch, (n *% k) as u64), "weight expansion")
+        && ok(cuda::linear_f32(x, scratch, y, tokens as i32, n as i32, k as i32, 0 as i32), "linear");
+}
+
+// Encodes `count` token IDs and writes the last decoder layer's output for
+// tokens [SYSTEM_TOKENS, count) as FP32 [count - 14, 4096] to `output` (host).
+fn encode(model_root: str, ids: *i32, count: usize, options: Options, output: *f32) -> bool {
+    if count <= SYSTEM_TOKENS {
+        io::eprintln("cuda text encoder: the prompt template needs more than ${SYSTEM_TOKENS} tokens");
+        return false;
+    }
+    var shards: vec::Vec[Shard] = vec::Vec[Shard]::with_capacity(4 as usize);
+    var shard_index: usize = 1 as usize;
+    while shard_index <= (4 as usize) {
+        let path: text::Text = "${model_root}/text_encoder/model-0000${shard_index}-of-00004.safetensors";
+        guard let option::Option[Shard]::Some(shard) = open_shard(path.view()) else { return false; };
+        if shards.append(shard) != status::Status::Ok { return false; }
+        shard_index = shard_index +% (1 as usize);
+    }
+    let result: bool = encode_with(shards, ids, count, options, output);
+    var index: usize = 0 as usize;
+    while index < shards.count() {
+        match shards.at_ptr(index) {
+            option::Option::Some(shard) => { let _closed: i32 = qi_close((*shard).fd); }
+            option::Option::None => {}
+        }
+        index = index +% (1 as usize);
+    }
+    return result;
+}
+
+fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Options, output: *f32) -> bool {
+    // Layer layout: the 11 tensors packed back to back in the slot.
+    var offsets: [u64; 11] = [0 as u64; 11];
+    var layer_bytes: u64 = 0 as u64;
+    var tensor: usize = 0 as usize;
+    while tensor < TENSORS_PER_LAYER {
+        let name: text::Text = layer_tensor_name(0 as usize, tensor);
+        guard let option::Option[Location]::Some(location) = locate(shards, name.view()) else { return false; };
+        offsets[tensor] = layer_bytes;
+        layer_bytes = layer_bytes +% ((location.bytes +% (255 as u64)) / (256 as u64)) *% (256 as u64);
+        tensor = tensor +% (1 as usize);
+    }
+    var plans: vec::Vec[ReadPlan] = vec::Vec[ReadPlan]::with_capacity(LAYERS);
+    var plan_layer: usize = 0 as usize;
+    while plan_layer < LAYERS {
+        var plan: ReadPlan = ReadPlan { fds: [0 as i32; 11], offsets: [0 as u64; 11], bytes: [0 as u64; 11], destinations: offsets };
+        var plan_tensor: usize = 0 as usize;
+        while plan_tensor < TENSORS_PER_LAYER {
+            let name: text::Text = layer_tensor_name(plan_layer, plan_tensor);
+            guard let option::Option[Location]::Some(location) = locate(shards, name.view()) else { return false; };
+            guard let option::Option[*Shard]::Some(shard) = shards.at_ptr(location.shard) else { return false; };
+            plan.fds[plan_tensor] = (*shard).fd;
+            plan.offsets[plan_tensor] = location.offset;
+            plan.bytes[plan_tensor] = location.bytes;
+            plan_tensor = plan_tensor +% (1 as usize);
+        }
+        if plans.append(plan) != status::Status::Ok { return false; }
+        plan_layer = plan_layer +% (1 as usize);
+    }
+    // Two pinned layer buffers: layer L + 1 is read while layer L uploads and runs.
+    var pinned_pointer: *u8 = 0 as *u8;
+    if qi_cuda_malloc_host(#addr_of(pinned_pointer), layer_bytes) != (0 as i32) { return false; }
+    let pinned: PinnedBuffer = PinnedBuffer { pointer: pinned_pointer, bytes: layer_bytes };
+    var second_pointer: *u8 = 0 as *u8;
+    if qi_cuda_malloc_host(#addr_of(second_pointer), layer_bytes) != (0 as i32) { return false; }
+    let second: PinnedBuffer = PinnedBuffer { pointer: second_pointer, bytes: layer_bytes };
+    guard let option::Option[cuda::DeviceBuffer]::Some(slot) = cuda::DeviceBuffer::allocate(layer_bytes) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(scratch) = device_floats(MLP *% WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(norm_weight) = device_floats(WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(hidden) = device_floats(count *% WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(normed) = device_floats(count *% WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(q) = device_floats(count *% WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(k) = device_floats(count *% KV_WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(v) = device_floats(count *% KV_WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(attended) = device_floats(count *% WIDTH) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(gate) = device_floats(count *% MLP) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(up) = device_floats(count *% MLP) else { return false; };
+
+    // Embedding rows for the prompt's tokens only.
+    guard let option::Option[Location]::Some(embeddings) = locate(shards, "model.language_model.embed_tokens.weight") else { return false; };
+    guard let option::Option[*Shard]::Some(embedding_shard) = shards.at_ptr(embeddings.shard) else { return false; };
+    var index: usize = 0 as usize;
+    while index < count {
+        let row_offset: u64 = embeddings.offset +% (ids[index] as u64) *% (WIDTH *% (2 as usize)) as u64;
+        if ids[index] < (0 as i32) || !pack::read_exact((*embedding_shard).fd, pinned.pointer + index *% WIDTH *% (2 as usize),
+                WIDTH *% (2 as usize), row_offset) {
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    let embedding_bytes: u64 = (count *% WIDTH *% (2 as usize)) as u64;
+    if cuda::upload(slot.pointer, pinned.pointer, embedding_bytes) != (0 as i32)
+        || !ok(cuda::bf16_to_f32(slot.pointer, hidden.pointer as *f32, (count *% WIDTH) as u64), "embeddings") {
+        return false;
+    }
+
+    let h: *f32 = hidden.pointer as *f32;
+    let n: *f32 = normed.pointer as *f32;
+    let w: *f32 = scratch.pointer as *f32;
+    var reading: vec::Vec[thread::JoinHandle[i32]] = vec::Vec[thread::JoinHandle[i32]]::with_capacity(READ_WORKERS);
+    guard let option::Option[*ReadPlan]::Some(first_plan) = plans.at_ptr(0 as usize) else { return false; };
+    if !start_read(first_plan, pinned.pointer, reading) { return false; }
+    var layer: usize = 0 as usize;
+    while layer < LAYERS {
+        let current: *u8 = if layer % (2 as usize) == (0 as usize) { pinned.pointer } else { second.pointer };
+        let following: *u8 = if layer % (2 as usize) == (0 as usize) { second.pointer } else { pinned.pointer };
+        if !finish_read(reading) {
+            io::eprintln("cuda text encoder: reading layer ${layer} failed");
+            return false;
+        }
+        if layer +% (1 as usize) < LAYERS {
+            guard let option::Option[*ReadPlan]::Some(next_plan) = plans.at_ptr(layer +% (1 as usize)) else { return false; };
+            if !start_read(next_plan, following, reading) { return false; }
+        }
+        if cuda::upload(slot.pointer, current, layer_bytes) != (0 as i32) {
+            let _joined: bool = finish_read(reading);
+            return false;
+        }
+        let s: *u8 = slot.pointer;
+        let vector: *f32 = norm_weight.pointer as *f32;
+        if !ok(cuda::bf16_to_f32(s + offsets[0] as usize, vector, WIDTH as u64), "norm weight")
+            || !ok(cuda::rms_norm(h, vector, 0.0f32, n, count as i32, WIDTH as i32), "input norm")
+            || !round_bf16(options, n, count *% WIDTH)
+            || !linear(s, offsets[1], w, n, q.pointer as *f32, count, WIDTH, WIDTH)
+            || !linear(s, offsets[2], w, n, k.pointer as *f32, count, KV_WIDTH, WIDTH)
+            || !linear(s, offsets[3], w, n, v.pointer as *f32, count, KV_WIDTH, WIDTH)
+            || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
+            || !round_bf16(options, k.pointer as *f32, count *% KV_WIDTH)
+            || !round_bf16(options, v.pointer as *f32, count *% KV_WIDTH)
+            || !ok(cuda::bf16_to_f32(s + offsets[4] as usize, vector, 128 as u64), "q norm weight")
+            || !ok(qi_text_head_norm_rope(q.pointer as *f32, vector, count as i32, Q_HEADS as i32, ROPE_THETA, 0 as i32), "q norm")
+            || !ok(cuda::bf16_to_f32(s + offsets[5] as usize, vector, 128 as u64), "k norm weight")
+            || !ok(qi_text_head_norm_rope(k.pointer as *f32, vector, count as i32, KV_HEADS as i32, ROPE_THETA, 0 as i32), "k norm")
+            || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
+            || !round_bf16(options, k.pointer as *f32, count *% KV_WIDTH)
+            || !ok(qi_text_attention(q.pointer as *f32, k.pointer as *f32, v.pointer as *f32, attended.pointer as *f32,
+                count as i32, Q_HEADS as i32, KV_HEADS as i32), "attention")
+            || !round_bf16(options, attended.pointer as *f32, count *% WIDTH)
+            || !linear(s, offsets[6], w, attended.pointer as *f32, q.pointer as *f32, count, WIDTH, WIDTH)
+            || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
+            || !ok(qi_add(h, q.pointer as *f32, (count *% WIDTH) as u64), "attention residual")
+            || !round_bf16(options, h, count *% WIDTH)
+            || !ok(cuda::bf16_to_f32(s + offsets[7] as usize, vector, WIDTH as u64), "norm weight")
+            || !ok(cuda::rms_norm(h, vector, 0.0f32, n, count as i32, WIDTH as i32), "post-attention norm")
+            || !round_bf16(options, n, count *% WIDTH)
+            || !linear(s, offsets[8], w, n, gate.pointer as *f32, count, MLP, WIDTH)
+            || !linear(s, offsets[9], w, n, up.pointer as *f32, count, MLP, WIDTH)
+            || !round_bf16(options, gate.pointer as *f32, count *% MLP)
+            || !round_bf16(options, up.pointer as *f32, count *% MLP)
+            || !ok(cuda::swiglu(gate.pointer as *f32, up.pointer as *f32, gate.pointer as *f32, (count *% MLP) as u64), "swiglu")
+            || !round_bf16(options, gate.pointer as *f32, count *% MLP)
+            || !linear(s, offsets[10], w, gate.pointer as *f32, q.pointer as *f32, count, WIDTH, MLP)
+            || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
+            || !ok(qi_add(h, q.pointer as *f32, (count *% WIDTH) as u64), "mlp residual")
+            || !round_bf16(options, h, count *% WIDTH) {
+            // Readers write into the pinned buffers; they must finish before those are freed.
+            let _joined: bool = finish_read(reading);
+            return false;
+        }
+        layer = layer +% (1 as usize);
+    }
+    let kept: usize = count -% SYSTEM_TOKENS;
+    return cuda::synchronize()
+        && cuda::download(output as *u8, (h + SYSTEM_TOKENS *% WIDTH) as *u8, (kept *% WIDTH *% (4 as usize)) as u64) == (0 as i32);
+}
+
+struct TokenIds {
+    buffer: pack::Buffer,
+    count: usize,
+}
+
+// Reads little-endian int32 token IDs (at most 16384).
+fn read_ids(path: str) -> option::Option[TokenIds] {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[TokenIds]::None; };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) { return option::Option[TokenIds]::None; }
+    guard let option::Option[pack::Buffer]::Some(buffer) = pack::Buffer::allocate(65536 as usize) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[TokenIds]::None;
+    };
+    var length: usize = 0 as usize;
+    while length < buffer.length && pack::read_exact(fd, buffer.pointer + length, 4 as usize, length as u64) {
+        length = length +% (4 as usize);
+    }
+    let _closed: i32 = qi_close(fd);
+    return option::Option[TokenIds]::Some(TokenIds { buffer: buffer, count: length / (4 as usize) });
+}
+
+// Encodes the IDs in `ids_path` and writes [count - 14, 4096] FP32 to `output_path`.
+fn encode_file(model_root: str, ids_path: str, bf16_boundaries: bool, output_path: str) -> i32 {
+    guard let option::Option[TokenIds]::Some(ids) = read_ids(ids_path) else { return 1; };
+    if ids.count <= SYSTEM_TOKENS { return 1; }
+    let kept: usize = ids.count -% SYSTEM_TOKENS;
+    guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(kept *% WIDTH *% (4 as usize)) else { return 1; };
+    if !encode(model_root, ids.buffer.pointer as *i32, ids.count, Options { bf16_boundaries: bf16_boundaries }, result.pointer as *f32) {
+        return 1;
+    }
+    guard let option::Option[text::CString]::Some(c_output) = pack::with_c_path(output_path) else { return 1; };
+    let fd: i32 = qi_open(c_output.as_ptr(), 0x241 as i32, 420 as i32);
+    if fd < (0 as i32) { return 1; }
+    let written: bool = pack::write_exact(fd, result.pointer, result.length, 0 as u64);
+    let _closed: i32 = qi_close(fd);
+    if !written { return 1; }
+    io::println("cuda text encoder: ${ids.count} tokens, wrote ${kept} rows to ${output_path}");
+    return 0;
+}

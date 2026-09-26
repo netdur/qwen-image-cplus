@@ -1,0 +1,175 @@
+// PNG output for the Linux engine: RGBA8 scanlines in stored (uncompressed)
+// DEFLATE blocks, CRC-32 and Adler-32, installed atomically. The encoding
+// functions are the macOS engine's (qwen_image/src/image_output.cplus),
+// carried over unchanged because that module is not importable here.
+
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+fn append_u32_be(ref output: vec::Vec[u8], value: u32) {
+    output.append(((value >> (24 as u32)) & (255 as u32)) as u8);
+    output.append(((value >> (16 as u32)) & (255 as u32)) as u8);
+    output.append(((value >> (8 as u32)) & (255 as u32)) as u8);
+    output.append((value & (255 as u32)) as u8);
+}
+
+// Standard reflected CRC-32 table (polynomial 0xEDB88320), built once per
+// chunk so the chunk body needs one lookup per byte instead of eight shifts.
+fn crc32_table() -> [u32; 256] {
+    var table: [u32; 256] = [0 as u32; 256];
+    var entry: usize = 0 as usize;
+    while entry < (256 as usize) {
+        var value: u32 = entry as u32;
+        var bit: usize = 0 as usize;
+        while bit < (8 as usize) {
+            value = if (value & (1 as u32)) != (0 as u32) {
+                (value >> (1 as u32)) ^ (0xEDB88320 as u32)
+            } else { value >> (1 as u32) };
+            bit = bit +% (1 as usize);
+        }
+        table[entry] = value;
+        entry = entry +% (1 as usize);
+    }
+    return table;
+}
+
+fn crc32_byte(crc: u32, byte: u8) -> u32 {
+    var value: u32 = crc ^ byte as u32;
+    var bit: usize = 0 as usize;
+    while bit < (8 as usize) {
+        if (value & (1 as u32)) != (0 as u32) {
+            value = (value >> (1 as u32)) ^ (0xEDB88320 as u32);
+        } else {
+            value = value >> (1 as u32);
+        }
+        bit = bit +% (1 as usize);
+    }
+    return value;
+}
+
+fn append_png_chunk(
+    ref output: vec::Vec[u8],
+    kind: u32,
+    data: *u8,
+    count: usize,
+) {
+    append_u32_be(output, count as u32);
+    var crc: u32 = 0xFFFFFFFF as u32;
+    var kind_index: usize = 0 as usize;
+    while kind_index < (4 as usize) {
+        let shift: u32 = ((3 as usize) -% kind_index) as u32 *% (8 as u32);
+        let byte: u8 = ((kind >> shift) & (255 as u32)) as u8;
+        output.append(byte);
+        crc = crc32_byte(crc, byte);
+        kind_index = kind_index +% (1 as usize);
+    }
+    if count > (0 as usize) {
+        output.extend_from_raw(data, count);
+        let table: [u32; 256] = crc32_table();
+        var index: usize = 0 as usize;
+        while index < count {
+            crc = table[((crc ^ data[index] as u32) & (255 as u32)) as usize] ^ (crc >> (8 as u32));
+            index = index +% (1 as usize);
+        }
+    }
+    append_u32_be(output, crc ^ (0xFFFFFFFF as u32));
+}
+
+fn encode_png_rgba(
+    scanlines: vec::Vec[u8],
+    output_path: str,
+    width: usize,
+    height: usize,
+) -> option::Option[usize] {
+    var adler_a: u32 = 1 as u32;
+    var adler_b: u32 = 0 as u32;
+    let scanline_values: *u8 = { #slice_ptr(scanlines.as_slice()) };
+    // 5552 is zlib's NMAX: the largest run for which b cannot overflow u32
+    // before the deferred modulo.
+    var scanline_index: usize = 0 as usize;
+    while scanline_index < scanlines.count() {
+        let run_end: usize = if scanlines.count() -% scanline_index > (5552 as usize) {
+            scanline_index +% (5552 as usize)
+        } else { scanlines.count() };
+        while scanline_index < run_end {
+            adler_a = adler_a +% scanline_values[scanline_index] as u32;
+            adler_b = adler_b +% adler_a;
+            scanline_index = scanline_index +% (1 as usize);
+        }
+        adler_a = adler_a % (65521 as u32);
+        adler_b = adler_b % (65521 as u32);
+    }
+
+    var idat: vec::Vec[u8] = vec::Vec[u8]::with_capacity(scanlines.count() +% (32 as usize));
+    idat.append(0x78 as u8);
+    idat.append(0x01 as u8);
+    var offset: usize = 0 as usize;
+    while offset < scanlines.count() {
+        let remaining: usize = scanlines.count() -% offset;
+        let block_length: usize = if remaining > (65535 as usize) { 65535 as usize } else { remaining };
+        let final_block: bool = offset +% block_length == scanlines.count();
+        idat.append(if final_block { 1 as u8 } else { 0 as u8 });
+        let length: u32 = block_length as u32;
+        let inverse: u32 = (0xFFFF as u32) -% length;
+        idat.append((length & (255 as u32)) as u8);
+        idat.append(((length >> (8 as u32)) & (255 as u32)) as u8);
+        idat.append((inverse & (255 as u32)) as u8);
+        idat.append(((inverse >> (8 as u32)) & (255 as u32)) as u8);
+        let source: *u8 = { scanline_values + offset };
+        idat.extend_from_raw(source, block_length);
+        offset = offset +% block_length;
+    }
+    append_u32_be(idat, (adler_b << (16 as u32)) | adler_a);
+
+    var png: vec::Vec[u8] = vec::Vec[u8]::with_capacity(idat.count() +% (64 as usize));
+    png.append(137 as u8); png.append(80 as u8); png.append(78 as u8); png.append(71 as u8);
+    png.append(13 as u8); png.append(10 as u8); png.append(26 as u8); png.append(10 as u8);
+    var header: [u8; 13] = [0 as u8; 13];
+    header[0] = ((width as u32 >> (24 as u32)) & (255 as u32)) as u8;
+    header[1] = ((width as u32 >> (16 as u32)) & (255 as u32)) as u8;
+    header[2] = ((width as u32 >> (8 as u32)) & (255 as u32)) as u8;
+    header[3] = (width as u32 & (255 as u32)) as u8;
+    header[4] = ((height as u32 >> (24 as u32)) & (255 as u32)) as u8;
+    header[5] = ((height as u32 >> (16 as u32)) & (255 as u32)) as u8;
+    header[6] = ((height as u32 >> (8 as u32)) & (255 as u32)) as u8;
+    header[7] = (height as u32 & (255 as u32)) as u8;
+    header[8] = 8 as u8;
+    header[9] = 6 as u8;
+    append_png_chunk(png, 0x49484452 as u32, #addr_of(header[0]), 13 as usize);
+    append_png_chunk(png, 0x49444154 as u32, #slice_ptr(idat.as_slice()), idat.count());
+    append_png_chunk(png, 0x49454E44 as u32, 0 as *u8, 0 as usize);
+    let png_bytes: usize = png.count();
+    let temporary_path: text::Text = "${output_path}.tmp";
+    guard let result::Result[fs::File, result::IoError]::Ok(file_value) = fs::create(temporary_path.view()) else {
+        return option::Option[usize]::None;
+    };
+    var file: fs::File = file_value;
+    guard let result::Result[usize, result::IoError]::Ok(written) = file.write_all(png) else {
+        return option::Option[usize]::None;
+    };
+    if written != png_bytes { return option::Option[usize]::None; }
+    file.close();
+    guard let result::Result[bool, result::IoError]::Ok(installed) = fs::rename(
+        temporary_path.view(),
+        output_path,
+    ) else {
+        return option::Option[usize]::None;
+    };
+    if !installed { return option::Option[usize]::None; }
+    return option::Option[usize]::Some(png_bytes);
+}
+
+// Writes `width` x `height` interleaved RGBA8 pixels to `output_path`.
+fn write_rgba(rgba: *u8, width: usize, height: usize, output_path: str) -> option::Option[usize] {
+    var scanlines: vec::Vec[u8] = vec::Vec[u8]::with_capacity(height *% (width *% (4 as usize) +% (1 as usize)));
+    var row: usize = 0 as usize;
+    while row < height {
+        scanlines.append(0 as u8);
+        scanlines.extend_from_raw(rgba + row *% width *% (4 as usize), width *% (4 as usize));
+        row = row +% (1 as usize);
+    }
+    return encode_png_rgba(scanlines, output_path, width, height);
+}

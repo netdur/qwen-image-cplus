@@ -1,0 +1,337 @@
+// Qwen-Image-2.1 VAE decoder on CUDA (Linux engine), first frame only.
+//
+// Graph (diffusers AutoencoderKLQwenImage21 at the pinned commit, is_residual):
+// latents * std + mean -> post_quant_conv (1x1) -> conv_in (3x3, 64 -> 1152)
+// -> mid block (residual, single-head attention, residual) -> five residual
+// up blocks -> RMSNorm + SiLU -> conv_out (3x3, 144 -> 4) -> clamp -> RGBA8.
+// Each up block runs three residual blocks, then (blocks 0-3) a nearest 2x
+// upsample and 3x3 conv, plus the DupUp3D shortcut of the block input.
+
+import "./int4_pack" as pack;
+import "./cuda" as cuda;
+import "./png" as png;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+
+#[link_name = "open"]
+extern fn qi_open(path: *u8, flags: i32, mode: i32) -> i32;
+#[link_name = "close"]
+extern fn qi_close(fd: i32) -> i32;
+#[link_name = "lseek"]
+extern fn qi_lseek(fd: i32, offset: i64, whence: i32) -> i64;
+#[link_name = "qi_vae_conv2d"]
+extern fn qi_vae_conv2d(x: *f32, weights: *f32, bias: *f32, y: *f32, in_channels: i32, out_channels: i32,
+    height: i32, width: i32, kernel: i32) -> i32;
+#[link_name = "qi_vae_rms_norm"]
+extern fn qi_vae_rms_norm(x: *f32, gamma: *f32, y: *f32, channels: i32, pixels: i32, silu: i32) -> i32;
+#[link_name = "qi_vae_upsample2x"]
+extern fn qi_vae_upsample2x(x: *f32, y: *f32, channels: i32, height: i32, width: i32) -> i32;
+#[link_name = "qi_vae_dup_up_add"]
+extern fn qi_vae_dup_up_add(y: *f32, x: *f32, out_channels: i32, height: i32, width: i32, factor_t: i32, repeats: i32) -> i32;
+#[link_name = "qi_vae_add"]
+extern fn qi_vae_add(y: *f32, x: *f32, count: u64) -> i32;
+#[link_name = "qi_vae_attention"]
+extern fn qi_vae_attention(qkv: *f32, out: *f32, scores: *f32, channels: i32, pixels: i32) -> i32;
+#[link_name = "qi_vae_unpack_latents"]
+extern fn qi_vae_unpack_latents(latents: *f32, mean: *f32, std: *f32, z: *f32, pixels: i32) -> i32;
+#[link_name = "qi_vae_to_rgba"]
+extern fn qi_vae_to_rgba(x: *f32, rgba: *u8, pixels: i32) -> i32;
+
+const LATENT_CHANNELS: usize = 64;
+const MID_CHANNELS: usize = 1152;
+
+// vae/config.json latents_mean and latents_std at the pinned snapshot.
+fn latents_mean() -> [f32; 64] {
+    return [0.5126f32, 0.7721f32, -0.0631f32, 1.3506f32, -0.7855f32, -2.1025f32, -0.3458f32, 1.3722f32,
+        1.8873f32, -1.7177f32, -0.651f32, 0.2732f32, 0.7562f32, -0.6163f32, -1.0277f32, 3.8363f32,
+        2.021f32, 0.0472f32, 0.932f32, 2.0087f32, 2.4954f32, -0.1391f32, -1.4249f32, 1.8464f32,
+        -0.5236f32, 1.2826f32, 3.7046f32, -1.3035f32, 2.7286f32, -1.4518f32, -1.9036f32, -1.9955f32,
+        -0.0342f32, -1.0265f32, -0.7636f32, 3.0555f32, 0.0746f32, -3.0751f32, -0.1076f32, 1.7376f32,
+        -1.0914f32, -1.9435f32, -0.2784f32, -1.368f32, 0.4809f32, -0.4433f32, 0.3764f32, 0.5729f32,
+        -2.0595f32, 1.096f32, -1.326f32, -2.0211f32, -5.0179f32, 0.5275f32, 4.0162f32, 1.8505f32,
+        0.3026f32, 1.9373f32, 1.4937f32, 0.2632f32, 0.5547f32, -1.7121f32, -0.1562f32, 0.0304f32];
+}
+
+fn latents_std() -> [f32; 64] {
+    return [3.2001f32, 3.2936f32, 3.4321f32, 3.0091f32, 3.1061f32, 4.0379f32, 4.0705f32, 3.791f32,
+        3.0785f32, 3.65f32, 3.9308f32, 3.0904f32, 2.8778f32, 3.7675f32, 3.732f32, 5.0756f32,
+        3.2864f32, 4.0397f32, 3.1317f32, 4.0443f32, 2.9249f32, 3.9454f32, 3.0988f32, 4.2489f32,
+        3.4896f32, 3.8513f32, 3.9323f32, 3.4719f32, 3.7498f32, 4.283f32, 3.5694f32, 4.2467f32,
+        3.9037f32, 3.2947f32, 5.077f32, 3.5075f32, 3.27f32, 3.4767f32, 2.8063f32, 5.1125f32,
+        3.5327f32, 4.7833f32, 3.1286f32, 4.1819f32, 3.8527f32, 3.8312f32, 3.5605f32, 4.3875f32,
+        3.9624f32, 4.0168f32, 3.5643f32, 4.055f32, 5.5614f32, 4.2963f32, 4.408f32, 3.4959f32,
+        3.8747f32, 3.7608f32, 3.5735f32, 3.149f32, 3.7662f32, 3.6746f32, 3.4563f32, 3.8161f32];
+}
+
+fn ok(result: i32, what: str) -> bool {
+    if result != (0 as i32) {
+        io::eprintln("cuda vae: ${what} failed (cuda status ${result})");
+        return false;
+    }
+    return true;
+}
+
+// MARK: - Weights
+
+// The whole safetensors data section, resident on the device, plus its JSON
+// header for name lookup.
+struct Weights {
+    header: text::Text,
+    device: cuda::DeviceBuffer,
+}
+
+fn load_weights(path: str) -> option::Option[Weights] {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[Weights]::None; };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) {
+        io::eprintln("cuda vae: could not open ${path}");
+        return option::Option[Weights]::None;
+    }
+    let size: i64 = qi_lseek(fd, 0 as i64, 2 as i32);
+    var length_bytes: [u8; 8] = [0 as u8; 8];
+    if size < (8 as i64) || !pack::read_exact(fd, #addr_of(length_bytes[0]), 8 as usize, 0 as u64) {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Weights]::None;
+    }
+    var header_bytes: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < (8 as usize) {
+        header_bytes = header_bytes | ((length_bytes[index] as u64) << ((index *% (8 as usize)) as u64));
+        index = index +% (1 as usize);
+    }
+    let data_start: u64 = (8 as u64) +% header_bytes;
+    guard let option::Option[pack::Buffer]::Some(json) = pack::Buffer::allocate(header_bytes as usize) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Weights]::None;
+    };
+    if header_bytes > (16777216 as u64) || data_start > size as u64
+        || !pack::read_exact(fd, json.pointer, json.length, 8 as u64) {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Weights]::None;
+    }
+    let data_bytes: u64 = size as u64 -% data_start;
+    guard let option::Option[cuda::DeviceBuffer]::Some(device) = cuda::DeviceBuffer::allocate(data_bytes) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Weights]::None;
+    };
+    guard let option::Option[pack::Buffer]::Some(chunk) = pack::Buffer::allocate(67108864 as usize) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Weights]::None;
+    };
+    var position: u64 = 0 as u64;
+    var uploaded: bool = true;
+    while uploaded && position < data_bytes {
+        let remaining: u64 = data_bytes -% position;
+        let amount: usize = if remaining < chunk.length as u64 { remaining as usize } else { chunk.length };
+        uploaded = pack::read_exact(fd, chunk.pointer, amount, data_start +% position)
+            && cuda::upload(device.pointer + position as usize, chunk.pointer, amount as u64) == (0 as i32);
+        position = position +% amount as u64;
+    }
+    let _closed: i32 = qi_close(fd);
+    if !uploaded { return option::Option[Weights]::None; }
+    return option::Option[Weights]::Some(Weights {
+        header: text::from_str(#str_from_raw_parts(json.pointer, json.length)),
+        device: device,
+    });
+}
+
+fn parse_number(source: str) -> u64 {
+    var value: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < source.count() {
+        guard let option::Option[u8]::Some(byte) = source.byte_at(index) else { return value; };
+        if byte < (48 as u8) || byte > (57 as u8) { return value; }
+        value = value *% (10 as u64) +% (byte -% (48 as u8)) as u64;
+        index = index +% (1 as usize);
+    }
+    return value;
+}
+
+// Device address of an F32 tensor, from its "data_offsets" in the header.
+fn tensor(weights: Weights, name: str) -> *f32 {
+    let key: text::Text = "\"${name}\":{";
+    let header: str = weights.header.view();
+    guard let option::Option[usize]::Some(at) = header.find(key.view()) else {
+        io::eprintln("cuda vae: missing tensor ${name}");
+        return 0 as *f32;
+    };
+    let entry: str = header.drop_first(at +% key.count());
+    guard let option::Option[usize]::Some(offsets) = entry.find("\"data_offsets\":[") else { return 0 as *f32; };
+    let start: u64 = parse_number(entry.drop_first(offsets +% (16 as usize)));
+    return (weights.device.pointer + start as usize) as *f32;
+}
+
+// MARK: - Graph
+
+struct Scratch {
+    a: cuda::DeviceBuffer,
+    b: cuda::DeviceBuffer,
+    c: cuda::DeviceBuffer,
+    d: cuda::DeviceBuffer,
+    e: cuda::DeviceBuffer,
+}
+
+fn conv(weights: Weights, prefix: str, x: *f32, y: *f32, in_channels: usize, out_channels: usize,
+        height: usize, width: usize, kernel: usize) -> bool {
+    let weight_name: text::Text = "${prefix}.weight";
+    let bias_name: text::Text = "${prefix}.bias";
+    let w: *f32 = tensor(weights, weight_name.view());
+    let bias: *f32 = tensor(weights, bias_name.view());
+    if w.is_null() || bias.is_null() { return false; }
+    return ok(qi_vae_conv2d(x, w, bias, y, in_channels as i32, out_channels as i32, height as i32, width as i32,
+        kernel as i32), prefix);
+}
+
+fn norm(weights: Weights, name: str, x: *f32, y: *f32, channels: usize, pixels: usize, silu: bool) -> bool {
+    let gamma: *f32 = tensor(weights, name);
+    if gamma.is_null() { return false; }
+    return ok(qi_vae_rms_norm(x, gamma, y, channels as i32, pixels as i32, if silu { 1 as i32 } else { 0 as i32 }), name);
+}
+
+// out = conv2(silu(norm2(conv1(silu(norm1(x)))))) + shortcut(x). `t` and `u`
+// are scratch; `out` must differ from `x`.
+fn residual(weights: Weights, prefix: str, x: *f32, out: *f32, t: *f32, u: *f32, in_channels: usize,
+            out_channels: usize, height: usize, width: usize) -> bool {
+    let pixels: usize = height *% width;
+    let norm1: text::Text = "${prefix}.norm1.gamma";
+    let conv1: text::Text = "${prefix}.conv1";
+    let norm2: text::Text = "${prefix}.norm2.gamma";
+    let conv2: text::Text = "${prefix}.conv2";
+    let shortcut: text::Text = "${prefix}.conv_shortcut";
+    if !norm(weights, norm1.view(), x, t, in_channels, pixels, true)
+        || !conv(weights, conv1.view(), t, u, in_channels, out_channels, height, width, 3 as usize)
+        || !norm(weights, norm2.view(), u, t, out_channels, pixels, true)
+        || !conv(weights, conv2.view(), t, out, out_channels, out_channels, height, width, 3 as usize) {
+        return false;
+    }
+    if in_channels == out_channels {
+        return ok(qi_vae_add(out, x, (out_channels *% pixels) as u64), "residual add");
+    }
+    return conv(weights, shortcut.view(), x, t, in_channels, out_channels, height, width, 1 as usize)
+        && ok(qi_vae_add(out, t, (out_channels *% pixels) as u64), "shortcut add");
+}
+
+// Decodes packed latents [pixels, 64] (device) for a latent grid of
+// latent_height x latent_width into RGBA8 on the host (16x each side).
+fn decode(weights: Weights, ref scratch: Scratch, latents: *f32, latent_height: usize, latent_width: usize,
+          rgba_host: *u8) -> bool {
+    var height: usize = latent_height;
+    var width: usize = latent_width;
+    var pixels: usize = height *% width;
+    var mean: [f32; 64] = latents_mean();
+    var std: [f32; 64] = latents_std();
+    let a: *f32 = scratch.a.pointer as *f32;
+    let b: *f32 = scratch.b.pointer as *f32;
+    let c: *f32 = scratch.c.pointer as *f32;
+    let d: *f32 = scratch.d.pointer as *f32;
+    let e: *f32 = scratch.e.pointer as *f32;
+    // Mean and std staged in the tail of scratch e.
+    let statistics: *f32 = e;
+    if cuda::upload(statistics as *u8, #addr_of(mean[0]) as *u8, 256 as u64) != (0 as i32)
+        || cuda::upload((statistics + (64 as usize)) as *u8, #addr_of(std[0]) as *u8, 256 as u64) != (0 as i32)
+        || !ok(qi_vae_unpack_latents(latents, statistics, statistics + (64 as usize), a, pixels as i32), "unpack")
+        || !conv(weights, "post_quant_conv", a, b, LATENT_CHANNELS, LATENT_CHANNELS, height, width, 1 as usize)
+        || !conv(weights, "decoder.conv_in", b, a, LATENT_CHANNELS, MID_CHANNELS, height, width, 3 as usize) {
+        return false;
+    }
+    // Mid block: a -> b -> (attention) a -> b.
+    if !residual(weights, "decoder.mid_block.resnets.0", a, b, c, d, MID_CHANNELS, MID_CHANNELS, height, width)
+        || !norm(weights, "decoder.mid_block.attentions.0.norm.gamma", b, c, MID_CHANNELS, pixels, false)
+        || !conv(weights, "decoder.mid_block.attentions.0.to_qkv", c, d, MID_CHANNELS, MID_CHANNELS *% (3 as usize), height, width, 1 as usize)
+        || !ok(qi_vae_attention(d, c, e, MID_CHANNELS as i32, pixels as i32), "mid attention")
+        || !conv(weights, "decoder.mid_block.attentions.0.proj", c, a, MID_CHANNELS, MID_CHANNELS, height, width, 1 as usize)
+        || !ok(qi_vae_add(a, b, (MID_CHANNELS *% pixels) as u64), "attention residual")
+        || !residual(weights, "decoder.mid_block.resnets.1", a, b, c, d, MID_CHANNELS, MID_CHANNELS, height, width) {
+        return false;
+    }
+    // Up blocks. The block input stays in b for the shortcut; residuals
+    // alternate a/e, with c and d as scratch.
+    var in_channels: usize = MID_CHANNELS;
+    var block: usize = 0 as usize;
+    while block < (5 as usize) {
+        let out_channels: usize = if block < (2 as usize) { 1152 as usize }
+            else if block == (2 as usize) { 576 as usize }
+            else if block == (3 as usize) { 288 as usize }
+            else { 144 as usize };
+        let prefix: text::Text = "decoder.up_blocks.${block}";
+        let r0: text::Text = "${prefix.view()}.resnets.0";
+        let r1: text::Text = "${prefix.view()}.resnets.1";
+        let r2: text::Text = "${prefix.view()}.resnets.2";
+        if !residual(weights, r0.view(), b, a, c, d, in_channels, out_channels, height, width)
+            || !residual(weights, r1.view(), a, e, c, d, out_channels, out_channels, height, width)
+            || !residual(weights, r2.view(), e, a, c, d, out_channels, out_channels, height, width) {
+            return false;
+        }
+        if block < (4 as usize) {
+            let resample: text::Text = "${prefix.view()}.upsampler.resample.1";
+            let factor_t: usize = if block < (3 as usize) { 2 as usize } else { 1 as usize };
+            let repeats: usize = out_channels *% factor_t *% (4 as usize) / in_channels;
+            if !ok(qi_vae_upsample2x(a, c, out_channels as i32, height as i32, width as i32), "upsample")
+                || !conv(weights, resample.view(), c, e, out_channels, out_channels, height *% (2 as usize), width *% (2 as usize), 3 as usize)
+                || !ok(qi_vae_dup_up_add(e, b, out_channels as i32, height as i32, width as i32, factor_t as i32, repeats as i32), "shortcut") {
+                return false;
+            }
+            height = height *% (2 as usize);
+            width = width *% (2 as usize);
+            pixels = height *% width;
+            // Next block input.
+            if !ok(cuda::copy(b as *u8, e as *u8, (out_channels *% pixels *% (4 as usize)) as u64), "copy") { return false; }
+        } else if !ok(cuda::copy(b as *u8, a as *u8, (out_channels *% pixels *% (4 as usize)) as u64), "copy") {
+            return false;
+        }
+        in_channels = out_channels;
+        block = block +% (1 as usize);
+    }
+    guard let option::Option[cuda::DeviceBuffer]::Some(rgba) = cuda::DeviceBuffer::allocate((pixels *% (4 as usize)) as u64) else {
+        return false;
+    };
+    return norm(weights, "decoder.norm_out.gamma", b, c, 144 as usize, pixels, true)
+        && conv(weights, "decoder.conv_out", c, d, 144 as usize, 4 as usize, height, width, 3 as usize)
+        && ok(qi_vae_to_rgba(d, rgba.pointer, pixels as i32), "rgba")
+        && cuda::synchronize()
+        && rgba.download(rgba_host, (pixels *% (4 as usize)) as u64);
+}
+
+// Scratch sized for a latent grid: the largest tensor is 288 channels at the
+// full output resolution (up block 3's upsample).
+fn allocate_scratch(latent_height: usize, latent_width: usize) -> option::Option[Scratch] {
+    let output_pixels: usize = latent_height *% latent_width *% (256 as usize);
+    let latent_pixels: usize = latent_height *% latent_width;
+    let largest: usize = output_pixels *% (288 as usize);
+    let attention: usize = latent_pixels *% latent_pixels;
+    let e_floats: usize = if attention > largest { attention } else { largest };
+    guard let option::Option[cuda::DeviceBuffer]::Some(a) = cuda::DeviceBuffer::allocate((largest *% (4 as usize)) as u64) else { return option::Option[Scratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(b) = cuda::DeviceBuffer::allocate((largest *% (4 as usize)) as u64) else { return option::Option[Scratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(c) = cuda::DeviceBuffer::allocate((largest *% (4 as usize)) as u64) else { return option::Option[Scratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(d) = cuda::DeviceBuffer::allocate((largest *% (4 as usize)) as u64) else { return option::Option[Scratch]::None; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(e) = cuda::DeviceBuffer::allocate((e_floats *% (4 as usize)) as u64) else { return option::Option[Scratch]::None; };
+    return option::Option[Scratch]::Some(Scratch { a: a, b: b, c: c, d: d, e: e });
+}
+
+// Decodes a [pixels, 64] FP32 latent file for a square grid and writes a PNG.
+fn decode_file(vae_path: str, latents_path: str, latent_side: usize, output_path: str) -> i32 {
+    let pixels: usize = latent_side *% latent_side;
+    guard let option::Option[text::CString]::Some(c_latents) = pack::with_c_path(latents_path) else { return 1; };
+    let fd: i32 = qi_open(c_latents.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) { return 1; }
+    guard let option::Option[pack::Buffer]::Some(host) = pack::Buffer::allocate(pixels *% LATENT_CHANNELS *% (4 as usize)) else { return 1; };
+    let read: bool = pack::read_exact(fd, host.pointer, host.length, 0 as u64);
+    let _closed: i32 = qi_close(fd);
+    if !read { return 1; }
+    guard let option::Option[cuda::DeviceBuffer]::Some(latents) = cuda::DeviceBuffer::allocate(host.length as u64) else { return 1; };
+    if !latents.upload(host.pointer, host.length as u64) { return 1; }
+    guard let option::Option[Weights]::Some(weights) = load_weights(vae_path) else { return 1; };
+    guard let option::Option[Scratch]::Some(allocated) = allocate_scratch(latent_side, latent_side) else {
+        io::eprintln("cuda vae: could not allocate scratch");
+        return 1;
+    };
+    var scratch: Scratch = allocated;
+    let side: usize = latent_side *% (16 as usize);
+    guard let option::Option[pack::Buffer]::Some(rgba) = pack::Buffer::allocate(side *% side *% (4 as usize)) else { return 1; };
+    if !decode(weights, scratch, latents.pointer as *f32, latent_side, latent_side, rgba.pointer) { return 1; }
+    guard let option::Option[usize]::Some(bytes) = png::write_rgba(rgba.pointer, side, side, output_path) else { return 1; };
+    io::println("cuda vae: wrote ${output_path} (${side}x${side}, ${bytes} bytes)");
+    return 0;
+}

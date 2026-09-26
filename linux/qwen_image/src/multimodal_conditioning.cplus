@@ -1,0 +1,28 @@
+// Linux image-conditioned generation.
+//
+// The signature matches the macOS `run_multi_image_transformer` that `api`
+// calls. The CUDA path is not implemented yet.
+
+import "./generation_control" as control;
+
+fn run_multi_image_transformer(
+    packed_path: str,
+    model_root: str,
+    image_paths: *str,
+    image_count: usize,
+    prompt: str = "Use Picture 1 and Picture 2 to create a coherent new scene.",
+    requested_steps: str = "1",
+    output_path: str = "",
+    seed: u64 = 1301 as u64,
+    output_resolution: usize = 512 as usize,
+    observer: control::Observer = control::none(),
+    output_width: usize = 0 as usize,
+    output_height: usize = 0 as usize,
+    benchmark_only: bool = false,
+) -> i32 {
+    if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
+        return 3;
+    }
+    control::diagnose(observer, "The Linux CUDA backend cannot generate images yet.");
+    return 1;
+}

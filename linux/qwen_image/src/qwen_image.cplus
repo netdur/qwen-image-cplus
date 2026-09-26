@@ -1,0 +1,18 @@
+// Root module for the Linux engine package.
+//
+// The package is named `qwen_image`, like the macOS engine, so clients import
+// `qwen_image/api` on both platforms; `scripts/link_vendor.sh` points that
+// name at this directory on Linux. `api` and `generation_control` are
+// byte-identical copies of the macOS modules, checked by
+// `scripts/check_engine_contract.sh`. Only the modules behind them differ.
+
+import "./api" as _;
+import "./int4_pack" as _;
+import "./cuda" as _;
+import "./transformer" as _;
+import "./vae" as _;
+import "./text_encoder" as _;
+import "./inputs" as _;
+import "./unicode" as _;
+import "./tokenizer" as _;
+import "./png" as _;

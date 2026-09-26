@@ -1,0 +1,978 @@
+// INT4 transformer packs for the CUDA engine, written from the all-FP16 v4
+// QIPACK. Both formats keep the QIPACK1 container (header, 256-byte records,
+// key/value metadata in the directory padding, FNV-1a checksums) and change
+// only the 224 block matrices. Globals and vectors are copied byte for byte.
+//
+// Every INT4 matrix stores codes row-major as [N, K/2] bytes, the even input
+// column in the low nibble, and one FP16 scale per (row, group of G inputs)
+// as [N, K/G]:
+//
+// - W4A16 (scheme 5): unsigned codes 0..15 plus an FP16 minimum per group in
+//   the zeros region, [N, K/G]. w = code * scale + minimum.
+// - W4A4 (scheme 6): signed two's-complement codes -7..7, no zeros region.
+//   The stored matrix is W' = W * blockdiag(H256) along K, with the same
+//   radix-4 H256 butterfly as the macOS v5 pack. Inference rotates each
+//   activation row the same way: y = (H x) . W'.
+//
+// With `clip`, each group picks the range shrink from CLIP_CANDIDATES that
+// minimizes its squared reconstruction error. tools/evaluate_int4_quantization.py
+// implements the same quantizers and measures their effect on the model.
+
+import "./half" as half;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/thread" as thread;
+import "stdlib/vec" as vec;
+
+#[link_name = "open"]
+extern fn qi_open(path: *u8, flags: i32, mode: i32) -> i32;
+#[link_name = "pread"]
+extern fn qi_pread(fd: i32, bytes: *u8, count: usize, offset: i64) -> isize;
+#[link_name = "pwrite"]
+extern fn qi_pwrite(fd: i32, bytes: *u8, count: usize, offset: i64) -> isize;
+#[link_name = "ftruncate"]
+extern fn qi_ftruncate(fd: i32, length: i64) -> i32;
+#[link_name = "fsync"]
+extern fn qi_fsync(fd: i32) -> i32;
+#[link_name = "close"]
+extern fn qi_close(fd: i32) -> i32;
+#[link_name = "rename"]
+extern fn qi_rename(source: *u8, destination: *u8) -> i32;
+#[link_name = "unlink"]
+extern fn qi_unlink(path: *u8) -> i32;
+#[link_name = "rintf"]
+extern fn qi_rintf(value: f32) -> f32;
+extern fn malloc(size: usize) -> *u8;
+extern fn free(pointer: *u8);
+
+const HEADER_BYTES: u64 = 256;
+const RECORD_BYTES: u64 = 256;
+const TENSOR_ALIGNMENT: u64 = 256;
+const TENSOR_COUNT: usize = 297;
+const SCHEME_BF16: u32 = 0;
+const SCHEME_FP16: u32 = 1;
+const SCHEME_W4A16: u32 = 5;
+const SCHEME_W4A4_H256: u32 = 6;
+const TYPE_NONE: u32 = 0;
+const TYPE_F16: u32 = 1;
+const METADATA_VERSION: u32 = 1;
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+const SOURCE_POLICY: str = "transformer:all-matrix-f16-v4";
+const O_RDONLY: i32 = 0;
+const O_RDWR: i32 = 2;
+const O_CREAT: i32 = 0x40;
+const O_TRUNC: i32 = 0x200;
+const WORKERS: usize = 12;
+const IO_CHUNK: usize = 67108864;
+// Smallest positive FP16 value, so a rounded scale is never zero.
+const SCALE_FLOOR: f32 = 0.000000059604645f32;
+
+#[repr(C)]
+struct PackedHeader {
+    magic: [u8; 8],
+    version: u32,
+    header_bytes: u32,
+    tensor_count: u32,
+    scope: u32,
+    directory_offset: u64,
+    data_offset: u64,
+    file_bytes: u64,
+    payload_checksum: u64,
+    model_snapshot: [u8; 40],
+    diffusers_commit: [u8; 40],
+    policy: [u8; 32],
+    metadata_offset: u64,
+    metadata_bytes: u32,
+    metadata_version: u32,
+    metadata_checksum: u64,
+    reserved: [u8; 64],
+}
+
+#[repr(C)]
+struct PackedRecord {
+    name: [u8; 128],
+    scheme: u32,
+    rank: u32,
+    dimensions: [u64; 4],
+    group_axis: u32,
+    group_size: u32,
+    scale_type: u32,
+    zero_type: u32,
+    weights_offset: u64,
+    weights_length: u64,
+    scales_offset: u64,
+    scales_length: u64,
+    zeros_offset: u64,
+    zeros_length: u64,
+    elements: u64,
+    tensor_checksum: u64,
+    reserved: [u8; 8],
+}
+
+enum Format {
+    W4A16,
+    W4A4,
+}
+
+struct Options {
+    format: Format,
+    group: usize,
+    clip: bool,
+}
+
+fn policy_name(options: Options) -> text::Text {
+    return match options.format {
+        Format::W4A16 => "transformer:w4a16-g${options.group}-v6",
+        Format::W4A4 => "transformer:w4a4-h256-g${options.group}-v6",
+    };
+}
+
+fn quant_name(options: Options) -> text::Text {
+    let base: text::Text = match options.format {
+        Format::W4A16 => "w4a16-g${options.group}",
+        Format::W4A4 => "w4a4-h256-g${options.group}",
+    };
+    return if options.clip { "${base.view()}-clip" } else { base };
+}
+
+// MARK: - Bytes and files
+
+struct Buffer {
+    opaque pointer: *u8,
+    length: usize,
+}
+
+impl Buffer {
+    fn allocate(length: usize) -> option::Option[Buffer] {
+        let pointer: *u8 = malloc(if length == (0 as usize) { 1 as usize } else { length });
+        if pointer.is_null() {
+            return option::Option[Buffer]::None;
+        }
+        return option::Option[Buffer]::Some(Buffer { pointer: pointer, length: length });
+    }
+
+    fn drop(ref this) {
+        if !this.pointer.is_null() {
+            free(this.pointer);
+            this.pointer = 0 as *u8;
+        }
+    }
+}
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    return ((value +% alignment -% (1 as u64)) / alignment) *% alignment;
+}
+
+fn hash_update(hash: u64, bytes: *u8, count: usize) -> u64 {
+    var result: u64 = hash;
+    var index: usize = 0 as usize;
+    while index < count {
+        result = (result ^ bytes[index] as u64) *% FNV_PRIME;
+        index = index +% (1 as usize);
+    }
+    return result;
+}
+
+fn read_exact(fd: i32, bytes: *u8, count: usize, offset: u64) -> bool {
+    var done: usize = 0 as usize;
+    while done < count {
+        let result: isize = qi_pread(fd, bytes + done, count -% done, (offset +% done as u64) as i64);
+        if result <= (0 as isize) {
+            return false;
+        }
+        done = done +% result as usize;
+    }
+    return true;
+}
+
+fn write_exact(fd: i32, bytes: *u8, count: usize, offset: u64) -> bool {
+    var done: usize = 0 as usize;
+    while done < count {
+        let result: isize = qi_pwrite(fd, bytes + done, count -% done, (offset +% done as u64) as i64);
+        if result <= (0 as isize) {
+            return false;
+        }
+        done = done +% result as usize;
+    }
+    return true;
+}
+
+fn fixed_matches(source: *u8, capacity: usize, expected: str) -> bool {
+    if expected.count() > capacity {
+        return false;
+    }
+    var index: usize = 0 as usize;
+    while index < capacity {
+        let wanted: u8 = if index < expected.count() {
+            match expected.byte_at(index) {
+                option::Option::Some(byte) => byte,
+                option::Option::None => 0 as u8,
+            }
+        } else { 0 as u8 };
+        if source[index] != wanted {
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn fixed_text(destination: *u8, capacity: usize, source: str) -> bool {
+    if source.count() > capacity {
+        return false;
+    }
+    var index: usize = 0 as usize;
+    while index < capacity {
+        destination[index] = if index < source.count() {
+            match source.byte_at(index) {
+                option::Option::Some(byte) => byte,
+                option::Option::None => 0 as u8,
+            }
+        } else { 0 as u8 };
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn magic_matches(header: *PackedHeader) -> bool {
+    let expected: [u8; 8] = [81 as u8, 73 as u8, 80 as u8, 65 as u8, 67 as u8, 75 as u8, 49 as u8, 0 as u8];
+    var index: usize = 0 as usize;
+    while index < (8 as usize) {
+        if (*header).magic[index] != expected[index] {
+            return false;
+        }
+        index = index +% (1 as usize);
+    }
+    return true;
+}
+
+fn read_header(fd: i32) -> option::Option[PackedHeader] {
+    guard let option::Option[Buffer]::Some(bytes) = Buffer::allocate(HEADER_BYTES as usize) else {
+        return option::Option[PackedHeader]::None;
+    };
+    if !read_exact(fd, bytes.pointer, bytes.length, 0 as u64) {
+        return option::Option[PackedHeader]::None;
+    }
+    return option::Option[PackedHeader]::Some(*(bytes.pointer as *PackedHeader));
+}
+
+fn with_c_path(path: str) -> option::Option[text::CString] {
+    let owner: text::Text = text::from_str(path);
+    return owner.c_str();
+}
+
+// MARK: - Quantizers
+
+fn clip_candidate(index: usize) -> f64 {
+    if index == (0 as usize) { return 1.0f64; }
+    if index == (1 as usize) { return 0.95f64; }
+    if index == (2 as usize) { return 0.9f64; }
+    if index == (3 as usize) { return 0.85f64; }
+    if index == (4 as usize) { return 0.8f64; }
+    if index == (5 as usize) { return 0.75f64; }
+    return 0.7f64;
+}
+
+const CLIP_CANDIDATE_COUNT: usize = 7;
+
+// The macOS v5 H256 butterfly: radix 4, strides 1, 4, 16, 64, orthonormal and
+// its own inverse.
+fn hadamard_256_in_place(values: *f32) {
+    var stride: usize = 1 as usize;
+    while stride < (256 as usize) {
+        let span: usize = stride *% (4 as usize);
+        var base: usize = 0 as usize;
+        while base < (256 as usize) {
+            var offset: usize = 0 as usize;
+            while offset < stride {
+                let a: f32 = values[base +% offset];
+                let b: f32 = values[base +% stride +% offset];
+                let c: f32 = values[base +% (2 as usize) *% stride +% offset];
+                let d: f32 = values[base +% (3 as usize) *% stride +% offset];
+                values[base +% offset] = (a + b + c - d) * 0.5f32;
+                values[base +% stride +% offset] = (a + b - c + d) * 0.5f32;
+                values[base +% (2 as usize) *% stride +% offset] = (a - b + c + d) * 0.5f32;
+                values[base +% (3 as usize) *% stride +% offset] = (0.0f32 - a + b + c + d) * 0.5f32;
+                offset = offset +% (1 as usize);
+            }
+            base = base +% span;
+        }
+        stride = stride *% (4 as usize);
+    }
+}
+
+// Unsigned codes with an FP16 scale and FP16 minimum: w = q * s + m.
+fn quantize_affine_group(
+    values: *f32,
+    group: usize,
+    clip: bool,
+    codes: *u8,
+    ref scale_bits: u16,
+    ref minimum_bits: u16,
+) {
+    var low: f32 = values[0];
+    var high: f32 = values[0];
+    var index: usize = 1 as usize;
+    while index < group {
+        low = low.min(values[index]);
+        high = high.max(values[index]);
+        index = index +% (1 as usize);
+    }
+    var best_error: f32 = 0.0f32;
+    let candidates: usize = if clip { CLIP_CANDIDATE_COUNT } else { 1 as usize };
+    var candidate: usize = 0 as usize;
+    while candidate < candidates {
+        let center: f32 = (high + low) * 0.5f32;
+        let half_range: f32 = (high - low) * ((0.5f64 * clip_candidate(candidate)) as f32);
+        let minimum: f32 = half::round_f32(center - half_range);
+        let scale: f32 = half::round_f32(((center + half_range - minimum) / 15.0f32).max(SCALE_FLOOR));
+        var error: f32 = 0.0f32;
+        index = 0 as usize;
+        while index < group {
+            let code: f32 = qi_rintf((values[index] - minimum) / scale).max(0.0f32).min(15.0f32);
+            let difference: f32 = code * scale + minimum - values[index];
+            error = error + difference * difference;
+            index = index +% (1 as usize);
+        }
+        if candidate == (0 as usize) || error < best_error {
+            best_error = error;
+            scale_bits = half::from_f32(scale);
+            minimum_bits = half::from_f32(minimum);
+            index = 0 as usize;
+            while index < group {
+                codes[index] = qi_rintf((values[index] - minimum) / scale).max(0.0f32).min(15.0f32) as u8;
+                index = index +% (1 as usize);
+            }
+        }
+        candidate = candidate +% (1 as usize);
+    }
+}
+
+// Signed codes -7..7 with one FP16 scale: w = q * s. Codes are stored as
+// two's-complement nibbles.
+fn quantize_symmetric_group(
+    values: *f32,
+    group: usize,
+    clip: bool,
+    codes: *u8,
+    ref scale_bits: u16,
+) {
+    var peak: f32 = 0.0f32;
+    var index: usize = 0 as usize;
+    while index < group {
+        peak = peak.max(values[index].abs());
+        index = index +% (1 as usize);
+    }
+    var best_error: f32 = 0.0f32;
+    let candidates: usize = if clip { CLIP_CANDIDATE_COUNT } else { 1 as usize };
+    var candidate: usize = 0 as usize;
+    while candidate < candidates {
+        let factor: f32 = (clip_candidate(candidate) / 7.0f64) as f32;
+        let scale: f32 = half::round_f32((peak * factor).max(SCALE_FLOOR));
+        var error: f32 = 0.0f32;
+        index = 0 as usize;
+        while index < group {
+            let code: f32 = qi_rintf(values[index] / scale).max(0.0f32 - 7.0f32).min(7.0f32);
+            let difference: f32 = code * scale - values[index];
+            error = error + difference * difference;
+            index = index +% (1 as usize);
+        }
+        if candidate == (0 as usize) || error < best_error {
+            best_error = error;
+            scale_bits = half::from_f32(scale);
+            index = 0 as usize;
+            while index < group {
+                let code: f32 = qi_rintf(values[index] / scale).max(0.0f32 - 7.0f32).min(7.0f32);
+                codes[index] = ((code as i32) & (15 as i32)) as u8;
+                index = index +% (1 as usize);
+            }
+        }
+        candidate = candidate +% (1 as usize);
+    }
+}
+
+struct RowJob {
+    opaque source: *u16,
+    opaque codes: *u8,
+    opaque scales: *u16,
+    opaque minimums: *u16,
+    inputs: usize,
+    group: usize,
+    start: usize,
+    end: usize,
+    rotate: bool,
+    clip: bool,
+}
+
+// Jobs write disjoint row ranges of buffers the caller keeps alive until join.
+impl RowJob: Send {}
+
+fn quantize_rows(take job: RowJob) -> i32 {
+    guard let option::Option[Buffer]::Some(row_storage) = Buffer::allocate(job.inputs *% (4 as usize)) else {
+        return 1;
+    };
+    let row_values: *f32 = row_storage.pointer as *f32;
+    var group_codes: [u8; 256] = [0 as u8; 256];
+    let groups: usize = job.inputs / job.group;
+    var row: usize = job.start;
+    while row < job.end {
+        var column: usize = 0 as usize;
+        while column < job.inputs {
+            row_values[column] = half::to_f32(job.source[row *% job.inputs +% column]);
+            column = column +% (1 as usize);
+        }
+        if job.rotate {
+            var chunk: usize = 0 as usize;
+            while chunk < job.inputs {
+                hadamard_256_in_place(row_values + chunk);
+                chunk = chunk +% (256 as usize);
+            }
+        }
+        var group: usize = 0 as usize;
+        while group < groups {
+            let start: usize = group *% job.group;
+            var scale_bits: u16 = 0 as u16;
+            var minimum_bits: u16 = 0 as u16;
+            if job.rotate {
+                quantize_symmetric_group(row_values + start, job.group, job.clip, #addr_of(group_codes[0]), scale_bits);
+            } else {
+                quantize_affine_group(row_values + start, job.group, job.clip, #addr_of(group_codes[0]), scale_bits, minimum_bits);
+                job.minimums[row *% groups +% group] = minimum_bits;
+            }
+            job.scales[row *% groups +% group] = scale_bits;
+            var pair: usize = 0 as usize;
+            while pair < job.group {
+                let packed_index: usize = (row *% job.inputs +% start +% pair) / (2 as usize);
+                job.codes[packed_index] = group_codes[pair] | (group_codes[pair +% (1 as usize)] << (4 as u8));
+                pair = pair +% (2 as usize);
+            }
+            group = group +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    return 0;
+}
+
+fn quantize_matrix(
+    source: *u16,
+    outputs: usize,
+    inputs: usize,
+    options: Options,
+    codes: *u8,
+    scales: *u16,
+    minimums: *u16,
+) -> bool {
+    var handles: vec::Vec[thread::JoinHandle[i32]] = vec::new::[thread::JoinHandle[i32]]();
+    let rows_per_worker: usize = (outputs +% WORKERS -% (1 as usize)) / WORKERS;
+    var start: usize = 0 as usize;
+    var ok: bool = true;
+    while start < outputs {
+        let end: usize = if start +% rows_per_worker < outputs { start +% rows_per_worker } else { outputs };
+        let job: RowJob = RowJob {
+            source: source,
+            codes: codes,
+            scales: scales,
+            minimums: minimums,
+            inputs: inputs,
+            group: options.group,
+            start: start,
+            end: end,
+            rotate: options.format == Format::W4A4,
+            clip: options.clip,
+        };
+        if handles.append(thread::spawn_with::[RowJob, i32](job, quantize_rows)) != status::Status::Ok {
+            ok = false;
+        }
+        start = end;
+    }
+    while true {
+        match handles.remove_last() {
+            option::Option::Some(handle) => {
+                if handle.join() != (0 as i32) { ok = false; }
+            }
+            option::Option::None => { break; }
+        }
+    }
+    return ok;
+}
+
+// MARK: - Writer
+
+fn is_block_matrix(record: PackedRecord) -> bool {
+    return record.scheme == SCHEME_FP16 && record.rank == (2 as u32);
+}
+
+fn plan_record(source: PackedRecord, options: Options, ref cursor: u64) -> PackedRecord {
+    var record: PackedRecord = source;
+    record.tensor_checksum = 0 as u64;
+    record.scales_offset = 0 as u64;
+    record.scales_length = 0 as u64;
+    record.zeros_offset = 0 as u64;
+    record.zeros_length = 0 as u64;
+    if is_block_matrix(source) {
+        let outputs: u64 = source.dimensions[0];
+        let inputs: u64 = source.dimensions[1];
+        let groups: u64 = outputs *% (inputs / options.group as u64);
+        record.scheme = match options.format {
+            Format::W4A16 => SCHEME_W4A16,
+            Format::W4A4 => SCHEME_W4A4_H256,
+        };
+        record.group_axis = 1 as u32;
+        record.group_size = options.group as u32;
+        record.scale_type = TYPE_F16;
+        record.zero_type = match options.format {
+            Format::W4A16 => TYPE_F16,
+            Format::W4A4 => TYPE_NONE,
+        };
+        record.weights_length = outputs *% inputs / (2 as u64);
+        record.scales_length = groups *% (2 as u64);
+        if options.format == Format::W4A16 {
+            record.zeros_length = groups *% (2 as u64);
+        }
+    }
+    cursor = align_up(cursor, TENSOR_ALIGNMENT);
+    record.weights_offset = cursor;
+    cursor = cursor +% record.weights_length;
+    if record.scales_length != (0 as u64) {
+        cursor = align_up(cursor, TENSOR_ALIGNMENT);
+        record.scales_offset = cursor;
+        cursor = cursor +% record.scales_length;
+    }
+    if record.zeros_length != (0 as u64) {
+        cursor = align_up(cursor, TENSOR_ALIGNMENT);
+        record.zeros_offset = cursor;
+        cursor = cursor +% record.zeros_length;
+    }
+    return record;
+}
+
+fn options_valid(options: Options) -> bool {
+    if options.group < (32 as usize) || options.group > (256 as usize) || options.group % (2 as usize) != (0 as usize) {
+        return false;
+    }
+    return (256 as usize) % options.group == (0 as usize);
+}
+
+fn write(source_path: str, output_path: str, options: Options) -> i32 {
+    if !options_valid(options) {
+        io::eprintln("int4 pack: group must divide 256 and be at least 32");
+        return 2;
+    }
+    guard let option::Option[text::CString]::Some(c_source) = with_c_path(source_path) else { return 1; };
+    let source_fd: i32 = qi_open(c_source.as_ptr(), O_RDONLY, 0 as i32);
+    if source_fd < (0 as i32) {
+        io::eprintln("int4 pack: could not open ${source_path}");
+        return 1;
+    }
+    let result: i32 = write_from(source_fd, output_path, options);
+    let _closed: i32 = qi_close(source_fd);
+    return result;
+}
+
+fn write_from(source_fd: i32, output_path: str, options: Options) -> i32 {
+    guard let option::Option[PackedHeader]::Some(header) = read_header(source_fd) else {
+        io::eprintln("int4 pack: could not read the source header");
+        return 1;
+    };
+    if !magic_matches(#addr_of(header))
+        || header.tensor_count != TENSOR_COUNT as u32
+        || !fixed_matches(#addr_of(header.policy[0]), 32 as usize, SOURCE_POLICY) {
+        io::eprintln("int4 pack: the source must be an all-matrix FP16 v4 QIPACK");
+        return 1;
+    }
+    let directory_end: u64 = header.directory_offset +% RECORD_BYTES *% TENSOR_COUNT as u64;
+    guard let option::Option[Buffer]::Some(source_records) = Buffer::allocate(
+        (RECORD_BYTES as usize) *% TENSOR_COUNT,
+    ) else { return 1; };
+    if !read_exact(source_fd, source_records.pointer, source_records.length, header.directory_offset) {
+        io::eprintln("int4 pack: could not read the tensor directory");
+        return 1;
+    }
+
+    // Metadata: the source's lines plus the quantization that produced this pack.
+    var metadata: text::Text = text::new();
+    if header.metadata_bytes != (0 as u32) {
+        guard let option::Option[Buffer]::Some(source_metadata) = Buffer::allocate(
+            header.metadata_bytes as usize,
+        ) else { return 1; };
+        if !read_exact(source_fd, source_metadata.pointer, source_metadata.length, header.metadata_offset) {
+            return 1;
+        }
+        let _copied: status::Status = metadata.append(
+            #str_from_raw_parts(source_metadata.pointer, source_metadata.length),
+        );
+    }
+    let quantization: text::Text = quant_name(options);
+    let _quant: status::Status = metadata.append("quant=${quantization.view()}\n");
+    let _source: status::Status = metadata.append("quant_source=${SOURCE_POLICY}\n");
+    if directory_end +% metadata.count() as u64 > header.data_offset {
+        io::eprintln("int4 pack: metadata does not fit in the directory padding");
+        return 1;
+    }
+
+    var records: vec::Vec[PackedRecord] = vec::Vec[PackedRecord]::with_capacity(TENSOR_COUNT);
+    var cursor: u64 = header.data_offset;
+    var matrices: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < TENSOR_COUNT {
+        let source: PackedRecord = *((source_records.pointer as *PackedRecord) + index);
+        if is_block_matrix(source) {
+            if source.dimensions[1] % (256 as u64) != (0 as u64) {
+                io::eprintln("int4 pack: matrix ${index} input width is not a multiple of 256");
+                return 1;
+            }
+            matrices = matrices +% (1 as usize);
+        }
+        if records.append(plan_record(source, options, cursor)) != status::Status::Ok {
+            return 1;
+        }
+        index = index +% (1 as usize);
+    }
+    if matrices != (224 as usize) {
+        io::eprintln("int4 pack: expected 224 FP16 block matrices, found ${matrices}");
+        return 1;
+    }
+    let file_bytes: u64 = align_up(cursor, TENSOR_ALIGNMENT);
+
+    let temporary_path: text::Text = "${output_path}.tmp";
+    guard let option::Option[text::CString]::Some(c_temporary) = temporary_path.c_str() else { return 1; };
+    let fd: i32 = qi_open(c_temporary.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 420 as i32);
+    if fd < (0 as i32) {
+        io::eprintln("int4 pack: could not create ${temporary_path.view()}");
+        return 1;
+    }
+    var ok: bool = qi_ftruncate(fd, file_bytes as i64) == (0 as i32);
+    index = 0 as usize;
+    while ok && index < TENSOR_COUNT {
+        let source: PackedRecord = *((source_records.pointer as *PackedRecord) + index);
+        guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else {
+            ok = false;
+            break;
+        };
+        ok = write_tensor(source_fd, fd, source, record, options);
+        if index >= (9 as usize) && (index -% (9 as usize)) % (9 as usize) == (8 as usize) {
+            io::println("int4 pack: block ${(index -% (9 as usize)) / (9 as usize) +% (1 as usize)}/32");
+        }
+        index = index +% (1 as usize);
+    }
+
+    var payload: u64 = FNV_OFFSET;
+    if ok {
+        guard let option::Option[Buffer]::Some(chunk) = Buffer::allocate(IO_CHUNK) else {
+            let _closed: i32 = qi_close(fd);
+            return 1;
+        };
+        var position: u64 = header.data_offset;
+        while ok && position < file_bytes {
+            let remaining: u64 = file_bytes -% position;
+            let amount: usize = if remaining < IO_CHUNK as u64 { remaining as usize } else { IO_CHUNK };
+            ok = read_exact(fd, chunk.pointer, amount, position);
+            payload = hash_update(payload, chunk.pointer, amount);
+            position = position +% amount as u64;
+        }
+    }
+
+    var output_header: PackedHeader = header;
+    let policy: text::Text = policy_name(options);
+    ok = ok && fixed_text(#addr_of(output_header.policy[0]), 32 as usize, policy.view());
+    output_header.file_bytes = file_bytes;
+    output_header.payload_checksum = payload;
+    output_header.metadata_offset = directory_end;
+    output_header.metadata_bytes = metadata.count() as u32;
+    output_header.metadata_version = METADATA_VERSION;
+    let metadata_view: str = metadata.view();
+    output_header.metadata_checksum = hash_update(FNV_OFFSET, #str_ptr(metadata_view), metadata_view.count());
+    if ok { ok = write_exact(fd, #addr_of(output_header) as *u8, HEADER_BYTES as usize, 0 as u64); }
+    index = 0 as usize;
+    while ok && index < TENSOR_COUNT {
+        guard let option::Option[*PackedRecord]::Some(record) = records.at_ptr(index) else {
+            ok = false;
+            break;
+        };
+        ok = write_exact(fd, record as *u8, RECORD_BYTES as usize,
+            header.directory_offset +% RECORD_BYTES *% index as u64);
+        index = index +% (1 as usize);
+    }
+    if ok { ok = write_exact(fd, #str_ptr(metadata_view), metadata_view.count(), directory_end); }
+    if ok && qi_fsync(fd) != (0 as i32) { ok = false; }
+    let _closed: i32 = qi_close(fd);
+    if !ok || verify(temporary_path.view(), true) != (0 as i32) {
+        let _removed: i32 = qi_unlink(c_temporary.as_ptr());
+        io::eprintln("int4 pack: writing or verifying ${temporary_path.view()} failed");
+        return 1;
+    }
+    guard let option::Option[text::CString]::Some(c_output) = with_c_path(output_path) else {
+        let _removed: i32 = qi_unlink(c_temporary.as_ptr());
+        return 1;
+    };
+    if qi_rename(c_temporary.as_ptr(), c_output.as_ptr()) != (0 as i32) {
+        let _removed: i32 = qi_unlink(c_temporary.as_ptr());
+        io::eprintln("int4 pack: could not install ${output_path}");
+        return 1;
+    }
+    io::println("int4 pack: wrote ${output_path} (${policy.view()}, ${file_bytes} bytes)");
+    return 0;
+}
+
+fn write_tensor(source_fd: i32, fd: i32, source: PackedRecord, record: *PackedRecord, options: Options) -> bool {
+    guard let option::Option[Buffer]::Some(input) = Buffer::allocate(source.weights_length as usize) else {
+        return false;
+    };
+    if !read_exact(source_fd, input.pointer, input.length, source.weights_offset) {
+        return false;
+    }
+    var tensor_hash: u64 = FNV_OFFSET;
+    if !is_block_matrix(source) {
+        tensor_hash = hash_update(tensor_hash, input.pointer, input.length);
+        (*record).tensor_checksum = tensor_hash;
+        return write_exact(fd, input.pointer, input.length, (*record).weights_offset);
+    }
+    guard let option::Option[Buffer]::Some(codes) = Buffer::allocate((*record).weights_length as usize) else {
+        return false;
+    };
+    guard let option::Option[Buffer]::Some(scales) = Buffer::allocate((*record).scales_length as usize) else {
+        return false;
+    };
+    guard let option::Option[Buffer]::Some(minimums) = Buffer::allocate((*record).zeros_length as usize) else {
+        return false;
+    };
+    if !quantize_matrix(
+        input.pointer as *u16,
+        source.dimensions[0] as usize,
+        source.dimensions[1] as usize,
+        options,
+        codes.pointer,
+        scales.pointer as *u16,
+        minimums.pointer as *u16,
+    ) {
+        return false;
+    }
+    tensor_hash = hash_update(tensor_hash, codes.pointer, codes.length);
+    tensor_hash = hash_update(tensor_hash, scales.pointer, scales.length);
+    if minimums.length != (0 as usize) {
+        tensor_hash = hash_update(tensor_hash, minimums.pointer, minimums.length);
+    }
+    (*record).tensor_checksum = tensor_hash;
+    var ok: bool = write_exact(fd, codes.pointer, codes.length, (*record).weights_offset);
+    ok = ok && write_exact(fd, scales.pointer, scales.length, (*record).scales_offset);
+    if minimums.length != (0 as usize) {
+        ok = ok && write_exact(fd, minimums.pointer, minimums.length, (*record).zeros_offset);
+    }
+    return ok;
+}
+
+// MARK: - Verification
+
+// Re-reads a written INT4 pack: header, layout, metadata checksum, every
+// tensor checksum, and the payload checksum.
+fn verify(path: str, quiet: bool = false) -> i32 {
+    guard let option::Option[text::CString]::Some(c_path) = with_c_path(path) else { return 1; };
+    let fd: i32 = qi_open(c_path.as_ptr(), O_RDONLY, 0 as i32);
+    if fd < (0 as i32) {
+        if !quiet { io::eprintln("int4 pack: could not open ${path}"); }
+        return 1;
+    }
+    let result: i32 = verify_open(fd, quiet);
+    let _closed: i32 = qi_close(fd);
+    if result == (0 as i32) && !quiet {
+        io::println("int4 pack: ${path} verified");
+    }
+    return result;
+}
+
+fn verify_open(fd: i32, quiet: bool) -> i32 {
+    guard let option::Option[PackedHeader]::Some(header) = read_header(fd) else { return 1; };
+    if !magic_matches(#addr_of(header)) || header.tensor_count != TENSOR_COUNT as u32 {
+        if !quiet { io::eprintln("int4 pack: not a transformer QIPACK"); }
+        return 1;
+    }
+    let w4a16: bool = fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a16-g64-v6")
+        || fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a16-g128-v6")
+        || fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a16-g32-v6");
+    let w4a4: bool = fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a4-h256-g64-v6")
+        || fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a4-h256-g128-v6")
+        || fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a4-h256-g32-v6");
+    if !w4a16 && !w4a4 {
+        if !quiet { io::eprintln("int4 pack: unknown policy"); }
+        return 1;
+    }
+    let directory_end: u64 = header.directory_offset +% RECORD_BYTES *% TENSOR_COUNT as u64;
+    if header.metadata_offset < directory_end
+        || header.metadata_offset +% header.metadata_bytes as u64 > header.data_offset {
+        if !quiet { io::eprintln("int4 pack: metadata outside the directory padding"); }
+        return 1;
+    }
+    guard let option::Option[Buffer]::Some(metadata) = Buffer::allocate(header.metadata_bytes as usize) else { return 1; };
+    if !read_exact(fd, metadata.pointer, metadata.length, header.metadata_offset)
+        || hash_update(FNV_OFFSET, metadata.pointer, metadata.length) != header.metadata_checksum {
+        if !quiet { io::eprintln("int4 pack: metadata checksum mismatch"); }
+        return 1;
+    }
+    guard let option::Option[Buffer]::Some(records) = Buffer::allocate((RECORD_BYTES as usize) *% TENSOR_COUNT) else {
+        return 1;
+    };
+    if !read_exact(fd, records.pointer, records.length, header.directory_offset) { return 1; }
+    let quantized_scheme: u32 = if w4a16 { SCHEME_W4A16 } else { SCHEME_W4A4_H256 };
+    var cursor: u64 = header.data_offset;
+    var matrices: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while index < TENSOR_COUNT {
+        let record: PackedRecord = *((records.pointer as *PackedRecord) + index);
+        var parts: [u64; 6] = [
+            record.weights_offset, record.weights_length,
+            record.scales_offset, record.scales_length,
+            record.zeros_offset, record.zeros_length,
+        ];
+        if record.scheme == quantized_scheme {
+            matrices = matrices +% (1 as usize);
+            let outputs: u64 = record.dimensions[0];
+            let inputs: u64 = record.dimensions[1];
+            let group: u64 = record.group_size as u64;
+            let groups: u64 = if group == (0 as u64) { 0 as u64 } else { outputs *% (inputs / group) };
+            if group == (0 as u64) || inputs % group != (0 as u64)
+                || record.weights_length != outputs *% inputs / (2 as u64)
+                || record.scales_length != groups *% (2 as u64)
+                || record.zeros_length != (if w4a16 { groups *% (2 as u64) } else { 0 as u64 }) {
+                if !quiet { io::eprintln("int4 pack: invalid INT4 record ${index}"); }
+                return 1;
+            }
+        } else if record.scheme != SCHEME_BF16 && record.scheme != SCHEME_FP16 {
+            if !quiet { io::eprintln("int4 pack: unexpected scheme in record ${index}"); }
+            return 1;
+        }
+        var tensor_hash: u64 = FNV_OFFSET;
+        var part: usize = 0 as usize;
+        while part < (6 as usize) {
+            let offset: u64 = parts[part];
+            let length: u64 = parts[part +% (1 as usize)];
+            if length != (0 as u64) {
+                if offset % TENSOR_ALIGNMENT != (0 as u64) || offset < cursor
+                    || offset +% length > header.file_bytes {
+                    if !quiet { io::eprintln("int4 pack: record ${index} is outside the data section"); }
+                    return 1;
+                }
+                guard let option::Option[Buffer]::Some(bytes) = Buffer::allocate(length as usize) else { return 1; };
+                if !read_exact(fd, bytes.pointer, bytes.length, offset) { return 1; }
+                tensor_hash = hash_update(tensor_hash, bytes.pointer, bytes.length);
+                cursor = offset +% length;
+            }
+            part = part +% (2 as usize);
+        }
+        if tensor_hash != record.tensor_checksum {
+            if !quiet { io::eprintln("int4 pack: tensor checksum mismatch in record ${index}"); }
+            return 1;
+        }
+        index = index +% (1 as usize);
+    }
+    if matrices != (224 as usize) || align_up(cursor, TENSOR_ALIGNMENT) != header.file_bytes {
+        if !quiet { io::eprintln("int4 pack: inventory or trailing data mismatch"); }
+        return 1;
+    }
+    guard let option::Option[Buffer]::Some(chunk) = Buffer::allocate(IO_CHUNK) else { return 1; };
+    var payload: u64 = FNV_OFFSET;
+    var position: u64 = header.data_offset;
+    while position < header.file_bytes {
+        let remaining: u64 = header.file_bytes -% position;
+        let amount: usize = if remaining < IO_CHUNK as u64 { remaining as usize } else { IO_CHUNK };
+        if !read_exact(fd, chunk.pointer, amount, position) { return 1; }
+        payload = hash_update(payload, chunk.pointer, amount);
+        position = position +% amount as u64;
+    }
+    if payload != header.payload_checksum {
+        if !quiet { io::eprintln("int4 pack: payload checksum mismatch"); }
+        return 1;
+    }
+    return 0;
+}
+
+// MARK: - Tests
+
+#[test]
+fn hadamard_256_is_an_involution() {
+    var values: [f32; 256] = [0.0f32; 256];
+    var index: usize = 0 as usize;
+    while index < (256 as usize) {
+        values[index] = (index as f32) * 0.01f32 - 1.0f32;
+        index = index +% (1 as usize);
+    }
+    hadamard_256_in_place(#addr_of(values[0]));
+    hadamard_256_in_place(#addr_of(values[0]));
+    index = 0 as usize;
+    while index < (256 as usize) {
+        assert (values[index] - ((index as f32) * 0.01f32 - 1.0f32)).abs() < 0.00001f32;
+        index = index +% (1 as usize);
+    }
+}
+
+#[test]
+fn affine_group_reconstructs_within_half_a_step() {
+    var values: [f32; 64] = [0.0f32; 64];
+    var index: usize = 0 as usize;
+    while index < (64 as usize) {
+        values[index] = (index as f32) * 0.003f32 - 0.05f32;
+        index = index +% (1 as usize);
+    }
+    var codes: [u8; 64] = [0 as u8; 64];
+    var scale_bits: u16 = 0 as u16;
+    var minimum_bits: u16 = 0 as u16;
+    quantize_affine_group(#addr_of(values[0]), 64 as usize, false, #addr_of(codes[0]), scale_bits, minimum_bits);
+    let scale: f32 = half::to_f32(scale_bits);
+    let minimum: f32 = half::to_f32(minimum_bits);
+    index = 0 as usize;
+    while index < (64 as usize) {
+        assert codes[index] <= (15 as u8);
+        let reconstructed: f32 = codes[index] as f32 * scale + minimum;
+        assert (reconstructed - values[index]).abs() <= scale * 0.5f32 + 0.0001f32;
+        index = index +% (1 as usize);
+    }
+}
+
+#[test]
+fn symmetric_group_uses_signed_nibbles() {
+    var values: [f32; 64] = [0.0f32; 64];
+    values[0] = 0.0f32 - 0.7f32;
+    values[1] = 0.7f32;
+    values[2] = 0.1f32;
+    var codes: [u8; 64] = [0 as u8; 64];
+    var scale_bits: u16 = 0 as u16;
+    quantize_symmetric_group(#addr_of(values[0]), 64 as usize, false, #addr_of(codes[0]), scale_bits);
+    assert (half::to_f32(scale_bits) - 0.1f32).abs() < 0.0001f32;
+    assert codes[0] == (9 as u8);
+    assert codes[1] == (7 as u8);
+    assert codes[2] == (1 as u8);
+    assert codes[3] == (0 as u8);
+}
+
+#[test]
+fn clipping_never_increases_group_error() {
+    var values: [f32; 64] = [0.0f32; 64];
+    var index: usize = 0 as usize;
+    while index < (64 as usize) {
+        values[index] = ((index *% (7 as usize)) % (13 as usize)) as f32 * 0.01f32;
+        index = index +% (1 as usize);
+    }
+    values[5] = 2.0f32;
+    var plain: [u8; 64] = [0 as u8; 64];
+    var clipped: [u8; 64] = [0 as u8; 64];
+    var plain_scale: u16 = 0 as u16;
+    var clipped_scale: u16 = 0 as u16;
+    quantize_symmetric_group(#addr_of(values[0]), 64 as usize, false, #addr_of(plain[0]), plain_scale);
+    quantize_symmetric_group(#addr_of(values[0]), 64 as usize, true, #addr_of(clipped[0]), clipped_scale);
+    var plain_error: f32 = 0.0f32;
+    var clipped_error: f32 = 0.0f32;
+    index = 0 as usize;
+    while index < (64 as usize) {
+        let p: f32 = ((plain[index] as i32) - (if plain[index] > (7 as u8) { 16 } else { 0 })) as f32;
+        let c: f32 = ((clipped[index] as i32) - (if clipped[index] > (7 as u8) { 16 } else { 0 })) as f32;
+        let pe: f32 = p * half::to_f32(plain_scale) - values[index];
+        let ce: f32 = c * half::to_f32(clipped_scale) - values[index];
+        plain_error = plain_error + pe * pe;
+        clipped_error = clipped_error + ce * ce;
+        index = index +% (1 as usize);
+    }
+    assert clipped_error <= plain_error;
+}
