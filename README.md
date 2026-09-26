@@ -9,6 +9,46 @@ PyTorch, Diffusers, C, C++, Objective-C source, or CMake. A separate Python
 development tool may generate small oracle fixtures from the pinned official
 Diffusers source; those fixtures are plain binary files consumed by C+ tests.
 
+## Quick start
+
+Install the CLI with Homebrew as shown below, then [download a model and its
+support files](#model-files). From the repository root, generate a 512x512 PNG
+with the six-step Viggle pack:
+
+```sh
+qwen-image-cplus generate \
+  models/qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack \
+  models output.png "A red balloon against a blue sky" 512 512 1301
+```
+
+The pack selects its six-step schedule; keep its LoRA `.safetensors` file beside
+the pack. The first `models` argument is the QIPACK file and the second is the
+directory containing the shared text encoder, processor, and VAE files. The
+last three values are width, height, and seed. For an image edit, use
+`generate-multi-image-sized` with an input image:
+
+```sh
+qwen-image-cplus generate-multi-image-sized \
+  models/qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack \
+  models edited.png "Make it rain" 1301 pack 512 512 input.jpg
+```
+
+`pack` uses the model's step count. The two numbers after it set the output
+width and height; you can supply up to ten reference images.
+
+The GUI is **not in the Homebrew release yet**. To launch it from this source
+checkout with the C+ toolchain and project dependencies installed:
+
+```sh
+cd gui
+cpc build
+./target/debug/gui
+```
+
+Choose a QIPACK in the GUI; its parent directory must also contain the shared
+files. To capture the window on macOS, press Shift-Command-4, then Space, then
+click the window.
+
 ## Install
 
 The supported binary distribution is macOS 14 or newer on Apple Silicon.
@@ -49,8 +89,26 @@ Their model card, Qwen license, required attribution, and artifact manifest
 live in [`huggingface/`](huggingface/README.md) so the published metadata stays
 versioned with the runtime.
 
-Download both packs and their shared support files into one folder with
-`hf download netdur/Qwen-Image-2.1-QIPACK --local-dir models`.
+For the six-step pack used above, download only that pack, its LoRA, and the
+shared support files into one folder:
+
+```sh
+hf download netdur/Qwen-Image-2.1-QIPACK \
+  qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack \
+  Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors \
+  processor/vocab.json processor/merges.txt \
+  text_encoder/model-00001-of-00004.safetensors \
+  text_encoder/model-00002-of-00004.safetensors \
+  text_encoder/model-00003-of-00004.safetensors \
+  text_encoder/model-00004-of-00004.safetensors \
+  vae/diffusion_pytorch_model.safetensors \
+  --local-dir models
+```
+
+This still needs roughly 34.5 GB of disk space. Omit the LoRA and choose one
+of the other QIPACK files if you prefer the base or four-step model; see the
+[model card](https://huggingface.co/netdur/Qwen-Image-2.1-QIPACK) for their
+names and defaults.
 
 For the GUI, the selected QIPACK's parent directory is the model root. Keep
 the supporting files alongside the pack in this layout; multiple packs can
