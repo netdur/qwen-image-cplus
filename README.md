@@ -2604,6 +2604,23 @@ fallback. A 512×512 text-only regression and the 832×1248 Eiffel edit were
 also byte-identical to their pre-change PNGs. These are correctness checks,
 not a controlled speed comparison.
 
+**Two-reference cost and masked-tile pruning (2026-09-25, historical six-step path).**
+Matched one/two/one-reference portrait edits at 736×1280 used Viggle v0.2.1,
+seed 1301, and the then-required FP32-staged activation fallback. The joint
+prefill grew from 7,379 to 11,025 rows. Input conditioning took
+6.24 / 10.98 / 6.06 s, the first transformer step took
+28.19 / 49.82 / 34.39 s, and end-to-end time was
+116.69 / 159.93 / 134.07 s. The one-reference rerun itself varied by
+17.38 s, so these runs do not establish a precise per-reference cost.
+
+On the same two-reference setup, adjacent two-step comparisons of masked
+flash-attention tile pruning reduced first-step GPU time from
+43.53 to 37.94 s and, in a slower period, from 63.14 to 52.24 s. The second
+step was essentially unchanged. A full six-step pruned PNG was byte-identical
+to the unpruned output. Those full runs were not adjacent, so their wall times
+are not a controlled end-to-end speed comparison. The direct-FP16 activation
+path was fixed later and is now the default.
+
 **Six-step edit speed pass (2026-09-26).** Four changes target the
 conditioned edit shapes, which sit below the 4,096-row graph-attention gate
 (736×1280 is 3,680 target rows, 832×1248 is 4,056):
