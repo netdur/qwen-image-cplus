@@ -35,7 +35,7 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = arm64
           version="${{ steps.meta.outputs.version }}"
-          for manifest in qwen_image/Cplus.toml cli/Cplus.toml ffi/Cplus.toml; do
+          for manifest in qwen_image/Cplus.toml cli/Cplus.toml ffi/Cplus.toml gui/Cplus.toml; do
             grep -Eq "^version *= *\"${version}\"$" "$manifest"
           done
 
@@ -45,7 +45,11 @@ jobs:
           echo "$RUNNER_TEMP/cplus" >> "$GITHUB_PATH"
 
       - name: Install released C+ packages
-        run: cpc pm install qwen_image
+        run: |
+          cpc pm install qwen_image
+          mkdir -p gui/vendor
+          ln -s ../../qwen_image gui/vendor/qwen_image
+          cpc pm install gui
 
       - name: Build and verify distribution
         run: |
@@ -71,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           asset=qwen-image-cplus-aarch64-apple-darwin.tar.gz
-          tar -czf "$asset" -C dist bin include lib
+          tar -czf "$asset" -C dist bin include lib "Qwen Image.app"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       - name: Publish immutable release asset

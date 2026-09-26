@@ -8,9 +8,18 @@ test -x "$dist/bin/qwen-image-cplus"
 test -f "$dist/include/qwen_image.h"
 test -f "$dist/lib/libqwen_image.a"
 test -f "$dist/lib/libqwen_image.dylib"
+bundle="$dist/Qwen Image.app"
+test -x "$bundle/Contents/MacOS/gui"
+test -f "$bundle/Contents/Info.plist"
+plutil -lint "$bundle/Contents/Info.plist" >/dev/null
+test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist")" = gui
+gui_version=$(sed -n 's/^version *= *"\([^"]*\)"$/\1/p' "$project_root/gui/Cplus.toml")
+test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Contents/Info.plist")" = "$gui_version"
+codesign --verify --deep --strict "$bundle"
 
 lipo "$dist/bin/qwen-image-cplus" -verify_arch arm64
 lipo "$dist/lib/libqwen_image.dylib" -verify_arch arm64
+lipo "$bundle/Contents/MacOS/gui" -verify_arch arm64
 
 if lipo "$dist/bin/qwen-image-cplus" -archs | grep -q x86_64; then
     echo "distribution unexpectedly contains an Intel CLI slice" >&2
@@ -20,8 +29,12 @@ if lipo "$dist/lib/libqwen_image.dylib" -archs | grep -q x86_64; then
     echo "distribution unexpectedly contains an Intel library slice" >&2
     exit 1
 fi
+if lipo "$bundle/Contents/MacOS/gui" -archs | grep -q x86_64; then
+    echo "distribution unexpectedly contains an Intel GUI slice" >&2
+    exit 1
+fi
 
-for binary in "$dist/bin/qwen-image-cplus" "$dist/lib/libqwen_image.dylib"; do
+for binary in "$dist/bin/qwen-image-cplus" "$dist/lib/libqwen_image.dylib" "$bundle/Contents/MacOS/gui"; do
     if ! xcrun vtool -show-build "$binary" | grep -q 'minos 14\.0'; then
         echo "$binary does not target macOS 14.0" >&2
         xcrun vtool -show-build "$binary" >&2
@@ -48,4 +61,4 @@ case "$usage" in
         ;;
 esac
 
-echo "verified ARM64 macOS 14 distribution"
+echo "verified ARM64 macOS 14 CLI, library, and GUI distribution"

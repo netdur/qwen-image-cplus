@@ -1,7 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
-# Installs the prebuilt qwen-image-cplus runtime for Apple Silicon.
+# Installs the prebuilt qwen-image-cplus CLI, library, and app for Apple Silicon.
 class QwenImageCplus < Formula
   desc "Native Qwen-Image-2.1 inference for Apple Silicon"
   homepage "https://github.com/netdur/qwen-image-cplus"
@@ -17,6 +17,8 @@ class QwenImageCplus < Formula
     bin.install "bin/qwen-image-cplus"
     include.install "include/qwen_image.h"
     lib.install "lib/libqwen_image.a", "lib/libqwen_image.dylib"
+    prefix.install "Qwen Image.app"
+    bin.install_symlink prefix/"Qwen Image.app/Contents/MacOS/gui" => "qwen-image-gui"
   end
 
   def caveats
@@ -24,6 +26,9 @@ class QwenImageCplus < Formula
       Model weights are not included in this package. Follow the model setup
       instructions at:
         https://github.com/netdur/qwen-image-cplus#model-files
+
+      Launch the app with `qwen-image-gui` or:
+        open "#{prefix}/Qwen Image.app"
     EOS
   end
 
@@ -32,5 +37,7 @@ class QwenImageCplus < Formula
     assert_path_exists include/"qwen_image.h"
     assert_path_exists lib/"libqwen_image.a"
     assert_path_exists lib/"libqwen_image.dylib"
+    assert_path_exists prefix/"Qwen Image.app/Contents/MacOS/gui"
+    assert_path_exists bin/"qwen-image-gui"
   end
 end

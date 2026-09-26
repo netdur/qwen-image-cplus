@@ -1,65 +1,18 @@
-# qwen-image-cplus
+# Qwen Image for Apple Silicon
 
-Native Qwen-Image-2.1 inference work for Apple Silicon, written in C+ and
-Metal Shading Language. The implementation target is an Apple M1 Max with
-32 GB unified memory.
+Generate and edit images locally on your Mac with Qwen-Image-2.1—no cloud
+inference or Python runtime. One Homebrew install gives you a native desktop
+app, a CLI for scripts, and a C library for other applications. The C+ and
+Metal engine accepts text prompts and up to ten reference images. Model weights
+are downloaded separately.
 
-The runtime is intentionally model-specific. It does not embed Python,
-PyTorch, Diffusers, C, C++, Objective-C source, or CMake. A separate Python
-development tool may generate small oracle fixtures from the pinned official
-Diffusers source; those fixtures are plain binary files consumed by C+ tests.
-
-## Quick start
-
-Install the CLI with Homebrew as shown below, then [download a model and its
-support files](#model-files). From the repository root, generate a 512x512 PNG
-with the six-step Viggle pack:
-
-```sh
-qwen-image-cplus generate \
-  models/qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack \
-  models output.png "A red balloon against a blue sky" 512 512 1301
-```
-
-The pack selects its six-step schedule; keep its LoRA `.safetensors` file beside
-the pack. The first `models` argument is the QIPACK file and the second is the
-directory containing the shared text encoder, processor, and VAE files. The
-last three values are width, height, and seed. For an image edit, use
-`generate-multi-image-sized` with an input image:
-
-```sh
-qwen-image-cplus generate-multi-image-sized \
-  models/qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack \
-  models edited.png "Make it rain" 1301 pack 512 512 input.jpg
-```
-
-`pack` uses the model's step count. The two numbers after it set the output
-width and height; you can supply up to ten reference images.
-
-The GUI is **not in the Homebrew release yet**. To launch it from this source
-checkout with the C+ toolchain and project dependencies installed:
-
-```sh
-cd gui
-cpc build
-./target/debug/gui
-```
-
-Choose a QIPACK in the GUI; its parent directory must also contain the shared
-files. To capture the window on macOS, press Shift-Command-4, then Space, then
-click the window.
+![Qwen Image app showing the prompt, reference-image controls, output settings, and preview](docs/images/qwen-image-gui.png)
 
 ## Install
 
-The supported binary distribution is macOS 14 or newer on Apple Silicon.
-Homebrew downloads a prebuilt ARM64 CLI and C ABI; it does not install the C+
-compiler or build this project on the user's machine.
-
-Because this repository contains both the product and its formula rather than
-using a separate `homebrew-*` repository, tap it with its explicit URL.
-Homebrew 7 also requires explicit trust for formulae from repositories that do
-not use the `homebrew-*` naming convention. Trust only this formula rather than
-the whole tap:
+Requires macOS 14 or newer on Apple Silicon. Homebrew installs prebuilt
+binaries; users do not need the C+ compiler. This project and its formula live
+in one repository. With Homebrew 7, trust only this formula when prompted:
 
 ```sh
 brew tap netdur/qwen-image-cplus https://github.com/netdur/qwen-image-cplus.git
@@ -71,12 +24,14 @@ The installation contains:
 
 ```text
 bin/qwen-image-cplus
+bin/qwen-image-gui
+Qwen Image.app
 include/qwen_image.h
 lib/libqwen_image.a
 lib/libqwen_image.dylib
 ```
 
-### Model files
+## Model files
 
 Model weights are intentionally not part of the Homebrew archive. The runtime
 expects a QIPACK transformer and its Qwen-Image-2.1 support files at paths
@@ -89,7 +44,7 @@ Their model card, Qwen license, required attribution, and artifact manifest
 live in [`huggingface/`](huggingface/README.md) so the published metadata stays
 versioned with the runtime.
 
-For the six-step pack used above, download only that pack, its LoRA, and the
+For the six-step pack used below, download only that pack, its LoRA, and the
 shared support files into one folder:
 
 ```sh
@@ -110,13 +65,13 @@ of the other QIPACK files if you prefer the base or four-step model; see the
 [model card](https://huggingface.co/netdur/Qwen-Image-2.1-QIPACK) for their
 names and defaults.
 
-For the GUI, the selected QIPACK's parent directory is the model root. Keep
-the supporting files alongside the pack in this layout; multiple packs can
-share the same supporting files:
+Keep the supporting files alongside the pack in this layout; multiple packs
+can share the same supporting files:
 
 ```text
 models/
   chosen-model.qipack
+  Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors
   processor/vocab.json
   processor/merges.txt
   text_encoder/model-00001-of-00004.safetensors
@@ -126,9 +81,58 @@ models/
   vae/diffusion_pytorch_model.safetensors
 ```
 
-The CLI and C/C+ APIs still take the QIPACK path and model root separately;
-they may point to the same directory. The local `models/` directory is ignored
-by Git and is not included in the Homebrew archive.
+The LoRA file is needed only for the six-step pack. The CLI and C/C+ APIs take
+the QIPACK path and model root separately; they may point to the same
+directory. The local `models/` directory is ignored by Git.
+
+## Run the app
+
+```sh
+qwen-image-gui
+```
+
+Alternatively, launch the bundled app through Finder or with
+`open "$(brew --prefix qwen-image-cplus)/Qwen Image.app"`. Choose a QIPACK
+from the downloaded model folder, enter a prompt, optionally add reference
+images, set the output size, then click the sparkle beside **Create**. The
+finished image appears on the right; **Save** opens a PNG save dialog. The
+selected model's folder supplies the text encoder, processor, and VAE files.
+
+## Use the CLI
+
+Generate a 512x512 PNG from text:
+
+```sh
+qwen-image-cplus generate \
+  models/qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack \
+  models output.png "A red balloon against a blue sky" 512 512 1301
+```
+
+The arguments after `generate` are QIPACK path, model folder, output PNG,
+prompt, width, height, and optional seed. This pack selects its own six-step
+schedule. To edit one or more images, use:
+
+```sh
+qwen-image-cplus generate-multi-image-sized \
+  models/qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack \
+  models edited.png "Make it rain" 1301 pack 512 512 input.jpg
+```
+
+Here `pack` selects the model's step count; the next two numbers are output
+width and height. Add up to ten reference-image paths after them. Run these
+commands in the directory containing `models/`, or use absolute paths.
+
+## Use the library
+
+The installed header and static/dynamic libraries expose a synchronous C ABI.
+See [API usage](docs/API.md) for a compiling C example, linking instructions,
+request fields, status handling, and the native C+ API. The GUI and CLI share
+the same inference engine.
+
+The runtime is intentionally model-specific. It does not embed Python,
+PyTorch, or Diffusers. A separate Python development tool may generate small
+oracle fixtures from the pinned official Diffusers source; those fixtures are
+plain binary files consumed by C+ tests.
 
 ## Pinned reference
 
@@ -489,7 +493,7 @@ Two reference-side findings came out of this:
 
 ## Package and API layout
 
-The repository is split into three C+ packages, but remains one product:
+The repository is split into four C+ packages, but remains one product:
 
 - `qwen_image/` is the native engine package. It owns inference, model I/O,
   Metal kernels, scheduling, caching, VAE decode, and PNG output. Native C+
@@ -497,6 +501,8 @@ The repository is split into three C+ packages, but remains one product:
 - `cli/` is a client of that engine. Normal generation commands go through
   the public API; diagnostic and quantization commands can still reach the
   lower engine modules while those developer tools are being stabilized.
+- `gui/` is the AppKit generation client. It shares the engine through the
+  native worker and is packaged as `Qwen Image.app` in the release archive.
 - `ffi/` is a thin C-ABI adapter over the same native API. C+ generates its
   `qwen_image.h`; there is no separately maintained handwritten header.
 
@@ -616,11 +622,12 @@ and height. New callers set both dimensions; setting only one is invalid.
 
 ## Build and verify
 
-`build.sh` is the distribution build. It builds the engine, CLI, and generated
-C ABI, then consolidates C+'s dependency slices into libraries a C or
-Objective-C application can link directly. It also compiles and runs the C
-ABI smoke test. Release is the default; `BUILD_MODE=debug` selects debug. The
-current source requires C+ 0.0.29 or newer because it uses `#bitcast`.
+`build.sh` is the distribution build. It builds the engine, CLI, generated C
+ABI, and GUI, then packages the app bundle and consolidates C+'s dependency
+slices into libraries a C or Objective-C application can link directly. It
+also compiles and runs the C ABI smoke test. Release is the default;
+`BUILD_MODE=debug` selects debug. The current source requires C+ 0.0.29 or
+newer because it uses `#bitcast`.
 
 ```sh
 CPC=/path/to/cpc ./build.sh
@@ -630,18 +637,20 @@ The resulting install-shaped tree is:
 
 ```text
 dist/bin/qwen-image-cplus
+dist/Qwen Image.app/
 dist/include/qwen_image.h
 dist/lib/libqwen_image.a
 dist/lib/libqwen_image.dylib
 ```
 
-For development, verify the three package boundaries independently:
+For development, verify the four package boundaries independently:
 
 ```sh
 cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src/main.cplus ffi/src/ffi.cplus
 (cd qwen_image && cpc check && cpc test)
 (cd cli && cpc check && cpc build && cpc test)
 (cd ffi && cpc check && cpc build && cpc test)
+(cd gui && cpc check && cpc build)
 ./cli/target/debug/qwen-image-cplus probe-stress
 ./cli/target/debug/qwen-image-cplus test-metal-primitives
 ./cli/target/debug/qwen-image-cplus test-metal-linear
