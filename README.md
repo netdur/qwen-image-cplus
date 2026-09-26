@@ -1,10 +1,31 @@
-# Qwen Image for Apple Silicon
+# qwen-image-cplus — FP16 1024×1024 in 38–39 s (M1 Max, 4 steps)
 
-Generate and edit images locally on your Mac with Qwen-Image-2.1—no cloud
-inference or Python runtime. One Homebrew install gives you a native desktop
-app, a CLI for scripts, and a C library for other applications. The C+ and
-Metal engine accepts text prompts and up to ten reference images. Model weights
-are downloaded separately.
+The headline result is a **fresh-process, prompt-to-PNG** run of the four-step
+Viggle model, with both quoted poster lines rendered exactly. Its transformer
+block matrices are stored in FP16 QIPACK, not 4-bit weights. The native C+ and
+Metal runtime also supports the original 40-step Qwen-Image-2.1 model and
+image editing with up to ten references.
+
+| Measured M1 Max run | End to end |
+| --- | ---: |
+| [Four-step Viggle FP16](benchmarks/m1-max-viggle-4step-1024-fixed-cost.json), 1024×1024 poster | **38.18–39.32 s** |
+| Six-step Viggle v0.2.1 FP16 + LoRA, 1024×1024 text-to-image smoke | **75.974 s** |
+| [Base FP16](benchmarks/m1-max-native-prompt-pipeline-1024.json), 1024×1024, 40 steps, cache off | **451.12 s** |
+| Base FP16, later optimized build with Cache-DiT 0.16, 27 of 40 steps cached | **126.69 s** |
+
+These are recorded end-to-end runs on one 32 GB M1 Max, with different prompts
+and dates—not a controlled comparison between the rows. In a separate
+1024×1024/40-step cache-off speed baseline,
+[patched stable-diffusion.cpp](benchmarks/m1-max-stable-diffusion-cpp-1024-40.json)
+took **1006.36 s**; its selected flow shift differed, so that is not an
+image-equivalence claim. FP16 describes the transformer weights, not every
+component of the pipeline. The four-step pack is fast but can deform some
+edits; the six-step LoRA is an alternative for those cases. See the
+[measurements below](#remaining-optimization-phases) for conditions and caveats.
+
+Generation is local, without cloud inference or a Python runtime. One Homebrew
+install provides a desktop app, CLI, and C library. Model weights are
+downloaded separately.
 
 ![Qwen Image app showing the prompt, reference-image controls, output settings, and preview](docs/images/qwen-image-gui.png)
 
