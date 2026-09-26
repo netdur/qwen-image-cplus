@@ -64,10 +64,29 @@ extern fn qi_euler(latents: *f32, velocity: *f32, delta: f32, count: u64) -> i32
 extern fn qi_cuda_malloc_host(pointer: **u8, bytes: u64) -> i32;
 #[link_name = "qi_cuda_free_host"]
 extern fn qi_cuda_free_host(pointer: *u8) -> i32;
+#[link_name = "qi_cuda_stream_create"]
+extern fn qi_cuda_stream_create(stream: **u8) -> i32;
+#[link_name = "qi_cuda_stream_destroy"]
+extern fn qi_cuda_stream_destroy(stream: *u8) -> i32;
+#[link_name = "qi_cuda_event_create"]
+extern fn qi_cuda_event_create(event: **u8) -> i32;
+#[link_name = "qi_cuda_event_destroy"]
+extern fn qi_cuda_event_destroy(event: *u8) -> i32;
+#[link_name = "qi_cuda_event_record"]
+extern fn qi_cuda_event_record(event: *u8, stream: *u8) -> i32;
+#[link_name = "qi_cuda_stream_wait"]
+extern fn qi_cuda_stream_wait(stream: *u8, event: *u8) -> i32;
+#[link_name = "qi_cuda_upload_async"]
+extern fn qi_cuda_upload_async(device: *u8, host: *u8, bytes: u64, stream: *u8) -> i32;
 #[link_name = "qi_cuda_memory"]
 extern fn qi_cuda_memory(free_bytes: *u64, total_bytes: *u64) -> i32;
 #[link_name = "qi_linear_f32_strided"]
 extern fn qi_linear_f32_strided(x: *f32, weights: *f32, y: *f32, m: i32, n: i32, k: i32, ldy: i32) -> i32;
+#[link_name = "qi_to_half"]
+extern fn qi_to_half(source: *f32, out: *u8, count: u64) -> i32;
+#[link_name = "qi_attention_half"]
+extern fn qi_attention_half(q: *f32, k_half: *u8, v_half: *u8, out: *f32, scratch: *u8, queries: i32, keys: i32,
+    heads: i32, query_offset: i32, causal_rows: i32) -> i32;
 #[link_name = "qi_attention_f16"]
 extern fn qi_attention_f16(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, halves: *u8, queries: i32, keys: i32,
     heads: i32, query_offset: i32, causal_rows: i32) -> i32;
@@ -111,6 +130,8 @@ fn free_memory() -> u64 {
     return free_bytes;
 }
 
+fn to_half(source: *f32, out: *u8, count: u64) -> i32 { return qi_to_half(source, out, count); }
+fn attention_half(q: *f32, k_half: *u8, v_half: *u8, out: *f32, scratch: *u8, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention_half(q, k_half, v_half, out, scratch, queries, keys, heads, query_offset, causal_rows); }
 fn attention_f16(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, halves: *u8, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention_f16(q, k, v, out, scores, halves, queries, keys, heads, query_offset, causal_rows); }
 fn attention(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention(q, k, v, out, scores, queries, keys, heads, query_offset, causal_rows); }
 
@@ -197,6 +218,58 @@ impl PinnedBuffer {
             this.pointer = 0 as *u8;
         }
     }
+}
+
+// A non-blocking stream (never implicitly ordered with the default stream).
+struct Stream {
+    opaque handle: *u8,
+}
+
+impl Stream {
+    fn create() -> option::Option[Stream] {
+        var handle: *u8 = 0 as *u8;
+        if qi_cuda_stream_create(#addr_of(handle)) != (0 as i32) { return option::Option[Stream]::None; }
+        return option::Option[Stream]::Some(Stream { handle: handle });
+    }
+
+    fn drop(ref this) {
+        if !this.handle.is_null() {
+            let _destroyed: i32 = qi_cuda_stream_destroy(this.handle);
+            this.handle = 0 as *u8;
+        }
+    }
+}
+
+struct Event {
+    opaque handle: *u8,
+}
+
+impl Event {
+    fn create() -> option::Option[Event] {
+        var handle: *u8 = 0 as *u8;
+        if qi_cuda_event_create(#addr_of(handle)) != (0 as i32) { return option::Option[Event]::None; }
+        return option::Option[Event]::Some(Event { handle: handle });
+    }
+
+    fn drop(ref this) {
+        if !this.handle.is_null() {
+            let _destroyed: i32 = qi_cuda_event_destroy(this.handle);
+            this.handle = 0 as *u8;
+        }
+    }
+}
+
+// Null stream handles below mean the default stream.
+fn record(event: *u8, stream: *u8) -> bool {
+    return qi_cuda_event_record(event, stream) == (0 as i32);
+}
+
+fn wait(stream: *u8, event: *u8) -> bool {
+    return qi_cuda_stream_wait(stream, event) == (0 as i32);
+}
+
+fn upload_async(device: *u8, host: *u8, bytes: u64, stream: *u8) -> bool {
+    return qi_cuda_upload_async(device, host, bytes, stream) == (0 as i32);
 }
 
 fn synchronize() -> bool {

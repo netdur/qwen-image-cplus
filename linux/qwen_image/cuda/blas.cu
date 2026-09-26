@@ -137,3 +137,75 @@ extern "C" int qi_linear_f32_strided(const float *x, const float *weights, float
     const float one = 1.0f, zero = 0.0f;
     return blas_status(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &one, weights, k, x, k, &zero, y, ldy));
 }
+
+// Masked softmax over FP16 scores in place (FP32 arithmetic); see
+// masked_softmax_kernel for the mask.
+__global__ void masked_softmax_half_kernel(__half *scores, int queries, int keys, int query_offset, int causal_rows,
+                                           float scale) {
+    __shared__ float scratch[32];
+    const int q = blockIdx.x, h = blockIdx.y;
+    __half *row = scores + ((size_t)h * queries + q) * keys;
+    const int global_q = q + query_offset;
+    const int visible = global_q < causal_rows ? global_q + 1 : keys;
+    float peak = -INFINITY;
+    for (int c = threadIdx.x; c < visible; c += blockDim.x) peak = fmaxf(peak, __half2float(row[c]) * scale);
+    for (int o = 16; o > 0; o /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, o));
+    if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = peak;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float value = threadIdx.x < blockDim.x / 32 ? scratch[threadIdx.x] : -INFINITY;
+        for (int o = 16; o > 0; o /= 2) value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, o));
+        if (threadIdx.x == 0) scratch[0] = value;
+    }
+    __syncthreads();
+    peak = scratch[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int c = threadIdx.x; c < keys; c += blockDim.x)
+        sum += c < visible ? expf(__half2float(row[c]) * scale - peak) : 0.0f;
+    for (int o = 16; o > 0; o /= 2) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float value = threadIdx.x < blockDim.x / 32 ? scratch[threadIdx.x] : 0.0f;
+        for (int o = 16; o > 0; o /= 2) value += __shfl_xor_sync(0xffffffffu, value, o);
+        if (threadIdx.x == 0) scratch[0] = value;
+    }
+    __syncthreads();
+    const float inverse = 1.0f / scratch[0];
+    for (int c = threadIdx.x; c < keys; c += blockDim.x)
+        row[c] = __float2half(c < visible ? expf(__half2float(row[c]) * scale - peak) * inverse : 0.0f);
+}
+
+// FP32 -> FP16 for K and V once per block, ahead of qi_attention_half.
+extern "C" int qi_to_half(const float *source, void *out, unsigned long long count) {
+    to_half_kernel<<<half_blocks(count), 256>>>(source, (__half *)out, count);
+    return (int)cudaGetLastError();
+}
+
+// Attention with FP16 K and V already converted, FP16 scores written by the
+// first GEMM (FP32 accumulation) and softmaxed in place.
+// scratch: queries * heads * 128 halves for Q, then heads * queries * keys
+// halves of scores.
+extern "C" int qi_attention_half(const float *q, const void *k_half, const void *v_half, float *out, void *scratch,
+                                 int queries, int keys, int heads, int query_offset, int causal_rows) {
+    if (int status = ensure_handle()) return status;
+    const int width = heads * 128;
+    __half *q_half = (__half *)scratch;
+    __half *scores = q_half + (size_t)queries * width;
+    to_half_kernel<<<half_blocks((unsigned long long)queries * width), 256>>>(q, q_half, (unsigned long long)queries * width);
+    const float one = 1.0f, zero = 0.0f;
+    cublasStatus_t status = cublasGemmStridedBatchedEx(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, keys, queries, 128, &one,
+        k_half, CUDA_R_16F, width, 128, q_half, CUDA_R_16F, width, 128, &zero,
+        scores, CUDA_R_16F, keys, (long long)queries * keys, heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) return (int)cudaErrorUnknown;
+    masked_softmax_half_kernel<<<dim3(queries, heads), 256>>>(scores, queries, keys, query_offset, causal_rows,
+                                                              1.0f / sqrtf(128.0f));
+    if (cudaError_t error = cudaGetLastError()) return (int)error;
+    status = cublasGemmStridedBatchedEx(
+        handle, CUBLAS_OP_N, CUBLAS_OP_N, 128, queries, keys, &one,
+        v_half, CUDA_R_16F, width, 128, scores, CUDA_R_16F, keys, (long long)queries * keys, &zero,
+        out, CUDA_R_32F, width, 128, heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return blas_status(status);
+}

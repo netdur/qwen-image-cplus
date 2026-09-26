@@ -129,6 +129,16 @@ struct Model {
     // INT4 blocks kept in pinned host memory when streamed; empty otherwise.
     host_blocks: cuda::PinnedBuffer,
     host_base: u64,
+    // Asynchronous streaming (INT4 from pinned memory): block b runs from
+    // slot b % 2 while block b + 1 uploads into the other on copy_stream.
+    // uploaded_* order compute after an upload; computed_* order the next
+    // upload into a slot after the block that last read it.
+    slot_b: cuda::DeviceBuffer,
+    copy_stream: cuda::Stream,
+    uploaded_a: cuda::Event,
+    uploaded_b: cuda::Event,
+    computed_a: cuda::Event,
+    computed_b: cuda::Event,
     // FP32 expansion of one BF16/FP16 matrix, and of one norm vector.
     weight_scratch: cuda::DeviceBuffer,
     vector_scratch: cuda::DeviceBuffer,
@@ -241,6 +251,16 @@ fn load(path: str, mode: WeightMode, auto_stream: bool = false) -> option::Optio
     if streamed {
         io::println("cuda transformer: streaming blocks (${free_megabytes()} MB free on the device)");
     }
+    let asynchronous: bool = host_bytes > (1 as u64);
+    guard let option::Option[cuda::DeviceBuffer]::Some(slot_b) = cuda::DeviceBuffer::allocate(if asynchronous { slot_bytes } else { 1 as u64 }) else {
+        let _closed: i32 = qi_close(fd);
+        return option::Option[Model]::None;
+    };
+    guard let option::Option[cuda::Stream]::Some(copy_stream) = cuda::Stream::create() else { return option::Option[Model]::None; };
+    guard let option::Option[cuda::Event]::Some(uploaded_a) = cuda::Event::create() else { return option::Option[Model]::None; };
+    guard let option::Option[cuda::Event]::Some(uploaded_b) = cuda::Event::create() else { return option::Option[Model]::None; };
+    guard let option::Option[cuda::Event]::Some(computed_a) = cuda::Event::create() else { return option::Option[Model]::None; };
+    guard let option::Option[cuda::Event]::Some(computed_b) = cuda::Event::create() else { return option::Option[Model]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(weight_scratch) = cuda::DeviceBuffer::allocate(
         (WEIGHT_SCRATCH_FLOATS *% (4 as usize)) as u64,
     ) else {
@@ -264,11 +284,20 @@ fn load(path: str, mode: WeightMode, auto_stream: bool = false) -> option::Optio
         slot_base: 0 as u64,
         host_blocks: host_blocks,
         host_base: first_block,
+        slot_b: slot_b,
+        copy_stream: copy_stream,
+        uploaded_a: uploaded_a,
+        uploaded_b: uploaded_b,
+        computed_a: computed_a,
+        computed_b: computed_b,
         weight_scratch: weight_scratch,
         vector_scratch: vector_scratch,
     };
     if !upload_range(model.fd, model.data_offset, model.resident_end, model.resident.pointer) {
         io::eprintln("cuda transformer: uploading weights failed");
+        return option::Option[Model]::None;
+    }
+    if asynchronous && (!queue_upload(model, 0 as usize) || !queue_upload(model, 1 as usize)) {
         return option::Option[Model]::None;
     }
     return option::Option[Model]::Some(model);
@@ -295,11 +324,53 @@ fn upload_range(fd: i32, start: u64, end: u64, device: *u8) -> bool {
     return true;
 }
 
+fn asynchronous(model: Model) -> bool {
+    return model.host_blocks.bytes > (1 as u64);
+}
+
+fn slot_pointer(model: Model, block: usize) -> *u8 {
+    return if block % (2 as usize) == (0 as usize) { model.slot.pointer } else { model.slot_b.pointer };
+}
+
+// Queues block `block` into its slot on the copy stream, after the block that
+// last read that slot has finished on the default stream.
+fn queue_upload(ref model: Model, block: usize) -> bool {
+    let even: bool = block % (2 as usize) == (0 as usize);
+    let computed: *u8 = if even { model.computed_a.handle } else { model.computed_b.handle };
+    let uploaded: *u8 = if even { model.uploaded_a.handle } else { model.uploaded_b.handle };
+    let start: u64 = model.block_start(block);
+    return cuda::wait(model.copy_stream.handle, computed)
+        && cuda::upload_async(slot_pointer(model, block), model.host_blocks.pointer + (start -% model.host_base) as usize,
+            model.block_end(block) -% start, model.copy_stream.handle)
+        && cuda::record(uploaded, model.copy_stream.handle);
+}
+
+// Before a block's kernels: the default stream waits for its upload.
+fn begin_block(ref model: Model, block: usize) -> bool {
+    if !asynchronous(model) { return true; }
+    let uploaded: *u8 = if block % (2 as usize) == (0 as usize) { model.uploaded_a.handle } else { model.uploaded_b.handle };
+    model.slot_block = block;
+    model.slot_base = model.block_start(block);
+    return cuda::wait(0 as *u8, uploaded);
+}
+
+// After a block's kernels are queued: mark its slot free once they finish and
+// queue the block two ahead (cyclically: prefix, then every step) into it.
+fn end_block(ref model: Model, block: usize) -> bool {
+    if !asynchronous(model) { return true; }
+    let computed: *u8 = if block % (2 as usize) == (0 as usize) { model.computed_a.handle } else { model.computed_b.handle };
+    return cuda::record(computed, 0 as *u8) && queue_upload(model, (block +% (2 as usize)) % BLOCKS);
+}
+
 // Device address of pack byte `offset`, uploading its block first when the
 // pack is streamed.
 fn device_address(ref model: Model, offset: u64) -> *u8 {
     if offset < model.resident_end {
         return model.resident.pointer + (offset -% model.data_offset) as usize;
+    }
+    if asynchronous(model) {
+        // begin_block selected the running block.
+        return slot_pointer(model, model.slot_block) + (offset -% model.slot_base) as usize;
     }
     var block: usize = 0 as usize;
     while block +% (1 as usize) < BLOCKS && offset >= model.block_start(block +% (1 as usize)) {
@@ -349,7 +420,6 @@ struct Work {
     up: cuda::DeviceBuffer,
     joint_k: cuda::DeviceBuffer,
     joint_v: cuda::DeviceBuffer,
-    scores: cuda::DeviceBuffer,
     codes: cuda::DeviceBuffer,
     code_scales: cuda::DeviceBuffer,
     halves: cuda::DeviceBuffer,
@@ -379,7 +449,6 @@ fn allocate_work(rows_needed: usize, keys: usize) -> option::Option[Work] {
     guard let option::Option[cuda::DeviceBuffer]::Some(joint_k) = device_floats(keys *% WIDTH) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(joint_v) = device_floats(keys *% WIDTH) else { return option::Option[Work]::None; };
     let chunk: usize = if rows < ATTENTION_CHUNK { rows } else { ATTENTION_CHUNK };
-    guard let option::Option[cuda::DeviceBuffer]::Some(scores) = device_floats(HEADS *% chunk *% keys) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(codes) = cuda::DeviceBuffer::allocate((rows *% MLP / (2 as usize)) as u64) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(code_scales) = cuda::DeviceBuffer::allocate((rows *% MLP / (64 as usize) *% (2 as usize)) as u64) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(halves) = cuda::DeviceBuffer::allocate((rows *% MLP *% (2 as usize)) as u64) else { return option::Option[Work]::None; };
@@ -393,7 +462,7 @@ fn allocate_work(rows_needed: usize, keys: usize) -> option::Option[Work] {
     let _zeroed: i32 = cuda::zero(hidden.pointer, hidden.bytes);
     return option::Option[Work]::Some(Work {
         rows: rows, keys: keys, hidden: hidden, normed: normed, q: q, k: k, v: v, attended: attended,
-        projected: projected, gate: gate, up: up, joint_k: joint_k, joint_v: joint_v, scores: scores,
+        projected: projected, gate: gate, up: up, joint_k: joint_k, joint_v: joint_v,
         codes: codes, code_scales: code_scales, halves: halves, attention_halves: attention_halves, time: time, time_hidden: time_hidden,
         modulation: modulation, final_scale: final_scale, timesteps: timesteps,
     });
@@ -470,6 +539,15 @@ fn condition(ref model: Model, ref work: Work, timestep: f32) -> bool {
 fn block(ref model: Model, ref work: Work, index: usize, rows: usize, valid_rows: usize, split: usize,
          rope: *f32, rope_offset: usize, cache_k: *f32, cache_v: *f32, prefix_keys: usize,
          causal_rows: usize, store_k: *f32, store_v: *f32) -> bool {
+    return begin_block(model, index)
+        && block_body(model, work, index, rows, valid_rows, split, rope, rope_offset, cache_k, cache_v, prefix_keys,
+            causal_rows, store_k, store_v)
+        && end_block(model, index);
+}
+
+fn block_body(ref model: Model, ref work: Work, index: usize, rows: usize, valid_rows: usize, split: usize,
+         rope: *f32, rope_offset: usize, cache_k: *f32, cache_v: *f32, prefix_keys: usize,
+         causal_rows: usize, store_k: *f32, store_v: *f32) -> bool {
     let modulation: *f32 = work.modulation.pointer as *f32;
     let stride: i32 = MODULATION_WIDTH as i32;
     let hidden: *f32 = work.hidden.pointer as *f32;
@@ -517,11 +595,20 @@ fn block(ref model: Model, ref work: Work, index: usize, rows: usize, valid_rows
     let projected: *f32 = work.projected.pointer as *f32;
     let gate: *f32 = work.gate.pointer as *f32;
     let up: *f32 = work.up.pointer as *f32;
+    // FP16 K and V once per block; attention_halves holds them, then the
+    // per-chunk Q and scores.
+    let k_half: *u8 = work.attention_halves.pointer;
+    let v_half: *u8 = k_half + keys *% WIDTH *% (2 as usize);
+    let chunk_scratch: *u8 = v_half + keys *% WIDTH *% (2 as usize);
+    if !ok(cuda::to_half(joint_k, k_half, (keys *% WIDTH) as u64), "keys to half")
+        || !ok(cuda::to_half(joint_v, v_half, (keys *% WIDTH) as u64), "values to half") {
+        return false;
+    }
     var chunk_start: usize = 0 as usize;
     while chunk_start < valid_rows {
         let chunk_rows: usize = if valid_rows -% chunk_start < ATTENTION_CHUNK { valid_rows -% chunk_start } else { ATTENTION_CHUNK };
-        if !ok(cuda::attention_f16(q + chunk_start *% WIDTH, joint_k, joint_v, attended + chunk_start *% WIDTH,
-                work.scores.pointer as *f32, work.attention_halves.pointer, chunk_rows as i32, keys as i32, HEADS as i32,
+        if !ok(cuda::attention_half(q + chunk_start *% WIDTH, k_half, v_half, attended + chunk_start *% WIDTH,
+                chunk_scratch, chunk_rows as i32, keys as i32, HEADS as i32,
                 (rope_offset +% chunk_start) as i32, causal_rows as i32), "attention") {
             return false;
         }

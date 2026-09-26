@@ -60,3 +60,33 @@ extern "C" int qi_cuda_memory(unsigned long long *free_bytes, unsigned long long
     *total_bytes = total_value;
     return (int)status;
 }
+
+// Streams and events for overlapping weight uploads with compute. A null
+// stream means the legacy default stream, where every kernel here runs.
+extern "C" int qi_cuda_stream_create(void **stream) {
+    return (int)cudaStreamCreateWithFlags((cudaStream_t *)stream, cudaStreamNonBlocking);
+}
+
+extern "C" int qi_cuda_stream_destroy(void *stream) {
+    return (int)cudaStreamDestroy((cudaStream_t)stream);
+}
+
+extern "C" int qi_cuda_event_create(void **event) {
+    return (int)cudaEventCreateWithFlags((cudaEvent_t *)event, cudaEventDisableTiming);
+}
+
+extern "C" int qi_cuda_event_destroy(void *event) {
+    return (int)cudaEventDestroy((cudaEvent_t)event);
+}
+
+extern "C" int qi_cuda_event_record(void *event, void *stream) {
+    return (int)cudaEventRecord((cudaEvent_t)event, (cudaStream_t)stream);
+}
+
+extern "C" int qi_cuda_stream_wait(void *stream, void *event) {
+    return (int)cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)event, 0);
+}
+
+extern "C" int qi_cuda_upload_async(void *device, const void *host, unsigned long long bytes, void *stream) {
+    return (int)cudaMemcpyAsync(device, host, (size_t)bytes, cudaMemcpyHostToDevice, (cudaStream_t)stream);
+}
