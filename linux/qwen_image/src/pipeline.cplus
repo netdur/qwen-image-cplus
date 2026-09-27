@@ -89,7 +89,8 @@ fn encode_prompt(model_root: str, prompt: str, ref rows: usize) -> option::Optio
 
 // Phase 2: denoise to final latents [latent_height * latent_width, 64] on the host.
 fn denoise(pack_path: str, mode: transformer::WeightMode, embeddings: *f32, text_rows: usize, latent_height: usize,
-           latent_width: usize, seed: u64, steps: usize, observer: control::Observer, latents_host: *f32) -> i32 {
+           latent_width: usize, seed: u64, steps: usize, observer: control::Observer, latents_host: *f32,
+           preload: *transformer::PackPreload = 0 as *transformer::PackPreload) -> i32 {
     let image_rows: usize = latent_height *% latent_width;
     guard let option::Option[pack::Buffer]::Some(rope_host) = pack::Buffer::allocate((text_rows +% image_rows) *% (512 as usize)) else { return 1; };
     guard let option::Option[pack::Buffer]::Some(scratch) = pack::Buffer::allocate(image_rows *% LATENT *% (4 as usize)) else { return 1; };
@@ -113,7 +114,8 @@ fn denoise(pack_path: str, mode: transformer::WeightMode, embeddings: *f32, text
         return 1;
     };
     var work: transformer::Work = allocated;
-    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true, transformer::cache_bytes(text_rows)) else {
+    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true, transformer::cache_bytes(text_rows),
+            preload) else {
         control::diagnose(observer, "Could not load the transformer pack.");
         return 1;
     };
@@ -159,6 +161,9 @@ fn run(pack_path: str, model_root: str, output_path: str, prompt: str, width: us
     if steps == (0 as usize) { return 2; }
     let latent_height: usize = height / (16 as usize);
     let latent_width: usize = width / (16 as usize);
+    // The pack loads into pinned memory while the text encoder runs.
+    var preload: transformer::PackPreload = transformer::begin_preload(pack_path);
+    let preload_pointer: *transformer::PackPreload = #addr_of(preload);
     if !control::report(observer, control::Phase::EncodingText, 0 as usize, steps) { return 3; }
     var text_rows: usize = 0 as usize;
     var phase: f64 = transformer::seconds();
@@ -170,7 +175,7 @@ fn run(pack_path: str, model_root: str, output_path: str, prompt: str, width: us
     guard let option::Option[pack::Buffer]::Some(latents) = pack::Buffer::allocate(latent_height *% latent_width *% LATENT *% (4 as usize)) else { return 1; };
     phase = transformer::seconds();
     let denoised: i32 = denoise(pack_path, mode, embeddings.pointer as *f32, text_rows, latent_height, latent_width,
-        seed, steps, observer, latents.pointer as *f32);
+        seed, steps, observer, latents.pointer as *f32, preload_pointer);
     if denoised != (0 as i32) { return denoised; }
     io::println("transformer: ${transformer::seconds() - phase} s (load, prefix, ${steps} steps)");
     if !control::report(observer, control::Phase::Decoding, steps, steps) { return 3; }

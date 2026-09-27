@@ -9,6 +9,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cudnn.h>
+#include <cuda_fp16.h>
+#include <cstdlib>
 #include <cmath>
 
 static cudnnHandle_t cudnn = nullptr;
@@ -23,6 +25,155 @@ static unsigned blocks_for(unsigned long long count, unsigned threads) {
 __global__ void add_bias_kernel(float *y, const float *bias, int channels, int pixels) {
     unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (i < (unsigned long long)channels * pixels) y[i] += bias[i / pixels];
+}
+
+// MARK: - FP16 tensor-core convolution (stride 1)
+
+// Stride-1 convolutions on FP16 tensor cores: cuDNN is fast here only for FP16
+// NHWC (implicit precomputed GEMM), about 2x FP32 Winograd. Activations stay
+// FP32 NCHW in memory; each horizontal strip of output rows converts its input
+// rows plus a k/2 halo (zeros outside the image) to FP16 NHWC, runs with
+// vertical padding 0 and horizontal padding k/2, and converts back with the
+// bias. Strips keep the FP16 scratch bounded at large sizes.
+static void *half_input = nullptr, *half_output = nullptr, *half_filter = nullptr;
+static size_t half_input_bytes = 0, half_output_bytes = 0, half_filter_bytes = 0;
+static const size_t HALF_STRIP_BYTES = (size_t)96 << 20;
+
+static int ensure(void **buffer, size_t *capacity, size_t bytes) {
+    if (bytes <= *capacity) return 0;
+    cudaFree(*buffer);
+    *buffer = nullptr;
+    *capacity = 0;
+    if (cudaMalloc(buffer, bytes) != cudaSuccess) return (int)cudaErrorMemoryAllocation;
+    *capacity = bytes;
+    return 0;
+}
+
+// Within a strip both layouts are a matrix: NCHW is [C][positions] (a
+// channel's rows are contiguous) and NHWC is [positions][C]. The conversions
+// are 32 x 32 tiled transposes through shared memory, coalesced both ways.
+
+// Rows [row0 - pad, row0 - pad + rows_in) of x [C, H, W] into NHWC halves,
+// zeros for rows outside the image.
+__global__ void strip_to_nhwc_kernel(const float *x, __half *out, int channels, int height, int width, int row0, int rows_in,
+                                     int pad) {
+    __shared__ float tile[32][33];
+    const long long positions = (long long)rows_in * width;
+    const long long first = (long long)(row0 - pad) * width;  // image offset of position 0
+    const long long image = (long long)height * width;
+    const long long p0 = (long long)blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    for (int j = threadIdx.y; j < 32; j += 8) {
+        const int c = c0 + j;
+        const long long p = p0 + threadIdx.x, at = first + p;
+        tile[j][threadIdx.x] = c < channels && p < positions && at >= 0 && at < image ? x[(size_t)c * image + at] : 0.0f;
+    }
+    __syncthreads();
+    for (int j = threadIdx.y; j < 32; j += 8) {
+        const long long p = p0 + j;
+        const int c = c0 + threadIdx.x;
+        if (p < positions && c < channels) out[(size_t)p * channels + c] = __float2half(tile[threadIdx.x][j]);
+    }
+}
+
+// NHWC halves [rows, W, C] back to rows [row0, row0 + rows) of y [C, H, W], plus bias.
+__global__ void strip_from_nhwc_kernel(const __half *in, const float *bias, float *y, int channels, int height, int width,
+                                       int row0, int rows) {
+    __shared__ float tile[32][33];
+    const long long positions = (long long)rows * width;
+    const long long first = (long long)row0 * width;
+    const long long image = (long long)height * width;
+    const long long p0 = (long long)blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    for (int j = threadIdx.y; j < 32; j += 8) {
+        const long long p = p0 + j;
+        const int c = c0 + threadIdx.x;
+        tile[j][threadIdx.x] = p < positions && c < channels ? __half2float(in[(size_t)p * channels + c]) : 0.0f;
+    }
+    __syncthreads();
+    for (int j = threadIdx.y; j < 32; j += 8) {
+        const int c = c0 + j;
+        const long long p = p0 + threadIdx.x;
+        if (c < channels && p < positions) y[(size_t)c * image + first + p] = tile[threadIdx.x][j] + bias[c];
+    }
+}
+
+// w [K, C, R, S] FP32 to [K, R, S, C] halves (cuDNN's NHWC filter layout).
+__global__ void filter_to_krsc_kernel(const float *w, __half *out, int k_count, int c_count, int kernel) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    const unsigned long long count = (unsigned long long)k_count * c_count * kernel * kernel;
+    if (i >= count) return;
+    const int c = (int)(i % c_count);
+    const int s = (int)((i / c_count) % kernel);
+    const int r = (int)((i / ((unsigned long long)c_count * kernel)) % kernel);
+    const int k = (int)(i / ((unsigned long long)c_count * kernel * kernel));
+    out[i] = __float2half(w[(((size_t)k * c_count + c) * kernel + r) * kernel + s]);
+}
+
+static int conv2d_half(const float *x, const float *weights, const float *bias, float *y, int in_channels,
+                       int out_channels, int height, int width, int kernel) {
+    const int pad = kernel / 2;
+    const size_t widest = (size_t)(in_channels > out_channels ? in_channels : out_channels);
+    int rows = (int)(HALF_STRIP_BYTES / (widest * width * 2)) - 2 * pad;
+    if (rows < 1) rows = 1;
+    if (rows > height) rows = height;
+    const size_t filter_count = (size_t)out_channels * in_channels * kernel * kernel;
+    if (int status = ensure(&half_input, &half_input_bytes, (size_t)(rows + 2 * pad) * width * in_channels * 2)) return status;
+    if (int status = ensure(&half_output, &half_output_bytes, (size_t)rows * width * out_channels * 2)) return status;
+    if (int status = ensure(&half_filter, &half_filter_bytes, filter_count * 2)) return status;
+    filter_to_krsc_kernel<<<blocks_for(filter_count, 256), 256>>>(weights, (__half *)half_filter, out_channels, in_channels, kernel);
+    cudnnTensorDescriptor_t input, output;
+    cudnnFilterDescriptor_t filter;
+    cudnnConvolutionDescriptor_t convolution;
+    cudnnCreateTensorDescriptor(&input);
+    cudnnCreateTensorDescriptor(&output);
+    cudnnCreateFilterDescriptor(&filter);
+    cudnnCreateConvolutionDescriptor(&convolution);
+    int status = 0;
+    if (cudnnSetFilter4dDescriptor(filter, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC, out_channels, in_channels, kernel, kernel) ||
+        cudnnSetConvolution2dDescriptor(convolution, 0, pad, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT) ||
+        cudnnSetConvolutionMathType(convolution, CUDNN_TENSOR_OP_MATH)) {
+        status = (int)cudaErrorInvalidValue;
+    }
+    const cudnnConvolutionFwdAlgo_t algorithm = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+    const float one = 1.0f, zero = 0.0f;
+    for (int row0 = 0; status == 0 && row0 < height; row0 += rows) {
+        const int strip = height - row0 < rows ? height - row0 : rows;
+        const int rows_in = strip + 2 * pad;
+        if (cudnnSetTensor4dDescriptor(input, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, 1, in_channels, rows_in, width) ||
+            cudnnSetTensor4dDescriptor(output, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, 1, out_channels, strip, width)) {
+            status = (int)cudaErrorInvalidValue;
+            break;
+        }
+        size_t needed = 0;
+        if (cudnnGetConvolutionForwardWorkspaceSize(cudnn, input, filter, convolution, output, algorithm, &needed) != CUDNN_STATUS_SUCCESS) {
+            status = (int)cudaErrorUnknown;
+            break;
+        }
+        if (needed > workspace_bytes) {
+            cudaFree(workspace);
+            workspace = nullptr;
+            workspace_bytes = 0;
+            if (cudaMalloc(&workspace, needed) != cudaSuccess) { status = (int)cudaErrorMemoryAllocation; break; }
+            workspace_bytes = needed;
+        }
+        const dim3 tiles_in((unsigned)(((long long)rows_in * width + 31) / 32), (unsigned)((in_channels + 31) / 32));
+        strip_to_nhwc_kernel<<<tiles_in, dim3(32, 8)>>>(x, (__half *)half_input, in_channels, height, width, row0, rows_in, pad);
+        if (cudnnConvolutionForward(cudnn, &one, input, half_input, filter, half_filter, convolution, algorithm, workspace,
+                                    workspace_bytes, &zero, output, half_output) != CUDNN_STATUS_SUCCESS) {
+            status = (int)cudaErrorUnknown;
+            break;
+        }
+        const dim3 tiles_out((unsigned)(((long long)strip * width + 31) / 32), (unsigned)((out_channels + 31) / 32));
+        strip_from_nhwc_kernel<<<tiles_out, dim3(32, 8)>>>((const __half *)half_output, bias, y, out_channels, height, width, row0,
+                                                           strip);
+    }
+    cudnnDestroyConvolutionDescriptor(convolution);
+    cudnnDestroyFilterDescriptor(filter);
+    cudnnDestroyTensorDescriptor(output);
+    cudnnDestroyTensorDescriptor(input);
+    if (status != 0) return status;
+    return (int)cudaGetLastError();
 }
 
 // y[out, H', W'] = conv(x[in, H, W], w[out, in, k, k]) + bias with symmetric
@@ -85,10 +236,11 @@ extern "C" int qi_vae_conv2d_strided(const float *x, const float *weights, const
     return (int)cudaGetLastError();
 }
 
-// Same-size convolution: stride 1, zero padding k/2.
+// Same-size convolution: stride 1, zero padding k/2, on FP16 tensor cores.
 extern "C" int qi_vae_conv2d(const float *x, const float *weights, const float *bias, float *y,
                              int in_channels, int out_channels, int height, int width, int kernel) {
-    return qi_vae_conv2d_strided(x, weights, bias, y, in_channels, out_channels, height, width, kernel, 1, kernel / 2);
+    if (cudnn == nullptr && cudnnCreate(&cudnn) != CUDNN_STATUS_SUCCESS) return (int)cudaErrorInitializationError;
+    return conv2d_half(x, weights, bias, y, in_channels, out_channels, height, width, kernel);
 }
 
 // y[c, H + 1, W + 1] = x[c, H, W] with one zero row below and one zero column

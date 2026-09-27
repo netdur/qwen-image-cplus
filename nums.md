@@ -146,3 +146,41 @@ Warm cache, 4 steps, seed 1301, end to end:
 | Image edit, 1 image | 512×512 | ~76.3 s | ~11.0 s | ~15.4 s |
 | Image edit, 1 image | 1024×1024 | ~101.5 s | ~29.4 s | ~46.1 s |
 | Image edit, 2 images | 512×512 | ~74.9 s | ~12.7 s | ~17.7 s |
+
+## Pack preload and FP16 VAE convolutions (2026-09-27)
+
+Pack preload: the INT4 pack's data section (4 GB) is read into ordinary host
+memory by 8 threads while the vision tower, VAE encoder and text encoder run;
+`transformer::load` then uploads it (pageable uploads run at full PCIe speed
+here, 0.70 s for 4.2 GB) or registers it for streaming (0.19 s). Page-locking
+4 GB up front costs 1.1 s and slowed the text encoder beside it by 1 s, so the
+buffer stays unpinned until load. Outputs are byte-identical.
+
+VAE: stride-1 convolutions run on FP16 tensor cores. cuDNN is only faster in
+FP16 NHWC (implicit precomputed GEMM: 99 ms against 200 ms for FP32 Winograd
+on a 288-channel 3x3 convolution at 1024x1024); activations stay FP32 NCHW and
+each horizontal strip of rows (with a halo) converts through a tiled transpose.
+1024 decode: 4.1 s to 2.4–2.6 s (process). Decoded image vs FP32: 64.3 dB,
+max 3 levels. The encoder's condition latents move 0.7% from FP32 and land
+closer to the oracle (0.25% against 0.65%; the oracle rounds its input to FP16).
+
+Warm cache, 4 steps, seed 1301, end to end:
+
+| Task | Size | GGUF Q4_K_M oracle | Engine W4A4 | Engine W4A16 |
+| --- | --- | ---: | ---: | ---: |
+| Text to image | 512×512 | ~39–45 s | ~7.2 s | ~10.9 s |
+| Text to image | 1024×1024 | ~74.5 s | ~17.4 s | ~30.8 s |
+| Image edit, 1 image | 512×512 | ~76.3 s | ~8.7 s | ~13.6 s |
+| Image edit, 1 image | 1024×1024 | ~101.5 s | ~24.8 s | ~41.8 s |
+| Image edit, 2 images | 512×512 | ~74.9 s | ~10.0 s | ~15.5 s |
+
+### Run-to-run variation on this machine
+
+Repeated runs occasionally differ slightly (text-encoder rows ~2e-6 relative,
+then amplified by the 4-step denoiser). The cause is the host memory, not the
+engine: a plain C program that reads the text-encoder shards with 8 threads
+(no CUDA) sees about one flipped bit per ~40 GB read (for example 1 byte / 1
+bit wrong in a 436 MB block, correct on re-read); the page cache and the files
+match the disk. The text encoder reads 16 GB per run, so roughly one run in
+three sees a flip. The GPU is clean (17 GB of uploads verified, 1500 SGEMM
+repeats bit-identical). This RAM is not ECC; memtest86+ would confirm.

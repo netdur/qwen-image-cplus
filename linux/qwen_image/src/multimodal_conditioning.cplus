@@ -212,7 +212,8 @@ fn encode_images(model_root: str, prompt: str, image_paths: *str, image_count: u
 
 // Conditioned prefix, then the denoising steps, to final latents on the host.
 fn denoise(pack_path: str, mode: transformer::WeightMode, encoded: Encoded, latent_height: usize, latent_width: usize,
-           seed: u64, steps: usize, observer: control::Observer, latents_host: *f32) -> i32 {
+           seed: u64, steps: usize, observer: control::Observer, latents_host: *f32,
+           preload: *transformer::PackPreload) -> i32 {
     let image_rows: usize = latent_height *% latent_width;
     let pad_rows: usize = encoded.condition_rows / (4 as usize);
     let prefix_rows: usize = encoded.prompt_rows -% pad_rows +% encoded.condition_rows;
@@ -250,7 +251,8 @@ fn denoise(pack_path: str, mode: transformer::WeightMode, encoded: Encoded, late
         return 1;
     };
     var work: transformer::Work = allocated;
-    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true, transformer::cache_bytes(prefix_rows)) else {
+    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true, transformer::cache_bytes(prefix_rows),
+            preload) else {
         control::diagnose(observer, "Could not load the transformer pack.");
         return 1;
     };
@@ -301,6 +303,9 @@ fn run_multi_image_transformer(
     let steps: usize = pipeline::parse_steps(requested_steps);
     if steps == (0 as usize) { return 2; }
     let reference_resolution: usize = ((width *% height) as f64).sqrt() as usize;
+    // The pack loads into pinned memory while the encoders run.
+    var preload: transformer::PackPreload = transformer::begin_preload(packed_path);
+    let preload_pointer: *transformer::PackPreload = #addr_of(preload);
     guard let option::Option[Encoded]::Some(encoded) = encode_images(model_root, prompt, image_paths, image_count,
             reference_resolution, observer) else {
         return 1;
@@ -309,7 +314,8 @@ fn run_multi_image_transformer(
     let latent_width: usize = width / (16 as usize);
     guard let option::Option[pack::Buffer]::Some(latents) = pack::Buffer::allocate(latent_height *% latent_width *% LATENT *% (4 as usize)) else { return 1; };
     var phase: f64 = transformer::seconds();
-    let denoised: i32 = denoise(packed_path, mode, encoded, latent_height, latent_width, seed, steps, observer, latents.pointer as *f32);
+    let denoised: i32 = denoise(packed_path, mode, encoded, latent_height, latent_width, seed, steps, observer, latents.pointer as *f32,
+        preload_pointer);
     if denoised != (0 as i32) { return denoised; }
     io::println("transformer: ${transformer::seconds() - phase} s (load, conditioned prefix of ${encoded.condition_rows} condition rows, ${steps} steps)");
     if benchmark_only || output_path.count() == (0 as usize) {

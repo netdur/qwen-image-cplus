@@ -95,3 +95,13 @@ extern "C" int qi_cuda_upload_async(void *device, const void *host, unsigned lon
 extern "C" int qi_cuda_event_synchronize(void *event) {
     return (int)cudaEventSynchronize((cudaEvent_t)event);
 }
+
+// Page-locks existing host memory (cheap once its pages are resident), and
+// releases it again.
+extern "C" int qi_cuda_host_register(void *pointer, unsigned long long bytes) {
+    return (int)cudaHostRegister(pointer, (size_t)bytes, cudaHostRegisterDefault);
+}
+
+extern "C" int qi_cuda_host_unregister(void *pointer) {
+    return (int)cudaHostUnregister(pointer);
+}

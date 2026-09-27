@@ -20,6 +20,8 @@ import "stdlib/io" as io;
 import "stdlib/option" as option;
 import "stdlib/status" as status;
 import "stdlib/text" as text;
+import "stdlib/thread" as thread;
+import "stdlib/vec" as vec;
 
 #[link_name = "open"]
 extern fn qi_open(path: *u8, flags: i32, mode: i32) -> i32;
@@ -162,11 +164,185 @@ impl Model {
     }
 }
 
+// MARK: - Pack preload
+
+// An INT4 pack's data section read ahead into host memory on worker threads
+// while the encoders run, so `load` only uploads it (resident: pageable
+// uploads run at full PCIe speed here) or registers it with CUDA and adopts it
+// as its streamed block store (registering filled memory takes ~0.2 s for
+// 4 GB). Plain memory, because page-locking 4 GB up front (about a second)
+// slows the text encoder running beside it.
+const PRELOAD_WORKERS: usize = 8;
+const PRELOAD_CHUNK: u64 = 8388608;
+
+struct PreloadRead {
+    fd: i32,
+    opaque destination: *u8,
+    start: u64,
+    bytes: u64,
+    worker: usize,
+}
+
+impl PreloadRead: Send {}
+
+fn preload_read(take job: PreloadRead) -> i32 {
+    var chunk: u64 = (job.worker as u64) *% PRELOAD_CHUNK;
+    while chunk < job.bytes {
+        let amount: u64 = if job.bytes -% chunk < PRELOAD_CHUNK { job.bytes -% chunk } else { PRELOAD_CHUNK };
+        if !pack::read_exact(job.fd, job.destination + chunk as usize, amount as usize, job.start +% chunk) { return 1; }
+        chunk = chunk +% (PRELOAD_WORKERS as u64) *% PRELOAD_CHUNK;
+    }
+    return 0;
+}
+
+struct PreloadJob {
+    fd: i32,
+    start: u64,
+    bytes: u64,
+    // Where the coordinator leaves the buffer pointer (the PackPreload's cell).
+    opaque result: **u8,
+}
+
+impl PreloadJob: Send {}
+
+#[link_name = "malloc"]
+extern fn qi_malloc(bytes: usize) -> *u8;
+#[link_name = "free"]
+extern fn qi_free(pointer: *u8);
+
+fn preload_coordinate(take job: PreloadJob) -> i32 {
+    let pinned: *u8 = qi_malloc(job.bytes as usize);
+    if pinned.is_null() { return 1; }
+    *job.result = pinned;
+    var readers: vec::Vec[thread::JoinHandle[i32]] = vec::Vec[thread::JoinHandle[i32]]::with_capacity(PRELOAD_WORKERS);
+    var worker: usize = 0 as usize;
+    var failed: bool = false;
+    while worker < PRELOAD_WORKERS {
+        let read: PreloadRead = PreloadRead { fd: job.fd, destination: pinned, start: job.start, bytes: job.bytes, worker: worker };
+        if readers.append(thread::spawn_with::[PreloadRead, i32](read, preload_read)) != status::Status::Ok { failed = true; }
+        worker = worker +% (1 as usize);
+    }
+    while true {
+        match readers.remove_last() {
+            option::Option::Some(handle) => { if handle.join() != (0 as i32) { failed = true; } }
+            option::Option::None => { break; }
+        }
+    }
+    return if failed { 1 } else { 0 };
+}
+
+struct PackPreload {
+    // False when nothing is being read (not an INT4 pack, or starting failed).
+    active: bool,
+    fd: i32,
+    start: u64,
+    bytes: u64,
+    cell: pack::Buffer,
+    coordinator: vec::Vec[thread::JoinHandle[i32]],
+    finished: bool,
+    succeeded: bool,
+}
+
+impl PackPreload {
+    // Joins the coordinator (once); true when the whole data section is in.
+    fn finish(ref this) -> bool {
+        if !this.active { return false; }
+        if !this.finished {
+            this.finished = true;
+            this.succeeded = true;
+            while true {
+                match this.coordinator.remove_last() {
+                    option::Option::Some(handle) => { if handle.join() != (0 as i32) { this.succeeded = false; } }
+                    option::Option::None => { break; }
+                }
+            }
+        }
+        return this.succeeded;
+    }
+
+    // The buffer, still owned by the preload.
+    fn buffer(this) -> *u8 {
+        if !this.active { return 0 as *u8; }
+        return *(this.cell.pointer as **u8);
+    }
+
+    // Registers the buffer with CUDA and hands it over; the preload no longer
+    // owns it.
+    fn take_registered(ref this) -> option::Option[cuda::PinnedBuffer] {
+        if !this.active { return option::Option[cuda::PinnedBuffer]::None; }
+        let slot: **u8 = this.cell.pointer as **u8;
+        let pointer: *u8 = *slot;
+        if pointer.is_null() { return option::Option[cuda::PinnedBuffer]::None; }
+        *slot = 0 as *u8;
+        return cuda::PinnedBuffer::register(pointer, this.bytes);
+    }
+
+    fn drop(ref this) {
+        let _joined: bool = this.finish();
+        if this.active {
+            let slot: **u8 = this.cell.pointer as **u8;
+            if !(*slot).is_null() {
+                qi_free(*slot);
+                *slot = 0 as *u8;
+            }
+        }
+        if this.fd >= (0 as i32) {
+            let _closed: i32 = qi_close(this.fd);
+            this.fd = 0 -% (1 as i32);
+        }
+    }
+}
+
+// Starts reading `path`'s data section into pinned memory when it is an INT4
+// pack (the FP16 pack streams from the file); None otherwise or on failure.
+fn inactive_preload() -> PackPreload {
+    return PackPreload {
+        active: false, fd: 0 -% (1 as i32), start: 0 as u64, bytes: 0 as u64,
+        cell: pack::Buffer { pointer: 0 as *u8, length: 0 as usize },
+        coordinator: vec::Vec[thread::JoinHandle[i32]]::with_capacity(0 as usize), finished: true, succeeded: false,
+    };
+}
+
+fn begin_preload(path: str) -> PackPreload {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return inactive_preload(); };
+    let fd: i32 = qi_open(c_path.as_ptr(), 0 as i32, 0 as i32);
+    if fd < (0 as i32) { return inactive_preload(); }
+    guard let option::Option[pack::PackedHeader]::Some(header) = pack::read_header(fd) else {
+        let _closed: i32 = qi_close(fd);
+        return inactive_preload();
+    };
+    if !pack::fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a4-h256-g64-v6")
+        && !pack::fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a16-g64-v6") {
+        let _closed: i32 = qi_close(fd);
+        return inactive_preload();
+    }
+    guard let option::Option[pack::Buffer]::Some(cell) = pack::Buffer::allocate(8 as usize) else {
+        let _closed: i32 = qi_close(fd);
+        return inactive_preload();
+    };
+    *(cell.pointer as **u8) = 0 as *u8;
+    let bytes: u64 = header.file_bytes -% header.data_offset;
+    var coordinator: vec::Vec[thread::JoinHandle[i32]] = vec::Vec[thread::JoinHandle[i32]]::with_capacity(1 as usize);
+    let job: PreloadJob = PreloadJob { fd: fd, start: header.data_offset, bytes: bytes, result: cell.pointer as **u8 };
+    if coordinator.append(thread::spawn_with::[PreloadJob, i32](job, preload_coordinate)) != status::Status::Ok {
+        let _closed: i32 = qi_close(fd);
+        return inactive_preload();
+    }
+    return PackPreload {
+        active: true, fd: fd, start: header.data_offset, bytes: bytes, cell: cell, coordinator: coordinator, finished: false,
+        succeeded: false,
+    };
+}
+
 // With `auto_stream`, an INT4 pack stays resident only when the free device
 // memory covers it plus STREAM_HEADROOM plus `reserve` (the prefix cache); otherwise its blocks are copied to
 // pinned host memory and uploaded one at a time as they run. The FP16 pack is
 // always streamed, from the file.
-fn load(path: str, mode: WeightMode, auto_stream: bool = false, reserve: u64 = 0 as u64) -> option::Option[Model] {
+//
+// A finished `preload` of the same pack replaces the file reads: resident
+// weights upload from its pinned buffer, and a streamed model adopts it.
+fn load(path: str, mode: WeightMode, auto_stream: bool = false, reserve: u64 = 0 as u64,
+        preload: *PackPreload = 0 as *PackPreload) -> option::Option[Model] {
     guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else {
         return option::Option[Model]::None;
     };
@@ -235,20 +411,42 @@ fn load(path: str, mode: WeightMode, auto_stream: bool = false, reserve: u64 = 0
         let _closed: i32 = qi_close(fd);
         return option::Option[Model]::None;
     };
-    let host_bytes: u64 = if streamed && mode != WeightMode::Fp16Streamed { header.file_bytes -% first_block } else { 1 as u64 };
-    guard let option::Option[cuda::PinnedBuffer]::Some(host_blocks) = cuda::PinnedBuffer::allocate(host_bytes) else {
-        io::eprintln("cuda transformer: could not pin ${host_bytes} bytes for streamed blocks");
-        let _closed: i32 = qi_close(fd);
-        return option::Option[Model]::None;
-    };
-    if host_bytes > (1 as u64) && !pack::read_exact(fd, host_blocks.pointer, host_bytes as usize, first_block) {
-        let _closed: i32 = qi_close(fd);
-        return option::Option[Model]::None;
+    // A usable preload covers the whole data section from data_offset.
+    let preloaded: bool = !preload.is_null() && (*preload).finish() && (*preload).start == header.data_offset
+        && (*preload).bytes == header.file_bytes -% header.data_offset;
+    if !preload.is_null() && (*preload).active && !preloaded {
+        io::eprintln("cuda transformer: pack preload unusable; reading the file");
+    }
+    var host_base: u64 = first_block;
+    var host_blocks: cuda::PinnedBuffer = cuda::PinnedBuffer::empty();
+    var adopted: bool = false;
+    if streamed && mode != WeightMode::Fp16Streamed && preloaded {
+        match (*preload).take_registered() {
+            option::Option::Some(registered) => {
+                host_blocks = registered;
+                host_base = header.data_offset;
+                adopted = true;
+            }
+            option::Option::None => { io::eprintln("cuda transformer: could not register the preloaded pack"); }
+        }
+    }
+    if !adopted {
+        let host_bytes: u64 = if streamed && mode != WeightMode::Fp16Streamed { header.file_bytes -% first_block } else { 1 as u64 };
+        guard let option::Option[cuda::PinnedBuffer]::Some(allocated) = cuda::PinnedBuffer::allocate(host_bytes) else {
+            io::eprintln("cuda transformer: could not pin ${host_bytes} bytes for streamed blocks");
+            let _closed: i32 = qi_close(fd);
+            return option::Option[Model]::None;
+        };
+        host_blocks = allocated;
+        if host_bytes > (1 as u64) && !pack::read_exact(fd, host_blocks.pointer, host_bytes as usize, first_block) {
+            let _closed: i32 = qi_close(fd);
+            return option::Option[Model]::None;
+        }
     }
     if streamed {
         io::println("cuda transformer: streaming blocks (${free_megabytes()} MB free on the device)");
     }
-    let asynchronous: bool = host_bytes > (1 as u64);
+    let asynchronous: bool = host_blocks.bytes > (1 as u64);
     guard let option::Option[cuda::DeviceBuffer]::Some(slot_b) = cuda::DeviceBuffer::allocate(if asynchronous { slot_bytes } else { 1 as u64 }) else {
         let _closed: i32 = qi_close(fd);
         return option::Option[Model]::None;
@@ -280,7 +478,7 @@ fn load(path: str, mode: WeightMode, auto_stream: bool = false, reserve: u64 = 0
         slot_block: BLOCKS,
         slot_base: 0 as u64,
         host_blocks: host_blocks,
-        host_base: first_block,
+        host_base: host_base,
         slot_b: slot_b,
         copy_stream: copy_stream,
         uploaded_a: uploaded_a,
@@ -290,7 +488,14 @@ fn load(path: str, mode: WeightMode, auto_stream: bool = false, reserve: u64 = 0
         weight_scratch: weight_scratch,
         vector_scratch: vector_scratch,
     };
-    if !upload_range(model.fd, model.data_offset, model.resident_end, model.resident.pointer) {
+    let resident_uploaded: bool = if preloaded && !asynchronous {
+        cuda::upload(model.resident.pointer, (*preload).buffer(), model.resident_end -% model.data_offset) == (0 as i32)
+    } else if asynchronous && model.host_base == model.data_offset {
+        cuda::upload(model.resident.pointer, model.host_blocks.pointer, model.resident_end -% model.data_offset) == (0 as i32)
+    } else {
+        upload_range(model.fd, model.data_offset, model.resident_end, model.resident.pointer)
+    };
+    if !resident_uploaded {
         io::eprintln("cuda transformer: uploading weights failed");
         return option::Option[Model]::None;
     }

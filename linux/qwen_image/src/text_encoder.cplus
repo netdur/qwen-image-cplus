@@ -457,6 +457,10 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
         }
     }
     let position_values: *i32 = positions.pointer as *i32;
+    // The embeddings were staged in `slot`, which layer 0's upload overwrites
+    // from the copy stream; that stream does not wait for the default stream,
+    // so the conversion must finish first.
+    if !cuda::synchronize() { return false; }
 
     let h: *f32 = hidden.pointer as *f32;
     let n: *f32 = normed.pointer as *f32;

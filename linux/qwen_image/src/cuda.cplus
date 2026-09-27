@@ -78,6 +78,12 @@ extern fn qi_cuda_event_record(event: *u8, stream: *u8) -> i32;
 extern fn qi_cuda_stream_wait(stream: *u8, event: *u8) -> i32;
 #[link_name = "qi_cuda_event_synchronize"]
 extern fn qi_cuda_event_synchronize(event: *u8) -> i32;
+#[link_name = "qi_cuda_host_register"]
+extern fn qi_cuda_host_register(pointer: *u8, bytes: u64) -> i32;
+#[link_name = "qi_cuda_host_unregister"]
+extern fn qi_cuda_host_unregister(pointer: *u8) -> i32;
+#[link_name = "free"]
+extern fn qi_free_host_memory(pointer: *u8);
 #[link_name = "qi_cuda_upload_async"]
 extern fn qi_cuda_upload_async(device: *u8, host: *u8, bytes: u64, stream: *u8) -> i32;
 #[link_name = "qi_cuda_memory"]
@@ -205,10 +211,13 @@ impl DeviceBuffer {
     }
 }
 
-// An owned page-locked host allocation, for full-speed uploads.
+// An owned page-locked host allocation, for full-speed uploads: allocated
+// pinned, or malloc'd memory registered with CUDA (`registered`), which drop
+// unregisters and frees.
 struct PinnedBuffer {
     opaque pointer: *u8,
     bytes: u64,
+    registered: bool,
 }
 
 impl PinnedBuffer {
@@ -217,12 +226,31 @@ impl PinnedBuffer {
         if qi_cuda_malloc_host(#addr_of(pointer), bytes) != (0 as i32) {
             return option::Option[PinnedBuffer]::None;
         }
-        return option::Option[PinnedBuffer]::Some(PinnedBuffer { pointer: pointer, bytes: bytes });
+        return option::Option[PinnedBuffer]::Some(PinnedBuffer { pointer: pointer, bytes: bytes, registered: false });
+    }
+
+    // Takes ownership of malloc'd `pointer` and page-locks it; None (and the
+    // memory freed) when registering fails.
+    fn register(pointer: *u8, bytes: u64) -> option::Option[PinnedBuffer] {
+        if qi_cuda_host_register(pointer, bytes) != (0 as i32) {
+            qi_free_host_memory(pointer);
+            return option::Option[PinnedBuffer]::None;
+        }
+        return option::Option[PinnedBuffer]::Some(PinnedBuffer { pointer: pointer, bytes: bytes, registered: true });
+    }
+
+    fn empty() -> PinnedBuffer {
+        return PinnedBuffer { pointer: 0 as *u8, bytes: 0 as u64, registered: false };
     }
 
     fn drop(ref this) {
         if !this.pointer.is_null() {
-            let _freed: i32 = qi_cuda_free_host(this.pointer);
+            if this.registered {
+                let _unregistered: i32 = qi_cuda_host_unregister(this.pointer);
+                qi_free_host_memory(this.pointer);
+            } else {
+                let _freed: i32 = qi_cuda_free_host(this.pointer);
+            }
             this.pointer = 0 as *u8;
         }
     }

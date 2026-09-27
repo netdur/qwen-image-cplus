@@ -38,11 +38,11 @@ Ours: C+ / CUDA engine with the W4A4 (H256, g64, clip, v6) or W4A16 (g64, v6) QI
 
 | Task | Size | GGUF Q4_K_M | Ours W4A4 | Ours W4A16 |
 | --- | --- | ---: | ---: | ---: |
-| Text to image | 512×512 | ~39–45 s | ~8.2 s | ~11.6 s |
-| Text to image | 1024×1024 | ~74.5 s | ~21.3 s | ~34.5 s |
-| Image edit (1 image) | 512×512 | ~76.3 s | ~11.0 s | ~15.4 s |
-| Image edit (1 image) | 1024×1024 | ~101.5 s | ~29.4 s | ~46.1 s |
-| Image edit (2 images) | 512×512 | ~74.9 s | ~12.7 s | ~17.7 s |
+| Text to image | 512×512 | ~39–45 s | ~7.2 s | ~10.9 s |
+| Text to image | 1024×1024 | ~74.5 s | ~17.4 s | ~30.8 s |
+| Image edit (1 image) | 512×512 | ~76.3 s | ~8.7 s | ~13.6 s |
+| Image edit (1 image) | 1024×1024 | ~101.5 s | ~24.8 s | ~41.8 s |
+| Image edit (2 images) | 512×512 | ~74.9 s | ~10.0 s | ~15.5 s |
 
 The pack picks the mode: W4A4 is faster, W4A16 stays closer to FP16.
 
