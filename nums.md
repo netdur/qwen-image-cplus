@@ -184,3 +184,18 @@ bit wrong in a 436 MB block, correct on re-read); the page cache and the files
 match the disk. The text encoder reads 16 GB per run, so roughly one run in
 three sees a flip. The GPU is clean (17 GB of uploads verified, 1500 SGEMM
 repeats bit-identical). This RAM is not ECC; memtest86+ would confirm.
+
+## Measured and not adopted (2026-09-27)
+
+- W4A4 GEMM: this RTX 2060 sustains ~115 INT4 TOPS in a register-only
+  mma.m8n8k32 loop; the GEMM runs at ~35 TOPS (4096 rows). Neither an exact
+  full-rate int-to-float conversion in the per-group epilogue nor a swizzled
+  launch order for L2 reuse changed it beyond run-to-run noise (clocks vary
+  with temperature on this laptop GPU); outputs were bit-identical. Further
+  gains need a new mainloop.
+- INT8 text encoder (weights symmetric per output row, simulated on the
+  device before the FP16 GEMMs): prompt rows 7.6% from the BF16 oracle,
+  against 2.8% now. Both poster strings still render; the scene changes a
+  little; the edit is nearly the same. It would halve the 16 GB upload (about
+  1.4 s per run) at the cost of an extra 8 GB weight file and that quality
+  gap, so it is left as an option.
