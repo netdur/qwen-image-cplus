@@ -29,6 +29,7 @@ build_package gui
 artifact_dir="$project_root/dist"
 mode_dir="$build_mode"
 ffi_object="$project_root/ffi/target/$mode_dir/qwen_image.objs/qwen_image_ffi.src.ffi.o"
+runtime_object="$project_root/ffi/target/$mode_dir/qwen_image.objs/qwen_image_runtime.src.runtime_macos.o"
 ffi_header="$project_root/ffi/target/$mode_dir/qwen_image.h"
 cli_binary="$project_root/cli/target/$mode_dir/qwen-image-cplus"
 
@@ -52,7 +53,7 @@ else
     dependency_link_args=$(cd "$project_root/ffi" && "$cpc_bin" build --print-link-args)
 fi
 
-set -- "$ffi_object"
+set -- "$ffi_object" "$runtime_object"
 while IFS= read -r arg; do
     case "$arg" in
         *.a) set -- "$@" "$arg" ;;
@@ -62,7 +63,7 @@ $dependency_link_args
 EOF
 xcrun libtool -static -o "$artifact_dir/lib/libqwen_image.a" "$@"
 
-set -- "$ffi_object"
+set -- "$ffi_object" "$runtime_object"
 while IFS= read -r arg; do
     if [ -n "$arg" ]; then
         set -- "$@" "$arg"
