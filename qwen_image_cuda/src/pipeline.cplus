@@ -1,0 +1,264 @@
+// Linux text-to-image pipeline (CUDA). Signatures match the macOS
+// `qwen_image/pipeline` functions that the shared `api.cplus` calls.
+//
+// Phases, each releasing its GPU memory before the next: tokenize and encode
+// the prompt (text encoder streamed from the BF16 shards), build RoPE and the
+// seeded latents, denoise with the INT4 transformer, decode with the VAE, and
+// write the PNG. The pack's policy selects W4A4 or W4A16; the step count comes
+// from the request.
+
+import "qwen_image/file_io" as file_io;
+import "qwen_image/generation_control" as control;
+import "./cuda" as cuda;
+import "./inputs" as inputs;
+import "./int4_pack" as pack;
+import "./png" as png;
+import "./text_encoder" as text_encoder;
+import "./tokenizer" as tokenizer;
+import "./transformer" as transformer;
+import "./vae" as vae;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+
+const WIDTH: usize = 4096;
+const LATENT: usize = 64;
+
+// Same limit as the macOS transformer's `max_target_tokens`.
+fn max_target_tokens() -> usize {
+    return 16384 as usize;
+}
+
+fn output_dimensions_supported(width: usize, height: usize) -> bool {
+    return width >= (256 as usize) && height >= (256 as usize)
+        && width % (32 as usize) == (0 as usize)
+        && height % (32 as usize) == (0 as usize)
+        && (width / (16 as usize)) *% (height / (16 as usize))
+            <= max_target_tokens();
+}
+
+fn weight_mode(pack_path: str) -> option::Option[transformer::WeightMode] {
+    let fd: i32 = file_io::open_read(pack_path);
+    if fd < (0 as i32) { return option::Option[transformer::WeightMode]::None; }
+    guard let option::Option[pack::PackedHeader]::Some(header) = pack::read_header(fd) else {
+        let _closed: i32 = file_io::close(fd);
+        return option::Option[transformer::WeightMode]::None;
+    };
+    let _closed: i32 = file_io::close(fd);
+    if pack::fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a4-h256-g64-v6") {
+        return option::Option[transformer::WeightMode]::Some(transformer::WeightMode::W4A4);
+    }
+    if pack::fixed_matches(#addr_of(header.policy[0]), 32 as usize, "transformer:w4a16-g64-v6") {
+        return option::Option[transformer::WeightMode]::Some(transformer::WeightMode::W4A16);
+    }
+    return option::Option[transformer::WeightMode]::None;
+}
+
+fn parse_steps(steps: str) -> usize {
+    return match steps.to_f64() {
+        option::Option::Some(value) => value as usize,
+        option::Option::None => 0 as usize,
+    };
+}
+
+// Phase 1: prompt embeddings [rows, 4096] on the host.
+fn encode_prompt(model_root: str, prompt: str, ref rows: usize) -> option::Option[pack::Buffer] {
+    guard let option::Option[vec::Vec[u32]]::Some(ids) = tokenizer::tokenize_full_prompt(model_root, prompt) else {
+        return option::Option[pack::Buffer]::None;
+    };
+    if ids.count() <= (14 as usize) { return option::Option[pack::Buffer]::None; }
+    rows = ids.count() -% (14 as usize);
+    guard let option::Option[pack::Buffer]::Some(embeddings) = pack::Buffer::allocate(rows *% WIDTH *% (4 as usize)) else {
+        return option::Option[pack::Buffer]::None;
+    };
+    if !text_encoder::encode(model_root, #slice_ptr(ids.as_slice()) as *i32, ids.count(),
+            text_encoder::Options { bf16_boundaries: true, half_gemm: true }, embeddings.pointer as *f32) {
+        return option::Option[pack::Buffer]::None;
+    }
+    return option::Option[pack::Buffer]::Some(embeddings);
+}
+
+// Phase 2: denoise to final latents [latent_height * latent_width, 64] on the host.
+fn denoise(pack_path: str, mode: transformer::WeightMode, embeddings: *f32, text_rows: usize, latent_height: usize,
+           latent_width: usize, seed: u64, steps: usize, observer: control::Observer, latents_host: *f32,
+           preload: *transformer::PackPreload = 0 as *transformer::PackPreload) -> i32 {
+    let image_rows: usize = latent_height *% latent_width;
+    guard let option::Option[pack::Buffer]::Some(rope_host) = pack::Buffer::allocate((text_rows +% image_rows) *% (512 as usize)) else { return 1; };
+    guard let option::Option[pack::Buffer]::Some(scratch) = pack::Buffer::allocate(image_rows *% LATENT *% (4 as usize)) else { return 1; };
+    inputs::rope_table(text_rows, latent_height, latent_width, rope_host.pointer as *f32);
+    // FP16 noise, as the pipeline draws it when its embeddings are FP16 (the
+    // dtype the GGUF oracle runs in on this GPU).
+    if !inputs::initial_noise(seed, latent_height, latent_width, inputs::NoiseDtype::Float16, scratch.pointer as *f32, latents_host) {
+        return 1;
+    }
+    guard let option::Option[cuda::DeviceBuffer]::Some(rope) = cuda::DeviceBuffer::allocate(rope_host.length as u64) else { return 1; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(latents) = cuda::DeviceBuffer::allocate((image_rows *% LATENT *% (4 as usize)) as u64) else { return 1; };
+    if !rope.upload(rope_host.pointer, rope_host.length as u64)
+        || !latents.upload(latents_host as *u8, (image_rows *% LATENT *% (4 as usize)) as u64) {
+        return 1;
+    }
+    // Activations first, so the pack streams its blocks when what is left
+    // cannot hold it.
+    guard let option::Option[transformer::Work]::Some(allocated) = transformer::allocate_work(
+        if image_rows > text_rows { image_rows } else { text_rows }, text_rows +% image_rows) else {
+        control::diagnose(observer, "Not enough GPU memory for the transformer activations at this size.");
+        return 1;
+    };
+    var work: transformer::Work = allocated;
+    guard let option::Option[transformer::Model]::Some(loaded) = transformer::load(pack_path, mode, true, transformer::cache_bytes(text_rows),
+            preload) else {
+        control::diagnose(observer, "Could not load the transformer pack.");
+        return 1;
+    };
+    var model: transformer::Model = loaded;
+    guard let option::Option[transformer::PrefixCache]::Some(computed) = transformer::prefix(model, work, embeddings, text_rows, rope.pointer as *f32) else {
+        return 1;
+    };
+    var cache: transformer::PrefixCache = computed;
+    if !control::report(observer, control::Phase::Denoising, 0 as usize, steps) { return 3; }
+    if !transformer::denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32) {
+        return 1;
+    }
+    if !control::report(observer, control::Phase::Denoising, steps, steps) { return 3; }
+    return if latents.download(latents_host as *u8, (image_rows *% LATENT *% (4 as usize)) as u64) { 0 } else { 1 };
+}
+
+// Phase 3: VAE decode and PNG.
+fn decode(model_root: str, latents_host: *f32, latent_height: usize, latent_width: usize, output_path: str) -> i32 {
+    let image_rows: usize = latent_height *% latent_width;
+    guard let option::Option[cuda::DeviceBuffer]::Some(latents) = cuda::DeviceBuffer::allocate((image_rows *% LATENT *% (4 as usize)) as u64) else { return 1; };
+    if !latents.upload(latents_host as *u8, (image_rows *% LATENT *% (4 as usize)) as u64) { return 1; }
+    let vae_path: text::Text = "${model_root}/vae/diffusion_pytorch_model.safetensors";
+    guard let option::Option[vae::Weights]::Some(weights) = vae::load_weights(vae_path.view()) else { return 1; };
+    guard let option::Option[vae::Scratch]::Some(allocated) = vae::allocate_scratch(latent_height, latent_width) else { return 1; };
+    var scratch: vae::Scratch = allocated;
+    let width: usize = latent_width *% (16 as usize);
+    let height: usize = latent_height *% (16 as usize);
+    guard let option::Option[pack::Buffer]::Some(rgba) = pack::Buffer::allocate(width *% height *% (4 as usize)) else { return 1; };
+    if !vae::decode(weights, scratch, latents.pointer as *f32, latent_height, latent_width, rgba.pointer) { return 1; }
+    guard let option::Option[usize]::Some(_bytes) = png::write_rgba(rgba.pointer, width, height, output_path) else { return 1; };
+    return 0;
+}
+
+fn run(pack_path: str, model_root: str, output_path: str, prompt: str, width: usize, height: usize, seed: u64,
+       steps_text: str, observer: control::Observer) -> i32 {
+    let started: f64 = transformer::seconds();
+    if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) { return 3; }
+    guard let option::Option[transformer::WeightMode]::Some(mode) = weight_mode(pack_path) else {
+        control::diagnose(observer, "The Linux engine needs a w4a4-h256-g64-v6 or w4a16-g64-v6 QIPACK.");
+        return 2;
+    };
+    let steps: usize = parse_steps(steps_text);
+    if steps == (0 as usize) { return 2; }
+    let latent_height: usize = height / (16 as usize);
+    let latent_width: usize = width / (16 as usize);
+    // The pack loads into pinned memory while the text encoder runs.
+    var preload: transformer::PackPreload = transformer::begin_preload(pack_path);
+    let preload_pointer: *transformer::PackPreload = #addr_of(preload);
+    if !control::report(observer, control::Phase::EncodingText, 0 as usize, steps) { return 3; }
+    var text_rows: usize = 0 as usize;
+    var phase: f64 = transformer::seconds();
+    guard let option::Option[pack::Buffer]::Some(embeddings) = encode_prompt(model_root, prompt, text_rows) else {
+        control::diagnose(observer, "Could not tokenize or encode the prompt. Check the processor and text_encoder files.");
+        return 1;
+    };
+    io::println("text: ${text_rows} rows, ${transformer::seconds() - phase} s");
+    guard let option::Option[pack::Buffer]::Some(latents) = pack::Buffer::allocate(latent_height *% latent_width *% LATENT *% (4 as usize)) else { return 1; };
+    phase = transformer::seconds();
+    let denoised: i32 = denoise(pack_path, mode, embeddings.pointer as *f32, text_rows, latent_height, latent_width,
+        seed, steps, observer, latents.pointer as *f32, preload_pointer);
+    if denoised != (0 as i32) { return denoised; }
+    io::println("transformer: ${transformer::seconds() - phase} s (load, prefix, ${steps} steps)");
+    if !control::report(observer, control::Phase::Decoding, steps, steps) { return 3; }
+    phase = transformer::seconds();
+    if decode(model_root, latents.pointer as *f32, latent_height, latent_width, output_path) != (0 as i32) {
+        control::diagnose(observer, "VAE decoding or PNG output failed.");
+        return 1;
+    }
+    io::println("vae + png: ${transformer::seconds() - phase} s");
+    io::println("end to end: ${transformer::seconds() - started} s -> ${output_path}");
+    return 0;
+}
+
+fn generate_256(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    steps: str = "40",
+    observer: control::Observer = control::none(),
+) -> i32 {
+    return run(packed_path, model_root, output_path, prompt, 256 as usize, 256 as usize, seed, steps, observer);
+}
+
+fn generate_256_cache_dit(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    threshold: f64 = 0.12f64,
+    steps: str = "40",
+    observer: control::Observer = control::none(),
+) -> i32 {
+    control::diagnose(observer, "Cache-DiT is not available in the Linux engine yet.");
+    return 2;
+}
+
+fn generate_1024(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    steps: str = "40",
+    observer: control::Observer = control::none(),
+) -> i32 {
+    return run(packed_path, model_root, output_path, prompt, 1024 as usize, 1024 as usize, seed, steps, observer);
+}
+
+fn generate_sized(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    image_width: usize,
+    image_height: usize,
+    seed: u64 = 1101 as u64,
+    steps: str = "40",
+    observer: control::Observer = control::none(),
+) -> i32 {
+    return run(packed_path, model_root, output_path, prompt, image_width, image_height, seed, steps, observer);
+}
+
+fn generate_1024_cache_dit(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    threshold: f64 = 0.12f64,
+    steps: str = "40",
+    observer: control::Observer = control::none(),
+) -> i32 {
+    control::diagnose(observer, "Cache-DiT is not available in the Linux engine yet.");
+    return 2;
+}
+
+fn generate_1024_taylorseer(
+    packed_path: str,
+    model_root: str,
+    output_path: str,
+    prompt: str,
+    seed: u64 = 1101 as u64,
+    threshold: f64 = 0.24f64,
+    steps: str = "40",
+    observer: control::Observer = control::none(),
+) -> i32 {
+    control::diagnose(observer, "TaylorSeer is not available in the Linux engine yet.");
+    return 2;
+}

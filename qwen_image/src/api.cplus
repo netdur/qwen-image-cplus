@@ -4,10 +4,13 @@
 // the command-line client out of the inference implementation while preserving
 // the current phase-scoped model-memory behavior. A resident Engine can be
 // added behind this module later without changing the C ABI entry module.
+//
+// Generation runs on the backend installed in `engine` (see
+// `qwen_image_runtime`); with none installed every request fails with a
+// diagnostic rather than touching model files.
 
-import "./pipeline" as pipeline;
+import "./engine" as engine;
 import "./generation_control" as control;
-import "./multimodal_conditioning" as multimodal_conditioning;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
 import "stdlib/vec" as vec;
@@ -185,7 +188,7 @@ fn _validate(
     }
     let width: usize = _request_width(request);
     let height: usize = _request_height(request);
-    if !pipeline::output_dimensions_supported(width, height) {
+    if !output_dimensions_supported(width, height) {
         control::diagnose(observer, "Output size must use multiples of 32 and fit within the model's token limit.");
         return GenerateStatus::InvalidArgument;
     }
@@ -219,6 +222,28 @@ fn _validate(
     return GenerateStatus::Ok;
 }
 
+// The model's own limit, the same on every backend: sides of at least 256 in
+// multiples of 32, and at most 16384 target latents (a 16 x 16 pixel tile each).
+fn max_target_tokens() -> usize {
+    return 16384 as usize;
+}
+
+fn output_dimensions_supported(width: usize, height: usize) -> bool {
+    return width >= (256 as usize) && height >= (256 as usize)
+        && width % (32 as usize) == (0 as usize)
+        && height % (32 as usize) == (0 as usize)
+        && (width / (16 as usize)) *% (height / (16 as usize)) <= max_target_tokens();
+}
+
+// The installed backend, or a diagnostic when there is none.
+fn _backend(observer: control::Observer) -> option::Option[engine::Engine] {
+    if !engine::installed() {
+        control::diagnose(observer, "No image backend is installed for this platform; call qwen_image_runtime::install() first.");
+        return option::Option[engine::Engine]::None;
+    }
+    return option::Option[engine::Engine]::Some(engine::current());
+}
+
 fn _from_pipeline_status(status: i32) -> GenerateStatus {
     if status == (0 as i32) { return GenerateStatus::Ok; }
     if status == (2 as i32) { return GenerateStatus::InvalidArgument; }
@@ -237,10 +262,13 @@ fn generate_to_png(
     };
     let width: usize = _request_width(request);
     let height: usize = _request_height(request);
+    guard let option::Option[engine::Engine]::Some(backend) = _backend(observer) else {
+        return GenerateStatus::Failed;
+    };
 
     let status: i32 = if width == (256 as usize) && height == (256 as usize) {
         match request.cache {
-            CacheMode::None => pipeline::generate_256(
+            CacheMode::None => backend.generate_256(
                 request.packed_path,
                 request.model_root,
                 request.output_path,
@@ -249,7 +277,7 @@ fn generate_to_png(
                 steps,
                 observer,
             ),
-            CacheMode::CacheDiT => pipeline::generate_256_cache_dit(
+            CacheMode::CacheDiT => backend.generate_256_cache_dit(
                 request.packed_path,
                 request.model_root,
                 request.output_path,
@@ -263,7 +291,7 @@ fn generate_to_png(
         }
     } else if width == (1024 as usize) && height == (1024 as usize) {
         match request.cache {
-            CacheMode::None => pipeline::generate_1024(
+            CacheMode::None => backend.generate_1024(
                 request.packed_path,
                 request.model_root,
                 request.output_path,
@@ -272,7 +300,7 @@ fn generate_to_png(
                 steps,
                 observer,
             ),
-            CacheMode::TaylorSeer => pipeline::generate_1024_taylorseer(
+            CacheMode::TaylorSeer => backend.generate_1024_taylorseer(
                 request.packed_path,
                 request.model_root,
                 request.output_path,
@@ -282,7 +310,7 @@ fn generate_to_png(
                 steps,
                 observer,
             ),
-            CacheMode::CacheDiT => pipeline::generate_1024_cache_dit(
+            CacheMode::CacheDiT => backend.generate_1024_cache_dit(
                 request.packed_path,
                 request.model_root,
                 request.output_path,
@@ -294,7 +322,7 @@ fn generate_to_png(
             ),
         }
     } else {
-        pipeline::generate_sized(
+        backend.generate_sized(
             request.packed_path,
             request.model_root,
             request.output_path,
@@ -338,8 +366,11 @@ fn generate_multi_image_sized_to_png(
     guard let option::Option[str]::Some(steps) = _step_name(request.steps) else {
         return GenerateStatus::InvalidArgument;
     };
+    guard let option::Option[engine::Engine]::Some(backend) = _backend(observer) else {
+        return GenerateStatus::Failed;
+    };
     return _from_pipeline_status(
-        multimodal_conditioning::run_multi_image_transformer(
+        backend.generate_multi_image(
             request.packed_path,
             request.model_root,
             request.image_paths,
@@ -350,8 +381,9 @@ fn generate_multi_image_sized_to_png(
             request.seed,
             request.width,
             observer,
-            output_width: request.width,
-            output_height: request.height,
+            request.width,
+            request.height,
+            false,
         ),
     );
 }
@@ -392,8 +424,60 @@ fn invalid_generation_reports_a_specific_reason_without_model_io() {
     assert capture.message.view() == "256 × 256 output requires 25 or 40 steps.";
 }
 
+// A backend that only reports progress: cancellation must reach it through
+// the observer the API was given.
+fn _stub_square(packed: str, model: str, output: str, prompt: str, seed: u64, steps: str, observer: control::Observer) -> i32 {
+    return if control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) { 1 } else { 3 };
+}
+
+fn _stub_sized(packed: str, model: str, output: str, prompt: str, width: usize, height: usize, seed: u64, steps: str,
+               observer: control::Observer) -> i32 {
+    return if control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) { 1 } else { 3 };
+}
+
+fn _stub_multi(packed: str, model: str, images: *str, count: usize, prompt: str, steps: str, output: str, seed: u64,
+               resolution: usize, observer: control::Observer, width: usize, height: usize, benchmark: bool) -> i32 {
+    return if control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) { 1 } else { 3 };
+}
+
+fn _install_stub_engine() {
+    var stub: engine::Engine = #zero::[engine::Engine]();
+    stub.generate_256 = _stub_square;
+    stub.generate_1024 = _stub_square;
+    stub.generate_sized = _stub_sized;
+    stub.generate_multi_image = _stub_multi;
+    engine::install(stub);
+}
+
+#[test]
+fn generation_without_a_backend_fails_with_a_diagnostic() {
+    engine::uninstall();
+    var capture: DiagnosticCapture = DiagnosticCapture { message: text::new() };
+    let observer: control::Observer = control::Observer {
+        callback: 0 as fn(control::Progress, *u8) -> bool,
+        diagnostic: _capture_diagnostic,
+        context: #addr_of(capture) as *u8,
+    };
+    let request: GenerateRequest = GenerateRequest {
+        packed_path: "absent.qipack",
+        model_root: "absent-model",
+        output_path: "unused.png",
+        prompt: "test",
+        pixels: 1024 as usize,
+        steps: 4 as usize,
+        seed: 1 as u64,
+        cache: CacheMode::None,
+        cache_threshold: 0.0f64,
+        width: 0 as usize,
+        height: 0 as usize,
+    };
+    assert generate_to_png(request, observer) == GenerateStatus::Failed;
+    assert capture.message.view().has_prefix("No image backend is installed");
+}
+
 #[test]
 fn observer_cancels_both_api_paths_before_model_io() {
+    _install_stub_engine();
     let observer: control::Observer = control::Observer {
         callback: _cancel_immediately,
         diagnostic: 0 as fn(str, *u8),
@@ -427,6 +511,7 @@ fn observer_cancels_both_api_paths_before_model_io() {
         seed: 1 as u64,
     };
     assert generate_multi_image_to_png(multi, observer) == GenerateStatus::Cancelled;
+    engine::uninstall();
 }
 
 #[test]

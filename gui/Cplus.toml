@@ -3,30 +3,55 @@ name    = "gui"
 version = "0.2.2"
 edition = "2026"
 
-[macos]
-entry = "src/main.cplus"
+# The Qwen Image desktop app: facet UI over qwen_image/api. The same source on
+# macOS (AppKit through facet_appkit, Metal backend) and Linux (GTK 4 through
+# facet_gtk, CUDA backend); the few native pieces facet does not cover (save
+# dialog, file drops, preferences storage, reference-image size) are
+# `_macos` / `_linux` files beside a neutral base.
 
 [dependencies]
-stdlib        = "*"
-facet         = "*"
-facet_runtime = "*"
-flex_layout   = "*"
-events        = "*"
-qwen_image    = "*"
+stdlib             = "*"
+facet              = "*"
+facet_runtime      = "*"
+flex_layout        = "*"
+events             = "*"
+qwen_image         = "*"
+qwen_image_runtime = "*"
+inspector          = "*"
+facet_agent        = "*"
+agent_core         = "*"
+agent_inapp        = "*"
+agent_mcp          = "*"
+json               = "*"
 
 [macos.dependencies]
-facet_appkit = "*"
-appkit       = "*"
-foundation   = "*"
-metal        = "*"
-objc         = "*"
-quartzcore   = "*"
-webkit       = "*"
+qwen_image_metal = "*"
+facet_appkit     = "*"
+appkit           = "*"
+foundation       = "*"
+metal            = "*"
+objc             = "*"
+quartzcore       = "*"
+webkit           = "*"
+agent_appkit     = "*"
 
-inspector    = "*"
-facet_agent  = "*"
-agent_appkit = "*"
-agent_core   = "*"
-agent_inapp  = "*"
-agent_mcp    = "*"
-json         = "*"
+# The CUDA backend, facet's GTK 4 backend, and the GTK stack they walk (the
+# resolver validates imports against this one flat set).
+[linux.dependencies]
+qwen_image_cuda = "*"
+facet_gtk       = "*"
+agent_gtk       = "*"
+gtk4            = "*"
+gobject         = "*"
+gobject_gir     = "*"
+gio             = "*"
+glib            = "*"
+cairo           = "*"
+gdk             = "*"
+gdkpixbuf       = "*"
+graphene        = "*"
+gsk             = "*"
+harfbuzz        = "*"
+pango           = "*"
+pangocairo      = "*"
+gmodule         = "*"

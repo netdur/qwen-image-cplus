@@ -7,12 +7,11 @@ import "facet/label" as label;
 import "facet/popup" as popup;
 import "facet/text_field" as text_field;
 import "facet/vocabulary" as vocab;
-import "appkit/appkit" as ak;
-import "objc/runtime" as rt;
 import "stdlib/option" as option;
 import "stdlib/status" as status;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
+import "../native_ui" as native_ui;
 import "../preferences" as preferences;
 import "../reference_size" as reference_size;
 import "./style" as style;
@@ -101,17 +100,7 @@ impl OutputOptions {
             let _field: text_field::TextField =
                 field.set_text(edit.digits.view())
                     .set_cursor_position(edit.caret as i64);
-            if sender.is_not_null() {
-                match ak::TextField::from_raw(sender).as_control().current_editor() {
-                    option::Option[ak::Text]::Some(editor) => {
-                        editor.set_string(edit.digits.view());
-                        editor.set_selected_range(rt::Range {
-                            location: edit.caret, length: 0 as u64,
-                        });
-                    }
-                    option::Option::None => {}
-                }
-            }
+            native_ui::sync_field_editor(sender, edit.digits.view(), edit.caret);
         }
     }
 

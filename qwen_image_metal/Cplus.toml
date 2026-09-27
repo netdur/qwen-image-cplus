@@ -1,0 +1,19 @@
+[package]
+name    = "qwen_image_metal"
+version = "0.2.2"
+edition = "2026"
+
+# The Metal inference backend. It implements the core's engine seam
+# (qwen_image/engine); qwen_image_runtime installs it on macOS.
+[dependencies]
+qwen_image  = "*"
+json        = "*"
+stdlib      = "*"
+
+[macos.dependencies]
+objc          = "*"
+metal         = "*"
+foundation    = "*"
+
+[link]
+frameworks = ["CoreFoundation", "CoreGraphics", "ImageIO"]

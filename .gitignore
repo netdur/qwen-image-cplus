@@ -7,6 +7,8 @@ __pycache__/
 target/
 /lib/
 /qwen_image/lib/
+/qwen_image_metal/lib/
+/qwen_image_runtime/lib/
 /dist/
 tests/fixtures/small/
 /bugs/

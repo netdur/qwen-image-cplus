@@ -1,0 +1,123 @@
+// File drops on Linux: a GTK 4 GtkDropTarget for GdkFileList on the facet
+// node's widget. Same surface as file_drop.cplus: "enter" asks the handler
+// about every file with `commit` false and accepts the drag when it takes
+// any; "drop" hands each file over with `commit` true.
+
+import "stdlib/text" as text;
+
+#[link_name = "gdk_file_list_get_type"]
+extern fn gdk_file_list_get_type() -> u64;
+#[link_name = "gtk_drop_target_new"]
+extern fn gtk_drop_target_new(kind: u64, actions: u32) -> *u8;
+#[link_name = "gtk_drop_target_set_preload"]
+extern fn gtk_drop_target_set_preload(target: *u8, preload: i32);
+#[link_name = "gtk_drop_target_get_value"]
+extern fn gtk_drop_target_get_value(target: *u8) -> *u8;
+#[link_name = "gtk_widget_add_controller"]
+extern fn gtk_widget_add_controller(widget: *u8, controller: *u8);
+#[link_name = "gtk_widget_remove_controller"]
+extern fn gtk_widget_remove_controller(widget: *u8, controller: *u8);
+#[link_name = "g_signal_connect_data"]
+extern fn g_signal_connect_data(instance: *u8, signal: *u8, handler: *u8, data: *u8, destroy: *u8, flags: u32) -> u64;
+#[link_name = "g_object_set_data_full"]
+extern fn g_object_set_data_full(object: *u8, key: *u8, data: *u8, destroy: *u8);
+#[link_name = "g_object_get_data"]
+extern fn g_object_get_data(object: *u8, key: *u8) -> *u8;
+#[link_name = "g_object_set_data"]
+extern fn g_object_set_data(object: *u8, key: *u8, data: *u8);
+#[link_name = "g_value_get_boxed"]
+extern fn g_value_get_boxed(value: *u8) -> *u8;
+#[link_name = "gdk_file_list_get_files"]
+extern fn gdk_file_list_get_files(list: *u8) -> *u8;
+#[link_name = "g_slist_free"]
+extern fn g_slist_free(list: *u8);
+#[link_name = "g_file_get_path"]
+extern fn g_file_get_path(file: *u8) -> *u8;
+#[link_name = "g_free"]
+extern fn g_free(pointer: *u8);
+#[link_name = "strlen"]
+extern fn qi_strlen(s: *u8) -> usize;
+#[link_name = "malloc"]
+extern fn qi_malloc(bytes: usize) -> *u8;
+#[link_name = "free"]
+extern fn qi_free(pointer: *u8);
+
+const ACTION_COPY: u32 = 1;
+
+// The handler and its context, owned by the drop target (freed with it).
+struct Binding {
+    handler: fn(text::Text, bool, *u8) -> bool,
+    opaque context: *u8,
+}
+
+// A GSList node: data, then next.
+struct ListNode {
+    opaque data: *u8,
+    opaque next: *ListNode,
+}
+
+fn controller_key() -> *u8 { return #str_ptr("qwen-image-file-drop\0"); }
+
+// Calls the binding's handler for every file in a GdkFileList value.
+fn visit(value: *u8, binding: *Binding, commit: bool) -> bool {
+    if value.is_null() || binding.is_null() { return false; }
+    let files: *u8 = g_value_get_boxed(value);
+    if files.is_null() { return false; }
+    let list: *ListNode = gdk_file_list_get_files(files) as *ListNode;
+    var node: *ListNode = list;
+    var accepted: bool = false;
+    while !node.is_null() {
+        let raw: *u8 = g_file_get_path((*node).data);
+        if !raw.is_null() {
+            let path: text::Text = text::from_str(#str_from_raw_parts(raw, qi_strlen(raw)));
+            g_free(raw);
+            let handler: fn(text::Text, bool, *u8) -> bool = (*binding).handler;
+            if handler(path, commit, (*binding).context) { accepted = true; }
+        }
+        node = (*node).next;
+    }
+    g_slist_free(list as *u8);
+    return accepted;
+}
+
+fn on_enter(target: *u8, x: f64, y: f64, data: *u8) -> u32 {
+    let value: *u8 = gtk_drop_target_get_value(target);
+    return if visit(value, data as *Binding, false) { ACTION_COPY } else { 0 as u32 };
+}
+
+fn on_drop(target: *u8, value: *u8, x: f64, y: f64, data: *u8) -> i32 {
+    return if visit(value, data as *Binding, true) { 1 as i32 } else { 0 as i32 };
+}
+
+fn release_binding(data: *u8) {
+    qi_free(data);
+}
+
+fn install(view: *u8, class_name: *u8,
+handler: fn(text::Text, bool, *u8) -> bool, context: *u8 = 0 as *u8) {
+    if view.is_null() { return; }
+    clear(view);
+    let binding: *Binding = qi_malloc(#size_of::[Binding]()) as *Binding;
+    if binding.is_null() { return; }
+    (*binding).handler = handler;
+    (*binding).context = context;
+    let target: *u8 = gtk_drop_target_new(gdk_file_list_get_type(), ACTION_COPY);
+    // Preload the file list so "enter" can ask the handler about it.
+    gtk_drop_target_set_preload(target, 1 as i32);
+    let release: fn(*u8) = release_binding;
+    let entered: fn(*u8, f64, f64, *u8) -> u32 = on_enter;
+    let dropped: fn(*u8, *u8, f64, f64, *u8) -> i32 = on_drop;
+    g_object_set_data_full(target, #str_ptr("qwen-image-binding\0"), binding as *u8, release as *u8);
+    let _entered: u64 = g_signal_connect_data(target, #str_ptr("enter\0"), entered as *u8, binding as *u8, 0 as *u8, 0 as u32);
+    let _dropped: u64 = g_signal_connect_data(target, #str_ptr("drop\0"), dropped as *u8, binding as *u8, 0 as *u8, 0 as u32);
+    gtk_widget_add_controller(view, target);
+    g_object_set_data(view, controller_key(), target);
+}
+
+fn clear(view: *u8) {
+    if view.is_null() { return; }
+    let target: *u8 = g_object_get_data(view, controller_key());
+    if target.is_null() { return; }
+    g_object_set_data(view, controller_key(), 0 as *u8);
+    gtk_widget_remove_controller(view, target);
+}

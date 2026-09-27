@@ -1,0 +1,8 @@
+// macOS runtime: the Metal backend. Idempotent; call it once before the first
+// `qwen_image/api` request (the CLI, the C library and the GUI all do).
+
+import "qwen_image_metal/backend" as backend;
+
+fn install() {
+    backend::install();
+}

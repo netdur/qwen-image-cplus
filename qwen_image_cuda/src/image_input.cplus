@@ -1,0 +1,166 @@
+// Condition-image input for image-conditioned generation (Linux).
+//
+// native/image.c decodes the file (stb_image, EXIF orientation applied as
+// Diffusers' `load_image` does) and resizes it exactly as the pinned pipeline's
+// Pillow Lanczos resize does. The same resized RGBA feeds both consumers: the
+// VAE reads all four channels in [-1, 1], and Qwen3-VL reads RGB composited
+// over white, cut into 16x16 patches repeated over two temporal frames.
+
+import "./image_conditioning" as conditioning;
+import "./int4_pack" as pack;
+import "./transformer" as transformer;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+#[link_name = "qi_image_load"]
+extern fn qi_image_load(path: *u8, width: *i32, height: *i32) -> *u8;
+#[link_name = "qi_image_info"]
+extern fn qi_image_info(path: *u8, width: *i32, height: *i32) -> i32;
+#[link_name = "qi_image_free"]
+extern fn qi_image_free(pixels: *u8);
+#[link_name = "qi_image_resize_lanczos"]
+extern fn qi_image_resize_lanczos(input: *u8, input_width: i32, input_height: i32, output: *u8, output_width: i32,
+    output_height: i32) -> i32;
+#[link_name = "qi_image_composite_white"]
+extern fn qi_image_composite_white(rgba: *u8, pixels: usize, rgb: *u8);
+
+const PATCH: usize = 16;
+const MERGE: usize = 2;
+const TEMPORAL: usize = 2;
+// Values per vision patch: 3 channels x 2 frames x 16 x 16.
+const PATCH_VALUES: usize = 1536;
+
+struct Dimensions {
+    width: usize,
+    height: usize,
+}
+
+// An image file's displayed size (EXIF orientation applied) from its header,
+// without decoding it; None when the file is not a readable image.
+fn source_dimensions(path: str) -> option::Option[Dimensions] {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[Dimensions]::None; };
+    var width: i32 = 0 as i32;
+    var height: i32 = 0 as i32;
+    if qi_image_info(c_path.as_ptr(), #addr_of(width), #addr_of(height)) != (0 as i32)
+        || width <= (0 as i32) || height <= (0 as i32) {
+        return option::Option[Dimensions]::None;
+    }
+    return option::Option[Dimensions]::Some(Dimensions { width: width as usize, height: height as usize });
+}
+
+struct Image {
+    shape: conditioning::Shape,
+    // Resized straight-alpha RGBA8, then RGB8 over white.
+    rgba: pack::Buffer,
+    rgb: pack::Buffer,
+}
+
+fn load_resized(path: str, output_resolution: usize = 512 as usize) -> option::Option[Image] {
+    guard let option::Option[text::CString]::Some(c_path) = pack::with_c_path(path) else { return option::Option[Image]::None; };
+    var width: i32 = 0 as i32;
+    var height: i32 = 0 as i32;
+    let decoded: *u8 = qi_image_load(c_path.as_ptr(), #addr_of(width), #addr_of(height));
+    if decoded.is_null() {
+        io::eprintln("image input: could not decode ${path}");
+        return option::Option[Image]::None;
+    }
+    guard let option::Option[conditioning::Shape]::Some(shape) = conditioning::calculate_shape(width as usize, height as usize,
+            output_resolution) else {
+        qi_image_free(decoded);
+        return option::Option[Image]::None;
+    };
+    let pixels: usize = shape.width *% shape.height;
+    guard let option::Option[pack::Buffer]::Some(rgba) = pack::Buffer::allocate(pixels *% (4 as usize)) else {
+        qi_image_free(decoded);
+        return option::Option[Image]::None;
+    };
+    guard let option::Option[pack::Buffer]::Some(rgb) = pack::Buffer::allocate(pixels *% (3 as usize)) else {
+        qi_image_free(decoded);
+        return option::Option[Image]::None;
+    };
+    let resized: i32 = qi_image_resize_lanczos(decoded, width, height, rgba.pointer, shape.width as i32, shape.height as i32);
+    qi_image_free(decoded);
+    if resized != (0 as i32) { return option::Option[Image]::None; }
+    qi_image_composite_white(rgba.pointer, pixels, rgb.pointer);
+    return option::Option[Image]::Some(Image { shape: shape, rgba: rgba, rgb: rgb });
+}
+
+// VAE input, [4, height, width] in [-1, 1].
+fn vae_input(image: Image, output: *f32) {
+    let pixels: usize = image.shape.width *% image.shape.height;
+    let rgba: *u8 = image.rgba.pointer;
+    var pixel: usize = 0 as usize;
+    while pixel < pixels {
+        var channel: usize = 0 as usize;
+        while channel < (4 as usize) {
+            output[channel *% pixels +% pixel] = rgba[pixel *% (4 as usize) +% channel] as f32 / 255.0f32 * 2.0f32 - 1.0f32;
+            channel = channel +% (1 as usize);
+        }
+        pixel = pixel +% (1 as usize);
+    }
+}
+
+// Qwen3-VL processor output, [grid_h * grid_w, 1536]. Patches are ordered by
+// 2x2 merge group (group row, group column, row in group, column in group);
+// each patch holds channel, frame, row, column with values (x / 255 - 0.5) / 0.5.
+fn vision_patches(image: Image, output: *f32) {
+    let width: usize = image.shape.width;
+    let grid_w: usize = image.shape.vision_grid_width;
+    let grid_h: usize = image.shape.vision_grid_height;
+    let rgb: *u8 = image.rgb.pointer;
+    var patch: usize = 0 as usize;
+    var group_row: usize = 0 as usize;
+    while group_row < grid_h / MERGE {
+        var group_column: usize = 0 as usize;
+        while group_column < grid_w / MERGE {
+            var inner: usize = 0 as usize;
+            while inner < MERGE *% MERGE {
+                let patch_row: usize = group_row *% MERGE +% inner / MERGE;
+                let patch_column: usize = group_column *% MERGE +% inner % MERGE;
+                let base: *f32 = output + patch *% PATCH_VALUES;
+                var channel: usize = 0 as usize;
+                while channel < (3 as usize) {
+                    var y: usize = 0 as usize;
+                    while y < PATCH {
+                        var x: usize = 0 as usize;
+                        while x < PATCH {
+                            let source: usize = ((patch_row *% PATCH +% y) *% width +% patch_column *% PATCH +% x) *% (3 as usize) +% channel;
+                            let value: f32 = rgb[source] as f32 / 255.0f32 * 2.0f32 - 1.0f32;
+                            var frame: usize = 0 as usize;
+                            while frame < TEMPORAL {
+                                base[((channel *% TEMPORAL +% frame) *% PATCH +% y) *% PATCH +% x] = value;
+                                frame = frame +% (1 as usize);
+                            }
+                            x = x +% (1 as usize);
+                        }
+                        y = y +% (1 as usize);
+                    }
+                    channel = channel +% (1 as usize);
+                }
+                patch = patch +% (1 as usize);
+                inner = inner +% (1 as usize);
+            }
+            group_column = group_column +% (1 as usize);
+        }
+        group_row = group_row +% (1 as usize);
+    }
+}
+
+// Writes vae_input.f32 and pixel_values.f32 for `path` into `directory`, in
+// the layouts tools/dump_oracle_edit.py dumps.
+fn write_inputs(path: str, output_resolution: usize, directory: str) -> i32 {
+    guard let option::Option[Image]::Some(image) = load_resized(path, output_resolution) else { return 1; };
+    let pixels: usize = image.shape.width *% image.shape.height;
+    let patches: usize = image.shape.vision_grid_width *% image.shape.vision_grid_height;
+    guard let option::Option[pack::Buffer]::Some(vae) = pack::Buffer::allocate(pixels *% (16 as usize)) else { return 1; };
+    guard let option::Option[pack::Buffer]::Some(vision) = pack::Buffer::allocate(patches *% PATCH_VALUES *% (4 as usize)) else { return 1; };
+    vae_input(image, vae.pointer as *f32);
+    vision_patches(image, vision.pointer as *f32);
+    if !transformer::write_floats("${directory}/vae_input.f32", vae.pointer, vae.length)
+        || !transformer::write_floats("${directory}/pixel_values.f32", vision.pointer, vision.length) {
+        return 1;
+    }
+    io::println("image input: ${image.shape.width}x${image.shape.height}, ${patches} patches, ${image.shape.vision_tokens} vision tokens");
+    return 0;
+}

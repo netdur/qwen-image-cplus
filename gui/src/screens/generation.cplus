@@ -10,8 +10,6 @@ import "facet/vocabulary" as vocab;
 import "facet/window_chrome" as _;
 import "facet_runtime/runtime" as runtime;
 import "events/events" as events;
-import "appkit/appkit" as ak;
-import "foundation/foundation" as foundation;
 import "stdlib/option" as option;
 import "stdlib/fs" as fs;
 import "stdlib/result" as result;
@@ -19,6 +17,8 @@ import "stdlib/status" as status;
 import "stdlib/text" as text;
 import "stdlib/time" as time;
 import "stdlib/vec" as vec;
+import "../files" as files;
+import "../native_ui" as native_ui;
 import "../components/style" as style;
 import "../components/compose" as compose;
 import "../components/preview" as preview;
@@ -27,11 +27,13 @@ import "../new_image" as new_image;
 
 extern fn getpid() -> i32;
 
-fn copy_png_to(source: str, destination: str) -> bool {
-    if source == destination { return true; }
-    guard let option::Option[foundation::Data]::Some(data) =
-        foundation::Data::data_with_contents_of_file(source) else { return false; };
-    return data.write_to_file(destination, true);
+// Copies the current image to the path the save dialog returned.
+fn save_current_image_to(destination: text::Text, context: *u8) {
+    guard let option::Option[text::Text]::Some(source) = current_image::path() else { return; };
+    if !files::copy_file(source.view(), destination.view()) {
+        runtime::alert("Could not save image",
+        "The image could not be copied to the chosen location.", "OK");
+    }
 }
 
 struct Generation {
@@ -125,23 +127,9 @@ impl Generation {
     }
 
     fn on_save(ref this, _sender: *u8) {
-        guard let option::Option[text::Text]::Some(source) =
+        guard let option::Option[text::Text]::Some(_source) =
             current_image::path() else { return; };
-        let panel: ak::SavePanel = ak::SavePanel::save_panel();
-        panel.set_title("Save Image");
-        panel.set_prompt("Save");
-        panel.set_name_field_string_value("Qwen Image.png");
-        var types: vec::Vec[text::Text] = vec::new::[text::Text]();
-        let _added: status::Status = types.append("png".to_text());
-        panel.set_allowed_file_types(types);
-        if panel.run_modal() != (1 as i64) { return; }
-        guard let option::Option[ak::URL]::Some(url) = panel.u_r_l() else { return; };
-        guard let option::Option[text::Text]::Some(destination) =
-            foundation::URL::from_raw(url.raw()).path() else { return; };
-        if !copy_png_to(source.view(), destination.view()) {
-            runtime::alert("Could not save image",
-            "The image could not be copied to the chosen location.", "OK");
-        }
+        let _shown: bool = native_ui::choose_save_path("Qwen Image.png", save_current_image_to, 0 as *u8);
     }
 
 }
@@ -209,22 +197,7 @@ impl Generation: component::Lifecycle {
         if why != component::Attach::Active || this.did_initial_focus { return; }
         match text_area::find("prompt:input") {
             option::Option[text_area::TextArea]::Some(input) => {
-                let native: *u8 = input.native();
-                if native.is_null() { return; }
-                match ak::ScrollView::from_raw(native).document_view() {
-                    option::Option[ak::View]::Some(editor) => {
-                        match editor.window() {
-                            option::Option[ak::Window]::Some(window) => {
-                                window.set_initial_first_responder(editor);
-                                if window.make_first_responder(editor.as_responder()) {
-                                    this.did_initial_focus = true;
-                                }
-                            }
-                            option::Option::None => {}
-                        }
-                    }
-                    option::Option::None => {}
-                }
+                if native_ui::focus_prompt(input) { this.did_initial_focus = true; }
             }
             option::Option::None => {}
         }
@@ -252,7 +225,7 @@ fn save_copy_replaces_destination_without_changing_output() {
     let destination: text::Text = "/tmp/qwen-image-gui-save-${nonce}-destination.png";
     let _source_written = fs::write_string(source, "new png bytes");
     let _destination_written = fs::write_string(destination, "old bytes");
-    assert copy_png_to(source, destination);
+    assert files::copy_file(source, destination);
     match fs::read_to_string(destination) {
         result::Result::Ok(value) => { assert value.view() == "new png bytes"; }
         result::Result::Err(_) => { assert false; }

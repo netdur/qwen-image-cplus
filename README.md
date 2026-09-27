@@ -57,7 +57,7 @@ binaries; users do not need the C+ compiler. This project and its formula live
 in one repository. With Homebrew 7, trust only this formula when prompted:
 
 ```sh
-brew tap netdur/qwen-image-cplus https://github.com/netdur/qwen-image-cplus.git
+brew tap netdur/qwen_image_metal_dev https://github.com/netdur/qwen-image-cplus.git
 brew trust --formula netdur/qwen-image-cplus/qwen-image-cplus
 brew install netdur/qwen-image-cplus/qwen-image-cplus
 ```
@@ -535,18 +535,37 @@ Two reference-side findings came out of this:
 
 ## Package and API layout
 
-The repository is split into four C+ packages, but remains one product:
+One product, built from C+ packages that sit side by side at the repository
+root, in the layered shape C+'s own `facet` family uses: a portable core, one
+backend per GPU API, and a runtime that picks the backend for the platform.
 
-- `qwen_image/` is the native engine package. It owns inference, model I/O,
-  Metal kernels, scheduling, caching, VAE decode, and PNG output. Native C+
-  clients import `qwen_image/api`.
-- `cli/` is a client of that engine. Normal generation commands go through
-  the public API; diagnostic and quantization commands can still reach the
-  lower engine modules while those developer tools are being stabilized.
-- `gui/` is the AppKit generation client. It shares the engine through the
-  native worker and is packaged as `Qwen Image.app` in the release archive.
-- `ffi/` is a thin C-ABI adapter over the same native API. C+ generates its
+- `qwen_image/` is the portable core: the public API (`qwen_image/api`),
+  generation control, QIPACK metadata (`pack_info`), positional file I/O, and
+  the engine seam (`engine`) a backend fills. It names no platform and links
+  nothing.
+- `qwen_image_metal/` is the Metal backend (macOS): inference, model I/O,
+  Metal kernels, scheduling, caching, VAE, and PNG output.
+- `qwen_image_cuda/` is the CUDA backend (Linux today; the backend is CUDA,
+  not Linux, so a Windows port adds platform files and a link table).
+- `qwen_image_runtime/` installs the backend for the platform being built:
+  `runtime_macos` installs Metal, `runtime_linux` installs CUDA, and any other
+  target gets a neutral runtime under which the API reports that no backend
+  exists.
+- `cli/` is the `qwen-image-cplus` command-line client: the same source on
+  every platform, over the public API only.
+- `gui/` is the AppKit generation client (macOS), packaged as
+  `Qwen Image.app` in the release archive.
+- `ffi/` is a thin C-ABI adapter over the same API. C+ generates its
   `qwen_image.h`; there is no separately maintained handwritten header.
+- `qwen_image_metal_dev/` and `qwen_image_cuda_dev/` hold each backend's
+  development commands (probes, stage validation, benchmarks, pack tools);
+  `qwen_image_quantize/` writes the CUDA backend's INT4 packs.
+
+Applications depend on `qwen_image` and `qwen_image_runtime`, call
+`runtime::install()` once, and then use `qwen_image/api`. The `qwen_image*`
+packages resolve as sibling directories, so each package's `vendor/` holds
+only third-party C+ packages (`scripts/link_vendor.sh` points them at a shared
+C+ vendor folder).
 
 This separation follows C+'s two library forms. An entry-less package is the
 native, prebuilt library consumed by another C+ package. A `[library]` target
@@ -685,95 +704,91 @@ dist/lib/libqwen_image.a
 dist/lib/libqwen_image.dylib
 ```
 
-For development, verify the four package boundaries independently:
+For development, verify the package boundaries independently:
 
 ```sh
-cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus cli/src/main.cplus ffi/src/ffi.cplus
+cpc fmt --check qwen_image/src/api.cplus qwen_image/src/engine.cplus cli/src/main.cplus ffi/src/ffi.cplus
 (cd qwen_image && cpc check && cpc test)
+(cd qwen_image_metal && cpc check && cpc test)
 (cd cli && cpc check && cpc build && cpc test)
 (cd ffi && cpc check && cpc build && cpc test)
 (cd gui && cpc check && cpc build)
-./cli/target/debug/qwen-image-cplus probe-stress
-./cli/target/debug/qwen-image-cplus test-metal-primitives
-./cli/target/debug/qwen-image-cplus test-metal-linear
-./cli/target/debug/qwen-image-cplus benchmark-linear
-./cli/target/debug/qwen-image-cplus test-metal-int8-linear
-./cli/target/debug/qwen-image-cplus benchmark-int8-linear
-./cli/target/debug/qwen-image-cplus test-attention-cache
-./cli/target/debug/qwen-image-cplus benchmark-attention
-./cli/target/debug/qwen-image-cplus benchmark-production-attention 256
-./cli/target/debug/qwen-image-cplus benchmark-production-attention 1024
-./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 1
-./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 2
-./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-1024 transformer.qipack 13
-./cli/target/debug/qwen-image-cplus benchmark-transformer-trajectory-2048 transformer.qipack
-./cli/target/debug/qwen-image-cplus test-transformer-block /path/to/model/snapshot
-./cli/target/debug/qwen-image-cplus quantize-block0 /path/to/model/snapshot block0.qipack
-./cli/target/debug/qwen-image-cplus quantize-transformer /path/to/model/snapshot transformer.qipack
-./cli/target/debug/qwen-image-cplus quantize-transformer-q4 /path/to/model/snapshot transformer-q4.qipack
-./cli/target/debug/qwen-image-cplus verify-packed block0.qipack
-./cli/target/debug/qwen-image-cplus verify-packed transformer.qipack
-./cli/target/debug/qwen-image-cplus verify-packed-source block0.qipack /path/to/model/snapshot
-./cli/target/debug/qwen-image-cplus verify-packed-source transformer.qipack /path/to/model/snapshot
-./cli/target/debug/qwen-image-cplus test-transformer-block-int8 block0.qipack
-./cli/target/debug/qwen-image-cplus test-transformer-mixed transformer.qipack
-./cli/target/debug/qwen-image-cplus test-transformer-complete transformer.qipack
-./cli/target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 256
-./cli/target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 512
-./cli/target/debug/qwen-image-cplus test-transformer-scale transformer.qipack 1024
-./cli/target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 1
-./cli/target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 2
-./cli/target/debug/qwen-image-cplus test-transformer-trajectory transformer.qipack 40
-./cli/target/debug/qwen-image-cplus test-transformer-trajectory-1024 transformer.qipack 40 /path/to/trajectory_1024
-./cli/target/debug/qwen-image-cplus test-transformer-cache-dit transformer.qipack 0.12
-./cli/target/debug/qwen-image-cplus test-transformer-cache-dit-1024 transformer.qipack 0.12 /path/to/trajectory_1024
-./cli/target/debug/qwen-image-cplus test-transformer-taylorseer transformer.qipack 0.24
-./cli/target/debug/qwen-image-cplus test-transformer-bottleneck transformer.qipack
-./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot small
-./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 256
-./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024
-./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 1024-profile
-./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot 2048
-./cli/target/debug/qwen-image-cplus test-vae-decoder /path/to/model/snapshot trajectory-1024 /path/to/vae_oracle_1024
-./cli/target/debug/qwen-image-cplus test-image-output reference.png
-./cli/target/debug/qwen-image-cplus test-image-input /tmp/reference-input.png
-./cli/target/debug/qwen-image-cplus test-image-orientation tests/fixtures/image_orientation
-./cli/target/debug/qwen-image-cplus test-vae-encoder /path/to/model/snapshot /path/to/reference.png 512
-./cli/target/debug/qwen-image-cplus test-vision-encoder /path/to/model/snapshot /path/to/reference.png 512
-./cli/target/debug/qwen-image-cplus test-vision-encoder-oracle /path/to/model/snapshot /path/to/vision_fixture
-./cli/target/debug/qwen-image-cplus test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
-./cli/target/debug/qwen-image-cplus test-pipeline-1024-oracle transformer.qipack /path/to/model/snapshot output.png /path/to/trajectory_1024 /path/to/vae_oracle_1024
-./cli/target/debug/qwen-image-cplus test-pipeline-cache-dit-1024-oracle transformer.qipack /path/to/model/snapshot cache.png 0.12 /path/to/trajectory_1024 /path/to/vae_oracle_1024
-./cli/target/debug/qwen-image-cplus test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
-./cli/target/debug/qwen-image-cplus test-native-inputs
-./cli/target/debug/qwen-image-cplus test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
-./cli/target/debug/qwen-image-cplus generate transformer.qipack /path/to/model/snapshot output.png "your prompt" 1344 768 1101 40
-./cli/target/debug/qwen-image-cplus generate transformer.qipack /path/to/model/snapshot output.png "your prompt" 2048 2048 1301 4
-./cli/target/debug/qwen-image-cplus generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
-./cli/target/debug/qwen-image-cplus generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
-./cli/target/debug/qwen-image-cplus generate-256-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
-./cli/target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25 none
-./cli/target/debug/qwen-image-cplus generate-1024 viggle.qipack /path/to/model/snapshot output.png "your prompt" 1301
-./cli/target/debug/qwen-image-cplus generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1301 40 cache-dit-0.16
-./cli/target/debug/qwen-image-cplus pack-metadata transformer.qipack
-./cli/target/debug/qwen-image-cplus pack-metadata transformer.qipack steps=40 cache=taylorseer
-./cli/target/debug/qwen-image-cplus generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
-./cli/target/debug/qwen-image-cplus generate-1024-taylorseer transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 1101 40
-./cli/target/debug/qwen-image-cplus generate-1024-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
-./cli/target/debug/qwen-image-cplus benchmark-q4-eager-1024 transformer-q4.qipack /path/to/model/snapshot eager.png "your prompt" 1301 40
-./cli/target/debug/qwen-image-cplus benchmark-q4-inference-1024 transformer-q4.qipack /path/to/model/snapshot destination.png "your prompt" 1301 40
-./cli/target/debug/qwen-image-cplus benchmark-q4-direct-1024 transformer-q4.qipack /path/to/model/snapshot direct.png "your prompt" 1301 1
-./cli/target/debug/qwen-image-cplus benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
-./cli/target/debug/qwen-image-cplus test-tokenizer /path/to/model/snapshot
-./cli/target/debug/qwen-image-cplus test-multi-image-prompt /path/to/model/snapshot
-./cli/target/debug/qwen-image-cplus test-multi-image-conditioning /path/to/model/snapshot first.png second.png "Combine both references"
-./cli/target/debug/qwen-image-cplus test-multi-image-transformer transformer.qipack /path/to/model/snapshot first.png second.png "Combine both references" 2
-./cli/target/debug/qwen-image-cplus generate-multi-image-512 transformer.qipack /path/to/model/snapshot output.png "Combine the references" 1301 40 first.png second.png [more.png ...]
-./cli/target/debug/qwen-image-cplus generate-multi-image-512 viggle.qipack /path/to/model/snapshot output.png "Combine the references" 1301 pack first.png second.png
-./cli/target/debug/qwen-image-cplus generate-multi-image-1024 viggle.qipack /path/to/model/snapshot output.png "Change the headline" 1301 pack reference.png
-./cli/target/debug/qwen-image-cplus generate-multi-image-sized viggle.qipack /path/to/model/snapshot output.png "Edit this image" 1301 pack 768 512 reference.png
-./cli/target/debug/qwen-image-cplus test-text-encoder /path/to/model/snapshot
-./cli/target/debug/qwen-image-cplus verify-model /path/to/model/snapshot
+(cd qwen_image_metal_dev && cpc build)
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev probe-stress
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-metal-primitives
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-metal-linear
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-linear
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-metal-int8-linear
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-int8-linear
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-attention-cache
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-attention
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-production-attention 256
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-production-attention 1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-transformer-trajectory-1024 transformer.qipack 1
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-transformer-trajectory-1024 transformer.qipack 2
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-transformer-trajectory-1024 transformer.qipack 13
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-transformer-trajectory-2048 transformer.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-block /path/to/model/snapshot
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev quantize-block0 /path/to/model/snapshot block0.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev quantize-transformer /path/to/model/snapshot transformer.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev quantize-transformer-q4 /path/to/model/snapshot transformer-q4.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev verify-packed block0.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev verify-packed transformer.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev verify-packed-source block0.qipack /path/to/model/snapshot
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev verify-packed-source transformer.qipack /path/to/model/snapshot
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-block-int8 block0.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-mixed transformer.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-complete transformer.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-scale transformer.qipack 256
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-scale transformer.qipack 512
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-scale transformer.qipack 1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-trajectory transformer.qipack 1
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-trajectory transformer.qipack 2
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-trajectory transformer.qipack 40
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-trajectory-1024 transformer.qipack 40 /path/to/trajectory_1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-cache-dit transformer.qipack 0.12
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-cache-dit-1024 transformer.qipack 0.12 /path/to/trajectory_1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-taylorseer transformer.qipack 0.24
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-transformer-bottleneck transformer.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vae-decoder /path/to/model/snapshot small
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vae-decoder /path/to/model/snapshot 256
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vae-decoder /path/to/model/snapshot 1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vae-decoder /path/to/model/snapshot 1024-profile
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vae-decoder /path/to/model/snapshot 2048
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vae-decoder /path/to/model/snapshot trajectory-1024 /path/to/vae_oracle_1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-image-output reference.png
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-image-input /tmp/reference-input.png
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-image-orientation tests/fixtures/image_orientation
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vae-encoder /path/to/model/snapshot /path/to/reference.png 512
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vision-encoder /path/to/model/snapshot /path/to/reference.png 512
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-vision-encoder-oracle /path/to/model/snapshot /path/to/vision_fixture
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-pipeline-1024-oracle transformer.qipack /path/to/model/snapshot output.png /path/to/trajectory_1024 /path/to/vae_oracle_1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-pipeline-cache-dit-1024-oracle transformer.qipack /path/to/model/snapshot cache.png 0.12 /path/to/trajectory_1024 /path/to/vae_oracle_1024
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-pipeline-cache-dit-256 transformer.qipack /path/to/model/snapshot cache.png 0.12
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-native-inputs
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-native-pipeline-256 transformer.qipack /path/to/model/snapshot output.png
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-256-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-256-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101 25 none
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-1024 viggle.qipack /path/to/model/snapshot output.png "your prompt" 1301
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-1024 transformer.qipack /path/to/model/snapshot output.png "your prompt" 1301 40 cache-dit-0.16
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev pack-metadata transformer.qipack
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev pack-metadata transformer.qipack steps=40 cache=taylorseer
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-1024-cache-dit transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.12 1101 25
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-1024-taylorseer transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 1101 40
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev generate-1024-bottleneck transformer.qipack /path/to/model/snapshot output.png "your prompt" 1101
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-q4-eager-1024 transformer-q4.qipack /path/to/model/snapshot eager.png "your prompt" 1301 40
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-q4-inference-1024 transformer-q4.qipack /path/to/model/snapshot destination.png "your prompt" 1301 40
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-q4-direct-1024 transformer-q4.qipack /path/to/model/snapshot direct.png "your prompt" 1301 1
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev benchmark-process-reuse-256 transformer.qipack /path/to/model/snapshot output.png "your prompt" 0.24 2 1101
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-tokenizer /path/to/model/snapshot
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-multi-image-prompt /path/to/model/snapshot
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-multi-image-conditioning /path/to/model/snapshot first.png second.png "Combine both references"
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-multi-image-transformer transformer.qipack /path/to/model/snapshot first.png second.png "Combine both references" 2
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev test-text-encoder /path/to/model/snapshot
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev verify-model /path/to/model/snapshot
 ```
 
 The storage-only Q4 builder implements the plan-6 H256 rotation rather than
@@ -976,7 +991,7 @@ the FLUX-tuned policy failed Qwen's 256px visual gate and was not promoted to a
 Inspect a shard, optionally filtering tensor names:
 
 ```sh
-./cli/target/debug/qwen-image-cplus inspect /path/to/shard.safetensors proj_out
+./qwen_image_metal_dev/target/debug/qwen_image_metal_dev inspect /path/to/shard.safetensors proj_out
 ```
 
 ## Implemented foundation
@@ -1826,7 +1841,7 @@ Inspect a shard, optionally filtering tensor names:
   measurements are in `benchmarks/m1-max-vae-1024-profile.json`.
 - That FP32 framework path now exists and is the default. Every decoder
   convolution runs through MPSGraph FP32 NHWC convolution in
-  `qwen_image/src/mps_graph_conv.cplus`, including 1x1 layers and the nearest-2x
+  `qwen_image_metal/src/mps_graph_conv.cplus`, including 1x1 layers and the nearest-2x
   upsample followed by 3x3. Weights are bound in place from the Safetensors
   mapping as flat `MPSNDArray`s and reshaped to OIHW inside the graph.
   - **Why the old kernel was slow.** From layer FLOPs, the custom kernel
@@ -2260,7 +2275,7 @@ repeatable observed range is therefore about 38-39 seconds.
     `sigmas=None`, `shift_terminal=None` and `true_cfg_scale=1.0`. That is
     the default `linspace(1, 1/4)` with the resolution mu shift and no
     terminal stretch, giving model timesteps 1000 / 857.19 / 666.76 /
-    400.10. This matches `qwen_image/src/scheduler.cplus` and its unit test, and
+    400.10. This matches `qwen_image_metal/src/scheduler.cplus` and its unit test, and
     confirms that CFG stays off. Viggle has since published a 5-step
     rank-256 LoRA (v0.2) whose card recommends explicit nodes
     `[1.0, 0.875, 0.75, 0.5, 0.25]`. Running it would need a `sigmas=`
@@ -2302,7 +2317,7 @@ repeatable observed range is therefore about 38-39 seconds.
     final-latent nRMSE (limit 1.1%); steps 1 and 2 are unchanged.
   - **Steel attention for cached steps.** MLX's steel attention kernel
     (`ml-explore/mlx` v0.32.2, MIT; flattened into
-    `qwen_image/kernels/mlx_steel_attention.metal`) uses only `simdgroup_matrix`
+    `qwen_image_metal/kernels/mlx_steel_attention.metal`) uses only `simdgroup_matrix`
     operations, so it compiles here, unlike Metal FlashAttention. At the
     cached 1024 shape (4,096 queries x 4,127-4,128 keys, 32 heads, D 128,
     FP16), MLX's own SDPA measured 36.4-40.8 ms per block against about
@@ -2630,7 +2645,7 @@ so `gui/src/file_drop.cplus` adds an AppKit file-URL destination to the two
 existing card views; it does not replace their click controls. Drop handlers
 are cleared when their components unmount. Prompt text and reference images
 remain session-only.
-The generation worker in `qwen_image/src/generation_worker.cplus` is driven by
+The generation worker in `qwen_image_metal/src/generation_worker.cplus` is driven by
 `gui/src/generation_session.cplus`. A single long-lived thread accepts
 an owned request through a typed channel, executes the native API, and sends
 typed progress and completion events back through another channel. The caller

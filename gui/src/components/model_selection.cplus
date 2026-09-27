@@ -1,3 +1,4 @@
+import "../files" as files;
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
@@ -6,8 +7,7 @@ import "facet/label" as label;
 import "facet/mount" as mount;
 import "facet/popup" as popup;
 import "facet_runtime/runtime" as runtime;
-import "qwen_image/lora" as lora;
-import "qwen_image/packed_model" as packed;
+import "qwen_image/pack_info" as pack_info;
 import "stdlib/option" as option;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
@@ -48,36 +48,42 @@ fn has_support_files(root: str) -> bool {
     let text_3: text::Text = "${root}/text_encoder/model-00003-of-00004.safetensors";
     let text_4: text::Text = "${root}/text_encoder/model-00004-of-00004.safetensors";
     let vae: text::Text = "${root}/vae/diffusion_pytorch_model.safetensors";
-    return file_drop::is_regular_file(vocabulary.view())
-        && file_drop::is_regular_file(merges.view())
-        && file_drop::is_regular_file(text_1.view())
-        && file_drop::is_regular_file(text_2.view())
-        && file_drop::is_regular_file(text_3.view())
-        && file_drop::is_regular_file(text_4.view())
-        && file_drop::is_regular_file(vae.view());
+    return files::is_regular_file(vocabulary.view())
+        && files::is_regular_file(merges.view())
+        && files::is_regular_file(text_1.view())
+        && files::is_regular_file(text_2.view())
+        && files::is_regular_file(text_3.view())
+        && files::is_regular_file(text_4.view())
+        && files::is_regular_file(vae.view());
 }
 
 fn is_model_file(path: str) -> bool {
-    if !file_drop::is_regular_file(path) || !has_model_extension(path) {
+    if !files::is_regular_file(path) || !has_model_extension(path) {
         return false;
     }
     guard let option::Option[text::Text]::Some(root) = model_root_for_pack(path)
         else { return false; };
     if !has_support_files(root.view()) { return false; }
     if is_viggle_v021_pack(path) {
-        let adapter: text::Text = lora::path_beside_pack(path);
-        return file_drop::is_regular_file(adapter.view());
+        let adapter: text::Text = adapter_beside_pack(root.view());
+        return files::is_regular_file(adapter.view());
     }
     return true;
 }
 
+// The Viggle v0.2.1 six-step pack needs its LoRA adapter beside it (the file
+// name the Metal backend's lora module loads).
+fn adapter_beside_pack(root: str) -> text::Text {
+    return "${root}/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors";
+}
+
 fn is_viggle_v021_pack(path: str) -> bool {
-    return match packed::read_metadata(path) {
-        packed::MetadataResult::Ok(metadata) => match metadata.get("schedule") {
+    return match pack_info::read(path) {
+        option::Option[pack_info::PackInfo]::Some(info) => match info.get("schedule") {
             option::Option[str]::Some(value) => value == "viggle-v0.2.1-6",
             option::Option::None => false,
         },
-        packed::MetadataResult::Err(_message) => false,
+        option::Option[pack_info::PackInfo]::None => false,
     };
 }
 

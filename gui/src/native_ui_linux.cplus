@@ -1,0 +1,112 @@
+// Native interactions on Linux (GTK 4): the save dialog is GtkFileDialog's
+// asynchronous save; focus goes through facet; GTK entries need no field
+// editor sync. Same surface as native_ui.cplus.
+
+import "facet/text_area" as text_area;
+import "stdlib/text" as text;
+
+#[link_name = "gtk_file_dialog_new"]
+extern fn gtk_file_dialog_new() -> *u8;
+#[link_name = "gtk_file_dialog_set_title"]
+extern fn gtk_file_dialog_set_title(dialog: *u8, title: *u8);
+#[link_name = "gtk_file_dialog_set_accept_label"]
+extern fn gtk_file_dialog_set_accept_label(dialog: *u8, label: *u8);
+#[link_name = "gtk_file_dialog_set_initial_name"]
+extern fn gtk_file_dialog_set_initial_name(dialog: *u8, name: *u8);
+#[link_name = "gtk_file_dialog_set_default_filter"]
+extern fn gtk_file_dialog_set_default_filter(dialog: *u8, filter: *u8);
+#[link_name = "gtk_file_dialog_save"]
+extern fn gtk_file_dialog_save(dialog: *u8, parent: *u8, cancellable: *u8, callback: *u8, data: *u8);
+#[link_name = "gtk_file_dialog_save_finish"]
+extern fn gtk_file_dialog_save_finish(dialog: *u8, result: *u8, error: **u8) -> *u8;
+#[link_name = "gtk_file_filter_new"]
+extern fn gtk_file_filter_new() -> *u8;
+#[link_name = "gtk_file_filter_set_name"]
+extern fn gtk_file_filter_set_name(filter: *u8, name: *u8);
+#[link_name = "gtk_file_filter_add_suffix"]
+extern fn gtk_file_filter_add_suffix(filter: *u8, suffix: *u8);
+#[link_name = "gtk_window_get_toplevels"]
+extern fn gtk_window_get_toplevels() -> *u8;
+#[link_name = "g_list_model_get_n_items"]
+extern fn g_list_model_get_n_items(model: *u8) -> u32;
+#[link_name = "g_list_model_get_item"]
+extern fn g_list_model_get_item(model: *u8, position: u32) -> *u8;
+#[link_name = "g_file_get_path"]
+extern fn g_file_get_path(file: *u8) -> *u8;
+#[link_name = "g_object_unref"]
+extern fn g_object_unref(object: *u8);
+#[link_name = "g_error_free"]
+extern fn g_error_free(error: *u8);
+#[link_name = "g_free"]
+extern fn g_free(pointer: *u8);
+#[link_name = "strlen"]
+extern fn qi_strlen(s: *u8) -> usize;
+#[link_name = "malloc"]
+extern fn qi_malloc(bytes: usize) -> *u8;
+#[link_name = "free"]
+extern fn qi_free(pointer: *u8);
+
+// What the dialog's completion needs: the caller's callback and context.
+struct Pending {
+    on_chosen: fn(text::Text, *u8),
+    opaque context: *u8,
+}
+
+fn c_string(value: str) -> text::Text {
+    return "${value}\0";
+}
+
+fn saved(source: *u8, result: *u8, data: *u8) {
+    let pending: *Pending = data as *Pending;
+    var error: *u8 = 0 as *u8;
+    let file: *u8 = gtk_file_dialog_save_finish(source, result, #addr_of(error));
+    if !error.is_null() { g_error_free(error); }
+    if !file.is_null() {
+        let raw: *u8 = g_file_get_path(file);
+        g_object_unref(file);
+        if !raw.is_null() {
+            let path: text::Text = text::from_str(#str_from_raw_parts(raw, qi_strlen(raw)));
+            g_free(raw);
+            let on_chosen: fn(text::Text, *u8) = (*pending).on_chosen;
+            on_chosen(path, (*pending).context);
+        }
+    }
+    g_object_unref(source);
+    qi_free(data);
+}
+
+fn choose_save_path(suggested: str, on_chosen: fn(text::Text, *u8), context: *u8) -> bool {
+    let pending: *Pending = qi_malloc(#size_of::[Pending]()) as *Pending;
+    if pending.is_null() { return false; }
+    (*pending).on_chosen = on_chosen;
+    (*pending).context = context;
+    let dialog: *u8 = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dialog, #str_ptr("Save Image\0"));
+    gtk_file_dialog_set_accept_label(dialog, #str_ptr("Save\0"));
+    let name: text::Text = c_string(suggested);
+    gtk_file_dialog_set_initial_name(dialog, #str_ptr(name.view()));
+    let filter: *u8 = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, #str_ptr("PNG image\0"));
+    gtk_file_filter_add_suffix(filter, #str_ptr("png\0"));
+    gtk_file_dialog_set_default_filter(dialog, filter);
+    g_object_unref(filter);
+    // Parent: the app's first toplevel window, when there is one.
+    let toplevels: *u8 = gtk_window_get_toplevels();
+    var parent: *u8 = 0 as *u8;
+    if !toplevels.is_null() && g_list_model_get_n_items(toplevels) > (0 as u32) {
+        parent = g_list_model_get_item(toplevels, 0 as u32);
+    }
+    let completion: fn(*u8, *u8, *u8) = saved;
+    gtk_file_dialog_save(dialog, parent, 0 as *u8, completion as *u8, pending as *u8);
+    if !parent.is_null() { g_object_unref(parent); }
+    return true;
+}
+
+fn focus_prompt(input: text_area::TextArea) -> bool {
+    let _focused: text_area::TextArea = input.focus();
+    return true;
+}
+
+fn sync_field_editor(sender: *u8, value: str, caret: u64) {
+    return;
+}

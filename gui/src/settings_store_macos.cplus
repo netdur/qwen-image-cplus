@@ -1,0 +1,45 @@
+// Preferences storage on macOS: NSUserDefaults, as the app always used. Same
+// surface as settings_store.cplus.
+
+import "foundation/foundation" as foundation;
+import "objc/bridge" as bridge;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+struct Store {
+    defaults: foundation::UserDefaults,
+}
+
+fn new_with_suite_name(suite: str) -> Store {
+    return Store { defaults: foundation::UserDefaults::new_with_suite_name(suite) };
+}
+
+impl Store {
+    fn string_for_key(this, key: str) -> option::Option[text::Text] {
+        return this.defaults.string_for_key(key);
+    }
+
+    fn integer_for_key(this, key: str) -> i64 {
+        return this.defaults.integer_for_key(key);
+    }
+
+    fn bool_for_key(this, key: str) -> bool {
+        return this.defaults.bool_for_key(key);
+    }
+
+    fn set_string(this, value: str, for_key: str) {
+        this.defaults.set_object(bridge::nsstring(value), for_key: for_key);
+    }
+
+    fn set_integer(this, value: i64, for_key: str) {
+        this.defaults.set_integer(value, for_key: for_key);
+    }
+
+    fn set_bool(this, value: bool, for_key: str) {
+        this.defaults.set_bool(value, for_key: for_key);
+    }
+
+    fn remove_object_for_key(this, key: str) {
+        this.defaults.remove_object_for_key(key);
+    }
+}

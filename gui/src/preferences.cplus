@@ -1,5 +1,4 @@
-import "foundation/foundation" as foundation;
-import "objc/bridge" as bridge;
+import "./settings_store" as settings_store;
 import "stdlib/fs" as fs;
 import "stdlib/option" as option;
 import "stdlib/result" as result;
@@ -17,8 +16,8 @@ struct GenerationPreferences {
     output_folder: text::Text,
 }
 
-fn store() -> foundation::UserDefaults {
-    return foundation::UserDefaults::new_with_suite_name(
+fn store() -> settings_store::Store {
+    return settings_store::new_with_suite_name(
         "dev.netdur.qwen-image-cplus.preferences");
 }
 
@@ -99,7 +98,7 @@ fn step_value(index: i64) -> i64 {
     };
 }
 
-fn load_from(defaults: foundation::UserDefaults) -> GenerationPreferences {
+fn load_from(defaults: settings_store::Store) -> GenerationPreferences {
     let stored_width: i64 = defaults.integer_for_key("generation.width");
     let stored_height: i64 = defaults.integer_for_key("generation.height");
     let stored_steps: i64 = defaults.integer_for_key("generation.steps");
@@ -149,7 +148,7 @@ fn effective_output_folder() -> text::Text {
     return output_folder_for(load());
 }
 
-fn save_dimensions_to(defaults: foundation::UserDefaults,
+fn save_dimensions_to(defaults: settings_store::Store,
 width: str, height: str) -> bool {
     guard let option::Option[i64]::Some(w) = width.to_i64()
         else { return false; };
@@ -165,7 +164,7 @@ fn save_dimensions(width: str, height: str) -> bool {
     return save_dimensions_to(store(), width, height);
 }
 
-fn save_steps_to(defaults: foundation::UserDefaults, value: i64) -> bool {
+fn save_steps_to(defaults: settings_store::Store, value: i64) -> bool {
     if !valid_steps(value) { return false; }
     defaults.set_integer(value, for_key: "generation.steps");
     return true;
@@ -173,21 +172,21 @@ fn save_steps_to(defaults: foundation::UserDefaults, value: i64) -> bool {
 
 fn save_steps(value: i64) -> bool { return save_steps_to(store(), value); }
 
-fn save_seed_to(defaults: foundation::UserDefaults, value: str) -> bool {
+fn save_seed_to(defaults: settings_store::Store, value: str) -> bool {
     if !valid_seed(value) { return false; }
-    defaults.set_object(bridge::nsstring(value), for_key: "generation.seed");
+    defaults.set_string(value, for_key: "generation.seed");
     return true;
 }
 
 fn save_seed(value: str) -> bool { return save_seed_to(store(), value); }
 
-fn save_random_seed_to(defaults: foundation::UserDefaults, value: bool) {
+fn save_random_seed_to(defaults: settings_store::Store, value: bool) {
     defaults.set_bool(value, for_key: "generation.random_seed");
 }
 
 fn save_random_seed(value: bool) { save_random_seed_to(store(), value); }
 
-fn save_cache_mode_to(defaults: foundation::UserDefaults, value: i64) -> bool {
+fn save_cache_mode_to(defaults: settings_store::Store, value: i64) -> bool {
     if !valid_cache_mode(value) { return false; }
     defaults.set_integer(value, for_key: "generation.cache_mode");
     return true;
@@ -197,7 +196,7 @@ fn save_cache_mode(value: i64) -> bool {
     return save_cache_mode_to(store(), value);
 }
 
-fn save_cache_threshold_to(defaults: foundation::UserDefaults, value: i64) -> bool {
+fn save_cache_threshold_to(defaults: settings_store::Store, value: i64) -> bool {
     if !valid_cache_threshold(value) { return false; }
     defaults.set_integer(value, for_key: "generation.cache_threshold");
     return true;
@@ -207,9 +206,9 @@ fn save_cache_threshold(value: i64) -> bool {
     return save_cache_threshold_to(store(), value);
 }
 
-fn save_output_folder_to(defaults: foundation::UserDefaults, path: str) -> bool {
+fn save_output_folder_to(defaults: settings_store::Store, path: str) -> bool {
     if !valid_output_folder(path) { return false; }
-    defaults.set_object(bridge::nsstring(path), for_key: "generation.output_folder");
+    defaults.set_string(path, for_key: "generation.output_folder");
     return true;
 }
 
@@ -217,13 +216,13 @@ fn save_output_folder(path: str) -> bool {
     return save_output_folder_to(store(), path);
 }
 
-fn reset_output_folder_to(defaults: foundation::UserDefaults) {
+fn reset_output_folder_to(defaults: settings_store::Store) {
     defaults.remove_object_for_key("generation.output_folder");
 }
 
 fn reset_output_folder() { reset_output_folder_to(store()); }
 
-fn load_model_path_from(defaults: foundation::UserDefaults) -> option::Option[text::Text] {
+fn load_model_path_from(defaults: settings_store::Store) -> option::Option[text::Text] {
     return defaults.string_for_key("generation.model_path");
 }
 
@@ -231,9 +230,9 @@ fn load_model_path() -> option::Option[text::Text] {
     return load_model_path_from(store());
 }
 
-fn save_model_path_to(defaults: foundation::UserDefaults, path: str) -> bool {
+fn save_model_path_to(defaults: settings_store::Store, path: str) -> bool {
     if path.count() == (0 as usize) { return false; }
-    defaults.set_object(bridge::nsstring(path), for_key: "generation.model_path");
+    defaults.set_string(path, for_key: "generation.model_path");
     return true;
 }
 
@@ -243,8 +242,8 @@ fn save_model_path(path: str) -> bool {
 
 #[test]
 fn generation_preferences_round_trip_and_validate() {
-    let defaults: foundation::UserDefaults =
-        foundation::UserDefaults::new_with_suite_name(
+    let defaults: settings_store::Store =
+        settings_store::new_with_suite_name(
             "dev.netdur.qwen-image-cplus.preferences.tests");
     defaults.remove_object_for_key("generation.width");
     defaults.remove_object_for_key("generation.height");
@@ -286,7 +285,7 @@ fn generation_preferences_round_trip_and_validate() {
     assert !save_cache_mode_to(defaults, 4 as i64);
     assert save_cache_threshold_to(defaults, 4 as i64);
     assert !save_cache_threshold_to(defaults, 5 as i64);
-    assert save_output_folder_to(defaults, "/private/tmp");
+    assert save_output_folder_to(defaults, "/usr");
     assert !save_output_folder_to(defaults, "/tmp/not-a-real-output-folder");
     assert save_model_path_to(defaults, "/tmp/example.qipack");
     assert !save_model_path_to(defaults, "");
@@ -299,8 +298,8 @@ fn generation_preferences_round_trip_and_validate() {
     assert saved.random_seed;
     assert saved.cache_mode == (3 as i64);
     assert saved.cache_threshold == (4 as i64);
-    assert saved.output_folder.view() == "/private/tmp";
-    assert output_folder_for(saved).view() == "/private/tmp";
+    assert saved.output_folder.view() == "/usr";
+    assert output_folder_for(saved).view() == "/usr";
     match load_model_path_from(defaults) {
         option::Option[text::Text]::Some(path) => {
             assert path.view() == "/tmp/example.qipack";
@@ -318,10 +317,8 @@ fn generation_preferences_round_trip_and_validate() {
     defaults.set_integer(7 as i64, for_key: "generation.steps");
     defaults.set_integer(7 as i64, for_key: "generation.cache_mode");
     defaults.set_integer(7 as i64, for_key: "generation.cache_threshold");
-    defaults.set_object(bridge::nsstring("/missing/output-folder"),
-    for_key: "generation.output_folder");
-    defaults.set_object(bridge::nsstring("18446744073709551616"),
-    for_key: "generation.seed");
+    defaults.set_string("/missing/output-folder", for_key: "generation.output_folder");
+    defaults.set_string("18446744073709551616", for_key: "generation.seed");
     let repaired: GenerationPreferences = load_from(defaults);
     assert repaired.width == (512 as i64);
     assert repaired.height == (1024 as i64);

@@ -1,0 +1,23 @@
+[package]
+name    = "qwen_image_metal_dev"
+version = "0.2.2"
+edition = "2026"
+
+# Development commands for the Metal backend: probes, kernel and stage
+# validation, benchmarks, pack tools, and the generate commands with every
+# cache variant. This was the macOS CLI; the public `qwen-image-cplus` CLI
+# (cli/) keeps only the portable commands over qwen_image/api.
+
+[macos]
+entry = "src/main.cplus"
+
+[dependencies]
+qwen_image       = "*"
+qwen_image_metal = "*"
+json             = "*"
+stdlib           = "*"
+
+[macos.dependencies]
+objc       = "*"
+metal      = "*"
+foundation = "*"

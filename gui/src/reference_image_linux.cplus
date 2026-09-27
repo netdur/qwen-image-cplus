@@ -1,0 +1,17 @@
+// Reference-image size on Linux: the CUDA backend's header reader (the same
+// decoders it uses for editing).
+
+import "qwen_image_cuda/image_input" as image_input;
+import "stdlib/option" as option;
+
+struct Dimensions {
+    width: usize,
+    height: usize,
+}
+
+fn source_dimensions(path: str) -> option::Option[Dimensions] {
+    guard let option::Option[image_input::Dimensions]::Some(found) = image_input::source_dimensions(path) else {
+        return option::Option[Dimensions]::None;
+    };
+    return option::Option[Dimensions]::Some(Dimensions { width: found.width, height: found.height });
+}

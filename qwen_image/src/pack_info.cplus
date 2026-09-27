@@ -1,0 +1,145 @@
+// QIPACK metadata, read from any pack without loading it: the header's policy
+// string and the key/value lines the pack writer stores in the directory
+// padding (`steps=4`, `kind=distilled`, `cache=...`, `quant=...`). Clients use
+// it to pick defaults (a distilled pack's own step count); engines keep their
+// own full readers.
+
+import "./file_io" as file_io;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+#[link_name = "malloc"]
+extern fn qi_pack_malloc(bytes: usize) -> *u8;
+#[link_name = "free"]
+extern fn qi_pack_free(pointer: *u8);
+
+const HEADER_BYTES: usize = 256;
+const METADATA_VERSION: u32 = 1;
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+// Header field offsets (QIPACK1, little-endian).
+const POLICY_OFFSET: usize = 136;
+const POLICY_BYTES: usize = 32;
+const METADATA_OFFSET_AT: usize = 168;
+const METADATA_BYTES_AT: usize = 176;
+const METADATA_VERSION_AT: usize = 180;
+const METADATA_CHECKSUM_AT: usize = 184;
+
+struct Entry {
+    key: text::Text,
+    value: text::Text,
+}
+
+struct PackInfo {
+    policy: text::Text,
+    entries: vec::Vec[Entry],
+}
+
+impl PackInfo {
+    // The returned view borrows this PackInfo.
+    fn get(this, key: str) -> option::Option[str] {
+        var index: usize = 0 as usize;
+        while index < this.entries.count() {
+            guard let option::Option[*Entry]::Some(entry) = this.entries.at_ptr(index) else { return option::Option[str]::None; };
+            if (*entry).key.view() == key { return option::Option[str]::Some((*entry).value.view()); }
+            index = index +% (1 as usize);
+        }
+        return option::Option[str]::None;
+    }
+
+    fn is_distilled(this) -> bool {
+        return match this.get("kind") {
+            option::Option[str]::Some(value) => value == "distilled",
+            option::Option[str]::None => false,
+        };
+    }
+}
+
+fn u32_at(bytes: *u8, at: usize) -> u32 {
+    return (bytes[at] as u32) | ((bytes[at +% (1 as usize)] as u32) << (8 as u32))
+        | ((bytes[at +% (2 as usize)] as u32) << (16 as u32)) | ((bytes[at +% (3 as usize)] as u32) << (24 as u32));
+}
+
+fn u64_at(bytes: *u8, at: usize) -> u64 {
+    return (u32_at(bytes, at) as u64) | ((u32_at(bytes, at +% (4 as usize)) as u64) << (32 as u64));
+}
+
+// Scratch owned for the length of one call.
+struct Scratch {
+    opaque pointer: *u8,
+}
+
+impl Scratch {
+    fn drop(ref this) {
+        if !this.pointer.is_null() { qi_pack_free(this.pointer); }
+        this.pointer = 0 as *u8;
+    }
+}
+
+// Splits `key=value` lines (each newline-terminated) into `info`.
+fn parse(source: str, ref info: PackInfo) -> bool {
+    var start: usize = 0 as usize;
+    while start < source.count() {
+        var end: usize = start;
+        while end < source.count() {
+            guard let option::Option[u8]::Some(byte) = source.byte_at(end) else { return false; };
+            if byte == (10 as u8) { break; }
+            end = end +% (1 as usize);
+        }
+        guard let option::Option[str]::Some(line) = source.slice(start, end) else { return false; };
+        guard let option::Option[usize]::Some(equals) = line.find("=") else { return false; };
+        guard let option::Option[str]::Some(key) = line.slice(0 as usize, equals) else { return false; };
+        guard let option::Option[str]::Some(value) = line.slice(equals +% (1 as usize), line.count()) else { return false; };
+        if info.entries.append(Entry { key: text::from_str(key), value: text::from_str(value) }) != status::Status::Ok {
+            return false;
+        }
+        start = end +% (1 as usize);
+    }
+    return true;
+}
+
+// The pack's policy and metadata; None when the file is not a readable QIPACK1
+// or its metadata block fails its checksum.
+fn read(path: str) -> option::Option[PackInfo] {
+    let fd: i32 = file_io::open_read(path);
+    if fd < (0 as i32) { return option::Option[PackInfo]::None; }
+    let header: Scratch = Scratch { pointer: qi_pack_malloc(HEADER_BYTES) };
+    if header.pointer.is_null() || !file_io::read_at(fd, header.pointer, HEADER_BYTES, 0 as u64)
+        || !#str_from_raw_parts(header.pointer, 8 as usize).has_prefix("QIPACK1") {
+        let _closed: i32 = file_io::close(fd);
+        return option::Option[PackInfo]::None;
+    }
+    var policy_length: usize = 0 as usize;
+    while policy_length < POLICY_BYTES && header.pointer[POLICY_OFFSET +% policy_length] != (0 as u8) {
+        policy_length = policy_length +% (1 as usize);
+    }
+    var info: PackInfo = PackInfo {
+        policy: text::from_str(#str_from_raw_parts(header.pointer + POLICY_OFFSET, policy_length)),
+        entries: vec::new::[Entry](),
+    };
+    let offset: u64 = u64_at(header.pointer, METADATA_OFFSET_AT);
+    let bytes: usize = u32_at(header.pointer, METADATA_BYTES_AT) as usize;
+    if bytes == (0 as usize) {
+        let _closed: i32 = file_io::close(fd);
+        return option::Option[PackInfo]::Some(info);
+    }
+    if u32_at(header.pointer, METADATA_VERSION_AT) != METADATA_VERSION || bytes > (1048576 as usize) {
+        let _closed: i32 = file_io::close(fd);
+        return option::Option[PackInfo]::None;
+    }
+    let block: Scratch = Scratch { pointer: qi_pack_malloc(bytes) };
+    let read_ok: bool = !block.pointer.is_null() && file_io::read_at(fd, block.pointer, bytes, offset);
+    let _closed: i32 = file_io::close(fd);
+    if !read_ok { return option::Option[PackInfo]::None; }
+    var hash: u64 = FNV_OFFSET;
+    var index: usize = 0 as usize;
+    while index < bytes {
+        hash = (hash ^ block.pointer[index] as u64) *% FNV_PRIME;
+        index = index +% (1 as usize);
+    }
+    if hash != u64_at(header.pointer, METADATA_CHECKSUM_AT) { return option::Option[PackInfo]::None; }
+    if !parse(#str_from_raw_parts(block.pointer, bytes), info) { return option::Option[PackInfo]::None; }
+    return option::Option[PackInfo]::Some(info);
+}

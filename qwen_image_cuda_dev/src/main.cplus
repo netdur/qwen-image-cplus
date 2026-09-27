@@ -1,0 +1,252 @@
+// Development and validation commands for the Linux CUDA engine.
+
+import "qwen_image_cuda/transformer" as transformer;
+import "qwen_image_cuda/vae" as vae;
+import "qwen_image_cuda/text_encoder" as text_encoder;
+import "qwen_image_cuda/inputs" as inputs;
+import "qwen_image_cuda/image_input" as image_input;
+import "qwen_image_cuda/vision" as vision;
+import "qwen_image_cuda/tokenizer" as tokenizer;
+import "qwen_image/api" as api;
+import "qwen_image_cuda/backend" as backend;
+import "qwen_image/generation_control" as generation_control;
+import "qwen_image_cuda/int4_pack" as pack;
+import "stdlib/env" as env;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+
+fn usage() -> i32 {
+    io::eprintln("usage: qwen_image_cuda_dev transformer-fixture fp16|w4a16|w4a4 PACK FIXTURE_DIR LATENT.f32 TIMESTEP OUTPUT.f32");
+    io::eprintln("       qwen_image_cuda_dev denoise-dump fp16|w4a16|w4a4 PACK DUMP_DIR STEPS OUTPUT.f32");
+    io::eprintln("       qwen_image_cuda_dev vae-decode VAE.safetensors LATENTS.f32 LATENT_SIDE OUTPUT.png");
+    io::eprintln("       qwen_image_cuda_dev vae-encode VAE.safetensors IMAGE.f32 WIDTH HEIGHT OUTPUT.f32  (image [4, H, W] in [-1, 1])");
+    io::eprintln("       qwen_image_cuda_dev vision-encode MODEL_ROOT PIXELS.f32 GRID_H GRID_W OUTPUT_DIR  (vision_embeds.f32, deepstack_N.f32)");
+    io::eprintln("       qwen_image_cuda_dev text-encode-edit MODEL_ROOT IDS.i32 VISION_DIR GRID_H GRID_W fp32|bf16[-half] OUTPUT.f32");
+    io::eprintln("       qwen_image_cuda_dev text-encode MODEL_ROOT IDS.i32 fp32|bf16 OUTPUT.f32");
+    io::eprintln("       qwen_image_cuda_dev inputs TEXT_ROWS LATENT_SIDE SEED OUTPUT_DIR  (rope.f32, noise_f16.f32, noise_bf16.f32)");
+    io::eprintln("       qwen_image_cuda_dev tokenizer-fixtures MODEL_ROOT FIXTURE_DIR");
+    io::eprintln("       qwen_image_cuda_dev generate PACK MODEL_ROOT OUTPUT.png PROMPT WIDTH HEIGHT SEED STEPS");
+    io::eprintln("       qwen_image_cuda_dev image-input IMAGE RESOLUTION OUTPUT_DIR  (vae_input.f32, pixel_values.f32)");
+    io::eprintln("       qwen_image_cuda_dev edit PACK MODEL_ROOT OUTPUT.png PROMPT SIZE SEED STEPS IMAGE [IMAGE2]");
+    io::eprintln("       qwen_image_cuda_dev denoise-edit-dump fp16|w4a16|w4a4 PACK DUMP_DIR STEPS OUTPUT.f32");
+    return 2;
+}
+
+fn main() -> i32 {
+    backend::install();
+    guard let option::Option[text::Text]::Some(command) = env::arg(1 as usize) else { return usage(); };
+    if command.view() == "transformer-fixture" {
+        guard let option::Option[text::Text]::Some(mode_name) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(pack_path) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(fixture) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(latent) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(timestep_text) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(7 as usize) else { return usage(); };
+        let mode: transformer::WeightMode = if mode_name.view() == "fp16" {
+            transformer::WeightMode::Fp16Streamed
+        } else if mode_name.view() == "w4a16" {
+            transformer::WeightMode::W4A16
+        } else if mode_name.view() == "w4a4" {
+            transformer::WeightMode::W4A4
+        } else {
+            return usage();
+        };
+        guard let option::Option[f64]::Some(timestep) = timestep_text.view().to_f64() else { return usage(); };
+        return transformer::run_fixture(pack_path.view(), mode, fixture.view(), latent.view(), timestep as f32, output.view());
+    }
+    if command.view() == "denoise-dump" {
+        guard let option::Option[text::Text]::Some(mode_name) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(pack_path) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(dump) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(steps_text) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[transformer::WeightMode]::Some(mode) = parse_mode(mode_name.view()) else { return usage(); };
+        guard let option::Option[f64]::Some(steps) = steps_text.view().to_f64() else { return usage(); };
+        return transformer::run_oracle_dump(pack_path.view(), mode, dump.view(), steps as usize, output.view());
+    }
+    if command.view() == "denoise-edit-dump" {
+        guard let option::Option[text::Text]::Some(mode_name) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(pack_path) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(dump) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(steps_text) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[transformer::WeightMode]::Some(mode) = parse_mode(mode_name.view()) else { return usage(); };
+        guard let option::Option[f64]::Some(steps) = steps_text.view().to_f64() else { return usage(); };
+        return transformer::run_edit_dump(pack_path.view(), mode, dump.view(), steps as usize, output.view());
+    }
+    if command.view() == "image-input" {
+        guard let option::Option[text::Text]::Some(image) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(resolution) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(directory) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(side) = resolution.view().to_f64() else { return usage(); };
+        return image_input::write_inputs(image.view(), side as usize, directory.view());
+    }
+    if command.view() == "vae-encode" {
+        guard let option::Option[text::Text]::Some(vae_path) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(image) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(width_text) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(height_text) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(width) = width_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(height) = height_text.view().to_f64() else { return usage(); };
+        return vae::encode_file(vae_path.view(), image.view(), height as usize, width as usize, output.view());
+    }
+    if command.view() == "vision-encode" {
+        guard let option::Option[text::Text]::Some(root) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(patches) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(grid_h_text) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(grid_w_text) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(directory) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(grid_h) = grid_h_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(grid_w) = grid_w_text.view().to_f64() else { return usage(); };
+        return vision::encode_file(root.view(), patches.view(), grid_h as usize, grid_w as usize, directory.view());
+    }
+    if command.view() == "text-encode-edit" {
+        guard let option::Option[text::Text]::Some(root) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(ids) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(vision_directory) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(grid_h_text) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(grid_w_text) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(precision) = env::arg(7 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(8 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(grid_h) = grid_h_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(grid_w) = grid_w_text.view().to_f64() else { return usage(); };
+        return text_encoder::encode_edit_file(root.view(), ids.view(), vision_directory.view(), grid_h as usize, grid_w as usize,
+            precision.view().has_prefix("bf16"), output.view(), precision.view().has_suffix("-half"));
+    }
+    if command.view() == "vae-decode" {
+        guard let option::Option[text::Text]::Some(vae_path) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(latents) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(side_text) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(side) = side_text.view().to_f64() else { return usage(); };
+        return vae::decode_file(vae_path.view(), latents.view(), side as usize, output.view());
+    }
+    if command.view() == "text-encode" {
+        guard let option::Option[text::Text]::Some(root) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(ids) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(precision) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(5 as usize) else { return usage(); };
+        return text_encoder::encode_file(root.view(), ids.view(), precision.view().has_prefix("bf16"), output.view(),
+            precision.view().has_suffix("-half"));
+    }
+    if command.view() == "inputs" {
+        guard let option::Option[text::Text]::Some(rows_text) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(side_text) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(seed_text) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(directory) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(rows) = rows_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(side) = side_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(seed) = seed_text.view().to_f64() else { return usage(); };
+        let text_rows: usize = rows as usize;
+        let latent_side: usize = side as usize;
+        let pixels: usize = latent_side *% latent_side;
+        guard let option::Option[pack::Buffer]::Some(rope) = pack::Buffer::allocate((text_rows +% pixels) *% (512 as usize)) else { return 1; };
+        guard let option::Option[pack::Buffer]::Some(noise) = pack::Buffer::allocate(pixels *% (256 as usize)) else { return 1; };
+        guard let option::Option[pack::Buffer]::Some(scratch) = pack::Buffer::allocate(pixels *% (256 as usize)) else { return 1; };
+        inputs::rope_table(text_rows, latent_side, latent_side, rope.pointer as *f32);
+        let rope_path: text::Text = "${directory.view()}/rope.f32";
+        if !write_file(rope_path.view(), rope.pointer, rope.length) { return 1; }
+        if !inputs::initial_noise(seed as u64, latent_side, latent_side, inputs::NoiseDtype::Float16, scratch.pointer as *f32, noise.pointer as *f32) { return 1; }
+        let f16_path: text::Text = "${directory.view()}/noise_f16.f32";
+        if !write_file(f16_path.view(), noise.pointer, noise.length) { return 1; }
+        if !inputs::initial_noise(seed as u64, latent_side, latent_side, inputs::NoiseDtype::BFloat16, scratch.pointer as *f32, noise.pointer as *f32) { return 1; }
+        let bf16_path: text::Text = "${directory.view()}/noise_bf16.f32";
+        if !write_file(bf16_path.view(), noise.pointer, noise.length) { return 1; }
+        io::println("wrote rope and noise to ${directory.view()}");
+        return 0;
+    }
+    if command.view() == "tokenizer-fixtures" {
+        guard let option::Option[text::Text]::Some(root) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(fixtures) = env::arg(3 as usize) else { return usage(); };
+        return tokenizer::validate_fixtures(root.view(), fixtures.view());
+    }
+    if command.view() == "edit" {
+        guard let option::Option[text::Text]::Some(pack_path) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(root) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(size_text) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(seed_text) = env::arg(7 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(steps_text) = env::arg(8 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(image) = env::arg(9 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(size) = size_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(seed) = seed_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(steps) = steps_text.view().to_f64() else { return usage(); };
+        let second: text::Text = match env::arg(10 as usize) {
+            option::Option::Some(path) => path,
+            option::Option::None => text::from_str(""),
+        };
+        let image_count: usize = if second.count() > (0 as usize) { 2 as usize } else { 1 as usize };
+        var paths: [str; 2] = [image.view(), second.view()];
+        let observer: generation_control::Observer = generation_control::Observer {
+            callback: 0 as fn(generation_control::Progress, *u8) -> bool,
+            diagnostic: print_diagnostic,
+            context: 0 as *u8,
+        };
+        let status: api::GenerateStatus = api::generate_multi_image_sized_to_png(api::MultiImageSizedGenerateRequest {
+            packed_path: pack_path.view(),
+            model_root: root.view(),
+            output_path: output.view(),
+            prompt: prompt.view(),
+            image_paths: #addr_of(paths[0]),
+            image_count: image_count,
+            width: size as usize,
+            height: size as usize,
+            steps: steps as usize,
+            seed: seed as u64,
+        }, observer);
+        return if status == api::GenerateStatus::Ok { 0 } else { 1 };
+    }
+    if command.view() == "generate" {
+        guard let option::Option[text::Text]::Some(pack_path) = env::arg(2 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(root) = env::arg(3 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(output) = env::arg(4 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(width_text) = env::arg(6 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(height_text) = env::arg(7 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(seed_text) = env::arg(8 as usize) else { return usage(); };
+        guard let option::Option[text::Text]::Some(steps_text) = env::arg(9 as usize) else { return usage(); };
+        guard let option::Option[f64]::Some(width) = width_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(height) = height_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(seed) = seed_text.view().to_f64() else { return usage(); };
+        guard let option::Option[f64]::Some(steps) = steps_text.view().to_f64() else { return usage(); };
+        let observer: generation_control::Observer = generation_control::Observer {
+            callback: 0 as fn(generation_control::Progress, *u8) -> bool,
+            diagnostic: print_diagnostic,
+            context: 0 as *u8,
+        };
+        let status: api::GenerateStatus = api::generate_to_png(api::GenerateRequest {
+            packed_path: pack_path.view(),
+            model_root: root.view(),
+            output_path: output.view(),
+            prompt: prompt.view(),
+            pixels: 0 as usize,
+            steps: steps as usize,
+            seed: seed as u64,
+            cache: api::CacheMode::None,
+            cache_threshold: 0.0f64,
+            width: width as usize,
+            height: height as usize,
+        }, observer);
+        return if status == api::GenerateStatus::Ok { 0 } else { 1 };
+    }
+    return usage();
+}
+
+fn print_diagnostic(message: str, _context: *u8) {
+    io::eprintln("error: ${message}");
+}
+
+fn write_file(path: str, data: *u8, bytes: usize) -> bool {
+    return transformer::write_floats(path, data, bytes);
+}
+
+fn parse_mode(name: str) -> option::Option[transformer::WeightMode] {
+    if name == "fp16" { return option::Option[transformer::WeightMode]::Some(transformer::WeightMode::Fp16Streamed); }
+    if name == "w4a16" { return option::Option[transformer::WeightMode]::Some(transformer::WeightMode::W4A16); }
+    if name == "w4a4" { return option::Option[transformer::WeightMode]::Some(transformer::WeightMode::W4A4); }
+    return option::Option[transformer::WeightMode]::None;
+}

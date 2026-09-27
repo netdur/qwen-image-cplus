@@ -1,0 +1,112 @@
+// Positional file access for the engines: open, size, read and write at an
+// offset, close. The model files are tens of gigabytes and read in parallel
+// at explicit offsets, which stdlib/fs does not offer.
+//
+// This base is POSIX (open / pread / pwrite / lseek), shared by macOS and
+// Linux. A Windows build shadows it with `file_io_windows.cplus` (ReadFile and
+// WriteFile with an OVERLAPPED offset) presenting the same functions; nothing
+// else in the engines names a file API.
+
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+#[link_name = "open"]
+extern fn qi_io_open(path: *u8, flags: i32, mode: i32) -> i32;
+#[link_name = "close"]
+extern fn qi_io_close(fd: i32) -> i32;
+#[link_name = "pread"]
+extern fn qi_io_pread(fd: i32, buffer: *u8, count: usize, offset: i64) -> isize;
+#[link_name = "pwrite"]
+extern fn qi_io_pwrite(fd: i32, buffer: *u8, count: usize, offset: i64) -> isize;
+#[link_name = "lseek"]
+extern fn qi_io_lseek(fd: i32, offset: i64, whence: i32) -> i64;
+#[link_name = "ftruncate"]
+extern fn qi_io_ftruncate(fd: i32, length: i64) -> i32;
+#[link_name = "fsync"]
+extern fn qi_io_fsync(fd: i32) -> i32;
+#[link_name = "rename"]
+extern fn qi_io_rename(source: *u8, destination: *u8) -> i32;
+#[link_name = "unlink"]
+extern fn qi_io_unlink(path: *u8) -> i32;
+
+const READ_ONLY: i32 = 0;
+// O_RDWR | O_CREAT | O_TRUNC; the flag values differ between Linux and Darwin.
+const CREATE_LINUX: i32 = 0x242;
+const CREATE_DARWIN: i32 = 0x602;
+const SEEK_END: i32 = 2;
+
+fn c_path(path: str) -> option::Option[text::CString] {
+    let owner: text::Text = text::from_str(path);
+    return owner.c_str();
+}
+
+// A descriptor for reading, or a negative value.
+fn open_read(path: str) -> i32 {
+    guard let option::Option[text::CString]::Some(name) = c_path(path) else { return 0 -% (1 as i32); };
+    return qi_io_open(name.as_ptr(), READ_ONLY, 0 as i32);
+}
+
+// A read-write descriptor for a new (or truncated) file with mode 0644, or a
+// negative value.
+fn create(path: str) -> i32 {
+    guard let option::Option[text::CString]::Some(name) = c_path(path) else { return 0 -% (1 as i32); };
+    let flags: i32 = if #platform() == "macos" { CREATE_DARWIN } else { CREATE_LINUX };
+    return qi_io_open(name.as_ptr(), flags, 420 as i32);
+}
+
+// 0 on success.
+fn close(fd: i32) -> i32 {
+    if fd < (0 as i32) { return 0 -% (1 as i32); }
+    return qi_io_close(fd);
+}
+
+// Sets the file's length; true on success.
+fn truncate(fd: i32, length: u64) -> bool {
+    return qi_io_ftruncate(fd, length as i64) == (0 as i32);
+}
+
+// Flushes the file to storage; true on success.
+fn sync(fd: i32) -> bool {
+    return qi_io_fsync(fd) == (0 as i32);
+}
+
+// Replaces `destination` with `source` in one step; true on success.
+fn rename(source: str, destination: str) -> bool {
+    guard let option::Option[text::CString]::Some(from) = c_path(source) else { return false; };
+    guard let option::Option[text::CString]::Some(to) = c_path(destination) else { return false; };
+    return qi_io_rename(from.as_ptr(), to.as_ptr()) == (0 as i32);
+}
+
+// Deletes a file; true on success.
+fn remove(path: str) -> bool {
+    guard let option::Option[text::CString]::Some(name) = c_path(path) else { return false; };
+    return qi_io_unlink(name.as_ptr()) == (0 as i32);
+}
+
+// File size in bytes, or a negative value.
+fn size(fd: i32) -> i64 {
+    return qi_io_lseek(fd, 0 as i64, SEEK_END);
+}
+
+// Reads exactly `count` bytes at `offset`; false on error or end of file.
+// Safe to call from several threads on one descriptor.
+fn read_at(fd: i32, bytes: *u8, count: usize, offset: u64) -> bool {
+    var done: usize = 0 as usize;
+    while done < count {
+        let result: isize = qi_io_pread(fd, bytes + done, count -% done, (offset +% done as u64) as i64);
+        if result <= (0 as isize) { return false; }
+        done = done +% result as usize;
+    }
+    return true;
+}
+
+// Writes exactly `count` bytes at `offset`.
+fn write_at(fd: i32, bytes: *u8, count: usize, offset: u64) -> bool {
+    var done: usize = 0 as usize;
+    while done < count {
+        let result: isize = qi_io_pwrite(fd, bytes + done, count -% done, (offset +% done as u64) as i64);
+        if result <= (0 as isize) { return false; }
+        done = done +% result as usize;
+    }
+    return true;
+}

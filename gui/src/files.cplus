@@ -1,0 +1,42 @@
+// Small portable file helpers.
+
+import "stdlib/fs" as fs;
+import "stdlib/result" as result;
+import "stdlib/vec" as vec;
+
+fn is_regular_file(path: str) -> bool {
+    guard let result::Result[fs::Metadata, result::IoError]::Ok(info) =
+        fs::metadata(path) else { return false; };
+    return !info.is_dir;
+}
+
+// Copies `source` to `destination` (replacing it); true on success.
+fn copy_file(source: str, destination: str) -> bool {
+    if source == destination { return true; }
+    guard let result::Result[fs::File, result::IoError]::Ok(input) = fs::open_read(source) else { return false; };
+    var reader: fs::File = input;
+    guard let result::Result[vec::Vec[u8], result::IoError]::Ok(bytes) = reader.read_to_end() else { return false; };
+    guard let result::Result[fs::File, result::IoError]::Ok(output) = fs::create(destination) else { return false; };
+    var writer: fs::File = output;
+    let expected: usize = bytes.count();
+    return match writer.write_all(bytes) {
+        result::Result[usize, result::IoError]::Ok(written) => written == expected,
+        result::Result[usize, result::IoError]::Err(_error) => false,
+    };
+}
+
+// Writes `count` bytes at `bytes` to a new (or truncated) file.
+fn write_bytes(path: str, bytes: *u8, count: usize) -> bool {
+    var data: vec::Vec[u8] = vec::Vec[u8]::with_capacity(count);
+    var index: usize = 0 as usize;
+    while index < count {
+        let _added = data.append(bytes[index]);
+        index = index +% (1 as usize);
+    }
+    guard let result::Result[fs::File, result::IoError]::Ok(output) = fs::create(path) else { return false; };
+    var writer: fs::File = output;
+    return match writer.write_all(data) {
+        result::Result[usize, result::IoError]::Ok(written) => written == count,
+        result::Result[usize, result::IoError]::Err(_error) => false,
+    };
+}

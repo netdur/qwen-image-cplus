@@ -1,8 +1,10 @@
-// Root module for the native C+ engine package.
-//
-// Consumers import the focused public surface from `qwen_image/api`. The
-// package remains entry-less so C+ can prebuild every module into one archive.
+// Root module for the portable core. Applications import `qwen_image/api`
+// (the contract) and `qwen_image_runtime/runtime` (which installs the
+// platform's backend into `qwen_image/engine`).
 
 import "./api" as _;
-import "./image_conditioning" as _;
-import "./image_input" as _;
+import "./engine" as _;
+import "./file_io" as _;
+import "./pack_info" as _;
+import "./generation_control" as _;
+import "./generation_worker" as _;

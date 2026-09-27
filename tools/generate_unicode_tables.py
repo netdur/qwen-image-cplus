@@ -3,7 +3,7 @@
 
 The Qwen2 pre-tokenizer splits on \\p{L}, \\p{N} and \\s, and its normalizer is
 NFC. This writes those properties, from this Python's unicodedata, to a small
-little-endian u32 blob that linux/qwen_image/src/unicode.cplus embeds with
+little-endian u32 blob that qwen_image_cuda/src/unicode.cplus embeds with
 #include_bytes. Development tool only.
 
 Layout (every value a u32):
@@ -61,7 +61,7 @@ def full_decomposition(cp: int) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=Path("linux/qwen_image/data/unicode.bin"))
+    parser.add_argument("--output", type=Path, default=Path("qwen_image_cuda/data/unicode.bin"))
     arguments = parser.parse_args()
 
     letters = ranges(lambda cp: unicodedata.category(chr(cp)).startswith("L"))

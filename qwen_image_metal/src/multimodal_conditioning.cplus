@@ -1,0 +1,522 @@
+// End-to-end native assembly of Qwen-Image-2.1 reference-image conditioning.
+//
+// The vision features replace `<|image_pad|>` rows in the Qwen3-VL prompt.
+// Separately, normalized VAE latents are concatenated in image order for the
+// denoiser's image prefix. DeepStack features are layer-major across images.
+
+import "./image_conditioning" as conditioning;
+import "qwen_image/generation_control" as control;
+import "./image_input" as image_input;
+import "./host_buffers" as host_buffers;
+import "./image_output" as image_output;
+import "./qwen3vl_text" as text_encoder;
+import "./qwen3vl_vision" as vision_encoder;
+import "./tokenizer" as tokenizer;
+import "./transformer_block" as transformer;
+import "./vae" as vae;
+import "stdlib/io" as io;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
+import "stdlib/vec" as vec;
+
+const WIDTH: usize = 4096;
+const LATENT_CHANNELS: usize = 64;
+const DEEPSTACK_LAYERS: usize = 3;
+const SYSTEM_PREFIX_TOKENS: usize = 14;
+const IMAGE_PAD_TOKEN: u32 = 151655;
+
+struct Encoded {
+    prompt_embeddings: vec::Vec[f32],
+    prompt_image_mask: vec::Vec[u8],
+    prompt_rows: usize,
+    condition_latents: vec::Vec[f32],
+    condition_rows: usize,
+    shapes: vec::Vec[conditioning::Shape],
+}
+
+// References are resized to the output area, as the reference pipeline's
+// `output_resolution` does for both the vision tower and the VAE.
+fn encode_images(
+    model_root: str,
+    prompt: str,
+    image_paths: *str,
+    image_count: usize,
+    output_resolution: usize = 512 as usize,
+    observer: control::Observer = control::none(),
+) -> option::Option[Encoded] {
+    if !conditioning::reference_count_supported(image_count) {
+        io::eprintln("multimodal conditioning: reference image count must be 1 through 10");
+        return option::Option[Encoded]::None;
+    }
+    let started_ms: i64 = time::now_millis();
+    var input_ms: i64 = 0 as i64;
+    var vision_ms: i64 = 0 as i64;
+    var vae_ms: i64 = 0 as i64;
+    var shapes: vec::Vec[conditioning::Shape] =
+        vec::Vec[conditioning::Shape]::with_capacity(image_count);
+    var image_token_counts: vec::Vec[usize] = vec::Vec[usize]::with_capacity(image_count);
+    var vision_rows: usize = 0 as usize;
+    var condition_rows: usize = 0 as usize;
+
+    // Decode every reference once. Ten 512-area images hold about 75 MB of
+    // float pixels (300 MB at 1024), far less than reloading both encoders
+    // per image costs.
+    var images: vec::Vec[image_input::Image] =
+        vec::Vec[image_input::Image]::with_capacity(image_count);
+    var image_index: usize = 0 as usize;
+    while image_index < image_count {
+        if !control::report(observer, control::Phase::EncodingReferences, image_index, image_count) {
+            return option::Option[Encoded]::None;
+        }
+        let input_start_ms: i64 = time::now_millis();
+        guard let option::Option[image_input::Image]::Some(image) =
+            image_input::load_resized(image_paths[image_index], output_resolution) else {
+            io::eprintln(
+                "multimodal conditioning: could not load ${image_paths[image_index]}",
+            );
+            control::diagnose(observer,
+                "Could not open reference image ${image_paths[image_index]}.");
+            return option::Option[Encoded]::None;
+        };
+        input_ms = input_ms + (time::now_millis() - input_start_ms);
+        let shape: conditioning::Shape = image.shape;
+        if shapes.append(shape) != status::Status::Ok
+            || image_token_counts.append(shape.vision_tokens) != status::Status::Ok
+            || images.append(image) != status::Status::Ok {
+            io::eprintln("multimodal conditioning: could not store decoded reference image");
+            return option::Option[Encoded]::None;
+        }
+        vision_rows = vision_rows +% shape.vision_tokens;
+        condition_rows = condition_rows +% shape.latent_tokens;
+        image_index = image_index +% (1 as usize);
+    }
+
+    guard let option::Option[vec::Vec[f32]]::Some(vision) = host_buffers::zeroed_f32(
+        vision_rows *% WIDTH,
+    ) else { io::eprintln("multimodal conditioning: could not allocate vision buffer"); return option::Option[Encoded]::None; };
+    guard let option::Option[vec::Vec[f32]]::Some(deepstack) = host_buffers::zeroed_f32(
+        DEEPSTACK_LAYERS *% vision_rows *% WIDTH,
+    ) else { io::eprintln("multimodal conditioning: could not allocate DeepStack buffer"); return option::Option[Encoded]::None; };
+    guard let option::Option[vec::Vec[f32]]::Some(condition_latents) = host_buffers::zeroed_f32(
+        condition_rows *% LATENT_CHANNELS,
+    ) else { io::eprintln("multimodal conditioning: could not allocate condition latents"); return option::Option[Encoded]::None; };
+
+    let shape_values: *conditioning::Shape = #slice_ptr(shapes.as_slice());
+    let image_values: *image_input::Image = #slice_ptr(images.as_slice());
+    let vision_values: *f32 = #slice_ptr(vision.as_slice());
+    let deep_values: *f32 = #slice_ptr(deepstack.as_slice());
+    let latent_values: *f32 = #slice_ptr(condition_latents.as_slice());
+    // Each image writes its rows at its offset in the combined arrays. The
+    // DeepStack stride spans all images' tokens, which is the language
+    // model's [layer, all images' tokens, channel] order.
+    var vision_inputs: vec::Vec[vision_encoder::Input] =
+        vec::Vec[vision_encoder::Input]::with_capacity(image_count);
+    var vae_inputs: vec::Vec[vae::EncodeInput] =
+        vec::Vec[vae::EncodeInput]::with_capacity(image_count);
+    var vision_row_offset: usize = 0 as usize;
+    var latent_row_offset: usize = 0 as usize;
+    image_index = 0 as usize;
+    while image_index < image_count {
+        let shape: conditioning::Shape = shape_values[image_index];
+        if vision_inputs.append(vision_encoder::Input {
+            rgb_pixels: #slice_ptr(image_values[image_index].vision_pixels.as_slice()),
+            width: shape.width,
+            height: shape.height,
+            output: vision_values + vision_row_offset *% WIDTH,
+            deepstack: deep_values + vision_row_offset *% WIDTH,
+            deepstack_layer_stride: vision_rows *% WIDTH,
+        }) != status::Status::Ok
+            || vae_inputs.append(vae::EncodeInput {
+            rgba_source: #slice_ptr(image_values[image_index].vae_pixels.as_slice()),
+            width: shape.width,
+            height: shape.height,
+            normalized_destination: latent_values
+                    + latent_row_offset *% LATENT_CHANNELS,
+        }) != status::Status::Ok {
+            return option::Option[Encoded]::None;
+        }
+        vision_row_offset = vision_row_offset +% shape.vision_tokens;
+        latent_row_offset = latent_row_offset +% shape.latent_tokens;
+        image_index = image_index +% (1 as usize);
+    }
+    let vision_start_ms: i64 = time::now_millis();
+    if !control::report(observer, control::Phase::EncodingReferences, image_count, image_count) {
+        return option::Option[Encoded]::None;
+    }
+    if vision_encoder::encode_batch_to_host(
+        model_root, #slice_ptr(vision_inputs.as_slice()), image_count,
+    ) != (0 as i32) {
+        control::diagnose(observer, "The vision encoder failed while processing reference images. Check its model files and available memory.");
+        return option::Option[Encoded]::None;
+    }
+    vision_ms = time::now_millis() - vision_start_ms;
+    host_buffers::dump_f32("vision_features.f32", vision_values, vision_rows *% WIDTH);
+    host_buffers::dump_f32(
+        "deepstack_features.f32", deep_values, DEEPSTACK_LAYERS *% vision_rows *% WIDTH,
+    );
+    let vae_start_ms: i64 = time::now_millis();
+    if vae::encode_batch_from_host(
+        model_root, #slice_ptr(vae_inputs.as_slice()), image_count,
+    ) != (0 as i32) {
+        control::diagnose(observer, "The VAE encoder failed while processing reference images. Check its model file and available memory.");
+        return option::Option[Encoded]::None;
+    }
+    vae_ms = time::now_millis() - vae_start_ms;
+
+    let text_start_ms: i64 = time::now_millis();
+    if !control::report(observer, control::Phase::EncodingText, 0 as usize, 0 as usize) {
+        return option::Option[Encoded]::None;
+    }
+    guard let option::Option[vec::Vec[u32]]::Some(tokens) =
+        tokenizer::tokenize_full_prompt_with_images(
+            model_root, prompt, #slice_ptr(image_token_counts.as_slice()), image_count,
+    ) else {
+        io::eprintln("multimodal conditioning: could not tokenize prompt");
+        control::diagnose(observer, "Could not tokenize the prompt and references. Check the tokenizer files beside the selected QIPACK.");
+        return option::Option[Encoded]::None;
+    };
+    guard let option::Option[vec::Vec[u32]]::Some(positions) = host_buffers::zeroed_u32(
+        tokens.count() *% (3 as usize),
+    ) else { return option::Option[Encoded]::None; };
+    if !conditioning::fill_language_positions(
+        #slice_ptr(tokens.as_slice()), tokens.count(), shape_values,
+        image_count, #slice_ptr(positions.as_slice()),
+    ) {
+        io::eprintln("multimodal conditioning: could not build MRoPE positions");
+        return option::Option[Encoded]::None;
+    }
+    let prompt_rows: usize = tokens.count() -% SYSTEM_PREFIX_TOKENS;
+    guard let option::Option[vec::Vec[f32]]::Some(prompt_embeddings) = host_buffers::zeroed_f32(
+        prompt_rows *% WIDTH,
+    ) else { return option::Option[Encoded]::None; };
+    var encoded_rows: usize = 0 as usize;
+    if text_encoder::encode_multimodal_tokens_to_host(
+        model_root,
+        #slice_ptr(tokens.as_slice()),
+        tokens.count(),
+        #slice_ptr(positions.as_slice()),
+        vision_values,
+        vision_rows,
+        deep_values,
+        #slice_ptr(prompt_embeddings.as_slice()),
+        prompt_rows *% WIDTH,
+        #addr_of(encoded_rows),
+    ) != (0 as i32) || encoded_rows != prompt_rows {
+        io::eprintln(
+            "multimodal conditioning: text rows expected=${prompt_rows} actual=${encoded_rows}",
+        );
+        control::diagnose(observer, "The text encoder failed while combining the prompt and references. Check its model shards and available memory.");
+        return option::Option[Encoded]::None;
+    }
+    var prompt_image_mask: vec::Vec[u8] = vec::Vec[u8]::with_capacity(prompt_rows);
+    let token_values: *u32 = #slice_ptr(tokens.as_slice());
+    var token: usize = SYSTEM_PREFIX_TOKENS;
+    while token < tokens.count() {
+        if prompt_image_mask.append(
+            if token_values[token] == IMAGE_PAD_TOKEN { 1 as u8 } else { 0 as u8 },
+        ) != status::Status::Ok { return option::Option[Encoded]::None; }
+        token = token +% (1 as usize);
+    }
+    let text_ms: i64 = time::now_millis() - text_start_ms;
+
+    io::println(
+        "multi-image conditioning: images=${image_count} output_resolution=${output_resolution} vision_rows=${vision_rows} prompt_rows=${prompt_rows} condition_rows=${condition_rows} input_ms=${input_ms} vision_ms=${vision_ms} text_ms=${text_ms} vae_ms=${vae_ms} total_wall_ms=${time::now_millis() - started_ms}",
+    );
+    return option::Option[Encoded]::Some(Encoded {
+        prompt_embeddings: prompt_embeddings,
+        prompt_image_mask: prompt_image_mask,
+        prompt_rows: prompt_rows,
+        condition_latents: condition_latents,
+        condition_rows: condition_rows,
+        shapes: shapes,
+    });
+}
+
+fn encode_two_images_512(
+    model_root: str,
+    prompt: str,
+    first_path: str,
+    second_path: str,
+) -> option::Option[Encoded] {
+    var image_paths: [str; 2] = [first_path, second_path];
+    return encode_images(model_root, prompt, #addr_of(image_paths[0]), 2 as usize);
+}
+
+fn finite_nonzero(values: *f32, count: usize) -> bool {
+    var absolute_sum: f64 = 0.0f64;
+    var index: usize = 0 as usize;
+    while index < count {
+        let value: f32 = values[index];
+        let bits: u32 = #bitcast::[u32](value);
+        if (bits & (0x7F800000 as u32)) == (0x7F800000 as u32) {
+            return false;
+        }
+        absolute_sum = absolute_sum + (value as f64).abs();
+        index = index +% (1 as usize);
+    }
+    return absolute_sum > 0.000001f64;
+}
+
+fn run_two_image_512(
+    model_root: str,
+    first_path: str,
+    second_path: str,
+    prompt: str = "Use Picture 1 and Picture 2 to create a coherent new scene.",
+) -> i32 {
+    guard let option::Option[Encoded]::Some(encoded) = encode_two_images_512(
+        model_root, prompt, first_path, second_path,
+    ) else {
+        return 1;
+    };
+    var mask_count: usize = 0 as usize;
+    let mask_values: *u8 = #slice_ptr(encoded.prompt_image_mask.as_slice());
+    var row: usize = 0 as usize;
+    while row < encoded.prompt_image_mask.count() {
+        if mask_values[row] != (0 as u8) {
+            mask_count = mask_count +% (1 as usize);
+        }
+        row = row +% (1 as usize);
+    }
+    let shape_values: *conditioning::Shape = #slice_ptr(encoded.shapes.as_slice());
+    let expected_vision_rows: usize =
+        shape_values[0].vision_tokens +% shape_values[1].vision_tokens;
+    let shape_rows: usize =
+        shape_values[0].latent_tokens +% shape_values[1].latent_tokens;
+    let prompt_ok: bool = finite_nonzero(
+        #slice_ptr(encoded.prompt_embeddings.as_slice()),
+        encoded.prompt_rows *% WIDTH,
+    );
+    let latent_ok: bool = finite_nonzero(
+        #slice_ptr(encoded.condition_latents.as_slice()),
+        encoded.condition_rows *% LATENT_CHANNELS,
+    );
+    if mask_count != expected_vision_rows || encoded.condition_rows != shape_rows
+        || !prompt_ok || !latent_ok {
+        io::eprintln(
+            "multi-image conditioning: mask=${mask_count}/${expected_vision_rows} latents=${encoded.condition_rows}/${shape_rows} prompt_finite=${prompt_ok} latent_finite=${latent_ok}",
+        );
+        return 1;
+    }
+    io::println(
+        "Qwen-Image-2.1 two-image 512 conditioning: verified prompt_rows=${encoded.prompt_rows} vision_rows=${expected_vision_rows} condition_rows=${encoded.condition_rows}",
+    );
+    return 0;
+}
+
+// Full native handoff through a short transformer smoke or a complete
+// trajectory. One and two steps are truncated prefixes of the 40-step schedule:
+// two prove that target-only decoding can reuse the interleaved prefix K/V
+// cache, but their latent is still mostly noise, so they never write a PNG.
+// Complete trajectories (3, 4, 8, 25, or 40 steps; the pack's shift_terminal
+// metadata selects the schedule) also run native VAE decode and PNG output.
+fn run_multi_image_transformer(
+    packed_path: str,
+    model_root: str,
+    image_paths: *str,
+    image_count: usize,
+    prompt: str = "Use Picture 1 and Picture 2 to create a coherent new scene.",
+    requested_steps: str = "1",
+    output_path: str = "",
+    seed: u64 = 1301 as u64,
+    output_resolution: usize = 512 as usize,
+    observer: control::Observer = control::none(),
+    output_width: usize = 0 as usize,
+    output_height: usize = 0 as usize,
+    benchmark_only: bool = false,
+) -> i32 {
+    if !control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) {
+        return 3;
+    }
+    let width: usize = if output_width == (0 as usize) {
+        output_resolution
+    } else { output_width };
+    let height: usize = if output_height == (0 as usize) {
+        output_resolution
+    } else { output_height };
+    if width < (256 as usize) || height < (256 as usize)
+        || width > (2048 as usize) || height > (2048 as usize)
+        || width % (32 as usize) != (0 as usize)
+        || height % (32 as usize) != (0 as usize)
+        || width > (1048576 as usize) / height {
+        io::eprintln("multi-image transformer: output size must fit within 1024x1024 pixels with both sides at least 256 and divisible by 32");
+        return 2;
+    }
+    let smoke_steps: bool = requested_steps == "1" || requested_steps == "2";
+    if !(smoke_steps || requested_steps == "3" || requested_steps == "4"
+        || requested_steps == "6" || requested_steps == "8" || requested_steps == "25" || requested_steps == "40") {
+        io::eprintln("multi-image transformer: steps must be 1, 2, 3, 4, 6, 8, 25, or 40");
+        return 2;
+    }
+    if smoke_steps && output_path.count() > (0 as usize) {
+        io::eprintln("multi-image transformer: ${requested_steps} steps is a truncated smoke trajectory; generating a PNG needs 3, 4, 6, 8, 25, or 40");
+        return 2;
+    }
+    let started_ms: i64 = time::now_millis();
+    let reference_resolution: usize =
+        ((width *% height) as f64).sqrt() as usize;
+    // Start the transformer's pack read now; it runs on the SSD while the
+    // encoders below run on the GPU.
+    var preload: transformer::PackPreload =
+        transformer::begin_pack_preload(packed_path, width, height);
+    guard let option::Option[Encoded]::Some(encoded) = encode_images(
+        model_root, prompt, image_paths, image_count, reference_resolution, observer,
+    ) else {
+        if !control::report(observer, control::Phase::EncodingReferences, 0 as usize, image_count) {
+            return 3;
+        }
+        return 1;
+    };
+    var shapes: vec::Vec[transformer::LatentShape] =
+        vec::Vec[transformer::LatentShape]::with_capacity(image_count);
+    let condition_shapes: *conditioning::Shape = #slice_ptr(encoded.shapes.as_slice());
+    var shape_index: usize = 0 as usize;
+    while shape_index < image_count {
+        if shapes.append(transformer::LatentShape {
+            height: condition_shapes[shape_index].height / (16 as usize),
+            width: condition_shapes[shape_index].width / (16 as usize),
+        }) != status::Status::Ok { return 1; }
+        shape_index = shape_index +% (1 as usize);
+    }
+    let latent_width: usize = width / (16 as usize);
+    let latent_height: usize = height / (16 as usize);
+    let target_rows: usize = latent_width *% latent_height;
+    guard let option::Option[vec::Vec[f32]]::Some(target) = host_buffers::zeroed_f32(
+        target_rows *% LATENT_CHANNELS,
+    ) else { return 1; };
+    host_buffers::dump_f32(
+        "prompt_embeddings.f32", #slice_ptr(encoded.prompt_embeddings.as_slice()),
+        encoded.prompt_rows *% WIDTH,
+    );
+    host_buffers::dump_bytes(
+        "prompt_image_mask.u8", #slice_ptr(encoded.prompt_image_mask.as_slice()),
+        encoded.prompt_rows,
+    );
+    host_buffers::dump_f32(
+        "condition_latents.f32", #slice_ptr(encoded.condition_latents.as_slice()),
+        encoded.condition_rows *% LATENT_CHANNELS,
+    );
+    let transformer_start_ms: i64 = time::now_millis();
+    if benchmark_only {
+        let result: i32 = transformer::benchmark_conditioned_trajectory_sized(
+            packed_path,
+            #slice_ptr(encoded.prompt_embeddings.as_slice()),
+            encoded.prompt_rows,
+            #slice_ptr(encoded.prompt_image_mask.as_slice()),
+            #slice_ptr(encoded.condition_latents.as_slice()),
+            encoded.condition_rows,
+            #slice_ptr(shapes.as_slice()),
+            image_count,
+            seed,
+            width,
+            height,
+            requested_steps,
+            #addr_of(preload),
+        );
+        io::println(
+            "multi-image benchmark: images=${image_count} output=${width}x${height} steps=${requested_steps} transformer_wall_ms=${time::now_millis() - transformer_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        );
+        return result;
+    }
+    let result: i32 = transformer::run_conditioned_trajectory_sized_to_host(
+        packed_path,
+        #slice_ptr(encoded.prompt_embeddings.as_slice()),
+        encoded.prompt_rows,
+        #slice_ptr(encoded.prompt_image_mask.as_slice()),
+        #slice_ptr(encoded.condition_latents.as_slice()),
+        encoded.condition_rows,
+        #slice_ptr(shapes.as_slice()),
+        image_count,
+        seed,
+        #slice_ptr(target.as_slice()),
+        width,
+        height,
+        requested_steps,
+        observer,
+        #addr_of(preload),
+    );
+    let transformer_ms: i64 = time::now_millis() - transformer_start_ms;
+    host_buffers::dump_f32(
+        "final_latent.f32", #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
+    );
+    if result == (3 as i32) { return 3; }
+    if result != (0 as i32) || !finite_nonzero(
+        #slice_ptr(target.as_slice()), target_rows *% LATENT_CHANNELS,
+    ) {
+        io::eprintln("multi-image transformer: trajectory target is invalid");
+        control::diagnose(observer, "The transformer failed or produced an invalid image latent. Check the QIPACK and app log for the underlying Metal error.");
+        return 1;
+    }
+    if output_path.count() > (0 as usize) {
+        if !control::report(observer, control::Phase::Decoding, 0 as usize, 0 as usize) {
+            return 3;
+        }
+        guard let option::Option[vec::Vec[f32]]::Some(decoded) = host_buffers::zeroed_f32(
+            width *% height *% (4 as usize),
+        ) else { return 1; };
+        let vae_start_ms: i64 = time::now_millis();
+        // 1024 uses the same decoder entry as text-to-image 1024.
+        let decode_status: i32 = if width == (1024 as usize)
+            && height == (1024 as usize) {
+            vae::decode_1024_from_host(
+                model_root, #slice_ptr(target.as_slice()), #slice_ptr(decoded.as_slice()),
+            )
+        } else {
+            vae::decode_sized_from_host(
+                model_root,
+                #slice_ptr(target.as_slice()),
+                #slice_ptr(decoded.as_slice()),
+                latent_width,
+                latent_height,
+            )
+        };
+        if decode_status != (0 as i32) {
+            control::diagnose(observer, "The VAE decoder failed. Check its model file and available memory.");
+            return 1;
+        }
+        let vae_ms: i64 = time::now_millis() - vae_start_ms;
+        let output_start_ms: i64 = time::now_millis();
+        if !control::report(observer, control::Phase::WritingPng, 0 as usize, 0 as usize) {
+            return 3;
+        }
+        if !image_output::write_png_sized(
+            #slice_ptr(decoded.as_slice()), output_path, width, height,
+        ) {
+            control::diagnose(observer, "Could not write the output PNG to ${output_path}. Check the destination folder and free space.");
+            return 1;
+        }
+        io::println(
+            "Qwen-Image-2.1 multi-image generation: images=${image_count} output=${output_path} pixels=${width}x${height} steps=${requested_steps} seed=${seed} transformer_ms=${transformer_ms} vae_ms=${vae_ms} image_output_ms=${time::now_millis() - output_start_ms} total_wall_ms=${time::now_millis() - started_ms}",
+        );
+        return 0;
+    }
+    io::println(
+        "Qwen-Image-2.1 multi-image transformer: verified images=${image_count} output=${width}x${height} steps=${requested_steps} prompt_rows=${encoded.prompt_rows} condition_rows=${encoded.condition_rows} transformer_wall_ms=${transformer_ms} total_wall_ms=${time::now_millis() - started_ms}",
+    );
+    return 0;
+}
+
+fn run_two_image_transformer_512(
+    packed_path: str,
+    model_root: str,
+    first_path: str,
+    second_path: str,
+    prompt: str = "Use Picture 1 and Picture 2 to create a coherent new scene.",
+    requested_steps: str = "1",
+    output_path: str = "",
+    seed: u64 = 1301 as u64,
+) -> i32 {
+    var image_paths: [str; 2] = [first_path, second_path];
+    return run_multi_image_transformer(
+        packed_path,
+        model_root,
+        #addr_of(image_paths[0]),
+        2 as usize,
+        prompt,
+        requested_steps,
+        output_path,
+        seed,
+    );
+}

@@ -1,7 +1,9 @@
 #!/bin/sh
-# Link each client package's vendor/ to the C+ vendor folder and to the engine
-# for this platform. Clients always import `qwen_image/...`; which directory
-# answers to that name is decided here, not in their sources.
+# Point every package's vendor/ at the C+ vendor folder, so third-party
+# packages (stdlib, json, objc, metal, facet, ...) are shared rather than
+# installed per package. The project's own packages (qwen_image,
+# qwen_image_metal, qwen_image_cuda, qwen_image_runtime) need no link: they sit
+# side by side at the repository root and cpc resolves them as siblings.
 #
 #   CPLUS_VENDOR=/path/to/cplus/vendor scripts/link_vendor.sh
 set -eu
@@ -13,24 +15,13 @@ if [ ! -d "$cplus_vendor" ]; then
     exit 1
 fi
 
-case "$(uname -s)" in
-    Darwin) engine=qwen_image ;;
-    Linux) engine=linux/qwen_image ;;
-    *) echo "unsupported platform: $(uname -s)" >&2; exit 1 ;;
-esac
-
-# Engines resolve their own dependencies straight from the C+ vendor folder.
-for package in qwen_image linux/qwen_image; do
-    ln -sfn "$cplus_vendor" "$root/$package/vendor"
+for package in qwen_image qwen_image_metal qwen_image_cuda qwen_image_runtime \
+               qwen_image_metal_dev qwen_image_cuda_dev qwen_image_quantize cli ffi gui; do
+    vendor="$root/$package/vendor"
+    if [ -L "$vendor" ] || [ ! -e "$vendor" ]; then
+        ln -sfn "$cplus_vendor" "$vendor"
+    else
+        echo "leaving $package/vendor (a real directory; remove it to link)" >&2
+    fi
 done
-
-for client in cli ffi gui; do
-    vendor="$root/$client/vendor"
-    if [ -L "$vendor" ]; then rm "$vendor"; fi
-    mkdir -p "$vendor"
-    for package in "$cplus_vendor"/*; do
-        ln -sfn "$package" "$vendor/$(basename "$package")"
-    done
-    ln -sfn "$root/$engine" "$vendor/qwen_image"
-done
-echo "clients linked to $engine"
+echo "vendor folders linked to $cplus_vendor"

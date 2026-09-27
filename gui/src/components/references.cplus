@@ -1,3 +1,4 @@
+import "../files" as files;
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
@@ -10,8 +11,7 @@ import "facet/scroll" as scroll;
 import "facet/vocabulary" as vocab;
 import "facet_runtime/runtime" as runtime;
 import "events/events" as events;
-import "qwen_image/image_input" as image_input;
-import "qwen_image/image_output" as image_output;
+import "../reference_image" as reference_image;
 import "stdlib/option" as option;
 import "stdlib/fs" as fs;
 import "stdlib/status" as status;
@@ -63,7 +63,7 @@ fn has_image_extension(path: str) -> bool {
 }
 
 fn is_image_file(path: str) -> bool {
-    return file_drop::is_regular_file(path) && has_image_extension(path);
+    return files::is_regular_file(path) && has_image_extension(path);
 }
 
 impl References {
@@ -243,8 +243,8 @@ impl References {
             return false;
         }
         if !commit { return true; }
-        guard let option::Option[image_input::Dimensions]::Some(dimensions) =
-            image_input::source_dimensions(path.view()) else { return false; };
+        guard let option::Option[reference_image::Dimensions]::Some(dimensions) =
+            reference_image::source_dimensions(path.view()) else { return false; };
         let first: bool = this.paths.count() == (0 as usize);
         if this.paths.insert(path.clone(), at: 0 as usize) != status::Status::Ok {
             return false;
@@ -354,15 +354,9 @@ fn edit_current_image_adds_it_to_the_reference_strip() {
     let path: text::Text =
         "/tmp/qwen-image-gui-edit-${getpid()}-${time::now_millis()}.png";
     let saved: preferences::GenerationPreferences = preferences::load();
-    var pixels: vec::Vec[f32] = vec::Vec[f32]::with_capacity(4096 as usize);
-    var index: usize = 0 as usize;
-    while index < (4096 as usize) {
-        let _added: status::Status = pixels.append(0.0f32);
-        index = index +% (1 as usize);
-    }
-    assert image_output::write_png_sized(
-        #slice_ptr(pixels.as_slice()), path.view(), 32 as usize, 32 as usize,
-    );
+    // A 32 x 32 black PNG.
+    let png: *[u8; 100] = #include_bytes("../../testdata/black32.png");
+    assert files::write_bytes(path.view(), png as *u8, 100 as usize);
     var references: References = References::new();
     references.edit_sub = current_image::watch_edit(references.on_edit_current);
     assert current_image::set_png(path.view());

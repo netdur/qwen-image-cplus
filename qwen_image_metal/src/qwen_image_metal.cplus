@@ -1,0 +1,10 @@
+// Root module for the Metal inference backend (macOS).
+//
+// Applications import the public surface from the core, `qwen_image/api`;
+// `qwen_image_runtime` installs this backend into the core's engine seam
+// through `backend::install()`. The package remains entry-less so C+ can
+// prebuild every module into one archive.
+
+import "./backend" as _;
+import "./image_conditioning" as _;
+import "./image_input" as _;

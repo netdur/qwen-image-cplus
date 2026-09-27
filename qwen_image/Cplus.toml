@@ -3,14 +3,15 @@ name    = "qwen_image"
 version = "0.2.2"
 edition = "2026"
 
+# qwen_image — the portable core: the public API contract, generation control,
+# pack metadata, and the engine seam a backend fills.
+#
+# ONE CORE, ONE BACKEND PER GPU API, the shape vendor/facet uses: this package
+# names no platform and links nothing. `qwen_image_metal` (macOS) and
+# `qwen_image_cuda` (Linux, later Windows) implement `engine::Engine` and
+# install it; `qwen_image_runtime` picks the backend for the platform being
+# built. Every arrow points down: backends import this core, the runtime
+# imports the backends, applications import the core and the runtime.
+
 [dependencies]
-json        = "*"
-stdlib      = "*"
-
-[macos.dependencies]
-objc          = "*"
-metal         = "*"
-foundation    = "*"
-
-[link]
-frameworks = ["CoreFoundation", "CoreGraphics", "ImageIO"]
+stdlib = "*"

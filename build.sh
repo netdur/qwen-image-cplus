@@ -6,19 +6,6 @@ cpc_bin=${CPC:-cpc}
 build_mode=${BUILD_MODE:-release}
 export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-14.0}
 
-ensure_engine_link() {
-    consumer=$1
-    vendor_dir="$project_root/$consumer/vendor"
-    if [ -L "$vendor_dir" ]; then
-        return
-    fi
-    link="$vendor_dir/qwen_image"
-    mkdir -p "$vendor_dir"
-    if [ ! -e "$link" ] && [ ! -L "$link" ]; then
-        ln -s ../../qwen_image "$link"
-    fi
-}
-
 build_package() {
     package_dir=$1
     if [ "$build_mode" = "release" ]; then
@@ -31,11 +18,10 @@ build_package() {
     fi
 }
 
-ensure_engine_link cli
-ensure_engine_link ffi
-ensure_engine_link gui
-
+# The qwen_image* packages sit side by side at the repository root and
+# resolve as sibling directories; vendor/ carries only third-party packages.
 build_package qwen_image
+build_package qwen_image_metal
 build_package cli
 build_package ffi
 build_package gui

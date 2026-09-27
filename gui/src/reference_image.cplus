@@ -1,0 +1,14 @@
+// A reference image's displayed size (EXIF orientation applied), read by the
+// platform's inference backend without decoding the image. With no backend
+// for this platform, no reference image is accepted.
+
+import "stdlib/option" as option;
+
+struct Dimensions {
+    width: usize,
+    height: usize,
+}
+
+fn source_dimensions(path: str) -> option::Option[Dimensions] {
+    return option::Option[Dimensions]::None;
+}

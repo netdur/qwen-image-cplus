@@ -1,0 +1,24 @@
+// Root module for the CUDA inference backend (Linux; the file I/O it uses is
+// the core's, so a Windows port adds only platform files and a link table).
+//
+// Applications do not import this package: `qwen_image_runtime` installs it
+// into the core's engine seam through `backend::install()`. Development
+// commands (qwen_image_cuda_dev) import its modules directly.
+
+import "./backend" as _;
+import "./cuda" as _;
+import "./half" as _;
+import "./image_conditioning" as _;
+import "./image_input" as _;
+import "./inputs" as _;
+import "./int4_pack" as _;
+import "./multimodal_conditioning" as _;
+import "./pipeline" as _;
+import "./png" as _;
+import "./random" as _;
+import "./text_encoder" as _;
+import "./tokenizer" as _;
+import "./transformer" as _;
+import "./unicode" as _;
+import "./vae" as _;
+import "./vision" as _;

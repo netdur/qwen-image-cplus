@@ -3,15 +3,21 @@ name    = "qwen-image-cplus"
 version = "0.2.2"
 edition = "2026"
 
-[macos]
-entry = "src/main.cplus"
-
+# The public CLI: the same source on every platform, over qwen_image/api.
+# qwen_image_runtime installs the platform's backend; each backend and its
+# closure is named for its platform (the resolver checks imports against this
+# manifest's flat dependency set).
 [dependencies]
-qwen_image = "*"
-json       = "*"
-stdlib     = "*"
+qwen_image         = "*"
+qwen_image_runtime = "*"
+json               = "*"
+stdlib             = "*"
 
 [macos.dependencies]
-objc       = "*"
-metal      = "*"
-foundation = "*"
+qwen_image_metal = "*"
+objc             = "*"
+metal            = "*"
+foundation       = "*"
+
+[linux.dependencies]
+qwen_image_cuda = "*"

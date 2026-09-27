@@ -8,12 +8,20 @@ name  = "qwen_image"
 entry = "src/ffi.cplus"
 kind  = "both"
 
+# The C library over the public API; the platform's backend comes through
+# qwen_image_runtime. Backends are named per platform because the resolver
+# validates imports against this manifest's flat dependency set.
 [dependencies]
-qwen_image = "*"
-json       = "*"
-stdlib     = "*"
+qwen_image         = "*"
+qwen_image_runtime = "*"
+json               = "*"
+stdlib             = "*"
 
 [macos.dependencies]
-objc       = "*"
-metal      = "*"
-foundation = "*"
+qwen_image_metal = "*"
+objc             = "*"
+metal            = "*"
+foundation       = "*"
+
+[linux.dependencies]
+qwen_image_cuda = "*"

@@ -1,5 +1,8 @@
 import "./app" as app;
+import "qwen_image_runtime/runtime" as runtime;
 
 fn main() -> i32 {
+    // Install the platform's inference backend before the first request.
+    runtime::install();
     return app::run();
 }

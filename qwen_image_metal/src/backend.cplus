@@ -1,0 +1,19 @@
+// Installs this package as the process's inference backend: fills the core's
+// `qwen_image/engine` seam with the Metal pipelines. `qwen_image_runtime`
+// calls `install()` on macOS; nothing else needs to.
+
+import "qwen_image/engine" as engine;
+import "./multimodal_conditioning" as multimodal_conditioning;
+import "./pipeline" as pipeline;
+
+fn install() {
+    engine::install(engine::Engine {
+        generate_256: pipeline::generate_256,
+        generate_256_cache_dit: pipeline::generate_256_cache_dit,
+        generate_1024: pipeline::generate_1024,
+        generate_1024_taylorseer: pipeline::generate_1024_taylorseer,
+        generate_1024_cache_dit: pipeline::generate_1024_cache_dit,
+        generate_sized: pipeline::generate_sized,
+        generate_multi_image: multimodal_conditioning::run_multi_image_transformer,
+    });
+}

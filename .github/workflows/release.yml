@@ -35,7 +35,7 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = arm64
           version="${{ steps.meta.outputs.version }}"
-          for manifest in qwen_image/Cplus.toml cli/Cplus.toml ffi/Cplus.toml gui/Cplus.toml; do
+          for manifest in qwen_image/Cplus.toml qwen_image_metal/Cplus.toml qwen_image_runtime/Cplus.toml cli/Cplus.toml ffi/Cplus.toml gui/Cplus.toml; do
             grep -Eq "^version *= *\"${version}\"$" "$manifest"
           done
 
@@ -46,14 +46,14 @@ jobs:
 
       - name: Install released C+ packages
         run: |
-          cpc pm install qwen_image
-          mkdir -p gui/vendor
-          ln -s ../../qwen_image gui/vendor/qwen_image
+          # Third-party packages only: the qwen_image* packages sit side by side
+          # at the repository root and resolve as sibling directories.
+          cpc pm install qwen_image_metal
           cpc pm install gui
 
       - name: Build and verify distribution
         run: |
-          cpc fmt --check qwen_image/src/api.cplus qwen_image/src/qwen_image.cplus
+          cpc fmt --check qwen_image/src/api.cplus qwen_image/src/engine.cplus qwen_image/src/qwen_image.cplus
           cpc fmt --check cli/src/main.cplus
           cpc fmt --check ffi/src/ffi.cplus
           ./build.sh
@@ -64,6 +64,10 @@ jobs:
           (cd qwen_image && cpc test --release --json --filter qwen_image::src) \
             | tee "$RUNNER_TEMP/qwen-image-tests.jsonl"
           tail -n 1 "$RUNNER_TEMP/qwen-image-tests.jsonl" | jq -e '.failed == 0'
+
+          (cd qwen_image_metal && cpc test --release --json --filter qwen_image_metal::src) \
+            | tee "$RUNNER_TEMP/qwen-image-metal-tests.jsonl"
+          tail -n 1 "$RUNNER_TEMP/qwen-image-metal-tests.jsonl" | jq -e '.failed == 0'
 
           (cd ffi && cpc test --release --json --filter ffi_version) \
             | tee "$RUNNER_TEMP/qwen-image-ffi-tests.jsonl"

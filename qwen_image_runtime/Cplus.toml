@@ -1,0 +1,36 @@
+[package]
+name    = "qwen_image_runtime"
+version = "0.2.2"
+edition = "2026"
+
+# qwen_image_runtime — picks the inference backend for the platform being
+# built and installs it into the core's engine seam, the role facet_runtime
+# plays for facet. `import "qwen_image_runtime/runtime"` resolves to
+# runtime_macos (Metal) or runtime_linux (CUDA) through the resolver's
+# platform override on the filename; any other target lands on the neutral
+# base, which installs nothing, so the API reports that no backend exists
+# rather than failing somewhere deeper.
+#
+# The backend is chosen by GPU API, not by OS name: a Windows port adds
+# runtime_windows.cplus (CUDA again) and a [windows.dependencies] table.
+
+[dependencies]
+qwen_image = "*"
+stdlib     = "*"
+json       = "*"
+
+# The Metal backend and its closure (the resolver validates imports against
+# one flat set, so a backend's own dependencies are named here too).
+[macos.dependencies]
+qwen_image_metal = "*"
+objc             = "*"
+metal            = "*"
+foundation       = "*"
+
+[linux.dependencies]
+qwen_image_cuda = "*"
+
+# Same as qwen_image_cuda: compiled into the consumer, not prebuilt, so GNU ld
+# sees the CUDA archive after the code that uses it.
+[build]
+prebuild = false

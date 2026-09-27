@@ -1,0 +1,46 @@
+// The engine seam: what an inference backend fills, once, with `install`.
+//
+// The entries mirror the generation paths `api` dispatches to; each returns
+// the pipeline status convention (0 ok, 2 invalid argument, 3 cancelled,
+// anything else failed) and reports progress and diagnostics through the
+// observer. A backend installs itself from its own `install()`, which
+// `qwen_image_runtime` calls for the platform being built; this module never
+// names a backend.
+
+import "./generation_control" as control;
+
+struct Engine {
+    // (packed_path, model_root, output_path, prompt, seed, steps, observer)
+    generate_256: fn(str, str, str, str, u64, str, control::Observer) -> i32,
+    // (packed_path, model_root, output_path, prompt, seed, threshold, steps, observer)
+    generate_256_cache_dit: fn(str, str, str, str, u64, f64, str, control::Observer) -> i32,
+    generate_1024: fn(str, str, str, str, u64, str, control::Observer) -> i32,
+    generate_1024_taylorseer: fn(str, str, str, str, u64, f64, str, control::Observer) -> i32,
+    generate_1024_cache_dit: fn(str, str, str, str, u64, f64, str, control::Observer) -> i32,
+    // (packed_path, model_root, output_path, prompt, width, height, seed, steps, observer)
+    generate_sized: fn(str, str, str, str, usize, usize, u64, str, control::Observer) -> i32,
+    // (packed_path, model_root, image_paths, image_count, prompt, steps, output_path,
+    //  seed, output_resolution, observer, output_width, output_height, benchmark_only)
+    generate_multi_image: fn(str, str, *str, usize, str, str, str, u64, usize, control::Observer, usize, usize, bool) -> i32,
+}
+
+// The process's backend. "Installed" is derived from it, so a separate flag
+// cannot disagree.
+static ENGINE: Engine = #zero::[Engine]();
+
+fn install(take engine: Engine) {
+    ENGINE = engine;
+}
+
+fn installed() -> bool {
+    return ENGINE.generate_sized.is_not_null();
+}
+
+fn current() -> Engine {
+    return ENGINE;
+}
+
+// Tests and teardown: back to no backend.
+fn uninstall() {
+    ENGINE = #zero::[Engine]();
+}

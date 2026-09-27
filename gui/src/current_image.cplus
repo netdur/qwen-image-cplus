@@ -1,3 +1,4 @@
+import "./files" as files;
 import "events/events" as events;
 import "stdlib/option" as option;
 import "stdlib/fs" as fs;
@@ -42,7 +43,7 @@ fn path() -> option::Option[text::Text] {
 
 fn set_png(path_value: str) -> bool {
     let lower: text::Text = path_value.to_text().lowercased();
-    if !lower.view().has_suffix(".png") || !file_drop::is_regular_file(path_value) {
+    if !lower.view().has_suffix(".png") || !files::is_regular_file(path_value) {
         return false;
     }
     ensure();

@@ -1,0 +1,16 @@
+[package]
+name    = "qwen_image_quantize"
+version = "0.2.2"
+edition = "2026"
+
+[linux]
+entry = "src/main.cplus"
+
+# Writes the INT4 (W4A16 / W4A4) packs the CUDA backend runs, from the FP16
+# QIPACK. CPU only; the pack format lives in qwen_image_cuda/int4_pack.
+
+[dependencies]
+qwen_image      = "*"
+qwen_image_cuda = "*"
+stdlib          = "*"
+json            = "*"

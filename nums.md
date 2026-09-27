@@ -8,8 +8,8 @@ RTX 2060 (6 GB), Linux, seed 1301, prompt
 | Runtime | Model | Quant | Steps | Prompt | ~Speed (end to end) |
 | --- | --- | --- | ---: | --- | ---: |
 | Diffusers oracle (80c7ed2, Torch 2.14) | Viggle Qwen-Image-2.1 turbo v0.1 | GGUF Q4_K_M (Abiray), FP16 compute; text encoder BF16, VAE FP32 | 4 | `a travel poster with the headline "CASABLANCA" and the tagline "MEET ME AT SUNSET"` | ~39–45 s |
-| C+ / CUDA engine (linux/) | Viggle Qwen-Image-2.1 turbo v0.1 | W4A4 H256 g64 clip v6 pack; text encoder BF16 streamed, VAE FP32 | 4 | same | ~8.8 s warm cache (~19 s with shards read from NVMe, before the later optimizations) |
-| C+ / CUDA engine (linux/) | Viggle Qwen-Image-2.1 turbo v0.1 | W4A16 g64 v6 pack; text encoder BF16 streamed, VAE FP32 | 4 | same | ~23 s (shards partly from NVMe) |
+| C+ / CUDA engine (qwen_image_cuda) | Viggle Qwen-Image-2.1 turbo v0.1 | W4A4 H256 g64 clip v6 pack; text encoder BF16 streamed, VAE FP32 | 4 | same | ~8.8 s warm cache (~19 s with shards read from NVMe, before the later optimizations) |
+| C+ / CUDA engine (qwen_image_cuda) | Viggle Qwen-Image-2.1 turbo v0.1 | W4A16 g64 v6 pack; text encoder BF16 streamed, VAE FP32 | 4 | same | ~23 s (shards partly from NVMe) |
 
 Oracle phases (run 1 / run 2): load 4.1 / 4.7 s, text 16.3 / 17.6 s,
 denoise 7.7 / 12.1 s, VAE 3.2–3.7 s. Both strings exact; PNGs byte-identical.
@@ -23,7 +23,7 @@ PNG 2.0 s. W4A4 with every file in the page cache: text 4.3 s, transformer
 After pipelined text-encoder reads, one activation quantization per shared
 input, FP16 tensor-core attention, and the 256-deep W4A4 GEMM (W4A4, warm
 cache): text 3.3 s, transformer 3.8 s (0.65 s per step), VAE + PNG 1.4 s,
-8.75-8.86 s end to end. Command: `linux/dev/target/release/qwen_image_dev generate PACK models
+8.75-8.86 s end to end. Command: `qwen_image_cuda_dev/target/release/qwen_image_cuda_dev generate PACK models
 OUT.png PROMPT 512 512 1301 4`.
 
 ## 1024×1024
@@ -31,7 +31,7 @@ OUT.png PROMPT 512 512 1301 4`.
 | Runtime | Model | Quant | Steps | ~Speed (end to end) |
 | --- | --- | --- | ---: | ---: |
 | Diffusers oracle (80c7ed2, Torch 2.14) | Viggle turbo v0.1 | GGUF Q4_K_M, FP16 compute; VAE tiling (untiled FP32 decode runs out of memory) | 4 | ~74.5 s (78.5 s process wall) |
-| C+ / CUDA engine (linux/) | Viggle turbo v0.1 | W4A4 H256 g64 clip v6, blocks streamed from pinned memory with overlapped uploads | 4 | ~23.5 s |
+| C+ / CUDA engine (qwen_image_cuda) | Viggle turbo v0.1 | W4A4 H256 g64 clip v6, blocks streamed from pinned memory with overlapped uploads | 4 | ~23.5 s |
 
 Oracle phases: load 4.8 s, text 19.9 s, denoise 32.2 s (about 8 s per step),
 VAE 9.5 s. Engine phases: text 3.3 s, transformer 16.1 s (3.3-3.4 s per step),
@@ -46,7 +46,7 @@ seed 1301, output 512×512.
 | Runtime | Model | Quant | Steps | Prompt | ~Speed (end to end) |
 | --- | --- | --- | ---: | --- | ---: |
 | Diffusers oracle (80c7ed2, Torch 2.14) | Viggle turbo v0.1 | GGUF Q4_K_M, FP16 compute; text encoder and vision tower FP16 (pipeline dtype), VAE FP32 | 4 | `make the cat wear a red wizard hat` | ~76.3 s (80.2 s process wall) |
-| C+ / CUDA engine (linux/) | Viggle turbo v0.1 | W4A4 H256 g64 clip v6; text encoder BF16 streamed, vision tower BF16 weights / FP32 math, VAE FP32 | 4 | same | ~12.2 s (12.3 s process wall) |
+| C+ / CUDA engine (qwen_image_cuda) | Viggle turbo v0.1 | W4A4 H256 g64 clip v6; text encoder BF16 streamed, vision tower BF16 weights / FP32 math, VAE FP32 | 4 | same | ~12.2 s (12.3 s process wall) |
 
 Oracle phases: load 21.1 s, text + vision 33.6 s, VAE encode 1.8 s, denoise
 ~9.0 s, VAE decode 3.0 s. Script: `tools/benchmark_oracle_edit.py`.
@@ -55,7 +55,7 @@ Engine phases (warm cache): decode + resize 0.1 s, vision tower 0.9-1.1 s
 (including its 1.2 GB weight load), VAE encode 0.36 s, text encoder (292
 tokens, 256 of them image) 4.0 s, transformer 5.5 s (load, 2070-row
 conditioned prefix, then 0.71 s per step), VAE + PNG 1.1 s. Command:
-`linux/dev/target/release/qwen_image_dev edit PACK models OUT.png PROMPT 512
+`qwen_image_cuda_dev/target/release/qwen_image_cuda_dev edit PACK models OUT.png PROMPT 512
 1301 4 IMAGE`.
 
 Both images show the cat in the same pose wearing a red, gold-starred wizard
@@ -126,7 +126,7 @@ end to end.
 
 ## Flash attention (2026-09-27)
 
-The transformer's attention is one fused kernel (`linux/qwen_image/cuda/flash.cu`):
+The transformer's attention is one fused kernel (`qwen_image_cuda/cuda/flash.cu`):
 mma.m16n8k8 FP16 tensor cores with FP32 accumulation, online softmax in
 registers, 64-key K/V tiles in shared memory, 8 warps x 16 query rows per
 block; no score matrix. Per block at the 1024-edit step shape (4096 queries x

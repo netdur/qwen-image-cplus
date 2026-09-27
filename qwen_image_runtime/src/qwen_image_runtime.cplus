@@ -1,0 +1,4 @@
+// Root module. `./runtime` resolves to this platform's file, so building the
+// package builds the active backend with it.
+
+import "./runtime" as _;

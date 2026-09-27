@@ -1,0 +1,181 @@
+// Preferences storage: string, integer and boolean values by key, in the
+// shape of Foundation's NSUserDefaults (which settings_store_macos.cplus
+// forwards to). This base keeps `key=value` lines in
+// $XDG_CONFIG_HOME/qwen-image-cplus/<suite>.conf (or ~/.config/...), read on
+// every call, so a Store is a copyable handle like the Foundation one.
+
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/status" as status;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+struct Store {
+    suite: str,
+}
+
+struct Entry {
+    key: text::Text,
+    value: text::Text,
+}
+
+fn new_with_suite_name(suite: str) -> Store {
+    return Store { suite: suite };
+}
+
+fn directory() -> text::Text {
+    match env::var("XDG_CONFIG_HOME") {
+        option::Option[text::Text]::Some(base) => {
+            if base.count() > (0 as usize) { return "${base.view()}/qwen-image-cplus"; }
+        }
+        option::Option[text::Text]::None => {}
+    }
+    return match env::var("HOME") {
+        option::Option[text::Text]::Some(home) => "${home.view()}/.config/qwen-image-cplus",
+        option::Option[text::Text]::None => text::from_str("/tmp/qwen-image-cplus"),
+    };
+}
+
+impl Store {
+    fn path(this) -> text::Text {
+        let folder: text::Text = directory();
+        return "${folder.view()}/${this.suite}.conf";
+    }
+
+    fn entries(this) -> vec::Vec[Entry] {
+        var entries: vec::Vec[Entry] = vec::new::[Entry]();
+        let path: text::Text = this.path();
+        guard let result::Result[text::Text, result::IoError]::Ok(contents) = fs::read_to_string(path.view()) else {
+            return entries;
+        };
+        let source: str = contents.view();
+        var start: usize = 0 as usize;
+        while start < source.count() {
+            var end: usize = start;
+            while end < source.count() {
+                guard let option::Option[u8]::Some(byte) = source.byte_at(end) else { break; };
+                if byte == (10 as u8) { break; }
+                end = end +% (1 as usize);
+            }
+            match source.slice(start, end) {
+                option::Option[str]::Some(line) => {
+                    match line.find("=") {
+                        option::Option[usize]::Some(equals) => {
+                            match line.slice(0 as usize, equals) {
+                                option::Option[str]::Some(key) => {
+                                    match line.slice(equals +% (1 as usize), line.count()) {
+                                        option::Option[str]::Some(value) => {
+                                            let _added: status::Status = entries.append(
+                                                Entry { key: text::from_str(key), value: text::from_str(value) });
+                                        }
+                                        option::Option[str]::None => {}
+                                    }
+                                }
+                                option::Option[str]::None => {}
+                            }
+                        }
+                        option::Option[usize]::None => {}
+                    }
+                }
+                option::Option[str]::None => {}
+            }
+            start = end +% (1 as usize);
+        }
+        return entries;
+    }
+
+    fn write(this, entries: vec::Vec[Entry]) {
+        let folder: text::Text = directory();
+        let _made = fs::create_dir_all(folder.view());
+        var contents: text::Text = text::new();
+        var index: usize = 0 as usize;
+        while index < entries.count() {
+            match entries.at_ptr(index) {
+                option::Option[*Entry]::Some(entry) => {
+                    let line: text::Text = "${(*entry).key.view()}=${(*entry).value.view()}\n";
+                    let _appended: status::Status = contents.append(line.view());
+                }
+                option::Option[*Entry]::None => {}
+            }
+            index = index +% (1 as usize);
+        }
+        let path: text::Text = this.path();
+        let _written = fs::write_string(path.view(), contents.view());
+    }
+
+    // `value` replaces the key's value; an empty value removes the key.
+    fn store(this, key: str, value: str) {
+        let entries: vec::Vec[Entry] = this.entries();
+        var kept: vec::Vec[Entry] = vec::new::[Entry]();
+        var index: usize = 0 as usize;
+        while index < entries.count() {
+            match entries.at_ptr(index) {
+                option::Option[*Entry]::Some(entry) => {
+                    if (*entry).key.view() != key {
+                        let _kept: status::Status = kept.append(
+                            Entry { key: (*entry).key.clone(), value: (*entry).value.clone() });
+                    }
+                }
+                option::Option[*Entry]::None => {}
+            }
+            index = index +% (1 as usize);
+        }
+        if value.count() > (0 as usize) {
+            let _added: status::Status = kept.append(Entry { key: text::from_str(key), value: text::from_str(value) });
+        }
+        this.write(kept);
+    }
+
+    fn string_for_key(this, key: str) -> option::Option[text::Text] {
+        let entries: vec::Vec[Entry] = this.entries();
+        var index: usize = 0 as usize;
+        while index < entries.count() {
+            match entries.at_ptr(index) {
+                option::Option[*Entry]::Some(entry) => {
+                    if (*entry).key.view() == key { return option::Option[text::Text]::Some((*entry).value.clone()); }
+                }
+                option::Option[*Entry]::None => {}
+            }
+            index = index +% (1 as usize);
+        }
+        return option::Option[text::Text]::None;
+    }
+
+    // 0 when absent or not a number, as NSUserDefaults answers.
+    fn integer_for_key(this, key: str) -> i64 {
+        return match this.string_for_key(key) {
+            option::Option[text::Text]::Some(value) => match value.view().to_i64() {
+                option::Option[i64]::Some(number) => number,
+                option::Option[i64]::None => 0 as i64,
+            },
+            option::Option[text::Text]::None => 0 as i64,
+        };
+    }
+
+    fn bool_for_key(this, key: str) -> bool {
+        return match this.string_for_key(key) {
+            option::Option[text::Text]::Some(value) => value.view() == "1",
+            option::Option[text::Text]::None => false,
+        };
+    }
+
+    fn set_string(this, value: str, for_key: str) {
+        this.store(for_key, value);
+    }
+
+    fn set_integer(this, value: i64, for_key: str) {
+        let number: text::Text = "${value}";
+        this.store(for_key, number.view());
+    }
+
+    fn set_bool(this, value: bool, for_key: str) {
+        this.store(for_key, if value { "1" } else { "0" });
+    }
+
+    fn remove_object_for_key(this, key: str) {
+        this.store(key, "");
+    }
+}

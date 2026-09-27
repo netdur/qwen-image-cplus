@@ -1,6 +1,11 @@
+// A generation thread for UI clients: requests go in over a channel, and
+// progress, diagnostics and completion come back as events, so the UI thread
+// never blocks and a request can be cancelled through its observer. Portable:
+// it speaks only to the public API.
+
 import "./api" as api;
 import "./generation_control" as control;
-import "foundation/foundation" as foundation;
+import "stdlib/time" as time;
 import "stdlib/channel" as channel;
 import "stdlib/mutex" as mutex;
 import "stdlib/option" as option;
@@ -58,8 +63,9 @@ struct ObserverContext {
     id: u64,
 }
 
+// Seconds for elapsed-time reports (millisecond resolution).
 fn clock_seconds() -> f64 {
-    return foundation::ProcessInfo::process_info().system_uptime();
+    return (time::now_millis() as f64) * 0.001f64;
 }
 
 fn _report(progress: control::Progress, raw: *u8) -> bool {

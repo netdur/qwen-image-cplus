@@ -1,33 +1,22 @@
+// qwen-image-cplus: the command-line client over the public API.
+//
+// The same source builds on every platform. It speaks only to qwen_image/api
+// (and pack_info for a pack's own defaults); qwen_image_runtime installs the
+// platform's backend (Metal on macOS, CUDA on Linux). Backend development
+// commands live in qwen_image_metal_dev and qwen_image_cuda_dev.
+
 import "qwen_image/api" as qwen_image;
-import "qwen_image/metal_probe" as metal_probe;
-import "qwen_image/metal_primitives" as metal_primitives;
-import "qwen_image/metal_linear" as metal_linear;
-import "qwen_image/metal_int8_linear" as metal_int8_linear;
-import "qwen_image/metal_q4_dot" as metal_q4_dot;
-import "qwen_image/transformer_block" as transformer_block;
-import "qwen_image/packed_model" as packed_model;
-import "qwen_image/model_inventory" as model_inventory;
-import "qwen_image/safetensors" as safetensors;
-import "qwen_image/lora" as lora;
-import "qwen_image/scheduler" as scheduler;
-import "qwen_image/vae" as vae;
-import "qwen_image/pipeline" as pipeline;
-import "qwen_image/image_output" as image_output;
-import "qwen_image/image_conditioning" as image_conditioning;
-import "qwen_image/image_input" as image_input;
-import "qwen_image/tokenizer" as tokenizer;
-import "qwen_image/qwen3vl_text" as qwen3vl_text;
-import "qwen_image/qwen3vl_vision" as qwen3vl_vision;
-import "qwen_image/multimodal_conditioning" as multimodal_conditioning;
-import "qwen_image/generation_control" as generation_control;
-import "qwen_image/tensor" as tensor;
-import "qwen_image/cpu_ops" as cpu_ops;
+import "qwen_image/generation_control" as control;
+import "qwen_image/pack_info" as pack_info;
+import "qwen_image_runtime/runtime" as runtime;
 import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/option" as option;
 import "stdlib/status" as status;
 import "stdlib/text" as text;
 import "stdlib/vec" as vec;
+
+const USAGE: str = "usage: qwen-image-cplus <command>\n  generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|6|8|25|40]\n  generate-multi-image-sized PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|6|8|25|40 WIDTH HEIGHT IMAGE [IMAGE ... up to 10]\n  generate-multi-image-512|generate-multi-image-1024 PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|6|8|25|40 IMAGE [IMAGE ... up to 10]\n  info PACKED";
 
 fn parse_u64_decimal(value: str) -> option::Option[u64] {
     if value.count() == (0 as usize) { return option::Option[u64]::None; }
@@ -48,51 +37,6 @@ fn parse_u64_decimal(value: str) -> option::Option[u64] {
         index = index +% (1 as usize);
     }
     return option::Option[u64]::Some(result);
-}
-
-fn parse_cache_dit_threshold(value: str) -> option::Option[f64] {
-    if value == "0.12" { return option::Option[f64]::Some(0.12f64); }
-    if value == "0.14" { return option::Option[f64]::Some(0.14f64); }
-    if value == "0.16" { return option::Option[f64]::Some(0.16f64); }
-    if value == "0.24" { return option::Option[f64]::Some(0.24f64); }
-    return option::Option[f64]::None;
-}
-
-fn _run_generation(
-    packed_path: str,
-    model_root: str,
-    output_path: str,
-    prompt: str,
-    pixels: usize,
-    steps: str,
-    seed: u64,
-    cache: qwen_image::CacheMode,
-    cache_threshold: f64,
-    width: usize = 0 as usize,
-    height: usize = 0 as usize,
-) -> i32 {
-    guard let option::Option[u64]::Some(step_count) = parse_u64_decimal(steps) else {
-        return 2;
-    };
-    let request: qwen_image::GenerateRequest = qwen_image::GenerateRequest {
-        packed_path: packed_path,
-        model_root: model_root,
-        output_path: output_path,
-        prompt: prompt,
-        pixels: pixels,
-        steps: step_count as usize,
-        seed: seed,
-        cache: cache,
-        cache_threshold: cache_threshold,
-        width: width,
-        height: height,
-    };
-    return match qwen_image::generate_to_png(request) {
-        qwen_image::GenerateStatus::Ok => 0,
-        qwen_image::GenerateStatus::InvalidArgument => 2,
-        qwen_image::GenerateStatus::Failed => 1,
-        qwen_image::GenerateStatus::Cancelled => 130,
-    };
 }
 
 #[test]
@@ -126,1594 +70,239 @@ fn decimal_seed_parser_checks_syntax_and_overflow() {
     }
 }
 
-#[test]
-fn cache_dit_threshold_parser_accepts_calibration_candidates() {
-    guard let option::Option[f64]::Some(low) = parse_cache_dit_threshold("0.12") else {
-        assert false;
-        return;
-    };
-    guard let option::Option[f64]::Some(middle_low) = parse_cache_dit_threshold("0.14") else {
-        assert false;
-        return;
-    };
-    guard let option::Option[f64]::Some(middle_high) = parse_cache_dit_threshold("0.16") else {
-        assert false;
-        return;
-    };
-    guard let option::Option[f64]::Some(high) = parse_cache_dit_threshold("0.24") else {
-        assert false;
-        return;
-    };
-    assert low == 0.12f64;
-    assert middle_low == 0.14f64;
-    assert middle_high == 0.16f64;
-    assert high == 0.24f64;
-    match parse_cache_dit_threshold("0.15") {
-        option::Option[f64]::None => {}
-        option::Option[f64]::Some(_) => { assert false; }
-    }
+// The step counts the API accepts.
+fn supported_steps(value: str) -> option::Option[str] {
+    if value == "3" { return option::Option[str]::Some("3"); }
+    if value == "4" { return option::Option[str]::Some("4"); }
+    if value == "6" { return option::Option[str]::Some("6"); }
+    if value == "8" { return option::Option[str]::Some("8"); }
+    if value == "25" { return option::Option[str]::Some("25"); }
+    if value == "40" { return option::Option[str]::Some("40"); }
+    return option::Option[str]::None;
 }
 
-// Step count a pack's metadata asks for, limited to the counts this command
-// supports. Packs without a `steps` key keep the canonical 40. A step count
-// the command cannot run is refused (None) rather than replaced, because
-// silently running 40 steps of a few-step distill produces a wrong image.
-fn pack_default_steps(packed_path: str, allowed: [str; 6]) -> option::Option[str] {
-    match packed_model::read_metadata(packed_path) {
-        packed_model::MetadataResult::Ok(metadata) => {
-            match metadata.get("steps") {
+// Step count a pack's metadata asks for. Packs without a `steps` key keep the
+// canonical 40. A count the API cannot run is refused (None) rather than
+// replaced, because 40 steps of a few-step distill produce a wrong image.
+fn pack_default_steps(packed_path: str) -> option::Option[str] {
+    match pack_info::read(packed_path) {
+        option::Option[pack_info::PackInfo]::Some(info) => {
+            match info.get("steps") {
                 option::Option[str]::Some(value) => {
-                    var index: usize = 0 as usize;
-                    while index < (6 as usize) {
-                        if allowed[index] == value { return option::Option[str]::Some(allowed[index]); }
-                        index = index +% (1 as usize);
+                    match supported_steps(value) {
+                        option::Option[str]::Some(steps) => { return option::Option[str]::Some(steps); }
+                        option::Option[str]::None => {
+                            io::eprintln("pack metadata: steps=${value} is not supported; pass an explicit step count");
+                            return option::Option[str]::None;
+                        }
                     }
-                    io::eprintln("pack metadata: steps=${value} is not supported by this command; pass an explicit step count");
-                    return option::Option[str]::None;
                 }
                 option::Option[str]::None => {}
             }
         }
-        packed_model::MetadataResult::Err(_message) => {}
+        option::Option[pack_info::PackInfo]::None => {}
     }
     return option::Option[str]::Some("40");
 }
 
-// Commands that fix their own step count and schedule. A kind=distilled pack
-// defines both through its metadata, which only generate-1024 honours.
-fn command_ignores_pack_steps(command: str) -> bool {
-    return command == "generate-256" || command == "generate-256-cache-dit"
-        || command == "generate-256-bottleneck" || command == "generate-1024-bottleneck"
-        || command == "test-pipeline-256" || command == "test-pipeline-cache-dit-256"
-        || command == "test-native-pipeline-256" || command == "test-pipeline-1024-oracle"
-        || command == "test-pipeline-cache-dit-1024-oracle"
-        || command == "benchmark-process-reuse-256";
-}
-
-// Cache policy for generate-1024: an explicit argument wins, otherwise the
-// pack's `cache` key, otherwise none.
-fn pack_cache_policy(packed_path: str) -> str {
-    match packed_model::read_metadata(packed_path) {
-        packed_model::MetadataResult::Ok(metadata) => {
-            match metadata.get("cache") {
-                option::Option[str]::Some(value) => {
-                    if value == "taylorseer" { return "taylorseer"; }
-                    if value == "cache-dit-0.16" { return "cache-dit-0.16"; }
-                }
-                option::Option[str]::None => {}
-            }
-        }
-        packed_model::MetadataResult::Err(_message) => {}
-    }
-    return "none";
-}
-
 fn pack_is_distilled(packed_path: str) -> bool {
-    return match packed_model::read_metadata(packed_path) {
-        packed_model::MetadataResult::Ok(metadata) => packed_model::metadata_is_distilled(metadata),
-        packed_model::MetadataResult::Err(_message) => false,
+    return match pack_info::read(packed_path) {
+        option::Option[pack_info::PackInfo]::Some(info) => info.is_distilled(),
+        option::Option[pack_info::PackInfo]::None => false,
     };
 }
 
-fn main() -> i32 {
-    if env::argc() < (2 as usize) {
-        io::println(
-            "usage: qwen-image-cplus <generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40] | generate-multi-image-512|generate-multi-image-1024 PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|8|25|40 IMAGE [IMAGE ... up to 10] | probe | probe-stress | test-metal-primitives | test-metal-linear | benchmark-linear | test-metal-int8-linear | benchmark-int8-linear | probe-metal-q4-integer | test-metal-q4-dot | benchmark-metal-q4-dot | benchmark-q4-eager-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-inference-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | benchmark-q4-direct-1024 Q4_PACKED MODEL_DIR OUTPUT PROMPT [SEED] [1|25|40] | test-attention-cache [FIXTURE_DIR] | benchmark-attention | benchmark-production-attention [256|1024] | benchmark-transformer-small-kernels | benchmark-transformer-gemm PACKED | benchmark-mps-gemm PACKED | benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT] | benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT] | benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED] | test-native-inputs [FIXTURE_DIR] | test-transformer-block MODEL_DIR [FIXTURE_DIR] | test-transformer-block-int8 PACKED [FIXTURE_DIR] | test-transformer-mixed PACKED [FIXTURE_DIR] | test-transformer-complete PACKED [FIXTURE_DIR] | test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT] | test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR] | test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR | test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR | test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR] | test-transformer-bottleneck PACKED [FIXTURE_DIR] | test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT] | test-image-output OUTPUT [FIXTURE_DIR] | test-image-input SOURCE_OUTPUT | test-image-orientation DIRECTORY | test-vae-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder MODEL_DIR IMAGE [32|512] | test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR] | test-pipeline-256 PACKED MODEL_DIR OUTPUT | test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24 | test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT | test-native-pipeline-256 PACKED MODEL_DIR OUTPUT | generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40] | generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40] | generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [3|4|8|25|40] [none|taylorseer|cache-dit-0.16] | generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-taylorseer PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [4|25|40] | generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED] | test-tokenizer MODEL_DIR [FIXTURE_DIR] | test-multi-image-prompt MODEL_DIR | test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] | test-text-encoder MODEL_DIR | quantize-block0 MODEL_DIR OUTPUT | quantize-transformer MODEL_DIR OUTPUT | quantize-transformer-q4 MODEL_DIR OUTPUT | verify-packed FILE | verify-packed-source FILE MODEL_DIR | pack-metadata FILE [key=value ...] | inspect FILE | verify-model MODEL_DIR>",
-        );
-        io::println("generate-multi-image-sized PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|8|25|40 WIDTH HEIGHT IMAGE [IMAGE ... up to 10]");
-        return 0;
-    }
-
-    guard let option::Option[text::Text]::Some(command) = env::arg(1 as usize) else {
-        io::eprintln("missing command");
-        return 2;
+fn exit_code(result: qwen_image::GenerateStatus) -> i32 {
+    return match result {
+        qwen_image::GenerateStatus::Ok => 0,
+        qwen_image::GenerateStatus::InvalidArgument => { io::eprintln("generation: invalid arguments"); 2 },
+        qwen_image::GenerateStatus::Failed => { io::eprintln("generation: failed"); 1 },
+        qwen_image::GenerateStatus::Cancelled => 130,
     };
+}
 
-    // QI_PROFILE_SKIP omits transformer work, so it is only meaningful for the
-    // transformer-only benchmarks. Refuse it before any image-producing command
-    // spends time on the text encoder (the trajectory refuses it again).
-    let command_name: str = command.view();
-    if env::has_var("QI_PROFILE_SKIP") && (command_name.has_prefix("generate-")
-        || command_name.contains("pipeline") || command_name.has_prefix("benchmark-q4-")
-        || command_name.has_prefix("benchmark-process-reuse")) {
-        io::eprintln("${command}: QI_PROFILE_SKIP is a benchmark-only ablation that omits transformer work; unset it to generate");
+// Diagnostics from the engine go to stderr.
+fn print_diagnostic(message: str, context: *u8) {
+    io::eprintln(message);
+}
+
+fn observer() -> control::Observer {
+    return control::Observer {
+        callback: 0 as fn(control::Progress, *u8) -> bool,
+        diagnostic: print_diagnostic,
+        context: 0 as *u8,
+    };
+}
+
+fn generate() -> i32 {
+    let usage: str = "usage: qwen-image-cplus generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|6|8|25|40]";
+    guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else { io::eprintln(usage); return 2; };
+    guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else { io::eprintln(usage); return 2; };
+    guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else { io::eprintln(usage); return 2; };
+    guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else { io::eprintln(usage); return 2; };
+    guard let option::Option[text::Text]::Some(width_text) = env::arg(6 as usize) else { io::eprintln(usage); return 2; };
+    guard let option::Option[text::Text]::Some(height_text) = env::arg(7 as usize) else { io::eprintln(usage); return 2; };
+    guard let option::Option[u64]::Some(width) = parse_u64_decimal(width_text.view()) else {
+        io::eprintln("generate: width must be an unsigned decimal integer"); return 2;
+    };
+    guard let option::Option[u64]::Some(height) = parse_u64_decimal(height_text.view()) else {
+        io::eprintln("generate: height must be an unsigned decimal integer"); return 2;
+    };
+    var seed: u64 = 1101 as u64;
+    match env::arg(8 as usize) {
+        option::Option[text::Text]::Some(seed_text) => {
+            guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
+                io::eprintln("generate: seed must be an unsigned decimal integer"); return 2;
+            };
+            seed = parsed;
+        }
+        option::Option[text::Text]::None => {}
+    }
+    guard let option::Option[str]::Some(pack_steps) = pack_default_steps(packed_path.view()) else { return 2; };
+    var steps: str = pack_steps;
+    match env::arg(9 as usize) {
+        option::Option[text::Text]::Some(steps_text) => {
+            guard let option::Option[str]::Some(requested) = supported_steps(steps_text.view()) else {
+                io::eprintln("generate: steps must be 3, 4, 6, 8, 25, or 40"); return 2;
+            };
+            steps = requested;
+        }
+        option::Option[text::Text]::None => {}
+    }
+    guard let option::Option[u64]::Some(step_count) = parse_u64_decimal(steps) else { return 2; };
+    io::println("generate: output=${width}x${height} steps=${steps}");
+    return exit_code(qwen_image::generate_to_png(qwen_image::GenerateRequest {
+        packed_path: packed_path.view(),
+        model_root: model_path.view(),
+        output_path: output_path.view(),
+        prompt: prompt.view(),
+        pixels: 0 as usize,
+        steps: step_count as usize,
+        seed: seed,
+        cache: qwen_image::CacheMode::None,
+        cache_threshold: 0.0f64,
+        width: width as usize,
+        height: height as usize,
+    }, observer()));
+}
+
+// generate-multi-image-sized, and the fixed-size 512 / 1024 forms.
+fn generate_multi_image(command: str) -> i32 {
+    let sized: bool = command == "generate-multi-image-sized";
+    let resolution: usize = if command == "generate-multi-image-1024" { 1024 as usize } else { 512 as usize };
+    let usage: text::Text = if sized {
+        text::from_str("usage: qwen-image-cplus generate-multi-image-sized PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|6|8|25|40 WIDTH HEIGHT IMAGE [IMAGE ... up to 10]")
+    } else {
+        "usage: qwen-image-cplus ${command} PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|6|8|25|40 IMAGE [IMAGE ... up to 10]"
+    };
+    guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else { io::eprintln(usage.view()); return 2; };
+    guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else { io::eprintln(usage.view()); return 2; };
+    guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else { io::eprintln(usage.view()); return 2; };
+    guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else { io::eprintln(usage.view()); return 2; };
+    guard let option::Option[text::Text]::Some(seed_text) = env::arg(6 as usize) else { io::eprintln(usage.view()); return 2; };
+    guard let option::Option[u64]::Some(seed) = parse_u64_decimal(seed_text.view()) else {
+        io::eprintln("${command}: seed must be an unsigned decimal integer"); return 2;
+    };
+    guard let option::Option[text::Text]::Some(steps_text) = env::arg(7 as usize) else { io::eprintln(usage.view()); return 2; };
+    // `pack` takes the step count from the pack metadata.
+    guard let option::Option[str]::Some(pack_steps) = pack_default_steps(packed_path.view()) else { return 2; };
+    let requested: str = if steps_text == "pack" { pack_steps } else { steps_text.view() };
+    guard let option::Option[str]::Some(steps) = supported_steps(requested) else { io::eprintln(usage.view()); return 2; };
+    if pack_is_distilled(packed_path.view()) && steps != pack_steps {
+        io::println("${command}: pack kind=distilled steps=${pack_steps}; running the requested ${steps} steps");
+    }
+    var width: usize = resolution;
+    var height: usize = resolution;
+    let image_offset: usize = if sized { 10 as usize } else { 8 as usize };
+    if sized {
+        guard let option::Option[text::Text]::Some(width_text) = env::arg(8 as usize) else { io::eprintln(usage.view()); return 2; };
+        guard let option::Option[text::Text]::Some(height_text) = env::arg(9 as usize) else { io::eprintln(usage.view()); return 2; };
+        guard let option::Option[u64]::Some(width_value) = parse_u64_decimal(width_text.view()) else { return 2; };
+        guard let option::Option[u64]::Some(height_value) = parse_u64_decimal(height_text.view()) else { return 2; };
+        width = width_value as usize;
+        height = height_value as usize;
+    }
+    if env::argc() < image_offset { io::eprintln(usage.view()); return 2; }
+    let image_count: usize = env::argc() -% image_offset;
+    if image_count < (1 as usize) || image_count > (10 as usize) {
+        io::eprintln("${command}: provide 1 through 10 image paths");
         return 2;
     }
-
-    if command_ignores_pack_steps(command_name) {
-        match env::arg(2 as usize) {
-            option::Option[text::Text]::Some(packed_path) => {
-                if pack_is_distilled(packed_path.view()) {
-                    io::eprintln("${command}: kind=distilled packs define their own steps and schedule; use generate-1024");
-                    return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
-        }
+    var owners: vec::Vec[text::Text] = vec::Vec[text::Text]::with_capacity(image_count);
+    var index: usize = 0 as usize;
+    while index < image_count {
+        guard let option::Option[text::Text]::Some(path) = env::arg(image_offset +% index) else { io::eprintln(usage.view()); return 2; };
+        if owners.append(path) != status::Status::Ok { return 1; }
+        index = index +% (1 as usize);
     }
-
-    if command == "probe" {
-        return metal_probe::run();
+    var image_paths: [str; 10] = ["", "", "", "", "", "", "", "", "", ""];
+    let owner_values: *text::Text = #slice_ptr(owners.as_slice());
+    index = 0 as usize;
+    while index < image_count {
+        image_paths[index] = owner_values[index].view();
+        index = index +% (1 as usize);
     }
-    if command == "probe-stress" {
-        return metal_probe::stress();
-    }
-    if command == "test-metal-primitives" {
-        return metal_primitives::run();
-    }
-    if command == "test-metal-linear" {
-        return metal_linear::run_validation();
-    }
-    if command == "benchmark-linear" {
-        return metal_linear::run_benchmark();
-    }
-    if command == "test-metal-int8-linear" {
-        return metal_int8_linear::run_validation();
-    }
-    if command == "benchmark-int8-linear" {
-        return metal_int8_linear::run_benchmark();
-    }
-    if command == "probe-metal-q4-integer" {
-        return metal_q4_dot::run_integer_probe();
-    }
-    if command == "test-metal-q4-dot" {
-        return metal_q4_dot::run_validation();
-    }
-    if command == "benchmark-metal-q4-dot" {
-        return metal_q4_dot::run_benchmark();
-    }
-    if command == "test-attention-cache" {
-        match env::arg(2 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::test_attention_cache(fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::test_attention_cache();
-            }
-        }
-    }
-    if command == "benchmark-attention" {
-        return transformer_block::benchmark_attention();
-    }
-    if command == "benchmark-production-attention" {
-        match env::arg(2 as usize) {
-            option::Option[text::Text]::Some(pixels) => {
-                return transformer_block::benchmark_production_attention(pixels.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::benchmark_production_attention();
-            }
-        }
-    }
-    if command == "benchmark-transformer-small-kernels" {
-        return transformer_block::benchmark_transformer_small_kernels();
-    }
-    if command == "benchmark-transformer-gemm" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-transformer-gemm PACKED");
-            return 2;
-        };
-        return transformer_block::benchmark_production_gemm(path.view());
-    }
-    if command == "benchmark-mps-gemm" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-mps-gemm PACKED");
-            return 2;
-        };
-        return transformer_block::benchmark_mps_gemm(path.view());
-    }
-    if command == "benchmark-transformer-trajectory-1024" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(steps) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-1024 PACKED 1|2|3|4|8|13|25|40 [FIXTURE_ROOT]");
-            return 2;
-        };
-        match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::benchmark_trajectory_1024(
-                    path.view(), steps.view(), fixtures.view(),
-                );
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::benchmark_trajectory_1024(
-                    path.view(), steps.view(),
-                );
-            }
-        }
-    }
-    if command == "benchmark-transformer-trajectory-2048" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-transformer-trajectory-2048 PACKED [FIXTURE_ROOT]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::benchmark_trajectory_2048(
-                    path.view(), fixtures.view(),
-                );
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::benchmark_trajectory_2048(path.view());
-            }
-        }
-    }
-    if command == "test-native-inputs" {
-        match env::arg(2 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::test_native_inputs_256(fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::test_native_inputs_256();
-            }
-        }
-    }
-    if command == "test-transformer-block" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-block MODEL_DIR [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run(path.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run(path.view());
-            }
-        }
-    }
-    if command == "test-transformer-block-int8" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-block-int8 PACKED [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_packed(path.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_packed(path.view());
-            }
-        }
-    }
-    if command == "test-transformer-mixed" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-mixed PACKED [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_full_packed(path.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_full_packed(path.view());
-            }
-        }
-    }
-    if command == "test-transformer-complete" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-complete PACKED [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_complete_packed(path.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_complete_packed(path.view());
-            }
-        }
-    }
-    if command == "test-transformer-scale" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(pixels) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-scale PACKED 256|512|1024 [FIXTURE_ROOT]");
-            return 2;
-        };
-        match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_scale_packed(path.view(), pixels.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_scale_packed(path.view(), pixels.view());
-            }
-        }
-    }
-    if command == "test-transformer-trajectory" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(steps) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory PACKED 1|2|40 [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_trajectory_packed(path.view(), steps.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_trajectory_packed(path.view(), steps.view());
-            }
-        }
-    }
-    if command == "test-transformer-trajectory-1024" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(steps) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(fixtures) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-trajectory-1024 PACKED 1|2|40 FIXTURE_DIR");
-            return 2;
-        };
-        return transformer_block::run_trajectory_1024_packed(
-            path.view(), steps.view(), fixtures.view(),
-        );
-    }
-    if command == "test-transformer-cache-dit" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit PACKED 0.12|0.24 [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_trajectory_cache_dit_packed(
-                    path.view(), threshold.view(), fixtures.view(),
-                );
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_trajectory_cache_dit_packed(
-                    path.view(), threshold.view(),
-                );
-            }
-        }
-    }
-    if command == "test-transformer-cache-dit-1024" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(fixtures) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-cache-dit-1024 PACKED 0.12|0.24 FIXTURE_DIR");
-            return 2;
-        };
-        return transformer_block::run_trajectory_cache_dit_1024_packed(
-            path.view(), threshold.view(), fixtures.view(),
-        );
-    }
-    if command == "test-transformer-taylorseer" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-taylorseer PACKED 0.12|0.24 [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_trajectory_taylorseer_packed(
-                    path.view(), threshold.view(), fixtures.view(),
-                );
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_trajectory_taylorseer_packed(
-                    path.view(), threshold.view(),
-                );
-            }
-        }
-    }
-    if command == "test-transformer-bottleneck" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-transformer-bottleneck PACKED [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return transformer_block::run_trajectory_bottleneck_packed(
-                    path.view(), fixtures.view(),
-                );
-            }
-            option::Option[text::Text]::None => {
-                return transformer_block::run_trajectory_bottleneck_packed(path.view());
-            }
-        }
-    }
-    if command == "test-vae-decoder" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(test_case) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vae-decoder MODEL_DIR small|256|1024|1024-profile|2048|trajectory-1024 [FIXTURE_ROOT]");
-            return 2;
-        };
-        match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return vae::run(path.view(), test_case.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return vae::run(path.view(), test_case.view());
-            }
-        }
-    }
-    if command == "test-pipeline-256" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-256 PACKED MODEL_DIR OUTPUT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-256 PACKED MODEL_DIR OUTPUT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-256 PACKED MODEL_DIR OUTPUT");
-            return 2;
-        };
-        return pipeline::run_fixture_256(
-            packed_path.view(),
-            model_path.view(),
-            output_path.view(),
-        );
-    }
-    if command == "test-pipeline-1024-oracle" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_root) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(trajectory_fixture) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(vae_fixture_root) = env::arg(6 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-1024-oracle PACKED MODEL_DIR OUTPUT TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        return pipeline::run_fixture_1024(
-            packed_path.view(), model_root.view(), output_path.view(),
-            trajectory_fixture.view(), vae_fixture_root.view(),
-        );
-    }
-    if command == "test-pipeline-cache-dit-1024-oracle" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_root) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold_text) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
-            io::eprintln("pipeline 1024 oracle Cache-DiT: threshold must be 0.12, 0.14, 0.16, or 0.24");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(trajectory_fixture) = env::arg(6 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(vae_fixture_root) = env::arg(7 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-1024-oracle PACKED MODEL_DIR OUTPUT 0.12|0.24 TRAJECTORY_FIXTURE VAE_FIXTURE_ROOT");
-            return 2;
-        };
-        return pipeline::run_fixture_cache_dit_1024(
-            packed_path.view(), model_root.view(), output_path.view(), threshold,
-            trajectory_fixture.view(), vae_fixture_root.view(),
-        );
-    }
-    if command == "test-pipeline-cache-dit-256" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold_text) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-pipeline-cache-dit-256 PACKED MODEL_DIR OUTPUT 0.12|0.24");
-            return 2;
-        };
-        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
-            io::eprintln("test-pipeline-cache-dit-256: threshold must be 0.12, 0.14, 0.16, or 0.24");
-            return 2;
-        };
-        return pipeline::run_fixture_cache_dit_256(
-            packed_path.view(), model_path.view(), output_path.view(), threshold,
-        );
-    }
-    if command == "generate" {
-        let usage: str = "usage: qwen-image-cplus generate PACKED MODEL_DIR OUTPUT PROMPT WIDTH HEIGHT [SEED] [3|4|8|25|40]";
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln(usage); return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln(usage); return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln(usage); return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln(usage); return 2;
-        };
-        guard let option::Option[text::Text]::Some(width_text) = env::arg(6 as usize) else {
-            io::eprintln(usage); return 2;
-        };
-        guard let option::Option[text::Text]::Some(height_text) = env::arg(7 as usize) else {
-            io::eprintln(usage); return 2;
-        };
-        guard let option::Option[u64]::Some(width_value) = parse_u64_decimal(width_text.view()) else {
-            io::eprintln("generate: width must be an unsigned decimal integer"); return 2;
-        };
-        guard let option::Option[u64]::Some(height_value) = parse_u64_decimal(height_text.view()) else {
-            io::eprintln("generate: height must be an unsigned decimal integer"); return 2;
-        };
-        var seed: u64 = 1101 as u64;
-        match env::arg(8 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate: seed must be an unsigned decimal integer"); return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        guard let option::Option[str]::Some(pack_steps) = pack_default_steps(
-            packed_path.view(), ["3", "4", "6", "8", "25", "40"],
-        ) else { return 2; };
-        var requested_steps: str = pack_steps;
-        match env::arg(9 as usize) {
-            option::Option[text::Text]::Some(steps_text) => {
-                if steps_text == "3" || steps_text == "4" || steps_text == "6" || steps_text == "8"
-                    || steps_text == "25" || steps_text == "40" {
-                    requested_steps = if steps_text == "3" { "3" }
-                    else if steps_text == "4" { "4" }
-                    else if steps_text == "6" { "6" }
-                    else if steps_text == "8" { "8" }
-                    else if steps_text == "25" { "25" } else { "40" };
-                } else {
-                    io::eprintln("generate: steps must be 3, 4, 6, 8, 25, or 40"); return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
-        }
-        io::println("generate: output=${width_value}x${height_value} cache=none steps=${requested_steps}");
-        return _run_generation(
-            packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-            0 as usize, requested_steps, seed, qwen_image::CacheMode::None, 0.0f64,
-            width_value as usize, height_value as usize,
-        );
-    }
-    if command == "generate-256" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [25|40]");
-            return 2;
-        };
-        var seed: u64 = 1101 as u64;
-        match env::arg(6 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate-256: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        var use_25_steps: bool = false;
-        match env::arg(7 as usize) {
-            option::Option[text::Text]::Some(steps_text) => {
-                if steps_text == "25" {
-                    use_25_steps = true;
-                } else if steps_text != "40" {
-                    io::eprintln("generate-256: steps must be 25 or 40");
-                    return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
-        }
-        return _run_generation(
-            packed_path.view(),
-            model_path.view(),
-            output_path.view(),
-            prompt.view(),
-            256 as usize,
-            if use_25_steps { "25" } else { "40" },
-            seed,
-            qwen_image::CacheMode::None,
-            0.0f64,
-        );
-    }
-    if command == "generate-256-cache-dit" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold_text) = env::arg(6 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
-            io::eprintln("generate-256-cache-dit: threshold must be 0.12, 0.14, 0.16, or 0.24");
-            return 2;
-        };
-        var seed: u64 = 1101 as u64;
-        match env::arg(7 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate-256-cache-dit: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        var use_25_steps: bool = false;
-        match env::arg(8 as usize) {
-            option::Option[text::Text]::Some(steps_text) => {
-                if steps_text == "25" {
-                    use_25_steps = true;
-                } else if steps_text != "40" {
-                    io::eprintln("generate-256-cache-dit: steps must be 25 or 40");
-                    return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
-        }
-        return _run_generation(
-            packed_path.view(),
-            model_path.view(),
-            output_path.view(),
-            prompt.view(),
-            256 as usize,
-            if use_25_steps { "25" } else { "40" },
-            seed,
-            qwen_image::CacheMode::CacheDiT,
-            threshold,
-        );
-    }
-    if command == "generate-256-bottleneck" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-256-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        var seed: u64 = 1101 as u64;
-        match env::arg(6 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate-256-bottleneck: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        return pipeline::generate_256_bottleneck(
-            packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
-        );
-    }
-    if command == "generate-1024" || command == "benchmark-q4-eager-1024"
-        || command == "benchmark-q4-inference-1024"
-        || command == "benchmark-q4-direct-1024" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024 PACKED MODEL_DIR OUTPUT PROMPT [SEED] [STEPS] [none|taylorseer|cache-dit-0.16]");
-            return 2;
-        };
-        var seed: u64 = 1101 as u64;
-        match env::arg(6 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate-1024: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        guard let option::Option[str]::Some(pack_steps) = if command == "generate-1024" {
-            pack_default_steps(packed_path.view(), ["3", "4", "6", "8", "25", "40"])
-        } else { option::Option[str]::Some("40") } else { return 2; };
-        var requested_steps: str = pack_steps;
-        match env::arg(7 as usize) {
-            option::Option[text::Text]::Some(steps_text) => {
-                if steps_text == "1" && command != "generate-1024" {
-                    requested_steps = "1";
-                } else if (steps_text == "3" || steps_text == "4" || steps_text == "6" || steps_text == "8")
-                    && command == "generate-1024" {
-                    // Few-step distillation; the pack's shift_terminal
-                    // metadata selects its schedule.
-                    requested_steps = if steps_text == "3" { "3" }
-                    else if steps_text == "4" { "4" }
-                    else if steps_text == "6" { "6" } else { "8" };
-                } else if steps_text == "25" {
-                    requested_steps = "25";
-                } else if steps_text == "40" {
-                    requested_steps = "40";
-                } else {
-                    io::eprintln("${command}: steps must be 3, 4, 6, 8, 25, or 40 (Q4 benchmarks: 1, 25, or 40)");
-                    return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
-        }
-        if command == "benchmark-q4-eager-1024" {
-            return pipeline::generate_1024_q4_speed(
-                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                true, false, seed, requested_steps,
-            );
-        }
-        if command == "benchmark-q4-inference-1024" {
-            return pipeline::generate_1024_q4_speed(
-                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                false, false, seed, requested_steps,
-            );
-        }
-        if command == "benchmark-q4-direct-1024" {
-            return pipeline::generate_1024_q4_speed(
-                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                false, true, seed, requested_steps,
-            );
-        }
-        var cache_policy: str = pack_cache_policy(packed_path.view());
-        let cache_from_pack: bool = cache_policy != "none";
-        var cache_explicit: bool = false;
-        match env::arg(8 as usize) {
-            option::Option[text::Text]::Some(cache_text) => {
-                cache_explicit = true;
-                if cache_text == "none" {
-                    cache_policy = "none";
-                } else if cache_text == "taylorseer" {
-                    cache_policy = "taylorseer";
-                } else if cache_text == "cache-dit-0.16" {
-                    cache_policy = "cache-dit-0.16";
-                } else {
-                    io::eprintln("generate-1024: cache must be none, taylorseer, or cache-dit-0.16");
-                    return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
-        }
-        if cache_policy != "none" {
-            if pack_is_distilled(packed_path.view()) {
-                io::eprintln("generate-1024: kind=distilled packs cannot use cache=${cache_policy}");
-                return 2;
-            }
-            if requested_steps != "25" && requested_steps != "40" {
-                io::eprintln("generate-1024: cache=${cache_policy} needs 25 or 40 steps");
-                return 2;
-            }
-            // A pack's cache default is calibrated for its own step count;
-            // other step counts must name the cache policy explicitly.
-            if cache_from_pack && !cache_explicit && requested_steps != pack_steps {
-                io::eprintln("generate-1024: the pack's cache=${cache_policy} is set for ${pack_steps} steps; pass none or ${cache_policy} explicitly to run ${requested_steps}");
-                return 2;
-            }
-            io::println("generate-1024: cache=${cache_policy} steps=${requested_steps}");
-            if cache_policy == "taylorseer" {
-                return _run_generation(
-                    packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                    1024 as usize, requested_steps, seed,
-                    qwen_image::CacheMode::TaylorSeer, 0.24f64,
-                );
-            }
-            return _run_generation(
-                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                1024 as usize, requested_steps, seed,
-                qwen_image::CacheMode::CacheDiT, 0.16f64,
-            );
-        }
-        if pack_is_distilled(packed_path.view()) && requested_steps != pack_steps {
-            io::println("generate-1024: pack kind=distilled steps=${pack_steps}; running the requested ${requested_steps} steps");
-        }
-        io::println("generate-1024: cache=none steps=${requested_steps}");
-        return _run_generation(
-            packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-            1024 as usize, requested_steps, seed, qwen_image::CacheMode::None, 0.0f64,
-        );
-    }
-    if command == "generate-1024-bottleneck" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-bottleneck PACKED MODEL_DIR OUTPUT PROMPT [SEED]");
-            return 2;
-        };
-        var seed: u64 = 1101 as u64;
-        match env::arg(6 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate-1024-bottleneck: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        return pipeline::generate_1024_bottleneck(
-            packed_path.view(), model_path.view(), output_path.view(), prompt.view(), seed,
-        );
-    }
-    if command == "generate-1024-cache-dit" || command == "generate-1024-taylorseer" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold_text) = env::arg(6 as usize) else {
-            io::eprintln("usage: qwen-image-cplus generate-1024-cache-dit PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 [SEED] [25|40]");
-            return 2;
-        };
-        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
-            io::eprintln("generate-1024-cache-dit: threshold must be 0.12, 0.14, 0.16, or 0.24");
-            return 2;
-        };
-        if pack_is_distilled(packed_path.view()) && !env::has_var("QI_CACHE_DIT_WARMUP") {
-            io::eprintln("${command}: kind=distilled packs have no steps to cache; use generate-1024");
-            return 2;
-        }
-        var seed: u64 = 1101 as u64;
-        match env::arg(7 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("generate-1024-cache-dit: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        guard let option::Option[str]::Some(cache_pack_steps) = pack_default_steps(
-            packed_path.view(), ["4", "25", "40", "40", "40", "40"],
-        ) else { return 2; };
-        var cache_steps: str = cache_pack_steps;
-        match env::arg(8 as usize) {
-            option::Option[text::Text]::Some(steps_text) => {
-                if steps_text == "25" {
-                    cache_steps = "25";
-                } else if steps_text == "4" {
-                    // Viggle distillation experiment.
-                    cache_steps = "4";
-                } else if steps_text == "40" {
-                    cache_steps = "40";
-                } else {
-                    io::eprintln("generate-1024-cache-dit: steps must be 4, 25, or 40");
-                    return 2;
-                }
-            }
-            option::Option[text::Text]::None => {}
-        }
-        io::println("${command}: steps=${cache_steps}");
-        if command == "generate-1024-taylorseer" {
-            return _run_generation(
-                packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-                1024 as usize, cache_steps, seed,
-                qwen_image::CacheMode::TaylorSeer, threshold,
-            );
-        }
-        return _run_generation(
-            packed_path.view(), model_path.view(), output_path.view(), prompt.view(),
-            1024 as usize, cache_steps, seed,
-            qwen_image::CacheMode::CacheDiT, threshold,
-        );
-    }
-    if command == "benchmark-process-reuse-256" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(threshold_text) = env::arg(6 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED]");
-            return 2;
-        };
-        guard let option::Option[f64]::Some(threshold) = parse_cache_dit_threshold(threshold_text.view()) else {
-            io::eprintln("benchmark-process-reuse-256: threshold must be 0.12, 0.14, 0.16, or 0.24");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(request_count_text) = env::arg(7 as usize) else {
-            io::eprintln("usage: qwen-image-cplus benchmark-process-reuse-256 PACKED MODEL_DIR OUTPUT PROMPT 0.12|0.24 REQUESTS [SEED]");
-            return 2;
-        };
-        guard let option::Option[u64]::Some(request_count_value) =
-            parse_u64_decimal(request_count_text.view()) else {
-            io::eprintln("benchmark-process-reuse-256: requests must be an integer from 2 through 16");
-            return 2;
-        };
-        if request_count_value < (2 as u64) || request_count_value > (16 as u64) {
-            io::eprintln("benchmark-process-reuse-256: requests must be an integer from 2 through 16");
-            return 2;
-        }
-        var seed: u64 = 42 as u64;
-        match env::arg(8 as usize) {
-            option::Option[text::Text]::Some(seed_text) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(seed_text.view()) else {
-                    io::eprintln("benchmark-process-reuse-256: seed must be an unsigned decimal integer");
-                    return 2;
-                };
-                seed = parsed;
-            }
-            option::Option[text::Text]::None => {}
-        }
-        return pipeline::benchmark_process_reuse_256(
-            packed_path.view(),
-            model_path.view(),
-            output_path.view(),
-            prompt.view(),
-            request_count_value as usize,
-            seed,
-            threshold,
-        );
-    }
-    if command == "test-native-pipeline-256" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-native-pipeline-256 PACKED MODEL_DIR OUTPUT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-native-pipeline-256 PACKED MODEL_DIR OUTPUT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-native-pipeline-256 PACKED MODEL_DIR OUTPUT");
-            return 2;
-        };
-        return pipeline::test_native_256(
-            packed_path.view(),
-            model_path.view(),
-            output_path.view(),
-        );
-    }
-    if command == "test-image-output" {
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-image-output OUTPUT [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return image_output::run_reference(output_path.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return image_output::run_reference(output_path.view());
-            }
-        }
-    }
-    if command == "test-tokenizer" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-tokenizer MODEL_DIR [FIXTURE_DIR]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixtures) => {
-                return tokenizer::run(model_path.view(), fixtures.view());
-            }
-            option::Option[text::Text]::None => {
-                return tokenizer::run(model_path.view());
-            }
-        }
-    }
-    if command == "test-multi-image-prompt" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-prompt MODEL_DIR");
-            return 2;
-        };
-        if !image_conditioning::reference_count_supported(2 as usize) { return 1; }
-        return tokenizer::test_multi_image_prompt(model_path.view());
-    }
-    if command == "test-multi-image-conditioning" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(first_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(second_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-conditioning MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT]");
-            return 2;
-        };
-        return match env::arg(5 as usize) {
-            option::Option[text::Text]::Some(prompt) => {
-                multimodal_conditioning::run_two_image_512(
-                    model_path.view(), first_path.view(), second_path.view(), prompt.view(),
-                )
-            }
-            option::Option[text::Text]::None => {
-                multimodal_conditioning::run_two_image_512(
-                    model_path.view(), first_path.view(), second_path.view(),
-                )
-            }
-        };
-    }
-    if command == "test-multi-image-transformer" {
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] [1|2]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] [1|2]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(first_path) = env::arg(4 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] [1|2]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(second_path) = env::arg(5 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-multi-image-transformer PACKED MODEL_DIR IMAGE_1 IMAGE_2 [PROMPT] [1|2]");
-            return 2;
-        };
-        return match env::arg(6 as usize) {
-            option::Option[text::Text]::Some(prompt) => {
-                return match env::arg(7 as usize) {
-                    option::Option[text::Text]::Some(steps) => {
-                        multimodal_conditioning::run_two_image_transformer_512(
-                            packed_path.view(), model_path.view(), first_path.view(),
-                            second_path.view(), prompt.view(), steps.view(),
-                        )
-                    }
-                    option::Option[text::Text]::None => {
-                        multimodal_conditioning::run_two_image_transformer_512(
-                            packed_path.view(), model_path.view(), first_path.view(),
-                            second_path.view(), prompt.view(),
-                        )
-                    }
-                };
-            }
-            option::Option[text::Text]::None => {
-                multimodal_conditioning::run_two_image_transformer_512(
-                    packed_path.view(), model_path.view(), first_path.view(),
-                    second_path.view(),
-                )
-            }
-        };
-    }
-    if command == "generate-multi-image-512" || command == "generate-multi-image-1024"
-        || command == "generate-multi-image-sized"
-        || command == "benchmark-multi-image-sized" {
-        let benchmark_only: bool = command == "benchmark-multi-image-sized";
-        let sized: bool = command == "generate-multi-image-sized" || benchmark_only;
-        let output_resolution: usize = if command == "generate-multi-image-1024" {
-            1024 as usize
-        } else { 512 as usize };
-        let usage: text::Text = if benchmark_only {
-            text::from_str("usage: qwen-image-cplus benchmark-multi-image-sized PACKED MODEL_DIR - PROMPT SEED 1|2 WIDTH HEIGHT IMAGE [IMAGE ... up to 10]")
-        } else if sized {
-            text::from_str("usage: qwen-image-cplus generate-multi-image-sized PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|6|8|25|40 WIDTH HEIGHT IMAGE [IMAGE ... up to 10]")
-        } else {
-            "usage: qwen-image-cplus ${command} PACKED MODEL_DIR OUTPUT PROMPT SEED pack|3|4|6|8|25|40 IMAGE [IMAGE ... up to 10]"
-        };
-        guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
-            io::eprintln(usage.view()); return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln(usage.view()); return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(4 as usize) else {
-            io::eprintln(usage.view()); return 2;
-        };
-        guard let option::Option[text::Text]::Some(prompt) = env::arg(5 as usize) else {
-            io::eprintln(usage.view()); return 2;
-        };
-        guard let option::Option[text::Text]::Some(seed_text) = env::arg(6 as usize) else {
-            io::eprintln(usage.view()); return 2;
-        };
-        guard let option::Option[u64]::Some(seed) = parse_u64_decimal(seed_text.view()) else {
-            io::eprintln("${command}: seed must be an unsigned decimal integer");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(steps_text) = env::arg(7 as usize) else {
-            io::eprintln(usage.view()); return 2;
-        };
-        // `pack` takes the step count from the pack metadata, as generate
-        // does when its step argument is omitted.
-        guard let option::Option[str]::Some(pack_steps) = pack_default_steps(
-            packed_path.view(), ["3", "4", "6", "8", "25", "40"],
-        ) else { return 2; };
-        let steps: str = if steps_text == "pack" { pack_steps } else { steps_text.view() };
-        if !(if benchmark_only { steps == "1" || steps == "2" } else {
-            steps == "3" || steps == "4" || steps == "6" || steps == "8"
-                || steps == "25" || steps == "40"
-        }) {
-            io::eprintln(usage.view());
-            return 2;
-        }
-        if !benchmark_only && pack_is_distilled(packed_path.view()) && steps != pack_steps {
-            io::println("${command}: pack kind=distilled steps=${pack_steps}; running the requested ${steps} steps");
-        }
-        var output_width: usize = output_resolution;
-        var output_height: usize = output_resolution;
-        let image_offset: usize = if sized { 10 as usize } else { 8 as usize };
-        if sized {
-            guard let option::Option[text::Text]::Some(width_text) =
-                env::arg(8 as usize) else { io::eprintln(usage.view()); return 2; };
-            guard let option::Option[text::Text]::Some(height_text) =
-                env::arg(9 as usize) else { io::eprintln(usage.view()); return 2; };
-            guard let option::Option[u64]::Some(width_value) =
-                parse_u64_decimal(width_text.view()) else { return 2; };
-            guard let option::Option[u64]::Some(height_value) =
-                parse_u64_decimal(height_text.view()) else { return 2; };
-            output_width = width_value as usize;
-            output_height = height_value as usize;
-        }
-        if env::argc() < image_offset { io::eprintln(usage.view()); return 2; }
-        let image_count: usize = env::argc() -% image_offset;
-        if image_count < (1 as usize) || image_count > (10 as usize) {
-            io::eprintln("${command}: provide 1 through 10 image paths");
-            return 2;
-        }
-        var path_owners: vec::Vec[text::Text] =
-            vec::Vec[text::Text]::with_capacity(image_count);
-        var image_index: usize = 0 as usize;
-        while image_index < image_count {
-            guard let option::Option[text::Text]::Some(image_path) =
-                env::arg(image_offset +% image_index) else {
-                io::eprintln(usage.view()); return 2;
-            };
-            if path_owners.append(image_path) != status::Status::Ok { return 1; }
-            image_index = image_index +% (1 as usize);
-        }
-        var image_paths: [str; 10] = ["", "", "", "", "", "", "", "", "", ""];
-        let owner_values: *text::Text = #slice_ptr(path_owners.as_slice());
-        image_index = 0 as usize;
-        while image_index < image_count {
-            image_paths[image_index] = owner_values[image_index].view();
-            image_index = image_index +% (1 as usize);
-        }
-        guard let option::Option[u64]::Some(step_count) = parse_u64_decimal(steps) else {
-            return 2;
-        };
-        if benchmark_only {
-            return multimodal_conditioning::run_multi_image_transformer(
-                packed_path.view(), model_path.view(), #addr_of(image_paths[0]),
-                image_count, prompt.view(), steps, "", seed, output_resolution,
-                generation_control::none(), output_width, output_height, true,
-            );
-        }
-        if sized {
-            let request: qwen_image::MultiImageSizedGenerateRequest =
-                qwen_image::MultiImageSizedGenerateRequest {
-                packed_path: packed_path.view(),
-                model_root: model_path.view(),
-                output_path: output_path.view(),
-                prompt: prompt.view(),
-                image_paths: #addr_of(image_paths[0]),
-                image_count: image_count,
-                width: output_width,
-                height: output_height,
-                steps: step_count as usize,
-                seed: seed,
-            };
-            return match qwen_image::generate_multi_image_sized_to_png(request) {
-                qwen_image::GenerateStatus::Ok => 0,
-                qwen_image::GenerateStatus::InvalidArgument => { io::eprintln("generation: invalid arguments"); 2 },
-                qwen_image::GenerateStatus::Failed => { io::eprintln("generation: failed"); 1 },
-                qwen_image::GenerateStatus::Cancelled => 130,
-            };
-        }
-        let request: qwen_image::MultiImageGenerateRequest =
-            qwen_image::MultiImageGenerateRequest {
+    guard let option::Option[u64]::Some(step_count) = parse_u64_decimal(steps) else { return 2; };
+    if sized {
+        return exit_code(qwen_image::generate_multi_image_sized_to_png(qwen_image::MultiImageSizedGenerateRequest {
             packed_path: packed_path.view(),
             model_root: model_path.view(),
             output_path: output_path.view(),
             prompt: prompt.view(),
             image_paths: #addr_of(image_paths[0]),
             image_count: image_count,
-            pixels: output_resolution,
+            width: width,
+            height: height,
             steps: step_count as usize,
             seed: seed,
-        };
-        return match qwen_image::generate_multi_image_to_png(request) {
-            qwen_image::GenerateStatus::Ok => 0,
-            qwen_image::GenerateStatus::InvalidArgument => 2,
-            qwen_image::GenerateStatus::Failed => 1,
-            qwen_image::GenerateStatus::Cancelled => 130,
-        };
+        }, observer()));
     }
-    if command == "test-image-orientation" {
-        guard let option::Option[text::Text]::Some(directory) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-image-orientation DIRECTORY");
-            return 2;
-        };
-        return image_input::run_orientation(directory.view());
-    }
-    if command == "test-image-input" {
-        guard let option::Option[text::Text]::Some(source_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-image-input SOURCE_OUTPUT");
-            return 2;
-        };
-        return image_input::run_reference(source_path.view());
-    }
-    if command == "test-vae-encoder" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vae-encoder MODEL_DIR IMAGE");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(image_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vae-encoder MODEL_DIR IMAGE [32|512]");
-            return 2;
-        };
-        let output_resolution: usize = match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(value) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(value.view())
-                    else {
-                    io::eprintln("usage: qwen-image-cplus test-vae-encoder MODEL_DIR IMAGE [32|512]");
-                    return 2;
-                };
-                if parsed != (32 as u64) && parsed != (512 as u64) {
-                    io::eprintln("VAE encoder test resolution must be 32 or 512");
-                    return 2;
-                }
-                parsed as usize
-            }
-            option::Option[text::Text]::None => { 512 as usize }
-        };
-        guard let option::Option[image_input::Image]::Some(input_image) =
-            image_input::load_resized(image_path.view(), output_resolution) else {
-            io::eprintln("VAE encoder test: could not load ${image_path}");
-            return 1;
-        };
-        let latent_values: usize = input_image.shape.latent_tokens *% (64 as usize);
-        var latent: vec::Vec[f32] = vec::Vec[f32]::with_capacity(latent_values);
-        var latent_index: usize = 0 as usize;
-        while latent_index < latent_values {
-            if latent.append(0.0f32) != status::Status::Ok { return 1; }
-            latent_index = latent_index +% (1 as usize);
-        }
-        let encode_status: i32 = vae::encode_sized_from_host(
-            model_path.view(),
-            #slice_ptr(input_image.vae_pixels.as_slice()),
-            input_image.shape.width,
-            input_image.shape.height,
-            #slice_ptr(latent.as_slice()),
-        );
-        if encode_status != (0 as i32) { return encode_status; }
-        let latent_pointer: *f32 = #slice_ptr(latent.as_slice());
-        var latent_min: f32 = latent_pointer[0];
-        var latent_max: f32 = latent_pointer[0];
-        var latent_abs_sum: f64 = 0.0f64;
-        latent_index = 0 as usize;
-        while latent_index < latent_values {
-            let value: f32 = latent_pointer[latent_index];
-            if value < latent_min { latent_min = value; }
-            if value > latent_max { latent_max = value; }
-            latent_abs_sum = latent_abs_sum + (value as f64).abs();
-            latent_index = latent_index +% (1 as usize);
-        }
-        if latent_max - latent_min < 0.000001f32 || latent_abs_sum < 0.000001f64 {
-            io::eprintln("VAE condition encoding: degenerate latent output");
-            return 1;
-        }
-        io::println(
-            "VAE condition encoding: output_resolution=${output_resolution} image=${input_image.shape.width}x${input_image.shape.height} latent_tokens=${input_image.shape.latent_tokens} values=${latent_values} min=${latent_min} max=${latent_max} mean_abs=${latent_abs_sum / latent_values as f64} finite_nonzero=verified",
-        );
-        return 0;
-    }
-    if command == "test-vision-encoder" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vision-encoder MODEL_DIR IMAGE [32|512]");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(image_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vision-encoder MODEL_DIR IMAGE [32|512]");
-            return 2;
-        };
-        let output_resolution: usize = match env::arg(4 as usize) {
-            option::Option[text::Text]::Some(value) => {
-                guard let option::Option[u64]::Some(parsed) = parse_u64_decimal(value.view())
-                    else { return 2; };
-                if parsed != (32 as u64) && parsed != (512 as u64) {
-                    io::eprintln("vision encoder test resolution must be 32 or 512");
-                    return 2;
-                }
-                parsed as usize
-            }
-            option::Option[text::Text]::None => { 512 as usize }
-        };
-        guard let option::Option[image_input::Image]::Some(input_image) =
-            image_input::load_resized(image_path.view(), output_resolution) else {
-            io::eprintln("vision encoder test: could not load ${image_path}");
-            return 1;
-        };
-        let output_values: usize = input_image.shape.vision_tokens *% (4096 as usize);
-        var visual: vec::Vec[f32] = vec::Vec[f32]::with_capacity(output_values);
-        var deepstack: vec::Vec[f32] = vec::Vec[f32]::with_capacity(
-            output_values *% (3 as usize),
-        );
-        var index: usize = 0 as usize;
-        while index < output_values {
-            if visual.append(0.0f32) != status::Status::Ok { return 1; }
-            index = index +% (1 as usize);
-        }
-        index = 0 as usize;
-        while index < output_values *% (3 as usize) {
-            if deepstack.append(0.0f32) != status::Status::Ok { return 1; }
-            index = index +% (1 as usize);
-        }
-        let encode_status: i32 = qwen3vl_vision::encode_sized_to_host(
-            model_path.view(), #slice_ptr(input_image.vision_pixels.as_slice()),
-            input_image.shape.width, input_image.shape.height,
-            #slice_ptr(visual.as_slice()), #slice_ptr(deepstack.as_slice()),
-        );
-        if encode_status != (0 as i32) { return encode_status; }
-        let visual_pointer: *f32 = #slice_ptr(visual.as_slice());
-        var minimum: f32 = visual_pointer[0];
-        var maximum: f32 = visual_pointer[0];
-        var mean_abs: f64 = 0.0f64;
-        index = 0 as usize;
-        while index < output_values {
-            let value: f32 = visual_pointer[index];
-            if value < minimum { minimum = value; }
-            if value > maximum { maximum = value; }
-            mean_abs = mean_abs + (value as f64).abs();
-            index = index +% (1 as usize);
-        }
-        if maximum - minimum < 0.000001f32 || mean_abs < 0.000001f64 {
-            io::eprintln("vision encoder: degenerate merged output");
-            return 1;
-        }
-        io::println(
-            "vision condition encoding: output_resolution=${output_resolution} image=${input_image.shape.width}x${input_image.shape.height} tokens=${input_image.shape.vision_tokens} values=${output_values} min=${minimum} max=${maximum} mean_abs=${mean_abs / output_values as f64} finite_nonzero=verified",
-        );
-        return 0;
-    }
-    if command == "test-vision-encoder-oracle" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-vision-encoder-oracle MODEL_DIR [FIXTURE_DIR]");
-            return 2;
-        };
-        return match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(fixture) => {
-                qwen3vl_vision::run_fixture(model_path.view(), fixture.view())
-            }
-            option::Option[text::Text]::None => {
-                qwen3vl_vision::run_fixture(model_path.view())
-            }
-        };
-    }
-    if command == "test-text-encoder" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus test-text-encoder MODEL_DIR");
-            return 2;
-        };
-        return qwen3vl_text::run(model_path.view());
-    }
-    if command == "quantize-block0" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus quantize-block0 MODEL_DIR OUTPUT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus quantize-block0 MODEL_DIR OUTPUT");
-            return 2;
-        };
-        return packed_model::quantize_block0(model_path.view(), output_path.view());
-    }
-    if command == "quantize-transformer" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus quantize-transformer MODEL_DIR OUTPUT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus quantize-transformer MODEL_DIR OUTPUT");
-            return 2;
-        };
-        return packed_model::quantize_transformer(model_path.view(), output_path.view());
-    }
-    if command == "quantize-transformer-q4" {
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus quantize-transformer-q4 MODEL_DIR OUTPUT");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(output_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus quantize-transformer-q4 MODEL_DIR OUTPUT");
-            return 2;
-        };
-        return packed_model::quantize_transformer_int4_rotated(
-            model_path.view(), output_path.view(),
-        );
-    }
-    if command == "pack-metadata" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus pack-metadata FILE [key=value ...]  (empty value removes a key)");
-            return 2;
-        };
-        var assignments: vec::Vec[text::Text] = vec::Vec[text::Text]::with_capacity(8 as usize);
-        var index: usize = 3 as usize;
-        while true {
-            guard let option::Option[text::Text]::Some(assignment) = env::arg(index) else { break; };
-            if assignments.append(assignment) != status::Status::Ok { return 1; }
-            index = index +% (1 as usize);
-        }
-        return packed_model::pack_metadata_command(path.view(), assignments);
-    }
-    if command == "verify-packed" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus verify-packed FILE");
-            return 2;
-        };
-        return packed_model::verify_packed(path.view());
-    }
-    if command == "verify-viggle-lora" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus verify-viggle-lora FILE");
-            return 2;
-        };
-        guard let safetensors::LoadResult::Ok(file) = safetensors::load(path.view()) else {
-            io::eprintln("adapter: could not load ${path}");
-            return 1;
-        };
-        if !lora::validate_viggle_v021_r256(file) {
-            io::eprintln("adapter: Viggle v0.2.1 rank-256 tensor validation failed");
-            return 1;
-        }
-        io::println("adapter: Viggle v0.2.1 rank-256 valid (${file.tensor_count()} tensors)");
-        return 0;
-    }
-    if command == "verify-packed-source" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus verify-packed-source FILE MODEL_DIR");
-            return 2;
-        };
-        guard let option::Option[text::Text]::Some(model_path) = env::arg(3 as usize) else {
-            io::eprintln("usage: qwen-image-cplus verify-packed-source FILE MODEL_DIR");
-            return 2;
-        };
-        return packed_model::verify_packed_source(path.view(), model_path.view());
-    }
-    if command == "inspect" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus inspect FILE [NAME_FILTER]");
-            return 2;
-        };
-        match env::arg(3 as usize) {
-            option::Option[text::Text]::Some(filter) => { return safetensors::inspect(path, filter); }
-            option::Option[text::Text]::None => { return safetensors::inspect(path); }
-        }
-    }
-    if command == "verify-model" || command == "verify" {
-        guard let option::Option[text::Text]::Some(path) = env::arg(2 as usize) else {
-            io::eprintln("usage: qwen-image-cplus verify-model MODEL_DIR");
-            return 2;
-        };
-        return model_inventory::verify_model(path);
-    }
+    return exit_code(qwen_image::generate_multi_image_to_png(qwen_image::MultiImageGenerateRequest {
+        packed_path: packed_path.view(),
+        model_root: model_path.view(),
+        output_path: output_path.view(),
+        prompt: prompt.view(),
+        image_paths: #addr_of(image_paths[0]),
+        image_count: image_count,
+        pixels: resolution,
+        steps: step_count as usize,
+        seed: seed,
+    }, observer()));
+}
 
-    io::eprintln("unknown command: ${command}");
+// Prints a pack's policy and metadata.
+fn info() -> i32 {
+    guard let option::Option[text::Text]::Some(packed_path) = env::arg(2 as usize) else {
+        io::eprintln("usage: qwen-image-cplus info PACKED");
+        return 2;
+    };
+    guard let option::Option[pack_info::PackInfo]::Some(pack) = pack_info::read(packed_path.view()) else {
+        io::eprintln("info: ${packed_path.view()} is not a readable QIPACK");
+        return 1;
+    };
+    io::println("policy=${pack.policy.view()}");
+    var index: usize = 0 as usize;
+    while index < pack.entries.count() {
+        guard let option::Option[*pack_info::Entry]::Some(entry) = pack.entries.at_ptr(index) else { return 1; };
+        io::println("${(*entry).key.view()}=${(*entry).value.view()}");
+        index = index +% (1 as usize);
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    guard let option::Option[text::Text]::Some(command) = env::arg(1 as usize) else {
+        io::println(USAGE);
+        return 0;
+    };
+    runtime::install();
+    let name: str = command.view();
+    if name == "generate" { return generate(); }
+    if name == "generate-multi-image-sized" || name == "generate-multi-image-512" || name == "generate-multi-image-1024" {
+        return generate_multi_image(name);
+    }
+    if name == "info" { return info(); }
+    io::eprintln("unknown command: ${name}");
+    io::eprintln(USAGE);
     return 2;
 }
