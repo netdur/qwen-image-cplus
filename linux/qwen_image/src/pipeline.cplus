@@ -81,7 +81,7 @@ fn encode_prompt(model_root: str, prompt: str, ref rows: usize) -> option::Optio
         return option::Option[pack::Buffer]::None;
     };
     if !text_encoder::encode(model_root, #slice_ptr(ids.as_slice()) as *i32, ids.count(),
-            text_encoder::Options { bf16_boundaries: true }, embeddings.pointer as *f32) {
+            text_encoder::Options { bf16_boundaries: true, half_gemm: true }, embeddings.pointer as *f32) {
         return option::Option[pack::Buffer]::None;
     }
     return option::Option[pack::Buffer]::Some(embeddings);

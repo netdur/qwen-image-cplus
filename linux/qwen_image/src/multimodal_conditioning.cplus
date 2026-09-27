@@ -20,6 +20,7 @@ import "./tokenizer" as tokenizer;
 import "./transformer" as transformer;
 import "./vae" as vae;
 import "./vision" as vision;
+import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
@@ -96,6 +97,18 @@ fn encode_latents(model_root: str, images: vec::Vec[image_input::Image], latents
     return true;
 }
 
+// With QI_DUMP_DIR set, writes `bytes` at `data` to that directory as `name`
+// (development checks against tools/dump_oracle_edit.py).
+fn dump(name: str, data: *u8, bytes: usize) {
+    match env::var("QI_DUMP_DIR") {
+        option::Option::Some(directory) => {
+            let path: text::Text = "${directory.view()}/${name}";
+            if !transformer::write_floats(path.view(), data, bytes) { io::eprintln("could not write ${path.view()}"); }
+        }
+        option::Option::None => {}
+    }
+}
+
 // References are resized to the output area, as the reference pipeline's
 // `output_resolution` does for both the vision tower and the VAE.
 fn encode_images(model_root: str, prompt: str, image_paths: *str, image_count: usize, output_resolution: usize,
@@ -167,11 +180,17 @@ fn encode_images(model_root: str, prompt: str, image_paths: *str, image_count: u
         deepstack: deepstack.pointer as *f32,
         vision_rows: vision_rows,
     };
-    if !text_encoder::encode(model_root, #slice_ptr(tokens.as_slice()) as *i32, count, text_encoder::Options { bf16_boundaries: true },
+    if !text_encoder::encode(model_root, #slice_ptr(tokens.as_slice()) as *i32, count, text_encoder::Options { bf16_boundaries: true, half_gemm: true },
             prompt_embeddings.pointer as *f32, multimodal) {
         control::diagnose(observer, "The text encoder failed while combining the prompt and references.");
         return option::Option[Encoded]::None;
     }
+    dump("input_ids.i32", #slice_ptr(tokens.as_slice()) as *u8, count *% (4 as usize));
+    dump("positions.i32", positions.pointer, positions.length);
+    dump("vision_embeds.f32", embeddings.pointer, embeddings.length);
+    dump("deepstack.f32", deepstack.pointer, deepstack.length);
+    dump("condition_latents.f32", condition_latents.pointer, condition_latents.length);
+    dump("prompt_embeds.f32", prompt_embeddings.pointer, prompt_embeddings.length);
     guard let option::Option[pack::Buffer]::Some(image_pad) = pack::Buffer::allocate(prompt_rows) else { return option::Option[Encoded]::None; };
     let token_values: *u32 = #slice_ptr(tokens.as_slice());
     var row: usize = 0 as usize;
@@ -179,6 +198,7 @@ fn encode_images(model_root: str, prompt: str, image_paths: *str, image_count: u
         image_pad.pointer[row] = if token_values[row +% SYSTEM_TOKENS] == IMAGE_PAD_TOKEN { 1 as u8 } else { 0 as u8 };
         row = row +% (1 as usize);
     }
+    dump("image_pad_mask.u8", image_pad.pointer, prompt_rows);
     io::println("text: ${count} tokens (${vision_rows} image), ${transformer::seconds() - phase} s");
     return option::Option[Encoded]::Some(Encoded {
         prompt: prompt_embeddings,
@@ -212,6 +232,7 @@ fn denoise(pack_path: str, mode: transformer::WeightMode, encoded: Encoded, late
         io::eprintln("multimodal conditioning: image placeholders do not match the condition images");
         return 1;
     }
+    dump("rope.f32", rope_host.pointer, rope_host.length);
     guard let option::Option[pack::Buffer]::Some(scratch) = pack::Buffer::allocate(image_rows *% LATENT *% (4 as usize)) else { return 1; };
     if !inputs::initial_noise(seed, latent_height, latent_width, inputs::NoiseDtype::Float16, scratch.pointer as *f32, latents_host) {
         return 1;
@@ -245,7 +266,9 @@ fn denoise(pack_path: str, mode: transformer::WeightMode, encoded: Encoded, late
         return 1;
     }
     if !control::report(observer, control::Phase::Denoising, steps, steps) { return 3; }
-    return if latents.download(latents_host as *u8, (image_rows *% LATENT *% (4 as usize)) as u64) { 0 } else { 1 };
+    if !latents.download(latents_host as *u8, (image_rows *% LATENT *% (4 as usize)) as u64) { return 1; }
+    dump("final_latents.f32", latents_host as *u8, image_rows *% LATENT *% (4 as usize));
+    return 0;
 }
 
 fn run_multi_image_transformer(

@@ -69,3 +69,80 @@ prompt embeddings within 0.7% (FP32) of the FP16 oracle. The native image
 scores 17.6 dB PSNR against the oracle image, the same as native denoising
 from the oracle's own encoder outputs (17.0 dB): the difference is W4A4 versus
 Q4_K_M, not the encoders.
+
+## After the text-encoder and attention changes (2026-09-27)
+
+Text encoder: layer uploads overlap the previous layer's compute (two device
+slots, a copy stream), attention runs as cuBLAS GEMMs, and the layer
+matrices run on FP16 tensor cores with FP32 accumulation (BF16 activation
+boundaries kept). It now takes ~3.0 s for 32 or 1060 tokens, its PCIe floor
+(16 GB of BF16 weights at 6.45 GB/s). Its prompt rows are 2.8% from the BF16
+oracle's (2.6% with FP32 GEMMs; 6.5% for pure FP32). The largest linear input
+is 6410, well inside FP16. The vision tower uses the same FP16 GEMMs (0.9% /
+2.3% from FP32 at 512 / 1024; the FP16 oracle is 1.3% away at 512). The
+transformer's FP16 attention softmax keeps each score row in registers (one
+read, one write instead of three reads and two writes).
+
+W4A4 H256 g64 clip v6, 4 steps, seed 1301, warm cache, end to end:
+
+| Task | Size | GGUF Q4_K_M oracle | Engine W4A4 | Engine W4A16 |
+| --- | --- | ---: | ---: | ---: |
+| Text to image | 512×512 | ~39–45 s | ~8.3 s | ~11.7 s |
+| Text to image | 1024×1024 | ~74.5 s | ~22.6 s | ~35.6 s |
+| Image edit, 1 image | 512×512 | ~76.3 s | ~11.1 s | ~18.3 s |
+| Image edit, 1 image | 1024×1024 | ~101.5 s (group offload) | ~33.4 s | ~50.9 s |
+| Image edit, 2 images (cat 512 area + dog 576×480) | 512×512 | ~74.9 s (group offload) | ~14.2 s | |
+
+1024 edit, oracle: model offload runs out of memory in the transformer; with
+block-level group offload (`tools/benchmark_oracle_edit.py --group-offload
+--vae-tiling`): load 26.8 s, text + vision 27.1 s, VAE encode 3.4 s, denoise
+29.8 s (11.4 s, then ~6.1 s per step), VAE decode 7.3 s; 105.2 s process wall.
+Engine: vision 2.1 s, VAE encode 0.9 s, text (1060 tokens) 3.0 s, transformer
+23.6 s (4.5 s per step over 8214 keys), VAE + PNG 3.7 s.
+
+Two-image edit, oracle: model offload runs out of memory in the transformer;
+with `--group-offload --vae-tiling`: load 24.8 s, text + vision 27.5 s, VAE
+encode 1.3 s, denoise 10.4 s, VAE decode 1.9 s; 78.7 s process wall.
+Engine: vision 1.2 s, VAE encode 0.6 s, text (579 tokens) 3.0 s, transformer
+8.1 s (1.05 s per step), VAE + PNG 1.2 s.
+
+Two-image edit, checked against the oracle's intermediates: token IDs, M-RoPE
+positions and image-pad mask equal; joint transformer RoPE within 2.4e-7;
+vision rows 0.6%, condition latents 0.5%.
+
+### W4A4 against W4A16
+
+Same oracle inputs (512, 4 steps) denoised with the FP16, W4A16 and W4A4
+packs, then decoded; distance to the FP16 result:
+
+| Case | W4A16 latents / PSNR | W4A4 latents / PSNR | Denoise FP16 / W4A16 / W4A4 |
+| --- | --- | --- | --- |
+| Text to image (poster) | 14.3% / 21.2 dB | 21.3% / 19.0 dB | 30.3 / 5.7 / 2.6 s |
+| Edit (cat) | 20.5% / 20.6 dB | 28.7% / 18.6 dB | 30.6 / 6.1 / 3.0 s |
+
+All render both poster strings exactly. W4A16 keeps the FP16 composition
+closer (the W4A4 poster changes the smoke and figure); W4A4 is 1.4–1.6x faster
+end to end.
+
+## Flash attention (2026-09-27)
+
+The transformer's attention is one fused kernel (`linux/qwen_image/cuda/flash.cu`):
+mma.m16n8k8 FP16 tensor cores with FP32 accumulation, online softmax in
+registers, 64-key K/V tiles in shared memory, 8 warps x 16 query rows per
+block; no score matrix. Per block at the 1024-edit step shape (4096 queries x
+8214 keys x 32 heads): 32.9 ms against 74 ms for cuBLAS + the stored FP16
+softmax; 15.2 ms against 34 ms at the 1024 text-to-image shape. It is closer to
+FP32 attention than the old path (3.8e-4 against 1.15e-3), and the FP16-weight
+transformer fixture moves from 1.7e-3 to 5.0e-4 of the NumPy reference. The
+score buffers are gone (about 540 MB at the 1024 edit). A 1024-edit step
+drops from 4.5 s to 3.26 s.
+
+Warm cache, 4 steps, seed 1301, end to end:
+
+| Task | Size | GGUF Q4_K_M oracle | Engine W4A4 | Engine W4A16 |
+| --- | --- | ---: | ---: | ---: |
+| Text to image | 512×512 | ~39–45 s | ~8.2 s | ~11.6 s |
+| Text to image | 1024×1024 | ~74.5 s | ~21.3 s | ~34.5 s |
+| Image edit, 1 image | 512×512 | ~76.3 s | ~11.0 s | ~15.4 s |
+| Image edit, 1 image | 1024×1024 | ~101.5 s | ~29.4 s | ~46.1 s |
+| Image edit, 2 images | 512×512 | ~74.9 s | ~12.7 s | ~17.7 s |

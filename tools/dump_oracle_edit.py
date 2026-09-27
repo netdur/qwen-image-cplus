@@ -5,7 +5,8 @@ little-endian files the Linux engine's stages are checked against:
   input_ids.i32            full template token IDs (system prefix included)
   image_grid_thw.i32       [images, 3] patch grid (t, h, w) per condition image
   pixel_values.f32         [patches, 1536] vision processor output
-  vae_input.f32            [images][4, H, W] VAE condition input in [-1, 1]
+  vae_input.f32            [4, H, W] VAE condition input in [-1, 1]
+                           (vae_input_N.f32 for image N > 0)
   vision_embeds.f32        [merged tokens, 4096] merger output
   deepstack_N.f32          [merged tokens, 4096] for N = 0, 1, 2
   position_ids.i32         [3, tokens] text-encoder M-RoPE positions
@@ -45,7 +46,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--gguf", type=Path, required=True)
-    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--image", type=Path, required=True, nargs="+", help="one or more condition images")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output", type=Path, required=True, help="directory")
     parser.add_argument("--size", type=int, default=512)
@@ -120,8 +121,12 @@ def main() -> None:
     pipe.encode_prompt = capture_encode
     vae_encode = pipe._encode_vae_image
 
+    vae_calls = [0]
+
     def capture_vae_encode(image, generator):
-        shapes["vae_input"] = save(out, "vae_input", image[0, :, 0])
+        name = "vae_input" if vae_calls[0] == 0 else f"vae_input_{vae_calls[0]}"
+        vae_calls[0] += 1
+        shapes[name] = save(out, name, image[0, :, 0])
         result = vae_encode(image.to(torch.float32), generator).to(image.dtype)
         pipe.vae.to("cpu")
         torch.cuda.empty_cache()
@@ -138,7 +143,14 @@ def main() -> None:
 
     pipe.prepare_latents = capture_prepare
     captured: dict[str, torch.Tensor] = {}
-    pipe.transformer.pos_embed.register_forward_hook(lambda m, a, o: captured.setdefault("rope", o.detach()))
+
+    def capture_rope(module, args, output):
+        # Saved at once, so a later out-of-memory failure still leaves it.
+        if "rope" not in captured:
+            captured["rope"] = output.detach()
+            shapes["rope"] = save(out, "rope", torch.cat([output.real, output.imag], dim=-1))
+
+    pipe.transformer.pos_embed.register_forward_hook(capture_rope)
     timesteps: list[float] = []
 
     def before(module, args, kwargs):
@@ -155,15 +167,13 @@ def main() -> None:
     pipe.transformer.register_forward_hook(after, with_kwargs=True)
 
     latents = pipe(
-        prompt=arguments.prompt, image=[Image.open(arguments.image)], height=arguments.size, width=arguments.size,
+        prompt=arguments.prompt, image=[Image.open(path) for path in arguments.image], height=arguments.size, width=arguments.size,
         num_inference_steps=arguments.steps, true_cfg_scale=1.0, output_resolution=arguments.size,
         generator=torch.Generator("cpu").manual_seed(arguments.seed), output_type="latent",
     ).images
     shapes["final_latents"] = save(out, "final_latents", latents[0])
-    rope = captured["rope"]
-    shapes["rope"] = save(out, "rope", torch.cat([rope.real, rope.imag], dim=-1))
     metadata = {
-        "prompt": arguments.prompt, "image": str(arguments.image), "size": arguments.size, "steps": arguments.steps,
+        "prompt": arguments.prompt, "image": [str(path) for path in arguments.image], "size": arguments.size, "steps": arguments.steps,
         "seed": arguments.seed, "transformer_timesteps": timesteps, "shapes": shapes,
     }
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

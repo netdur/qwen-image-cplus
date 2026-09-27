@@ -22,7 +22,7 @@ fn usage() -> i32 {
     io::eprintln("       qwen-image-dev vae-decode VAE.safetensors LATENTS.f32 LATENT_SIDE OUTPUT.png");
     io::eprintln("       qwen-image-dev vae-encode VAE.safetensors IMAGE.f32 WIDTH HEIGHT OUTPUT.f32  (image [4, H, W] in [-1, 1])");
     io::eprintln("       qwen-image-dev vision-encode MODEL_ROOT PIXELS.f32 GRID_H GRID_W OUTPUT_DIR  (vision_embeds.f32, deepstack_N.f32)");
-    io::eprintln("       qwen-image-dev text-encode-edit MODEL_ROOT IDS.i32 VISION_DIR GRID_H GRID_W fp32|bf16 OUTPUT.f32");
+    io::eprintln("       qwen-image-dev text-encode-edit MODEL_ROOT IDS.i32 VISION_DIR GRID_H GRID_W fp32|bf16[-half] OUTPUT.f32");
     io::eprintln("       qwen-image-dev text-encode MODEL_ROOT IDS.i32 fp32|bf16 OUTPUT.f32");
     io::eprintln("       qwen-image-dev inputs TEXT_ROWS LATENT_SIDE SEED OUTPUT_DIR  (rope.f32, noise_f16.f32, noise_bf16.f32)");
     io::eprintln("       qwen-image-dev tokenizer-fixtures MODEL_ROOT FIXTURE_DIR");
@@ -112,7 +112,7 @@ fn main() -> i32 {
         guard let option::Option[f64]::Some(grid_h) = grid_h_text.view().to_f64() else { return usage(); };
         guard let option::Option[f64]::Some(grid_w) = grid_w_text.view().to_f64() else { return usage(); };
         return text_encoder::encode_edit_file(root.view(), ids.view(), vision_directory.view(), grid_h as usize, grid_w as usize,
-            precision.view() == "bf16", output.view());
+            precision.view().has_prefix("bf16"), output.view(), precision.view().has_suffix("-half"));
     }
     if command.view() == "vae-decode" {
         guard let option::Option[text::Text]::Some(vae_path) = env::arg(2 as usize) else { return usage(); };
@@ -127,7 +127,8 @@ fn main() -> i32 {
         guard let option::Option[text::Text]::Some(ids) = env::arg(3 as usize) else { return usage(); };
         guard let option::Option[text::Text]::Some(precision) = env::arg(4 as usize) else { return usage(); };
         guard let option::Option[text::Text]::Some(output) = env::arg(5 as usize) else { return usage(); };
-        return text_encoder::encode_file(root.view(), ids.view(), precision.view() == "bf16", output.view());
+        return text_encoder::encode_file(root.view(), ids.view(), precision.view().has_prefix("bf16"), output.view(),
+            precision.view().has_suffix("-half"));
     }
     if command.view() == "inputs" {
         guard let option::Option[text::Text]::Some(rows_text) = env::arg(2 as usize) else { return usage(); };

@@ -39,6 +39,11 @@ extern fn qi_text_head_norm_mrope(x: *f32, weight: *f32, rows: i32, heads: i32, 
 extern fn qi_scatter_rows(target: *f32, source: *f32, indices: *i32, rows: i32, width: i32, accumulate: i32) -> i32;
 #[link_name = "qi_text_attention"]
 extern fn qi_text_attention(q: *f32, k: *f32, v: *f32, out: *f32, tokens: i32, q_heads: i32, kv_heads: i32) -> i32;
+#[link_name = "qi_text_attention_gemm"]
+extern fn qi_text_attention_gemm(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, score_floats: u64, tokens: i32, q_heads: i32,
+    kv_heads: i32) -> i32;
+#[link_name = "qi_linear_bf16_half"]
+extern fn qi_linear_bf16_half(x: *f32, w_bf16: *u8, y: *f32, w_half: *u8, x_half: *u8, m: i32, n: i32, k: i32) -> i32;
 #[link_name = "qi_round_bf16"]
 extern fn qi_round_bf16(x: *f32, count: u64) -> i32;
 #[link_name = "qi_vae_add"]
@@ -61,6 +66,8 @@ const READ_WORKERS: usize = 8;
 const READ_CHUNK: u64 = 8388608;
 const IMAGE_PAD: i32 = 151655;
 const DEEPSTACK_LAYERS: usize = 3;
+// Attention scores scratch: 32M floats (128 MB) bounds the query chunk.
+const SCORE_FLOATS: usize = 33554432;
 
 fn ok(result: i32, what: str) -> bool {
     if result != (0 as i32) {
@@ -262,6 +269,9 @@ impl PinnedBuffer {
 struct Options {
     // Round activations to BF16 where the reference's BF16 execution does.
     bf16_boundaries: bool,
+    // Run the layer matrices on FP16 tensor cores (FP32 accumulation) instead
+    // of FP32 SGEMM.
+    half_gemm: bool,
 }
 
 // Condition-image inputs (host). All null for a text-only prompt.
@@ -288,9 +298,15 @@ fn round_bf16(options: Options, x: *f32, count: usize) -> bool {
     return ok(qi_round_bf16(x, count as u64), "bf16 rounding");
 }
 
-// FP32 expansion of the BF16 matrix at `offset` in the layer slot, then
-// y[tokens, n] = x[tokens, k] . W^T.
-fn linear(slot: *u8, offset: u64, scratch: *f32, x: *f32, y: *f32, tokens: usize, n: usize, k: usize) -> bool {
+// y[tokens, n] = x[tokens, k] . W^T for the BF16 matrix at `offset` in the
+// layer slot: FP32 expansion and SGEMM, or with `half` FP16 tensor cores
+// (weights into `scratch`, activations into `x_half`).
+fn linear(slot: *u8, offset: u64, scratch: *f32, x: *f32, y: *f32, tokens: usize, n: usize, k: usize, half: bool = false,
+          x_half: *u8 = 0 as *u8) -> bool {
+    if half {
+        return ok(qi_linear_bf16_half(x, slot + offset as usize, y, scratch as *u8, x_half, tokens as i32, n as i32, k as i32),
+            "half linear");
+    }
     return ok(cuda::bf16_to_f32(slot + offset as usize, scratch, (n *% k) as u64), "weight expansion")
         && ok(cuda::linear_f32(x, scratch, y, tokens as i32, n as i32, k as i32, 0 as i32), "linear");
 }
@@ -358,7 +374,15 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
     var second_pointer: *u8 = 0 as *u8;
     if qi_cuda_malloc_host(#addr_of(second_pointer), layer_bytes) != (0 as i32) { return false; }
     let second: PinnedBuffer = PinnedBuffer { pointer: second_pointer, bytes: layer_bytes };
+    // Two device slots: layer L + 1 uploads on the copy stream while layer L
+    // runs on the default stream.
     guard let option::Option[cuda::DeviceBuffer]::Some(slot) = cuda::DeviceBuffer::allocate(layer_bytes) else { return false; };
+    guard let option::Option[cuda::DeviceBuffer]::Some(slot_b) = cuda::DeviceBuffer::allocate(layer_bytes) else { return false; };
+    guard let option::Option[cuda::Stream]::Some(copy_stream) = cuda::Stream::create() else { return false; };
+    guard let option::Option[cuda::Event]::Some(uploaded_a) = cuda::Event::create() else { return false; };
+    guard let option::Option[cuda::Event]::Some(uploaded_b) = cuda::Event::create() else { return false; };
+    guard let option::Option[cuda::Event]::Some(computed_a) = cuda::Event::create() else { return false; };
+    guard let option::Option[cuda::Event]::Some(computed_b) = cuda::Event::create() else { return false; };
     guard let option::Option[cuda::DeviceBuffer]::Some(scratch) = device_floats(MLP *% WIDTH) else { return false; };
     guard let option::Option[cuda::DeviceBuffer]::Some(norm_weight) = device_floats(WIDTH) else { return false; };
     guard let option::Option[cuda::DeviceBuffer]::Some(hidden) = device_floats(count *% WIDTH) else { return false; };
@@ -369,6 +393,13 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
     guard let option::Option[cuda::DeviceBuffer]::Some(attended) = device_floats(count *% WIDTH) else { return false; };
     guard let option::Option[cuda::DeviceBuffer]::Some(gate) = device_floats(count *% MLP) else { return false; };
     guard let option::Option[cuda::DeviceBuffer]::Some(up) = device_floats(count *% MLP) else { return false; };
+    // FP16 copies of a linear's input (at most count x MLP halves).
+    guard let option::Option[cuda::DeviceBuffer]::Some(x_half) = device_floats(if options.half_gemm { count *% MLP / (2 as usize) } else { 1 as usize }) else { return false; };
+    let hx: *u8 = x_half.pointer;
+    let hg: bool = options.half_gemm;
+    let group_scores: usize = (Q_HEADS / KV_HEADS) *% count *% count;
+    let score_floats: usize = if group_scores < SCORE_FLOATS { group_scores } else { SCORE_FLOATS };
+    guard let option::Option[cuda::DeviceBuffer]::Some(scores) = device_floats(score_floats) else { return false; };
 
     // Embedding rows for the prompt's tokens only.
     guard let option::Option[Location]::Some(embeddings) = locate(shards, "model.language_model.embed_tokens.weight") else { return false; };
@@ -435,28 +466,41 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
     if !start_read(first_plan, pinned.pointer, reading) { return false; }
     var layer: usize = 0 as usize;
     while layer < LAYERS {
-        let current: *u8 = if layer % (2 as usize) == (0 as usize) { pinned.pointer } else { second.pointer };
-        let following: *u8 = if layer % (2 as usize) == (0 as usize) { second.pointer } else { pinned.pointer };
+        let even: bool = layer % (2 as usize) == (0 as usize);
+        let current: *u8 = if even { pinned.pointer } else { second.pointer };
+        let following: *u8 = if even { second.pointer } else { pinned.pointer };
+        let s: *u8 = if even { slot.pointer } else { slot_b.pointer };
+        let uploaded: *u8 = if even { uploaded_a.handle } else { uploaded_b.handle };
+        let other_uploaded: *u8 = if even { uploaded_b.handle } else { uploaded_a.handle };
+        let computed: *u8 = if even { computed_a.handle } else { computed_b.handle };
         if !finish_read(reading) {
             io::eprintln("cuda text encoder: reading layer ${layer} failed");
             return false;
         }
+        // The slot is free once layer L - 2 has run; the upload overlaps the
+        // compute of layer L - 1.
+        if (layer >= (2 as usize) && !cuda::wait(copy_stream.handle, computed))
+            || !cuda::upload_async(s, current, layer_bytes, copy_stream.handle)
+            || !cuda::record(uploaded, copy_stream.handle) {
+            return false;
+        }
         if layer +% (1 as usize) < LAYERS {
+            // The other pinned buffer still feeds layer L - 1's upload.
+            if layer >= (1 as usize) && !cuda::event_synchronize(other_uploaded) { return false; }
             guard let option::Option[*ReadPlan]::Some(next_plan) = plans.at_ptr(layer +% (1 as usize)) else { return false; };
             if !start_read(next_plan, following, reading) { return false; }
         }
-        if cuda::upload(slot.pointer, current, layer_bytes) != (0 as i32) {
+        if !cuda::wait(0 as *u8, uploaded) {
             let _joined: bool = finish_read(reading);
             return false;
         }
-        let s: *u8 = slot.pointer;
         let vector: *f32 = norm_weight.pointer as *f32;
         if !ok(cuda::bf16_to_f32(s + offsets[0] as usize, vector, WIDTH as u64), "norm weight")
             || !ok(cuda::rms_norm(h, vector, 0.0f32, n, count as i32, WIDTH as i32), "input norm")
             || !round_bf16(options, n, count *% WIDTH)
-            || !linear(s, offsets[1], w, n, q.pointer as *f32, count, WIDTH, WIDTH)
-            || !linear(s, offsets[2], w, n, k.pointer as *f32, count, KV_WIDTH, WIDTH)
-            || !linear(s, offsets[3], w, n, v.pointer as *f32, count, KV_WIDTH, WIDTH)
+            || !linear(s, offsets[1], w, n, q.pointer as *f32, count, WIDTH, WIDTH, hg, hx)
+            || !linear(s, offsets[2], w, n, k.pointer as *f32, count, KV_WIDTH, WIDTH, hg, hx)
+            || !linear(s, offsets[3], w, n, v.pointer as *f32, count, KV_WIDTH, WIDTH, hg, hx)
             || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
             || !round_bf16(options, k.pointer as *f32, count *% KV_WIDTH)
             || !round_bf16(options, v.pointer as *f32, count *% KV_WIDTH)
@@ -466,27 +510,31 @@ fn encode_with(shards: vec::Vec[Shard], ids: *i32, count: usize, options: Option
             || !head_norm_rope(k.pointer as *f32, vector, count, KV_HEADS, multimodal, position_values)
             || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
             || !round_bf16(options, k.pointer as *f32, count *% KV_WIDTH)
-            || !ok(qi_text_attention(q.pointer as *f32, k.pointer as *f32, v.pointer as *f32, attended.pointer as *f32,
-                count as i32, Q_HEADS as i32, KV_HEADS as i32), "attention")
+            || !ok(qi_text_attention_gemm(q.pointer as *f32, k.pointer as *f32, v.pointer as *f32, attended.pointer as *f32,
+                scores.pointer as *f32, score_floats as u64, count as i32, Q_HEADS as i32, KV_HEADS as i32), "attention")
             || !round_bf16(options, attended.pointer as *f32, count *% WIDTH)
-            || !linear(s, offsets[6], w, attended.pointer as *f32, q.pointer as *f32, count, WIDTH, WIDTH)
+            || !linear(s, offsets[6], w, attended.pointer as *f32, q.pointer as *f32, count, WIDTH, WIDTH, hg, hx)
             || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
             || !ok(qi_add(h, q.pointer as *f32, (count *% WIDTH) as u64), "attention residual")
             || !round_bf16(options, h, count *% WIDTH)
             || !ok(cuda::bf16_to_f32(s + offsets[7] as usize, vector, WIDTH as u64), "norm weight")
             || !ok(cuda::rms_norm(h, vector, 0.0f32, n, count as i32, WIDTH as i32), "post-attention norm")
             || !round_bf16(options, n, count *% WIDTH)
-            || !linear(s, offsets[8], w, n, gate.pointer as *f32, count, MLP, WIDTH)
-            || !linear(s, offsets[9], w, n, up.pointer as *f32, count, MLP, WIDTH)
+            || !linear(s, offsets[8], w, n, gate.pointer as *f32, count, MLP, WIDTH, hg, hx)
+            || !linear(s, offsets[9], w, n, up.pointer as *f32, count, MLP, WIDTH, hg, hx)
             || !round_bf16(options, gate.pointer as *f32, count *% MLP)
             || !round_bf16(options, up.pointer as *f32, count *% MLP)
             || !ok(cuda::swiglu(gate.pointer as *f32, up.pointer as *f32, gate.pointer as *f32, (count *% MLP) as u64), "swiglu")
             || !round_bf16(options, gate.pointer as *f32, count *% MLP)
-            || !linear(s, offsets[10], w, gate.pointer as *f32, q.pointer as *f32, count, WIDTH, MLP)
+            || !linear(s, offsets[10], w, gate.pointer as *f32, q.pointer as *f32, count, WIDTH, MLP, hg, hx)
             || !round_bf16(options, q.pointer as *f32, count *% WIDTH)
             || !ok(qi_add(h, q.pointer as *f32, (count *% WIDTH) as u64), "mlp residual")
             || !round_bf16(options, h, count *% WIDTH) {
             // Readers write into the pinned buffers; they must finish before those are freed.
+            let _joined: bool = finish_read(reading);
+            return false;
+        }
+        if !cuda::record(computed, 0 as *u8) {
             let _joined: bool = finish_read(reading);
             return false;
         }
@@ -536,12 +584,12 @@ fn read_ids(path: str) -> option::Option[TokenIds] {
 }
 
 // Encodes the IDs in `ids_path` and writes [count - 14, 4096] FP32 to `output_path`.
-fn encode_file(model_root: str, ids_path: str, bf16_boundaries: bool, output_path: str) -> i32 {
+fn encode_file(model_root: str, ids_path: str, bf16_boundaries: bool, output_path: str, half_gemm: bool = false) -> i32 {
     guard let option::Option[TokenIds]::Some(ids) = read_ids(ids_path) else { return 1; };
     if ids.count <= SYSTEM_TOKENS { return 1; }
     let kept: usize = ids.count -% SYSTEM_TOKENS;
     guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(kept *% WIDTH *% (4 as usize)) else { return 1; };
-    if !encode(model_root, ids.buffer.pointer as *i32, ids.count, Options { bf16_boundaries: bf16_boundaries }, result.pointer as *f32) {
+    if !encode(model_root, ids.buffer.pointer as *i32, ids.count, Options { bf16_boundaries: bf16_boundaries, half_gemm: half_gemm }, result.pointer as *f32) {
         return 1;
     }
     guard let option::Option[text::CString]::Some(c_output) = pack::with_c_path(output_path) else { return 1; };
@@ -585,7 +633,7 @@ fn write_file(path: str, data: *u8, bytes: usize) -> bool {
 // `vision_directory` for a grid_h x grid_w patch grid. Writes the prompt rows
 // to `output_path` and the M-RoPE positions ([count, 3]) beside it.
 fn encode_edit_file(model_root: str, ids_path: str, vision_directory: str, grid_h: usize, grid_w: usize, bf16_boundaries: bool,
-                    output_path: str) -> i32 {
+                    output_path: str, half_gemm: bool = false) -> i32 {
     guard let option::Option[TokenIds]::Some(ids) = read_ids(ids_path) else { return 1; };
     if ids.count <= SYSTEM_TOKENS { return 1; }
     var shape: conditioning::Shape = conditioning::Shape {
@@ -622,8 +670,8 @@ fn encode_edit_file(model_root: str, ids_path: str, vision_directory: str, grid_
         deepstack: deepstack.pointer as *f32,
         vision_rows: vision_rows,
     };
-    if !encode(model_root, ids.buffer.pointer as *i32, ids.count, Options { bf16_boundaries: bf16_boundaries }, result.pointer as *f32,
-            inputs) {
+    if !encode(model_root, ids.buffer.pointer as *i32, ids.count, Options { bf16_boundaries: bf16_boundaries, half_gemm: half_gemm },
+            result.pointer as *f32, inputs) {
         return 1;
     }
     let positions_path: text::Text = "${output_path}.positions.i32";

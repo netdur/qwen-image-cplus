@@ -40,9 +40,6 @@ const MODULATION_WIDTH: usize = 16384;
 const WEIGHT_SCRATCH_FLOATS: usize = 16777216;
 // Device memory left free beyond the resident pack before choosing to stream.
 const STREAM_HEADROOM: u64 = 536870912;
-// Attention runs over query chunks of at most this many rows against all
-// keys, so scores stay bounded (32 heads x 1024 x keys) at any resolution.
-const ATTENTION_CHUNK: usize = 1024;
 
 const IMG_IN: usize = 0;
 const MODULATION: usize = 1;
@@ -449,11 +446,11 @@ fn allocate_work(rows_needed: usize, keys: usize) -> option::Option[Work] {
     guard let option::Option[cuda::DeviceBuffer]::Some(projected) = device_floats(rows *% WIDTH) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(gate) = device_floats(rows *% MLP) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(up) = device_floats(rows *% MLP) else { return option::Option[Work]::None; };
-    let chunk: usize = if rows < ATTENTION_CHUNK { rows } else { ATTENTION_CHUNK };
     guard let option::Option[cuda::DeviceBuffer]::Some(codes) = cuda::DeviceBuffer::allocate((rows *% MLP / (2 as usize)) as u64) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(code_scales) = cuda::DeviceBuffer::allocate((rows *% MLP / (64 as usize) *% (2 as usize)) as u64) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(halves) = cuda::DeviceBuffer::allocate((rows *% MLP *% (2 as usize)) as u64) else { return option::Option[Work]::None; };
-    let attention_half_count: usize = (chunk +% (2 as usize) *% keys) *% WIDTH +% HEADS *% chunk *% keys;
+    // FP16 keys and values for every key; flash attention needs no scores.
+    let attention_half_count: usize = (2 as usize) *% keys *% WIDTH;
     guard let option::Option[cuda::DeviceBuffer]::Some(attention_halves) = cuda::DeviceBuffer::allocate((attention_half_count *% (2 as usize)) as u64) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(time) = device_floats(2 as usize *% WIDTH) else { return option::Option[Work]::None; };
     guard let option::Option[cuda::DeviceBuffer]::Some(time_hidden) = device_floats(2 as usize *% WIDTH) else { return option::Option[Work]::None; };
@@ -577,14 +574,13 @@ fn block_body(ref model: Model, ref work: Work, index: usize, rows: usize, valid
     let projected: *f32 = work.projected.pointer as *f32;
     let gate: *f32 = work.gate.pointer as *f32;
     let up: *f32 = work.up.pointer as *f32;
-    // attention_halves: FP16 keys and values for [prefix | own rows], then the
-    // per-chunk Q and scores. Cached prefix rows are already FP16; this call's
-    // rows convert once and, in a prefix pass, are stored for later steps.
+    // attention_halves: FP16 keys and values for [prefix | own rows]. Cached
+    // prefix rows are already FP16; this call's rows convert once and, in a
+    // prefix pass, are stored for later steps.
     let width: i32 = WIDTH as i32;
     let half_row: usize = WIDTH *% (2 as usize);
     let k_half: *u8 = work.attention_halves.pointer;
     let v_half: *u8 = k_half + keys *% half_row;
-    let chunk_scratch: *u8 = v_half + keys *% half_row;
     let own_bytes: u64 = (valid_rows *% half_row) as u64;
     if prefix_keys != (0 as usize) {
         let prefix_bytes: u64 = (prefix_keys *% half_row) as u64;
@@ -603,15 +599,9 @@ fn block_body(ref model: Model, ref work: Work, index: usize, rows: usize, valid
             return false;
         }
     }
-    var chunk_start: usize = 0 as usize;
-    while chunk_start < valid_rows {
-        let chunk_rows: usize = if valid_rows -% chunk_start < ATTENTION_CHUNK { valid_rows -% chunk_start } else { ATTENTION_CHUNK };
-        if !ok(cuda::attention_half(q + chunk_start *% WIDTH, k_half, v_half, attended + chunk_start *% WIDTH,
-                chunk_scratch, chunk_rows as i32, keys as i32, HEADS as i32,
-                (rope_offset +% chunk_start) as i32, causal_rows as i32, visible_keys), "attention") {
-            return false;
-        }
-        chunk_start = chunk_start +% chunk_rows;
+    if !ok(cuda::flash_attention(q, k_half, v_half, attended, valid_rows as i32, keys as i32, HEADS as i32,
+            rope_offset as i32, causal_rows as i32, visible_keys), "attention") {
+        return false;
     }
     if !linear(model, work, block_record(index, ROLE_OUT), attended, projected, rows)
         || !ok(cuda::gated_residual(hidden, projected, modulation + WIDTH, stride, rows as i32, width, split as i32), "attention residual")

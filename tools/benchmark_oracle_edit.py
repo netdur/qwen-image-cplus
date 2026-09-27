@@ -28,13 +28,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--gguf", type=Path, required=True)
-    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--image", type=Path, required=True, nargs="+", help="one or more condition images")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--size", type=int, default=512, help="output side and condition-image area side")
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1301)
     parser.add_argument("--vae-tiling", action="store_true")
+    parser.add_argument("--group-offload", action="store_true",
+                        help="stream the transformer block by block (needed for 1024 edits on 6 GB)")
     parser.add_argument("--json", type=Path)
     arguments = parser.parse_args()
 
@@ -54,10 +56,25 @@ def main() -> None:
     text_encoder = pipe.text_encoder
     oracle.stream_text_encoder(text_encoder)
     text_encoder.model.visual.to("cuda")
-    # Offload hooks only for the transformer and the VAE.
+    # Offload hooks only for the transformer and the VAE (or, with
+    # --group-offload, the VAE alone; the transformer then streams its blocks).
     pipe.text_encoder = None
     pipe.register_modules(text_encoder=None)
-    pipe.enable_model_cpu_offload()
+    if arguments.group_offload:
+        transformer = pipe.transformer
+        pipe.transformer = None
+        pipe.register_modules(transformer=None)
+        pipe.enable_model_cpu_offload()
+        pipe.register_modules(transformer=transformer)
+        transformer.enable_group_offload(
+            onload_device=torch.device("cuda"), offload_device=torch.device("cpu"),
+            offload_type="block_level", num_blocks_per_group=1, use_stream=True,
+        )
+        # The end-of-call hook reset re-applies model offload, which Diffusers
+        # refuses next to group offload; nothing needs resetting here.
+        pipe.maybe_free_model_hooks = lambda: None
+    else:
+        pipe.enable_model_cpu_offload()
     pipe.register_modules(text_encoder=text_encoder)
     if arguments.vae_tiling:
         pipe.vae.enable_tiling()
@@ -123,11 +140,11 @@ def main() -> None:
 
     pipe.prepare_latents = timed_prepare
 
-    image = Image.open(arguments.image)
+    images = [Image.open(path) for path in arguments.image]
     begin = oracle.synchronized()
     result = pipe(
         prompt=arguments.prompt,
-        image=[image],
+        image=images,
         height=arguments.size,
         width=arguments.size,
         num_inference_steps=arguments.steps,
@@ -140,7 +157,7 @@ def main() -> None:
     result.save(arguments.output)
     total = time.perf_counter() - PROCESS_START
     report = {
-        "image": str(arguments.image),
+        "image": [str(path) for path in arguments.image],
         "prompt": arguments.prompt,
         "size": arguments.size,
         "steps": arguments.steps,

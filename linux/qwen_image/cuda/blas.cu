@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cuda_fp16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 static cublasHandle_t handle = nullptr;
 
@@ -180,6 +183,88 @@ __global__ void masked_softmax_half_kernel(__half *scores, int queries, int keys
         row[c] = __float2half(c < visible ? expf(__half2float(row[c]) * scale - peak) * inverse : 0.0f);
 }
 
+// masked_softmax_half_kernel with the row held in registers: each of the 256
+// threads keeps PAIRS half2 values, so the row is read once and written once
+// (the loop version reads it three times). Needs an even key count and
+// keys <= 512 * PAIRS.
+template <int PAIRS>
+__global__ void masked_softmax_half_registers_kernel(__half *scores, int queries, int keys, int query_offset,
+                                                     int causal_rows, float scale, const int *visible_keys) {
+    __shared__ float scratch[32];
+    const int q = blockIdx.x, h = blockIdx.y;
+    __half2 *row = (__half2 *)(scores + ((size_t)h * queries + q) * keys);
+    const int global_q = q + query_offset;
+    const int visible = visible_keys != nullptr ? visible_keys[global_q]
+        : (global_q < causal_rows ? global_q + 1 : keys);
+    const int pairs = keys / 2;
+    float values[2 * PAIRS];
+    float peak = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < PAIRS; ++i) {
+        const int pair = threadIdx.x + i * 256;
+        float first = -INFINITY, second = -INFINITY;
+        if (pair < pairs) {
+            const float2 loaded = __half22float2(row[pair]);
+            if (2 * pair < visible) first = loaded.x * scale;
+            if (2 * pair + 1 < visible) second = loaded.y * scale;
+        }
+        values[2 * i] = first;
+        values[2 * i + 1] = second;
+        peak = fmaxf(peak, fmaxf(first, second));
+    }
+    for (int o = 16; o > 0; o /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, o));
+    if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = peak;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float value = threadIdx.x < 8 ? scratch[threadIdx.x] : -INFINITY;
+        for (int o = 16; o > 0; o /= 2) value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, o));
+        if (threadIdx.x == 0) scratch[0] = value;
+    }
+    __syncthreads();
+    peak = scratch[0];
+    __syncthreads();
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2 * PAIRS; ++i) {
+        values[i] = expf(values[i] - peak);
+        sum += values[i];
+    }
+    for (int o = 16; o > 0; o /= 2) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float value = threadIdx.x < 8 ? scratch[threadIdx.x] : 0.0f;
+        for (int o = 16; o > 0; o /= 2) value += __shfl_xor_sync(0xffffffffu, value, o);
+        if (threadIdx.x == 0) scratch[0] = value;
+    }
+    __syncthreads();
+    const float inverse = 1.0f / scratch[0];
+#pragma unroll
+    for (int i = 0; i < PAIRS; ++i) {
+        const int pair = threadIdx.x + i * 256;
+        if (pair < pairs) row[pair] = __floats2half2_rn(values[2 * i] * inverse, values[2 * i + 1] * inverse);
+    }
+}
+
+// Launches the register kernel sized to the row, or the loop kernel for odd or
+// very long rows.
+static void masked_softmax_half(__half *scores, int queries, int keys, int heads, int query_offset, int causal_rows,
+                                float scale, const int *visible_keys) {
+    const dim3 grid(queries, heads);
+    const int pairs_per_thread = (keys / 2 + 255) / 256;
+    if (keys % 2 != 0 || pairs_per_thread > 32) {
+        masked_softmax_half_kernel<<<grid, 256>>>(scores, queries, keys, query_offset, causal_rows, scale, visible_keys);
+    } else if (pairs_per_thread <= 4) {
+        masked_softmax_half_registers_kernel<4><<<grid, 256>>>(scores, queries, keys, query_offset, causal_rows, scale, visible_keys);
+    } else if (pairs_per_thread <= 8) {
+        masked_softmax_half_registers_kernel<8><<<grid, 256>>>(scores, queries, keys, query_offset, causal_rows, scale, visible_keys);
+    } else if (pairs_per_thread <= 16) {
+        masked_softmax_half_registers_kernel<16><<<grid, 256>>>(scores, queries, keys, query_offset, causal_rows, scale, visible_keys);
+    } else {
+        masked_softmax_half_registers_kernel<32><<<grid, 256>>>(scores, queries, keys, query_offset, causal_rows, scale, visible_keys);
+    }
+}
+
 // FP32 -> FP16 for K and V once per block, ahead of qi_attention_half.
 extern "C" int qi_to_half(const float *source, void *out, unsigned long long count) {
     to_half_kernel<<<half_blocks(count), 256>>>(source, (__half *)out, count);
@@ -204,12 +289,85 @@ extern "C" int qi_attention_half(const float *q, const void *k_half, const void 
         k_half, CUDA_R_16F, width, 128, q_half, CUDA_R_16F, width, 128, &zero,
         scores, CUDA_R_16F, keys, (long long)queries * keys, heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) return (int)cudaErrorUnknown;
-    masked_softmax_half_kernel<<<dim3(queries, heads), 256>>>(scores, queries, keys, query_offset, causal_rows,
-                                                              1.0f / sqrtf(128.0f), visible_keys);
+    masked_softmax_half(scores, queries, keys, heads, query_offset, causal_rows, 1.0f / sqrtf(128.0f), visible_keys);
     if (cudaError_t error = cudaGetLastError()) return (int)error;
     status = cublasGemmStridedBatchedEx(
         handle, CUBLAS_OP_N, CUBLAS_OP_N, 128, queries, keys, &one,
         v_half, CUDA_R_16F, width, 128, scores, CUDA_R_16F, keys, (long long)queries * keys, &zero,
         out, CUDA_R_32F, width, 128, heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return blas_status(status);
+}
+
+// Causal grouped-query attention for the text encoder with cuBLAS: q [tokens,
+// q_heads * 128], k and v [tokens, kv_heads * 128]; query head h reads kv head
+// h / (q_heads / kv_heads). Queries run in chunks sized to `score_floats`, and
+// a chunk only multiplies the keys it can see.
+extern "C" int qi_text_attention_gemm(const float *q, const float *k, const float *v, float *out, float *scores,
+                                      unsigned long long score_floats, int tokens, int q_heads, int kv_heads) {
+    if (int status = ensure_handle()) return status;
+    const int group = q_heads / kv_heads;
+    const int q_width = q_heads * 128, kv_width = kv_heads * 128;
+    long long chunk = (long long)(score_floats / ((unsigned long long)group * tokens));
+    if (chunk < 1) return (int)cudaErrorInvalidValue;
+    if (chunk > tokens) chunk = tokens;
+    const float one = 1.0f, zero = 0.0f;
+    for (int start = 0; start < tokens; start += (int)chunk) {
+        const int queries = tokens - start < chunk ? tokens - start : (int)chunk;
+        const int keys = start + queries;
+        for (int g = 0; g < kv_heads; ++g) {
+            // Column-major S^T[keys, queries] per query head of the group.
+            cublasStatus_t status = cublasSgemmStridedBatched(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N, keys, queries, 128, &one,
+                k + (size_t)g * 128, kv_width, 0,
+                q + (size_t)start * q_width + (size_t)g * group * 128, q_width, 128,
+                &zero, scores, keys, (long long)queries * keys, group);
+            if (status != CUBLAS_STATUS_SUCCESS) return (int)cudaErrorUnknown;
+            masked_softmax_kernel<<<dim3(queries, group), 256>>>(scores, queries, keys, start, tokens, 1.0f / sqrtf(128.0f));
+            if (cudaError_t error = cudaGetLastError()) return (int)error;
+            status = cublasSgemmStridedBatched(
+                handle, CUBLAS_OP_N, CUBLAS_OP_N, 128, queries, keys, &one,
+                v + (size_t)g * 128, kv_width, 0,
+                scores, keys, (long long)queries * keys,
+                &zero, out + (size_t)start * q_width + (size_t)g * group * 128, q_width, 128, group);
+            if (status != CUBLAS_STATUS_SUCCESS) return (int)cudaErrorUnknown;
+        }
+    }
+    return (int)cudaGetLastError();
+}
+
+__global__ void bf16_to_half_kernel(const unsigned short *source, __half *out, unsigned long long count) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i < count) out[i] = __float2half(__uint_as_float((unsigned int)source[i] << 16));
+}
+
+__global__ void absmax_kernel(const float *x, unsigned long long count, unsigned int *out) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i < count) atomicMax(out, __float_as_uint(fabsf(x[i])));
+}
+
+// y[M,N] = x[M,K] . W[N,K]^T with W stored BF16, on FP16 tensor cores with
+// FP32 accumulation: W is converted into w_half (N*K halves) and x into x_half
+// (M*K halves). FP16 holds every activation this is used for (checked with
+// QI_TRACE_ABSMAX=1, which prints each input's peak).
+extern "C" int qi_linear_bf16_half(const float *x, const void *w_bf16, float *y, void *w_half, void *x_half, int m, int n,
+                                   int k) {
+    if (int status = ensure_handle()) return status;
+    const unsigned long long weights = (unsigned long long)n * k, inputs = (unsigned long long)m * k;
+    if (getenv("QI_TRACE_ABSMAX") != nullptr) {
+        unsigned int *peak;
+        cudaMalloc(&peak, 4);
+        cudaMemset(peak, 0, 4);
+        absmax_kernel<<<half_blocks(inputs), 256>>>(x, inputs, peak);
+        unsigned int bits = 0;
+        cudaMemcpy(&bits, peak, 4, cudaMemcpyDeviceToHost);
+        cudaFree(peak);
+        float value;
+        memcpy(&value, &bits, 4);
+        fprintf(stderr, "absmax m=%d n=%d k=%d: %g\n", m, n, k, value);
+    }
+    bf16_to_half_kernel<<<half_blocks(weights), 256>>>((const unsigned short *)w_bf16, (__half *)w_half, weights);
+    to_half_kernel<<<half_blocks(inputs), 256>>>(x, (__half *)x_half, inputs);
+    const float one = 1.0f, zero = 0.0f;
+    return blas_status(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &one, w_half, CUDA_R_16F, k, x_half, CUDA_R_16F,
+                                    k, &zero, y, CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }

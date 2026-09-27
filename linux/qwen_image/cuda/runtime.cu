@@ -90,3 +90,8 @@ extern "C" int qi_cuda_stream_wait(void *stream, void *event) {
 extern "C" int qi_cuda_upload_async(void *device, const void *host, unsigned long long bytes, void *stream) {
     return (int)cudaMemcpyAsync(device, host, (size_t)bytes, cudaMemcpyHostToDevice, (cudaStream_t)stream);
 }
+
+// Blocks the host until `event` has completed.
+extern "C" int qi_cuda_event_synchronize(void *event) {
+    return (int)cudaEventSynchronize((cudaEvent_t)event);
+}

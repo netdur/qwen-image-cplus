@@ -76,6 +76,8 @@ extern fn qi_cuda_event_destroy(event: *u8) -> i32;
 extern fn qi_cuda_event_record(event: *u8, stream: *u8) -> i32;
 #[link_name = "qi_cuda_stream_wait"]
 extern fn qi_cuda_stream_wait(stream: *u8, event: *u8) -> i32;
+#[link_name = "qi_cuda_event_synchronize"]
+extern fn qi_cuda_event_synchronize(event: *u8) -> i32;
 #[link_name = "qi_cuda_upload_async"]
 extern fn qi_cuda_upload_async(device: *u8, host: *u8, bytes: u64, stream: *u8) -> i32;
 #[link_name = "qi_cuda_memory"]
@@ -84,6 +86,8 @@ extern fn qi_cuda_memory(free_bytes: *u64, total_bytes: *u64) -> i32;
 extern fn qi_linear_f32_strided(x: *f32, weights: *f32, y: *f32, m: i32, n: i32, k: i32, ldy: i32) -> i32;
 #[link_name = "qi_to_half"]
 extern fn qi_to_half(source: *f32, out: *u8, count: u64) -> i32;
+#[link_name = "qi_flash_attention"]
+extern fn qi_flash_attention(q: *f32, k_half: *u8, v_half: *u8, out: *f32, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32, visible_keys: *i32) -> i32;
 #[link_name = "qi_attention_half"]
 extern fn qi_attention_half(q: *f32, k_half: *u8, v_half: *u8, out: *f32, scratch: *u8, queries: i32, keys: i32,
     heads: i32, query_offset: i32, causal_rows: i32, visible_keys: *i32) -> i32;
@@ -132,6 +136,9 @@ fn free_memory() -> u64 {
 
 fn to_half(source: *f32, out: *u8, count: u64) -> i32 { return qi_to_half(source, out, count); }
 // `visible_keys` (device, one per global query row) overrides the causal rule; null keeps it.
+// Fused attention (cuda/flash.cu): the same mask arguments as attention_half,
+// no score scratch.
+fn flash_attention(q: *f32, k_half: *u8, v_half: *u8, out: *f32, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32, visible_keys: *i32 = 0 as *i32) -> i32 { return qi_flash_attention(q, k_half, v_half, out, queries, keys, heads, query_offset, causal_rows, visible_keys); }
 fn attention_half(q: *f32, k_half: *u8, v_half: *u8, out: *f32, scratch: *u8, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32, visible_keys: *i32 = 0 as *i32) -> i32 { return qi_attention_half(q, k_half, v_half, out, scratch, queries, keys, heads, query_offset, causal_rows, visible_keys); }
 fn attention_f16(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, halves: *u8, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention_f16(q, k, v, out, scores, halves, queries, keys, heads, query_offset, causal_rows); }
 fn attention(q: *f32, k: *f32, v: *f32, out: *f32, scores: *f32, queries: i32, keys: i32, heads: i32, query_offset: i32, causal_rows: i32) -> i32 { return qi_attention(q, k, v, out, scores, queries, keys, heads, query_offset, causal_rows); }
@@ -267,6 +274,11 @@ fn record(event: *u8, stream: *u8) -> bool {
 
 fn wait(stream: *u8, event: *u8) -> bool {
     return qi_cuda_stream_wait(stream, event) == (0 as i32);
+}
+
+// Blocks the host until the work before `event` has finished.
+fn event_synchronize(event: *u8) -> bool {
+    return qi_cuda_event_synchronize(event) == (0 as i32);
 }
 
 fn upload_async(device: *u8, host: *u8, bytes: u64, stream: *u8) -> bool {
