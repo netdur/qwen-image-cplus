@@ -131,6 +131,6 @@ call `qwen_image_runtime::install()` once to install the platform's backend
 are the native equivalents; the sized edit API accepts rectangular output.
 The native package is a source-level C+ dependency, not part of the installed
 C ABI archive. See [`qwen_image/src/api.cplus`](../qwen_image/src/api.cplus)
-for the exact types and [`generation_worker.cplus`](../qwen_image_metal/src/generation_worker.cplus)
+for the exact types and [`generation_worker.cplus`](../qwen_image/src/generation_worker.cplus)
 for a client that sends progress and cancellation events without blocking the
 GUI main thread. The plain C ABI does not expose those worker events.
