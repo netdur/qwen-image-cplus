@@ -4,12 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  # A manual run builds and checks the Linux distribution and the snap, keeps
+  # the .snap as a workflow artifact, and publishes nothing.
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build-macos-arm64:
+    if: github.event_name == 'push'
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -114,21 +118,27 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CUDA_HOME: /usr/local/cuda-12.6
-      # Published to the Snap Store only when this secret exists (see
-      # docs/build-and-verify.md); the .snap is attached to the release either way.
+      # A tagged release uploads the snap to the Snap Store only when this
+      # secret exists; it attaches the .snap to the GitHub release either way.
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      RELEASE: ${{ github.event_name == 'push' }}
     steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
       - name: Resolve and validate version
         id: meta
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
-          version="${tag#v}"
+          if [ "$RELEASE" = true ]; then
+            tag="${{ github.ref_name }}"
+            version="${tag#v}"
+          else
+            # A manual run has no tag; the packages name the version.
+            version=$(sed -n 's/^version *= *"\([^"]*\)"$/\1/p' gui/Cplus.toml)
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Check out tagged source
-        uses: actions/checkout@v5
 
       - name: Require matching package versions
         shell: bash
@@ -141,7 +151,8 @@ jobs:
 
       - name: Free disk space
         run: |
-          # CUDA, cuDNN, the 1.3 GB distribution and the snap do not fit beside the runner's preinstalled SDKs.
+          # CUDA, cuDNN, the 1.3 GB distribution and the snap do not fit
+          # beside the runner's preinstalled SDKs.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
@@ -209,7 +220,18 @@ jobs:
           snap_file=$(ls qwen-image-cplus_*_amd64.snap)
           echo "file=$snap_file" >> "$GITHUB_OUTPUT"
 
+      - name: Keep the snap as a workflow artifact
+        if: env.RELEASE != 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.snap.outputs.file }}
+          path: ${{ steps.snap.outputs.file }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
       - name: Attach snap to the release
+        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -227,10 +249,11 @@ jobs:
           fi
 
       - name: Publish snap to the Snap Store
-        if: env.SNAPCRAFT_STORE_CREDENTIALS != ''
+        if: env.RELEASE == 'true' && env.SNAPCRAFT_STORE_CREDENTIALS != ''
         run: snapcraft upload --release=stable "${{ steps.snap.outputs.file }}"
 
   update-formula:
+    if: github.event_name == 'push'
     needs: build-macos-arm64
     runs-on: ubuntu-latest
     steps:
