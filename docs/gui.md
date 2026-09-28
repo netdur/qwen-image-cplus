@@ -83,13 +83,13 @@ cards also accept Finder file drops anywhere on their surfaces. Both routes
 validate real local files: references accept common image extensions and stop
 at ten, while the model card accepts a `.qipack` only when those supporting
 files are present beside it, and then persists its path. A multi-image drop
-keeps the Finder order at the front of the thumbnail strip. Unsupported files
-are ignored. Facet's built-in drop gesture currently carries plain text only,
-so `gui/src/file_drop.cplus` adds an AppKit file-URL destination to the two
-existing card views; it does not replace their click controls. Drop handlers
-are cleared when their components unmount. Prompt text and reference images
-remain session-only.
-The generation worker in `qwen_image_metal/src/generation_worker.cplus` is driven by
+keeps the first accepted files in Finder order at the front of the thumbnail
+strip; its first image sets the suggested output dimensions. Unsupported files
+are ignored. Facet's `allow_file_drop` gesture supplies file paths to the
+cards, while their click controls remain available. Prompt text and reference
+images remain session-only.
+
+The generation worker in `qwen_image/src/generation_worker.cplus` is driven by
 `gui/src/generation_session.cplus`. A single long-lived thread accepts
 an owned request through a typed channel, executes the native API, and sends
 typed progress and completion events back through another channel. The caller

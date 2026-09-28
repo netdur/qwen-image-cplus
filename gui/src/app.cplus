@@ -42,6 +42,7 @@ fn run() -> i32 {
             title: "Qwen Image", width: 1180.0f64, height: 760.0f64,
             min_width: 1000.0f64, min_height: 700.0f64,
             bar: screen::Bar::Blended,
+            zoomable: true,
         ),
     );
     let _settings = app.window(

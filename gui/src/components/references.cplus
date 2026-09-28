@@ -254,30 +254,39 @@ impl References {
         return false;
     }
 
-    // Last to first, each inserted at the front, so the strip ends up in the
-    // order the files were picked.
     fn on_files_dropped(ref this, sender: *u8) -> bool {
-        let files: vec::Vec[text::Text] = component::dropped_files(sender);
+        return this.add_files(component::dropped_files(sender));
+    }
+
+    fn add_files(ref this, files: vec::Vec[text::Text]) -> bool {
         var took: bool = false;
-        var i: usize = files.count();
-        while i > (0 as usize) {
-            i = i -% (1 as usize);
+        var inserted: usize = 0 as usize;
+        var i: usize = 0 as usize;
+        while i < files.count() && this.paths.count() < (10 as usize) {
             match files.at_ptr(i) {
                 option::Option[*text::Text]::Some(p) => {
-                    if this.add_reference({ (*p).clone() }) { took = true; }
+                    if this.add_reference_at({ (*p).clone() }, inserted) {
+                        took = true;
+                        inserted = inserted +% (1 as usize);
+                    }
                 }
                 option::Option::None => {}
             }
+            i = i +% (1 as usize);
         }
         return took;
     }
 
     fn add_reference(ref this, path: text::Text) -> bool {
+        return this.add_reference_at(path, 0 as usize);
+    }
+
+    fn add_reference_at(ref this, path: text::Text, index: usize) -> bool {
         if !this.can_take(path.view()) { return false; }
         guard let option::Option[reference_image::Dimensions]::Some(dimensions) =
             reference_image::source_dimensions(path.view()) else { return false; };
         let first: bool = this.paths.count() == (0 as usize);
-        if this.paths.insert(path.clone(), at: 0 as usize) != status::Status::Ok {
+        if this.paths.insert(path.clone(), at: index) != status::Status::Ok {
             return false;
         }
         if first {
@@ -399,6 +408,66 @@ fn edit_current_image_adds_it_to_the_reference_strip() {
     assert snapshot().count() == (0 as usize);
     current_image::clear();
     let _removed = fs::remove_file(path.view());
+    let width: text::Text = "${saved.width}";
+    let height: text::Text = "${saved.height}";
+    let _restored: bool = preferences::save_dimensions(width.view(), height.view());
+}
+
+#[test]
+fn multi_image_drop_keeps_first_ten_and_sizes_from_first() {
+    let nonce: text::Text = "${process::current_id()}-${time::now_millis()}";
+    let first: text::Text = "/tmp/qwen-image-gui-drop-${nonce}-first.bmp";
+    var bmp: [u8; 62] = [0u8; 62];
+    bmp[0] = 0x42u8;
+    bmp[1] = 0x4du8;
+    bmp[2] = 62u8;
+    bmp[10] = 54u8;
+    bmp[14] = 40u8;
+    bmp[18] = 2u8;
+    bmp[22] = 1u8;
+    bmp[26] = 1u8;
+    bmp[28] = 24u8;
+    bmp[34] = 8u8;
+    assert files::write_bytes(first.view(), #addr_of(bmp) as *u8, 62 as usize);
+
+    let png: *[u8; 100] = #include_bytes("../../testdata/black32.png");
+    var dropped: vec::Vec[text::Text] = vec::new::[text::Text]();
+    assert dropped.append(first.clone()) == status::Status::Ok;
+    var i: usize = 0 as usize;
+    while i < (11 as usize) {
+        let path: text::Text = "/tmp/qwen-image-gui-drop-${nonce}-${i}.png";
+        assert files::write_bytes(path.view(), png as *u8, 100 as usize);
+        assert dropped.append(path) == status::Status::Ok;
+        i = i +% (1 as usize);
+    }
+
+    let saved: preferences::GenerationPreferences = preferences::load();
+    var references: References = References::new();
+    assert references.add_files(dropped);
+    assert references.paths.count() == (10 as usize);
+    i = 0 as usize;
+    while i < (10 as usize) {
+        guard let option::Option[*text::Text]::Some(actual) =
+            references.paths.at_ptr(i) else { assert false; return; };
+        guard let option::Option[*text::Text]::Some(expected) =
+            dropped.at_ptr(i) else { assert false; return; };
+        assert { (*actual).view() } == { (*expected).view() };
+        i = i +% (1 as usize);
+    }
+    let adopted: preferences::GenerationPreferences = preferences::load();
+    assert adopted.width == (512 as i64);
+    assert adopted.height == (256 as i64);
+
+    i = 0 as usize;
+    while i < dropped.count() {
+        match dropped.at_ptr(i) {
+            option::Option[*text::Text]::Some(path) => {
+                let _removed = fs::remove_file({ (*path).view() });
+            }
+            option::Option::None => {}
+        }
+        i = i +% (1 as usize);
+    }
     let width: text::Text = "${saved.width}";
     let height: text::Text = "${saved.height}";
     let _restored: bool = preferences::save_dimensions(width.view(), height.view());
