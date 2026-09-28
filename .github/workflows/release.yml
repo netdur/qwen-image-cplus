@@ -49,17 +49,17 @@ jobs:
             grep -Eq "^version *= *\"${version}\"$" "$manifest"
           done
 
-      - name: Install pinned C+ compiler
-        run: |
-          scripts/install-cpc.sh "$RUNNER_TEMP/cplus"
-          echo "$RUNNER_TEMP/cplus" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install released C+ packages
+      - name: Build the pinned C+ compiler
         run: |
-          # Third-party packages only: the qwen_image* packages sit side by side
-          # at the repository root and resolve as sibling directories.
-          cpc pm install qwen_image_metal
-          cpc pm install gui
+          # The same pinned commit as Linux and Windows, with its vendor/ as the
+          # package set. The released 0.0.29 toolchain cannot build this source:
+          # its package manager fetches the sibling qwen_image package from the
+          # cplus release, and its facet predates button(symbol:).
+          scripts/install-cpc-source.sh "$RUNNER_TEMP/cplus"
+          echo "$RUNNER_TEMP/cplus/target/release" >> "$GITHUB_PATH"
+          CPLUS_VENDOR="$RUNNER_TEMP/cplus/vendor" scripts/link_vendor.sh
 
       - name: Build and verify distribution
         run: |
