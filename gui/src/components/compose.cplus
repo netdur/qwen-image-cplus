@@ -18,6 +18,7 @@ import "stdlib/option" as option;
 import "stdlib/result" as result;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
+import "stdlib/process" as process;
 import "stdlib/time" as time;
 import "../generation_session" as generation_session;
 import "../preferences" as preferences;
@@ -27,7 +28,6 @@ import "./references" as references;
 import "./output_options" as output_options;
 import "./model_selection" as model_selection;
 
-extern fn getpid() -> i32;
 extern fn arc4random() -> u32;
 
 static NEXT_OUTPUT: u64 = 1 as u64;
@@ -86,7 +86,7 @@ impl Compose {
             let nonce: u64 = NEXT_OUTPUT;
             NEXT_OUTPUT = NEXT_OUTPUT +% (1 as u64);
             let path: text::Text =
-                "${folder}/qwen-image-${time::now_millis()}-${getpid()}-${nonce}.png";
+                "${folder}/qwen-image-${time::now_millis()}-${process::current_id()}-${nonce}.png";
             match fs::metadata(path.view()) {
                 result::Result::Ok(_) => {}
                 result::Result::Err(_) => { return path; }

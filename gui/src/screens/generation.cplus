@@ -15,20 +15,19 @@ import "stdlib/fs" as fs;
 import "stdlib/result" as result;
 import "stdlib/status" as status;
 import "stdlib/text" as text;
+import "stdlib/process" as process;
 import "stdlib/time" as time;
 import "stdlib/vec" as vec;
 import "../files" as files;
-import "../native_ui" as native_ui;
 import "../components/style" as style;
 import "../components/compose" as compose;
 import "../components/preview" as preview;
 import "../current_image" as current_image;
 import "../new_image" as new_image;
 
-extern fn getpid() -> i32;
 
-// Copies the current image to the path the save dialog returned.
-fn save_current_image_to(destination: text::Text, context: *u8) {
+// Copies the current image to the path the save panel returned.
+fn save_current_image_to(destination: text::Text) {
     guard let option::Option[text::Text]::Some(source) = current_image::path() else { return; };
     if !files::copy_file(source.view(), destination.view()) {
         runtime::alert("Could not save image",
@@ -129,7 +128,10 @@ impl Generation {
     fn on_save(ref this, _sender: *u8) {
         guard let option::Option[text::Text]::Some(_source) =
             current_image::path() else { return; };
-        let _shown: bool = native_ui::choose_save_path("Qwen Image.png", save_current_image_to, 0 as *u8);
+        match runtime::choose_save_path("Qwen Image.png", extension: "png") {
+            option::Option[text::Text]::Some(destination) => { save_current_image_to(destination); }
+            option::Option[text::Text]::None => {}
+        }
     }
 
 }
@@ -197,7 +199,8 @@ impl Generation: component::Lifecycle {
         if why != component::Attach::Active || this.did_initial_focus { return; }
         match text_area::find("prompt:input") {
             option::Option[text_area::TextArea]::Some(input) => {
-                if native_ui::focus_prompt(input) { this.did_initial_focus = true; }
+                let _focused: text_area::TextArea = input.focus();
+                this.did_initial_focus = true;
             }
             option::Option::None => {}
         }
@@ -220,7 +223,7 @@ fn boxed() -> screen::ScreenBox {
 
 #[test]
 fn save_copy_replaces_destination_without_changing_output() {
-    let nonce: text::Text = "${getpid()}-${time::now_millis()}";
+    let nonce: text::Text = "${process::current_id()}-${time::now_millis()}";
     let source: text::Text = "/tmp/qwen-image-gui-save-${nonce}-source.png";
     let destination: text::Text = "/tmp/qwen-image-gui-save-${nonce}-destination.png";
     let _source_written = fs::write_string(source, "new png bytes");

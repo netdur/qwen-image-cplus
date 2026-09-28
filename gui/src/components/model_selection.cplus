@@ -11,14 +11,14 @@ import "qwen_image/pack_info" as pack_info;
 import "stdlib/option" as option;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
-import "../file_drop" as file_drop;
+import "stdlib/vec" as vec;
+import "facet/gestures" as _;
 import "../preferences" as preferences;
 import "./style" as style;
 
 struct ModelSelection {
     path: text::Text,
     error: text::Text,
-    opaque drop_view: *u8,
 }
 
 fn has_model_extension(path: str) -> bool {
@@ -126,7 +126,7 @@ impl ModelSelection {
             text::from_str("Model folder is missing required files")
         } else { text::new() };
         return ModelSelection {
-            path: path, error: error, drop_view: 0 as *u8,
+            path: path, error: error,
         };
     }
 
@@ -177,12 +177,20 @@ impl ModelSelection {
         }
     }
 
-    fn on_dropped_path(ref this, path: text::Text, commit: bool) -> bool {
-        if !is_model_file(path.view()) { return false; }
-        if !commit { return true; }
+    // A drag is taken only when it carries a model file.
+    fn on_files_over(ref this, sender: *u8) -> bool {
+        return match first_model_file(component::dropped_files(sender)) {
+            option::Option[text::Text]::Some(_path) => true,
+            option::Option::None => false,
+        };
+    }
+
+    fn on_files_dropped(ref this, sender: *u8) -> bool {
+        guard let option::Option[text::Text]::Some(path) =
+            first_model_file(component::dropped_files(sender)) else { return false; };
         if !preferences::save_model_path(path.view()) { return false; }
         select_pack_steps(path.view());
-        this.path = path.clone();
+        this.path = path;
         this.error = text::new();
         this.refresh();
         return true;
@@ -204,29 +212,32 @@ impl ModelSelection: component::Component {
                 this.selected_label()
             }
             .gap(8.0f64)
+            .gesture(allow_file_drop: true,
+                     on_drag_over: this.on_files_over,
+                     on_drop: this.on_files_dropped)
         };
         return style::card(content);
     }
 }
 
 impl ModelSelection: component::Lifecycle {
-    fn on_attach(ref this, why: component::Attach) {
-        if why != component::Attach::Mount { return; }
-        match mount::find("model:card") {
-            option::Option[*core::Node]::Some(card) => {
-                this.drop_view = core::native(card);
-                file_drop::install(this.drop_view,
-                #str_ptr("QwenModelFileDropView\0"),
-                this.on_dropped_path);
+    fn on_attach(ref this, why: component::Attach) {}
+    fn on_detach(ref this, why: component::Detach) {}
+}
+
+// The first model file among dropped paths, in the order they were picked.
+fn first_model_file(files: vec::Vec[text::Text]) -> option::Option[text::Text] {
+    var i: usize = 0 as usize;
+    while i < files.count() {
+        match files.at_ptr(i) {
+            option::Option[*text::Text]::Some(p) => {
+                if is_model_file({ (*p).view() }) { return option::Option[text::Text]::Some({ (*p).clone() }); }
             }
             option::Option::None => {}
         }
+        i = i +% (1 as usize);
     }
-    fn on_detach(ref this, why: component::Detach) {
-        if why != component::Detach::Unmount { return; }
-        file_drop::clear(this.drop_view);
-        this.drop_view = 0 as *u8;
-    }
+    return option::Option[text::Text]::None;
 }
 
 impl ModelSelection: core::IntoNode {

@@ -17,20 +17,19 @@ import "stdlib/fs" as fs;
 import "stdlib/status" as status;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
+import "stdlib/process" as process;
 import "stdlib/time" as time;
 import "stdlib/vec" as vec;
-import "../file_drop" as file_drop;
+import "facet/gestures" as _;
 import "../current_image" as current_image;
 import "../new_image" as new_image;
 import "../preferences" as preferences;
 import "./style" as style;
 import "./output_options" as output_options;
 
-extern fn getpid() -> i32;
 
 struct References {
     paths: vec::Vec[text::Text],
-    opaque drop_view: *u8,
     edit_sub: events::SignalSubscription[text::Text],
     clear_sub: events::SignalSubscription[new_image::Change],
 }
@@ -70,7 +69,6 @@ impl References {
     fn new() -> References {
         return References {
             paths: vec::new::[text::Text](),
-            drop_view: 0 as *u8,
             edit_sub: events::SignalSubscription[text::Text]::none(),
             clear_sub: events::SignalSubscription[new_image::Change]::none(),
         };
@@ -229,7 +227,7 @@ impl References {
         if this.paths.count() >= (10 as usize) { return; }
         match runtime::choose_file() {
             option::Option[text::Text]::Some(path) => {
-                if !this.on_dropped_path(path, true) {
+                if !this.add_reference(path) {
                     runtime::alert("Image unavailable",
                         "This file could not be read as a reference image.", "OK");
                 }
@@ -238,11 +236,44 @@ impl References {
         }
     }
 
-    fn on_dropped_path(ref this, path: text::Text, commit: bool) -> bool {
-        if this.paths.count() >= (10 as usize) || !is_image_file(path.view()) {
-            return false;
+    fn can_take(ref this, path: str) -> bool {
+        return this.paths.count() < (10 as usize) && is_image_file(path);
+    }
+
+    // A drag is taken when any file in it could become a reference.
+    fn on_files_over(ref this, sender: *u8) -> bool {
+        let files: vec::Vec[text::Text] = component::dropped_files(sender);
+        var i: usize = 0 as usize;
+        while i < files.count() {
+            match files.at_ptr(i) {
+                option::Option[*text::Text]::Some(p) => { if this.can_take({ (*p).view() }) { return true; } }
+                option::Option::None => {}
+            }
+            i = i +% (1 as usize);
         }
-        if !commit { return true; }
+        return false;
+    }
+
+    // Last to first, each inserted at the front, so the strip ends up in the
+    // order the files were picked.
+    fn on_files_dropped(ref this, sender: *u8) -> bool {
+        let files: vec::Vec[text::Text] = component::dropped_files(sender);
+        var took: bool = false;
+        var i: usize = files.count();
+        while i > (0 as usize) {
+            i = i -% (1 as usize);
+            match files.at_ptr(i) {
+                option::Option[*text::Text]::Some(p) => {
+                    if this.add_reference({ (*p).clone() }) { took = true; }
+                }
+                option::Option::None => {}
+            }
+        }
+        return took;
+    }
+
+    fn add_reference(ref this, path: text::Text) -> bool {
+        if !this.can_take(path.view()) { return false; }
         guard let option::Option[reference_image::Dimensions]::Some(dimensions) =
             reference_image::source_dimensions(path.view()) else { return false; };
         let first: bool = this.paths.count() == (0 as usize);
@@ -275,7 +306,7 @@ impl References {
             "Remove a reference image before editing this image.", "OK");
             return;
         }
-        if !this.on_dropped_path(path, true) {
+        if !this.add_reference(path) {
             runtime::alert("Image unavailable",
             "The generated image could not be added to references.", "OK");
         }
@@ -302,6 +333,9 @@ impl References: component::Component {
                 this.strip()
             }
             .gap(12.0f64)
+            .gesture(allow_file_drop: true,
+                     on_drag_over: this.on_files_over,
+                     on_drop: this.on_files_dropped)
         };
         return style::card(content);
     }
@@ -313,23 +347,12 @@ impl References: component::Lifecycle {
         this.edit_sub = current_image::watch_edit(this.on_edit_current);
         this.clear_sub = new_image::watch(this.on_new);
         this.refresh();
-        match mount::find("references:card") {
-            option::Option[*core::Node]::Some(card) => {
-                this.drop_view = core::native(card);
-                file_drop::install(this.drop_view,
-                #str_ptr("QwenReferenceFileDropView\0"),
-                this.on_dropped_path);
-            }
-            option::Option::None => {}
-        }
     }
     fn on_detach(ref this, why: component::Detach) {
         if why != component::Detach::Unmount { return; }
         SNAPSHOT = vec::new::[text::Text]();
         let _cancelled: bool = this.edit_sub.cancel();
         let _cleared: bool = this.clear_sub.cancel();
-        file_drop::clear(this.drop_view);
-        this.drop_view = 0 as *u8;
     }
 }
 
@@ -352,7 +375,7 @@ fn image_drop_accepts_supported_extensions_only() {
 #[test]
 fn edit_current_image_adds_it_to_the_reference_strip() {
     let path: text::Text =
-        "/tmp/qwen-image-gui-edit-${getpid()}-${time::now_millis()}.png";
+        "/tmp/qwen-image-gui-edit-${process::current_id()}-${time::now_millis()}.png";
     let saved: preferences::GenerationPreferences = preferences::load();
     // A 32 x 32 black PNG.
     let png: *[u8; 100] = #include_bytes("../../testdata/black32.png");

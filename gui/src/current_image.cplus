@@ -4,8 +4,8 @@ import "stdlib/option" as option;
 import "stdlib/fs" as fs;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
+import "stdlib/process" as process;
 import "stdlib/time" as time;
-import "./file_drop" as file_drop;
 
 struct Change { available: bool }
 
@@ -18,7 +18,6 @@ struct CurrentImage {
 
 static CURRENT: CurrentImage = #zero::[CurrentImage]();
 
-extern fn getpid() -> i32;
 
 fn ensure() {
     if CURRENT.live { return; }
@@ -88,7 +87,7 @@ fn capture_edit(path_value: text::Text, raw: *u8) {
 #[test]
 fn current_png_enables_edit_and_delivers_the_path() {
     let path_value: text::Text =
-        "/tmp/qwen-image-gui-current-${getpid()}-${time::now_millis()}.png";
+        "/tmp/qwen-image-gui-current-${process::current_id()}-${time::now_millis()}.png";
     let _written = fs::write_string(path_value.view(), "png bytes");
     clear();
     var capture: EditCapture = EditCapture { count: 0 as usize, path: text::new() };
