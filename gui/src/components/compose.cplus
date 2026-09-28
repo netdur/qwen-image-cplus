@@ -28,10 +28,17 @@ import "./prompt" as prompt;
 import "./references" as references;
 import "./output_options" as output_options;
 import "./model_selection" as model_selection;
-
-extern fn arc4random() -> u32;
+import "stdlib/crypto" as crypto;
 
 static NEXT_OUTPUT: u64 = 1 as u64;
+
+// A fresh unsigned 64-bit seed from the system's secure generator, which every
+// platform has (arc4random does not exist on Windows).
+fn random_seed() -> u64 {
+    var seed: u64 = 0 as u64;
+    let _filled: bool = crypto::random_bytes(#addr_of(seed) as *u8, 8 as usize);
+    return seed;
+}
 
 struct Compose {
     session_sub: events::SignalSubscription[generation_session::Change],
@@ -61,18 +68,24 @@ impl Compose {
         return action;
     }
 
+    // Runs on every session change — ten a second while a generation is in
+    // flight — so it touches Create and Cancel only when the busy state has
+    // actually flipped. A relayout on every poll re-laid the whole window each
+    // time, and on Win32 that repainted it all, preview image included.
     fn refresh(this) {
         let running: bool = generation_session::busy();
         match mount::find("compose:create") {
             option::Option[*core::Node]::Some(node) => {
-                core::set_enabled(node, !running);
+                if core::is_enabled(node) == running { core::set_enabled(node, !running); }
             }
             option::Option::None => {}
         }
         match mount::find("compose:cancel") {
             option::Option[*core::Node]::Some(node) => {
-                core::set_shown(node, running);
-                core::relayout(node);
+                if core::is_visible(node) != running {
+                    core::set_shown(node, running);
+                    core::relayout(node);
+                }
             }
             option::Option::None => {}
         }
@@ -175,8 +188,7 @@ impl Compose {
             return;
         }
         let seed: u64 = if saved.random_seed {
-            (arc4random() as u64) *% (4294967296 as u64)
-                +% (arc4random() as u64)
+            random_seed()
         } else {
             guard let option::Option[text_field::TextField]::Some(seed_field) =
                 text_field::find("settings:seed") else { return; };

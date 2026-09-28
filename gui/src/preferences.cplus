@@ -1,4 +1,5 @@
 import "./settings_store" as settings_store;
+import "./system_paths" as system_paths;
 import "stdlib/fs" as fs;
 import "stdlib/option" as option;
 import "stdlib/result" as result;
@@ -51,7 +52,7 @@ fn cache_threshold_value(mode: i64, choice: i64) -> f64 {
 }
 
 fn valid_output_folder(path: str) -> bool {
-    if !path.has_prefix("/") { return false; }
+    if !system_paths::is_absolute(path) { return false; }
     guard let result::Result[fs::Metadata, result::IoError]::Ok(info) =
         fs::metadata(path) else { return false; };
     return info.is_dir;
@@ -139,7 +140,7 @@ fn load() -> GenerationPreferences { return load_from(store()); }
 
 fn output_folder_for(saved: GenerationPreferences) -> text::Text {
     if saved.output_folder.count() == (0 as usize) {
-        return text::from_str("/tmp");
+        return system_paths::temporary_folder();
     }
     return saved.output_folder.clone();
 }
@@ -255,6 +256,9 @@ fn generation_preferences_round_trip_and_validate() {
     defaults.remove_object_for_key("generation.cache_threshold");
     defaults.remove_object_for_key("generation.output_folder");
 
+    // A folder that exists on every platform, and one that cannot.
+    let existing: text::Text = system_paths::temporary_folder();
+    let missing: text::Text = "${existing.view()}/not-a-real-output-folder";
     let initial: GenerationPreferences = load_from(defaults);
     assert initial.width == (512 as i64);
     assert initial.height == (512 as i64);
@@ -264,7 +268,7 @@ fn generation_preferences_round_trip_and_validate() {
     assert initial.cache_mode == (0 as i64);
     assert initial.cache_threshold == (0 as i64);
     assert initial.output_folder.count() == (0 as usize);
-    assert output_folder_for(initial).view() == "/tmp";
+    assert output_folder_for(initial).view() == existing.view();
     assert cache_threshold_value(2 as i64, 0 as i64) == 0.24f64;
     assert cache_threshold_value(3 as i64, 0 as i64) == 0.16f64;
     assert cache_threshold_value(3 as i64, 1 as i64) == 0.12f64;
@@ -285,8 +289,8 @@ fn generation_preferences_round_trip_and_validate() {
     assert !save_cache_mode_to(defaults, 4 as i64);
     assert save_cache_threshold_to(defaults, 4 as i64);
     assert !save_cache_threshold_to(defaults, 5 as i64);
-    assert save_output_folder_to(defaults, "/usr");
-    assert !save_output_folder_to(defaults, "/tmp/not-a-real-output-folder");
+    assert save_output_folder_to(defaults, existing.view());
+    assert !save_output_folder_to(defaults, missing.view());
     assert save_model_path_to(defaults, "/tmp/example.qipack");
     assert !save_model_path_to(defaults, "");
 
@@ -298,8 +302,8 @@ fn generation_preferences_round_trip_and_validate() {
     assert saved.random_seed;
     assert saved.cache_mode == (3 as i64);
     assert saved.cache_threshold == (4 as i64);
-    assert saved.output_folder.view() == "/usr";
-    assert output_folder_for(saved).view() == "/usr";
+    assert saved.output_folder.view() == existing.view();
+    assert output_folder_for(saved).view() == existing.view();
     match load_model_path_from(defaults) {
         option::Option[text::Text]::Some(path) => {
             assert path.view() == "/tmp/example.qipack";

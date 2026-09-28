@@ -11,6 +11,7 @@ import "stdlib/option" as option;
 import "stdlib/status" as status;
 import "stdlib/text" as text;
 import "../preferences" as preferences;
+import "../system_paths" as system_paths;
 import "./style" as style;
 
 struct GenerationSettings { _shell: u8 }
@@ -72,7 +73,8 @@ impl GenerationSettings {
 
     fn folder_label(this, path: str) -> text::Text {
         if path.count() == (0 as usize) {
-            return text::from_str("/tmp (default)");
+            let folder: text::Text = system_paths::temporary_folder();
+            return "${folder.view()} (default)";
         }
         return text::from_str(path);
     }

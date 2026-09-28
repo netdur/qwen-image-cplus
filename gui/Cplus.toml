@@ -4,9 +4,10 @@ version = "0.2.2"
 edition = "2026"
 
 # The Qwen Image desktop app: facet UI over qwen_image/api. The same source on
-# macOS (AppKit through facet_appkit, Metal backend) and Linux (GTK 4 through
-# facet_gtk, CUDA backend); the two native pieces left (preferences storage,
-# reference-image size) are `_macos` / `_linux` files beside a neutral base.
+# macOS (AppKit through facet_appkit, Metal backend), Linux (GTK 4 through
+# facet_gtk, CUDA backend) and Windows (Win32 through facet_win32, CUDA
+# backend); the native pieces left (preferences storage, reference-image size,
+# system paths) are `_macos` / `_linux` / `_windows` files beside a neutral base.
 
 [dependencies]
 stdlib             = "*"
@@ -54,3 +55,11 @@ harfbuzz        = "*"
 pango           = "*"
 pangocairo      = "*"
 gmodule         = "*"
+
+# The CUDA backend and facet's Win32 backend, which needs nothing installed:
+# user32 and gdi32 ship with Windows.
+[windows.dependencies]
+qwen_image_cuda = "*"
+facet_win32     = "*"
+agent_win32     = "*"
+win32           = "*"

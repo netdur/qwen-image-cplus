@@ -15,6 +15,7 @@ import "stdlib/text" as text;
 import "stdlib/vec" as vec;
 import "facet/gestures" as _;
 import "../preferences" as preferences;
+import "../system_paths" as system_paths;
 import "./style" as style;
 
 struct ModelSelection {
@@ -28,17 +29,7 @@ fn has_model_extension(path: str) -> bool {
 }
 
 fn model_root_for_pack(path: str) -> option::Option[text::Text] {
-    guard let option::Option[usize]::Some(index) = path.rfind("/") else {
-        return option::Option[text::Text]::None;
-    };
-    if index == (0 as usize) {
-        return option::Option[text::Text]::Some(text::from_str("/"));
-    }
-    return match path.slice(0 as usize, index) {
-        option::Option[str]::Some(root) =>
-        option::Option[text::Text]::Some(text::from_str(root)),
-        option::Option::None => option::Option[text::Text]::None,
-    };
+    return system_paths::parent_folder(path);
 }
 
 fn has_support_files(root: str) -> bool {
@@ -102,7 +93,7 @@ fn select_pack_steps(path: str) {
 
 fn selected_name(path: str) -> text::Text {
     if path.count() == (0 as usize) { return text::from_str("No file selected"); }
-    match path.rfind("/") {
+    match system_paths::last_separator(path) {
         option::Option[usize]::Some(index) => {
             match path.slice(index +% (1 as usize), path.count()) {
                 option::Option[str]::Some(name) => {
