@@ -11,7 +11,7 @@
 # facet_gtk fixes newer than the last release.
 set -eu
 
-ref=1cd832e9836fd794c86e6ed74b2d60beb8f34e7a
+ref=b30eeb0c1d22108d924a38dee321c37748db95f9
 repository=https://github.com/netdur/cplus
 destination=${1:?usage: install-cpc-source.sh DESTINATION}
 
