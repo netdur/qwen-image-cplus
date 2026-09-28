@@ -15,10 +15,23 @@ if [ ! -d "$cplus_vendor" ]; then
     exit 1
 fi
 
+# Git Bash's `ln -s` copies the whole tree instead of linking it, so on Windows
+# the link is a directory junction, which needs no administrator.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) windows=true ;;
+    *) windows=false ;;
+esac
+
 for package in qwen_image qwen_image_metal qwen_image_cuda qwen_image_runtime \
                qwen_image_metal_dev qwen_image_cuda_dev qwen_image_quantize cli ffi gui; do
     vendor="$root/$package/vendor"
-    if [ -L "$vendor" ] || [ ! -e "$vendor" ]; then
+    if [ "$windows" = true ]; then
+        if [ -e "$vendor" ]; then
+            echo "leaving $package/vendor (already present; remove it to relink)" >&2
+        else
+            cmd //c mklink //J "$(cygpath -w "$vendor")" "$(cygpath -w "$cplus_vendor")" >/dev/null
+        fi
+    elif [ -L "$vendor" ] || [ ! -e "$vendor" ]; then
         ln -sfn "$cplus_vendor" "$vendor"
     else
         echo "leaving $package/vendor (a real directory; remove it to link)" >&2

@@ -1,7 +1,8 @@
-# Builds the Windows distribution into dist\: the CLI, the C library, and the
-# CUDA runtime DLLs they load, laid out as an install prefix.
+# Builds the Windows distribution into dist\: the CLI, the GUI, the C library,
+# and the CUDA runtime DLLs they load, laid out as an install prefix.
 #
 #   dist\bin\qwen-image-cplus.exe          CLI
+#   dist\bin\qwen-image-gui.exe            desktop app (Win32)
 #   dist\bin\qwen_image.dll                C API, shared
 #   dist\bin\*.dll                         bundled CUDA 12 / cuDNN 8 runtime
 #   dist\include\qwen_image.h              C API
@@ -10,8 +11,7 @@
 #
 # Windows loads a DLL from the executable's own directory first, so the
 # runtime DLLs sit in bin\ beside the binaries and the prefix can be moved as
-# a whole. The GPU driver (nvcuda.dll) comes from the system. There is no GUI
-# yet: the desktop app has no Win32 backend.
+# a whole. The GPU driver (nvcuda.dll) comes from the system.
 #
 # Environment:
 #   CPC          C+ compiler (default: cpc)
@@ -53,6 +53,7 @@ function Build-Package([string]$package) {
 Build-Package "qwen_image"
 Build-Package "cli"
 Build-Package "ffi"
+Build-Package "gui"
 
 $dist = Join-Path $projectRoot "dist"
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
@@ -62,6 +63,7 @@ $lib = New-Item -ItemType Directory -Force (Join-Path $dist "lib")
 $ffiTarget = Join-Path $projectRoot "ffi\target\$buildMode"
 
 Copy-Item (Join-Path $projectRoot "cli\target\$buildMode\qwen-image-cplus.exe") $bin
+Copy-Item (Join-Path $projectRoot "gui\target\$buildMode\gui.exe") (Join-Path $bin "qwen-image-gui.exe")
 Copy-Item (Join-Path $ffiTarget "qwen_image.dll") $bin
 Copy-Item (Join-Path $ffiTarget "qwen_image.lib") $lib
 Copy-Item (Join-Path $ffiTarget "qwen_image.h") $include
@@ -104,6 +106,22 @@ $runtime = @(
 foreach ($dll in $runtime) {
     if (-not (Test-Path $dll)) { throw "cannot find $dll (check CUDA_HOME / CUDNN_HOME)" }
     Copy-Item $dll $bin
+}
+
+# Every binary resolves every DLL it imports from bin\ or from the system, the
+# Windows form of the Linux build's ldd check. The import table is read rather
+# than the binary run, so a missing DLL is named instead of reported as a
+# failure to start.
+$systemDirectory = Join-Path $env:SystemRoot "System32"
+foreach ($binary in Get-ChildItem $bin -Include *.exe, *.dll -Recurse) {
+    $imports = & llvm-readobj --coff-imports $binary.FullName |
+        Select-String "^\s*Name: (.+\.dll)\s*$" | ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique
+    foreach ($dll in $imports) {
+        if ($dll -match "^(api|ext)-ms-") { continue }
+        if (-not (Test-Path (Join-Path $bin $dll)) -and -not (Test-Path (Join-Path $systemDirectory $dll))) {
+            throw "$($binary.Name) imports $dll, which is neither in dist\bin nor in the system"
+        }
+    }
 }
 
 # The C API links and answers, shared and static, and the CLI starts, all with

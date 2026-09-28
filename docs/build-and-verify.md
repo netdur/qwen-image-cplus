@@ -30,30 +30,41 @@ dist/lib/libqwen_image.dylib
 
 On Windows, `build.sh` (from Git Bash) hands over to
 `scripts/build-windows.ps1`, which can also be run directly from PowerShell.
-It builds the CUDA engine, the CLI and the C library; there is no GUI yet.
-It needs Visual Studio 2022 with the C++ x64 tools, LLVM (`clang`,
-`llvm-ar`) and three libraries, named by environment variable:
+It builds the CUDA engine, the CLI, the GUI and the C library, checks that
+every binary finds every DLL it imports, and runs the C ABI smoke test. It
+needs Visual Studio 2022 with the C++ x64 tools, LLVM 19 or newer (`clang`,
+`llvm-ar`, `llvm-readobj`), and three libraries named by environment variable:
 
 - `CUDA_HOME`: a CUDA 12 toolkit.
 - `CUDNN_HOME`: cuDNN 8 for CUDA 12.
-- `JPEG_HOME`: libjpeg-turbo, built static against the static C runtime
-  (`cmake -DENABLE_SHARED=OFF -DWITH_CRT_DLL=OFF`), because cpc links C+
-  programs with `/MT`.
+- `JPEG_HOME`: libjpeg-turbo, built static against the static C runtime,
+  because cpc links C+ programs with `/MT`.
+
+`scripts/install-windows-deps.ps1 FOLDER` installs all three from pinned,
+hash-checked downloads (CUDA from NVIDIA's per-component archives, so no
+installer, administrator or driver change) and prints the three variables.
+The release workflow uses the same script.
 
 libjpeg-turbo is required rather than `stb_image` alone, as on Linux: it
 decodes JPEGs to Pillow's exact pixels, and `stb_image` differs by up to three
 levels on ordinary 4:2:0 photos (see `qwen_image_cuda/native/image.c`).
 
+The C+ compiler comes from the commit `scripts/install-cpc-source.sh` pins,
+with each package's `vendor\` pointed at that checkout by
+`scripts/link_vendor.sh` (directory junctions on Windows).
+
 ```powershell
+scripts\install-windows-deps.ps1 C:\deps   # once; prints CUDA_HOME, CUDNN_HOME, JPEG_HOME
 $env:CPC = "C:\path\to\cpc.exe"
-$env:CUDA_HOME = "C:\path\to\cuda-12.6"
-$env:CUDNN_HOME = "C:\path\to\cudnn-8.9-cuda12"
-$env:JPEG_HOME = "C:\path\to\libjpeg-turbo"
+$env:CUDA_HOME = "C:\deps\cuda"
+$env:CUDNN_HOME = "C:\deps\cudnn"
+$env:JPEG_HOME = "C:\deps\libjpeg-turbo"
 scripts\build-windows.ps1
 ```
 
 ```text
 dist\bin\qwen-image-cplus.exe
+dist\bin\qwen-image-gui.exe
 dist\bin\qwen_image.dll
 dist\bin\cudart64_12.dll, cublas*.dll, cudnn*.dll
 dist\include\qwen_image.h
