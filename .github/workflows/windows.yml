@@ -1,0 +1,142 @@
+name: Windows
+
+# The Windows build, on its own so it can run on every push to the branch that
+# carries the port, and called by the release workflow for tags and manual
+# runs. Only the release workflow's tag push makes it publish.
+on:
+  push:
+    branches:
+      - windows-port
+  workflow_call:
+    inputs:
+      release:
+        description: Attach the package to the release named by the tag.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-x86_64:
+    # windows-2022 for Visual Studio 2022: CUDA 12.6's nvcc accepts MSVC up to
+    # 14.4x and refuses a newer toolset.
+    runs-on: windows-2022
+    env:
+      RELEASE: ${{ inputs.release == true }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Resolve and validate version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE" = true ]; then
+            tag="${{ github.ref_name }}"
+            version="${tag#v}"
+          else
+            # A manual run has no tag; the packages name the version.
+            version=$(sed -n 's/^version *= *"\([^"]*\)"$/\1/p' gui/Cplus.toml)
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require matching package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          for manifest in qwen_image/Cplus.toml qwen_image_cuda/Cplus.toml qwen_image_runtime/Cplus.toml cli/Cplus.toml ffi/Cplus.toml gui/Cplus.toml; do
+            grep -Eq "^version *= *\"${version}\"$" "$manifest"
+          done
+
+      - name: Install LLVM 19 and NASM
+        shell: pwsh
+        run: |
+          # cpc needs LLVM 19 or newer (clang, lld-link, llvm-ar, llvm-rc). The
+          # image's own LLVM is used when it is new enough. NASM gives
+          # libjpeg-turbo its SIMD path.
+          $clang = "C:\Program Files\LLVM\bin\clang.exe"
+          $major = 0
+          if (Test-Path $clang) {
+            if ((& $clang --version | Select-Object -First 1) -match "version (\d+)\.") { $major = [int]$Matches[1] }
+          }
+          if ($major -lt 19) { choco install llvm --version=19.1.7 --allow-downgrade -y --no-progress }
+          & $clang --version | Select-Object -First 1
+          choco install nasm -y --no-progress
+          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "C:\Program Files\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install CUDA 12.6, cuDNN 8.9.7 and libjpeg-turbo
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files\NASM;$env:PATH"
+          & scripts\install-windows-deps.ps1 "$env:RUNNER_TEMP\deps" |
+            Tee-Object -Variable lines
+          $lines | Where-Object { $_ -match "^(CUDA_HOME|CUDNN_HOME|JPEG_HOME)=" } |
+            Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the pinned C+ compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang --version | head -1
+          scripts/install-cpc-source.sh "$RUNNER_TEMP/cplus"
+          echo "CPC=$(cygpath -w "$RUNNER_TEMP/cplus/target/release/cpc.exe")" >> "$GITHUB_ENV"
+          CPLUS_VENDOR="$RUNNER_TEMP/cplus/vendor" scripts/link_vendor.sh
+
+      - name: Build and verify distribution
+        shell: pwsh
+        run: scripts\build-windows.ps1
+
+      - name: Run project tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd qwen_image && "$CPC" test --release --json --filter qwen_image::src) \
+            | tee "$RUNNER_TEMP/qwen-image-tests.jsonl"
+          tail -n 1 "$RUNNER_TEMP/qwen-image-tests.jsonl" | jq -e '.failed == 0'
+
+          (cd ffi && "$CPC" test --release --json --filter ffi_version) \
+            | tee "$RUNNER_TEMP/qwen-image-ffi-tests.jsonl"
+          tail -n 1 "$RUNNER_TEMP/qwen-image-ffi-tests.jsonl" | jq -e '.failed == 0'
+
+      - name: Package distribution
+        id: package
+        shell: pwsh
+        run: |
+          $asset = "qwen-image-cplus-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path dist\bin, dist\include, dist\lib -DestinationPath $asset
+          "asset=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Keep the package as a workflow artifact
+        if: env.RELEASE != 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Attach package to the release
+        if: env.RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          asset="${{ steps.package.outputs.asset }}"
+          # The macOS and Linux jobs may be creating the release at the same
+          # moment.
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --generate-notes || \
+            gh release view "$tag" >/dev/null
+          if ! gh release view "$tag" --json assets \
+              --jq '.assets[].name' | grep -Fxq "$asset"; then
+            gh release upload "$tag" "$asset"
+          fi
