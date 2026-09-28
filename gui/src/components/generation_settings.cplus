@@ -1,6 +1,7 @@
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
+import "facet/icons" as icons;
 import "facet/component" as component;
 import "facet/label" as label;
 import "facet/popup" as popup;
@@ -147,11 +148,13 @@ impl GenerationSettings: component::Component {
                         style::caption("OUTPUT PNG FOLDER", "settings:output-folder:title")
                         style::secondary(folder.view(), "settings:output-folder:path")
                         hstack {
-                            ui::text_button("Choose Folder…",
+                            ui::button("Choose Folder…",
                             key: "settings:output-folder:choose",
+                            symbol: icons::folder_open, bordered: false,
                             on_click: this.on_choose_folder)
-                            ui::text_button("Use Temporary Folder",
+                            ui::button("Use Temporary Folder",
                             key: "settings:output-folder:temporary",
+                            symbol: icons::hourglass_empty, bordered: false,
                             on_click: this.on_use_temporary)
                         }
                         .align(flex::Align::Center)

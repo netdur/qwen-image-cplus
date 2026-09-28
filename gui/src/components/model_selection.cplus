@@ -2,6 +2,7 @@ import "../files" as files;
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
+import "facet/icons" as icons;
 import "facet/component" as component;
 import "facet/label" as label;
 import "facet/mount" as mount;
@@ -204,17 +205,17 @@ impl ModelSelection: component::Component {
                 hstack {
                     style::caption("MODEL", "model:title")
                     spacer().grow(1.0f64)
-                    text_button("Choose file…", key: "model:choose",
-                    bordered: true, on_click: this.on_choose)
-                        .width(112.0f64).height(28.0f64)
+                    button("Choose file…", key: "model:choose",
+                    symbol: icons::folder_open, bordered: true, on_click: this.on_choose)
+                        .width(136.0f64).height(28.0f64)
                 }
                 .align(flex::Align::Center)
                 this.selected_label()
             }
             .gap(8.0f64)
             .gesture(allow_file_drop: true,
-                     on_drag_over: this.on_files_over,
-                     on_drop: this.on_files_dropped)
+            on_drag_over: this.on_files_over,
+            on_drop: this.on_files_dropped)
         };
         return style::card(content);
     }

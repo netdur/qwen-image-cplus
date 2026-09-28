@@ -1,6 +1,7 @@
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
+import "facet/icons" as icons;
 import "facet/component" as component;
 import "facet/button" as button;
 import "facet/mount" as mount;
@@ -44,18 +45,18 @@ impl Compose {
     }
 
     fn create_button(ref this) -> core::Node {
-        var action: core::Node = ui::icon_button("sparkles",
+        var action: core::Node = ui::icon_button(
         key: "compose:create", bordered: true,
-        on_clicked: this.on_create,
-        corner_radius: vocab::Corners::all(10.0f64));
+            symbol: icons::auto_awesome, on_clicked: this.on_create,
+            corner_radius: vocab::Corners::all(10.0f64));
         core::set_accessibility_label(#addr_of(action), "Create image");
         return action.width(36.0f64).height(36.0f64);
     }
 
     fn cancel_button(ref this) -> core::Node {
         var action: core::Node = ui::button("Cancel", key: "compose:cancel",
-            bordered: true, on_click: this.on_cancel)
-            .width(72.0f64).height(36.0f64);
+        bordered: true, symbol: icons::close, on_click: this.on_cancel)
+            .width(90.0f64).height(36.0f64);
         core::set_shown(#addr_of(action), false);
         return action;
     }
@@ -123,7 +124,7 @@ impl Compose {
         };
         if !model_selection::is_model_file(pack.view()) {
             runtime::alert("Model unavailable",
-                "The selected model or its support files are missing.", "OK");
+            "The selected model or its support files are missing.", "OK");
             return;
         }
         guard let option::Option[text::Text]::Some(model_root) =
@@ -138,7 +139,7 @@ impl Compose {
             else { return; };
         if !preferences::valid_dimension(width) || !preferences::valid_dimension(height) {
             runtime::alert("Unsupported size",
-                "Use width and height of at least 256, in multiples of 32.", "OK");
+            "Use width and height of at least 256, in multiples of 32.", "OK");
             return;
         }
         guard let option::Option[popup::Popup]::Some(steps_field) =
@@ -147,7 +148,7 @@ impl Compose {
         if width == (256 as i64) && height == (256 as i64)
             && steps != (25 as i64) && steps != (40 as i64) {
             runtime::alert("Unsupported step count",
-                "256 × 256 generation requires 25 or 40 steps.", "OK");
+            "256 × 256 generation requires 25 or 40 steps.", "OK");
             return;
         }
         let saved: preferences::GenerationPreferences = preferences::load();
@@ -162,7 +163,7 @@ impl Compose {
              width > (1048576 as i64) / height ||
              cache != api::CacheMode::None) {
             runtime::alert("Unsupported reference settings",
-                "Reference output must fit within 1 MP with cache off. Reduce the size or use the suggested dimensions.", "OK");
+            "Reference output must fit within 1 MP with cache off. Reduce the size or use the suggested dimensions.", "OK");
             return;
         }
         if cache != api::CacheMode::None &&
@@ -170,7 +171,7 @@ impl Compose {
              (width != (256 as i64) && width != (1024 as i64)) ||
              (width == (256 as i64) && cache == api::CacheMode::TaylorSeer)) {
             runtime::alert("Unsupported cache settings",
-                "This cache mode is unavailable for the selected size.", "OK");
+            "This cache mode is unavailable for the selected size.", "OK");
             return;
         }
         let seed: u64 = if saved.random_seed {
@@ -202,7 +203,7 @@ impl Compose {
         };
         if !generation_session::start(request) {
             runtime::alert("Could not start generation",
-                "The generation worker is unavailable or already busy.", "OK");
+            "The generation worker is unavailable or already busy.", "OK");
         }
     }
 

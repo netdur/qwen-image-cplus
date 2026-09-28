@@ -1,6 +1,7 @@
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
+import "facet/icons" as icons;
 import "facet/component" as component;
 import "facet/button" as button;
 import "facet/screen" as screen;
@@ -24,7 +25,6 @@ import "../components/compose" as compose;
 import "../components/preview" as preview;
 import "../current_image" as current_image;
 import "../new_image" as new_image;
-
 
 // Copies the current image to the path the save panel returned.
 fn save_current_image_to(destination: text::Text) {
@@ -50,25 +50,25 @@ impl Generation {
 
     fn edit_button(ref this) -> core::Node {
         var action: core::Node = ui::button("Edit", key: "generation:edit",
-            bordered: true, corner_radius: vocab::Corners::all(8.0f64),
-            font_size: 13.0f64, on_click: this.on_edit)
-            .width(68.0f64).height(32.0f64);
+        bordered: true, corner_radius: vocab::Corners::all(8.0f64),
+        font_size: 13.0f64, symbol: icons::edit, on_click: this.on_edit)
+            .width(80.0f64).height(32.0f64);
         core::set_enabled(#addr_of(action), current_image::has_image());
         return action;
     }
 
     fn new_button(ref this) -> core::Node {
         return ui::button("New", key: "generation:new",
-            bordered: true, corner_radius: vocab::Corners::all(8.0f64),
-            font_size: 13.0f64, on_click: this.on_new)
-            .width(68.0f64).height(32.0f64);
+        bordered: true, corner_radius: vocab::Corners::all(8.0f64),
+        font_size: 13.0f64, symbol: icons::note_add, on_click: this.on_new)
+            .width(80.0f64).height(32.0f64);
     }
 
     fn save_button(ref this) -> core::Node {
         var action: core::Node = ui::button("Save", key: "generation:save",
-            bordered: true, corner_radius: vocab::Corners::all(8.0f64),
-            font_size: 13.0f64, on_click: this.on_save)
-            .width(68.0f64).height(32.0f64);
+        bordered: true, corner_radius: vocab::Corners::all(8.0f64),
+        font_size: 13.0f64, symbol: icons::save, on_click: this.on_save)
+            .width(80.0f64).height(32.0f64);
         core::set_enabled(#addr_of(action), current_image::has_image());
         return action;
     }

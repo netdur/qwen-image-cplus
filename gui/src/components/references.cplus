@@ -2,6 +2,7 @@ import "../files" as files;
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
+import "facet/icons" as icons;
 import "facet/component" as component;
 import "facet/icon_button" as icon_button;
 import "facet/image" as image;
@@ -26,7 +27,6 @@ import "../new_image" as new_image;
 import "../preferences" as preferences;
 import "./style" as style;
 import "./output_options" as output_options;
-
 
 struct References {
     paths: vec::Vec[text::Text],
@@ -75,11 +75,11 @@ impl References {
     }
 
     fn remove_button(ref this, index: usize) -> core::Node {
-        var action: core::Node = ui::text_button("×",
+        var action: core::Node = ui::button("",
         key: "references:remove:${index}",
+        symbol: icons::close, bordered: false,
         text_color: vocab::Color::rgba(1.0f64, 1.0f64, 1.0f64, 1.0f64),
-        font_size: 18.0f64, font_weight: vocab::FontWeight::Bold,
-        font_scales: false, on_click: this.on_remove)
+        on_click: this.on_remove)
             .width(24.0f64)
             .height(24.0f64);
         core::set_item_index(#addr_of(action), index);
@@ -119,9 +119,9 @@ impl References {
     }
 
     fn add_button(ref this) -> core::Node {
-        var action: core::Node = ui::icon_button("plus.circle.fill",
-        key: "references:add", fit: vocab::ImageFit::AspectFit,
-        on_clicked: this.on_add)
+        var action: core::Node = ui::icon_button(
+        key: "references:add", symbol: icons::add_circle,
+            on_clicked: this.on_add)
             .width(24.0f64)
             .height(24.0f64);
         core::set_accessibility_label(#addr_of(action), "Add reference image");
@@ -229,7 +229,7 @@ impl References {
             option::Option[text::Text]::Some(path) => {
                 if !this.add_reference(path) {
                     runtime::alert("Image unavailable",
-                        "This file could not be read as a reference image.", "OK");
+                    "This file could not be read as a reference image.", "OK");
                 }
             }
             option::Option::None => {}
@@ -343,8 +343,8 @@ impl References: component::Component {
             }
             .gap(12.0f64)
             .gesture(allow_file_drop: true,
-                     on_drag_over: this.on_files_over,
-                     on_drop: this.on_files_dropped)
+            on_drag_over: this.on_files_over,
+            on_drop: this.on_files_dropped)
         };
         return style::card(content);
     }
