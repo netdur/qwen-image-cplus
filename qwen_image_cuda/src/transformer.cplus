@@ -16,6 +16,7 @@
 
 import "stdlib/time" as time;
 import "qwen_image/file_io" as file_io;
+import "qwen_image/generation_control" as control;
 import "./cuda" as cuda;
 import "./int4_pack" as pack;
 import "stdlib/io" as io;
@@ -1045,9 +1046,11 @@ fn seconds() -> f64 {
     return (time::now_millis() as f64) * 0.001f64;
 }
 
-// Runs every step from `latents` (device, [image_rows, 64]) in place.
+// Runs every step from `latents` (device, [image_rows, 64]) in place,
+// reporting each finished step to `observer`. 0 on success, 1 on a GPU
+// failure, 3 when the observer cancels between steps (the pipeline's codes).
 fn denoise(ref model: Model, ref work: Work, ref cache: PrefixCache, latents: *f32, image_rows: usize, steps: usize,
-           rope: *f32) -> bool {
+           rope: *f32, observer: control::Observer) -> i32 {
     var index: usize = 0 as usize;
     while index < steps {
         let started: f64 = seconds();
@@ -1056,12 +1059,13 @@ fn denoise(ref model: Model, ref work: Work, ref cache: PrefixCache, latents: *f
         if !step_device(model, work, cache, latents, image_rows, (current * 1000.0f64) as f32, rope)
             || !ok(cuda::euler(latents, work.q.pointer as *f32, (next - current) as f32, (image_rows *% LATENT) as u64), "euler")
             || !cuda::synchronize() {
-            return false;
+            return 1;
         }
         io::println("step ${index +% (1 as usize)}/${steps}: sigma ${current} -> ${next}, ${seconds() - started} s");
         index = index +% (1 as usize);
+        if !control::report(observer, control::Phase::Denoising, index, steps) { return 3; }
     }
-    return true;
+    return 0;
 }
 
 #[test]
@@ -1182,7 +1186,8 @@ fn run_oracle_dump(pack_path: str, mode: WeightMode, dump: str, steps: usize, ou
     let _prefix_synced: bool = cuda::synchronize();
     io::println("text prefix (${text_rows} rows): ${seconds() - started} s");
     started = seconds();
-    if !denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32) { return 1; }
+    if denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32,
+               control::none()) != (0 as i32) { return 1; }
     io::println("denoise (${steps} steps, ${image_rows} image rows): ${seconds() - started} s");
     guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(noise.length) else { return 1; };
     if !latents.download(result.pointer, noise.length as u64) || !write_floats(output_path, result.pointer, result.length) { return 1; }
@@ -1244,7 +1249,8 @@ fn run_edit_dump(pack_path: str, mode: WeightMode, dump: str, steps: usize, outp
     let _prefix_synced: bool = cuda::synchronize();
     io::println("conditioned prefix (${prefix_rows} rows: ${prompt_rows -% pad_rows} text, ${condition_rows} condition): ${seconds() - started} s");
     started = seconds();
-    if !denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32) { return 1; }
+    if denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32,
+               control::none()) != (0 as i32) { return 1; }
     io::println("denoise (${steps} steps, ${image_rows} image rows): ${seconds() - started} s");
     guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(noise.length) else { return 1; };
     if !latents.download(result.pointer, noise.length as u64) || !write_floats(output_path, result.pointer, result.length) { return 1; }

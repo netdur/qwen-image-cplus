@@ -119,10 +119,9 @@ fn denoise(pack_path: str, mode: transformer::WeightMode, embeddings: *f32, text
     };
     var cache: transformer::PrefixCache = computed;
     if !control::report(observer, control::Phase::Denoising, 0 as usize, steps) { return 3; }
-    if !transformer::denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32) {
-        return 1;
-    }
-    if !control::report(observer, control::Phase::Denoising, steps, steps) { return 3; }
+    let denoised: i32 = transformer::denoise(model, work, cache, latents.pointer as *f32, image_rows, steps,
+        rope.pointer as *f32, observer);
+    if denoised != (0 as i32) { return denoised; }
     return if latents.download(latents_host as *u8, (image_rows *% LATENT *% (4 as usize)) as u64) { 0 } else { 1 };
 }
 
