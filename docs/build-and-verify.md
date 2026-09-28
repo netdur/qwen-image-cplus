@@ -26,6 +26,41 @@ dist/lib/libqwen_image.a
 dist/lib/libqwen_image.dylib
 ```
 
+### Windows
+
+On Windows, `build.sh` (from Git Bash) hands over to
+`scripts/build-windows.ps1`, which can also be run directly from PowerShell.
+It builds the CUDA engine, the CLI and the C library; there is no GUI yet.
+It needs Visual Studio 2022 with the C++ x64 tools, LLVM (`clang`,
+`llvm-ar`) and three libraries, named by environment variable:
+
+- `CUDA_HOME`: a CUDA 12 toolkit.
+- `CUDNN_HOME`: cuDNN 8 for CUDA 12.
+- `JPEG_HOME`: libjpeg-turbo, built static against the static C runtime
+  (`cmake -DENABLE_SHARED=OFF -DWITH_CRT_DLL=OFF`), because cpc links C+
+  programs with `/MT`.
+
+libjpeg-turbo is required rather than `stb_image` alone, as on Linux: it
+decodes JPEGs to Pillow's exact pixels, and `stb_image` differs by up to three
+levels on ordinary 4:2:0 photos (see `qwen_image_cuda/native/image.c`).
+
+```powershell
+$env:CPC = "C:\path\to\cpc.exe"
+$env:CUDA_HOME = "C:\path\to\cuda-12.6"
+$env:CUDNN_HOME = "C:\path\to\cudnn-8.9-cuda12"
+$env:JPEG_HOME = "C:\path\to\libjpeg-turbo"
+scripts\build-windows.ps1
+```
+
+```text
+dist\bin\qwen-image-cplus.exe
+dist\bin\qwen_image.dll
+dist\bin\cudart64_12.dll, cublas*.dll, cudnn*.dll
+dist\include\qwen_image.h
+dist\lib\qwen_image.lib
+dist\lib\qwen_image_static.lib
+```
+
 For development, verify the package boundaries independently:
 
 ```sh

@@ -6,6 +6,9 @@ edition = "2026"
 [linux]
 entry = "src/main.cplus"
 
+[windows]
+entry = "src/main.cplus"
+
 # Development commands for the CUDA backend: fixtures, dumps, stage checks,
 # and generate/edit through the public API with the CUDA engine installed.
 

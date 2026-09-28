@@ -15,10 +15,23 @@ json       = "*"
 [build]
 prebuild = false
 
-# CUDA kernels and native/*.c helpers built by build_cuda.sh; libjpeg
-# (libjpeg-turbo) decodes condition JPEGs. Linux today; a Windows port adds a
-# [windows.link] beside this one (the backend is CUDA, not Linux).
+# CUDA kernels and native/*.c helpers built by build_cuda.sh (build_cuda.ps1
+# on Windows); libjpeg (libjpeg-turbo) decodes condition JPEGs. The backend is
+# CUDA, not Linux, so the two tables differ only in how libraries are found.
 [linux.link]
 libs          = ["cudart", "cublas", ":libcudnn.so.8", "jpeg", "stdc++"]
 search-paths  = ["${CUDA_HOME:-/usr/local/cuda}/lib64"]
 extra-objects = ["cuda/target/libqwen_image_cuda.a"]
+
+# Import libraries by full path: `search-paths` also emits an ELF `-rpath`,
+# which lld-link does not take. The DLLs they import must sit beside the
+# executable or on PATH at run time. libjpeg-turbo is linked statically; the
+# C++ runtime comes in through the kernel objects' own /MT directives.
+[windows.link]
+extra-objects = [
+    "cuda/target/qwen_image_cuda.lib",
+    "${CUDA_HOME}/lib/x64/cudart.lib",
+    "${CUDA_HOME}/lib/x64/cublas.lib",
+    "${CUDNN_HOME}/lib/x64/cudnn.lib",
+    "${JPEG_HOME}/lib/jpeg-static.lib",
+]

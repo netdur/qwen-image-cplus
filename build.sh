@@ -2,9 +2,10 @@
 set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ "$(uname -s)" = Linux ]; then
-    exec "$project_root/scripts/build-linux.sh" "$@"
-fi
+case "$(uname -s)" in
+    Linux) exec "$project_root/scripts/build-linux.sh" "$@" ;;
+    MINGW*|MSYS*|CYGWIN*) exec pwsh -NoProfile -File "$project_root/scripts/build-windows.ps1" "$@" ;;
+esac
 cpc_bin=${CPC:-cpc}
 build_mode=${BUILD_MODE:-release}
 export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-14.0}

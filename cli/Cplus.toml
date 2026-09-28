@@ -21,3 +21,6 @@ foundation       = "*"
 
 [linux.dependencies]
 qwen_image_cuda = "*"
+
+[windows.dependencies]
+qwen_image_cuda = "*"

@@ -11,8 +11,8 @@ edition = "2026"
 # base, which installs nothing, so the API reports that no backend exists
 # rather than failing somewhere deeper.
 #
-# The backend is chosen by GPU API, not by OS name: a Windows port adds
-# runtime_windows.cplus (CUDA again) and a [windows.dependencies] table.
+# The backend is chosen by GPU API, not by OS name: Linux and Windows both
+# install the CUDA backend.
 
 [dependencies]
 qwen_image = "*"
@@ -28,6 +28,9 @@ metal            = "*"
 foundation       = "*"
 
 [linux.dependencies]
+qwen_image_cuda = "*"
+
+[windows.dependencies]
 qwen_image_cuda = "*"
 
 # Same as qwen_image_cuda: compiled into the consumer, not prebuilt, so GNU ld
