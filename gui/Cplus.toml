@@ -5,9 +5,8 @@ edition = "2026"
 
 # The Qwen Image desktop app: facet UI over qwen_image/api. The same source on
 # macOS (AppKit through facet_appkit, Metal backend) and Linux (GTK 4 through
-# facet_gtk, CUDA backend); the few native pieces facet does not cover (save
-# dialog, file drops, preferences storage, reference-image size) are
-# `_macos` / `_linux` files beside a neutral base.
+# facet_gtk, CUDA backend); the two native pieces left (preferences storage,
+# reference-image size) are `_macos` / `_linux` files beside a neutral base.
 
 [dependencies]
 stdlib             = "*"
