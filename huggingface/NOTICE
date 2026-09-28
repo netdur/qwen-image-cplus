@@ -4,10 +4,9 @@ Modification notice
 -------------------
 
 The distributed QIPACK files were converted from their named source
-checkpoints for use by qwen-image-cplus on Apple Silicon. The conversion
-changes the tensor storage container and stores transformer-block matrices as
-FP16 while retaining vectors and global tensors as BF16. It does not retrain
-the model.
+checkpoints for use by qwen-image-cplus. The conversion changes the tensor
+storage container and stores transformer-block matrices as FP16 while
+retaining vectors and global tensors as BF16. It does not retrain the model.
 
 The base pack was converted from:
 
@@ -25,6 +24,13 @@ rank-256 LoRA adapter is an unmodified copy from:
   Viggle/Qwen-Image-2.1-viggle-turbo
   File revision 139e9492e6b81e85395877a549ec8f0afbb18f8f
   Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors
+
+The two -v6 QIPACK files (w4a4-h256-g64-clip and w4a16-g64) were produced
+from the four-step distilled FP16 pack above for the qwen-image-cplus CUDA
+engine. They quantize the 224 transformer-block matrices to 4-bit codes with
+one FP16 scale per group of 64 inputs (the W4A4 pack also rotates them by a
+256-point Hadamard transform); vectors and global tensors are copied
+unchanged. This is post-training quantization, not retraining.
 
 The processor, text-encoder, and VAE files are unmodified copies from:
 

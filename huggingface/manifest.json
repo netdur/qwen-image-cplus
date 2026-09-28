@@ -74,6 +74,62 @@
         "adapter": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors"
       },
       "verification": "structural validation and native six-step generation passed"
+    },
+    {
+      "path": "qwen-image-2.1-viggle-v0.1-4step-w4a4-h256-g64-clip-v6.qipack",
+      "local_source": "models/qwen-image-2.1-viggle-v0.1-4step-w4a4-h256-g64-clip-v6.qipack",
+      "bytes": 3979448320,
+      "sha256": "6250f581430854d0dde0f11740b8b3644e7ce2ac1dc2f074b538d341f8e582e8",
+      "runtime": "cuda",
+      "format": {
+        "name": "QIPACK1",
+        "version": 1,
+        "policy": "transformer:w4a4-h256-g64-v6",
+        "matrix_storage": "int4 signed, FP16 scale per 64 inputs, 256-point Hadamard along K, 4-bit activations, clipped ranges",
+        "vector_and_global_storage": "bf16"
+      },
+      "source": {
+        "repository": "Viggle/Qwen-Image-2.1-viggle-turbo",
+        "revision": "bafc91e4cc934f5fb1406b22496a0bed9b99c548",
+        "component": "transformer/diffusion_pytorch_model.safetensors",
+        "variant": "v0.1 four-step full fine-tune, not LoRA",
+        "quantized_from": "qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack"
+      },
+      "generation_defaults": {
+        "kind": "distilled",
+        "steps": 4,
+        "shift_terminal": null,
+        "cache": "none"
+      },
+      "verification": "structural validation and native CUDA text-to-image and edit generation passed"
+    },
+    {
+      "path": "qwen-image-2.1-viggle-v0.1-4step-w4a16-g64-v6.qipack",
+      "local_source": "models/qwen-image-2.1-viggle-v0.1-4step-w4a16-g64-v6.qipack",
+      "bytes": 4197552128,
+      "sha256": "8d837585b3204bc253bd9002d74d8cbf278e93efa50288850fb9f36790104063",
+      "runtime": "cuda",
+      "format": {
+        "name": "QIPACK1",
+        "version": 1,
+        "policy": "transformer:w4a16-g64-v6",
+        "matrix_storage": "int4 unsigned, FP16 scale and minimum per 64 inputs, FP16 activations",
+        "vector_and_global_storage": "bf16"
+      },
+      "source": {
+        "repository": "Viggle/Qwen-Image-2.1-viggle-turbo",
+        "revision": "bafc91e4cc934f5fb1406b22496a0bed9b99c548",
+        "component": "transformer/diffusion_pytorch_model.safetensors",
+        "variant": "v0.1 four-step full fine-tune, not LoRA",
+        "quantized_from": "qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack"
+      },
+      "generation_defaults": {
+        "kind": "distilled",
+        "steps": 4,
+        "shift_terminal": null,
+        "cache": "none"
+      },
+      "verification": "structural validation and native CUDA text-to-image and edit generation passed"
     }
   ],
   "adapters": [
