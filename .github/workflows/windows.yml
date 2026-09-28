@@ -96,6 +96,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The ffi test binary links the CUDA backend. Linux finds its
+          # libraries through the RUNPATH the build bakes in; Windows has none,
+          # so the bundled DLLs in dist\bin go on PATH, or the binary cannot
+          # start (and cpc test exits 1 without a word).
+          export PATH="$PWD/dist/bin:$PATH"
           (cd qwen_image && "$CPC" test --release --json --filter qwen_image::src) \
             | tee "$RUNNER_TEMP/qwen-image-tests.jsonl"
           tail -n 1 "$RUNNER_TEMP/qwen-image-tests.jsonl" | jq -e '.failed == 0'
