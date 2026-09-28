@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Qwen Image
+Comment=Generate and edit images locally with Qwen-Image
+Exec=qwen-image-cplus.gui
+Icon=${SNAP}/meta/gui/qwen-image-cplus.png
+Terminal=false
+Categories=Graphics;
+StartupWMClass=qwen_image_gui

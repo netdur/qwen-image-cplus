@@ -1,0 +1,62 @@
+name: qwen-image-cplus
+base: core24
+adopt-info: qwen-image
+summary: Local Qwen-Image text-to-image and image editing on NVIDIA GPUs
+description: |
+  Native Qwen-Image-2.1 inference written in C+, with a CUDA engine for NVIDIA
+  GPUs (Turing and newer, 6 GB VRAM is enough for 512x512).
+
+  - `qwen-image-cplus` is the command-line tool.
+  - `qwen-image-cplus.gui` is the desktop app ("Qwen Image").
+
+  Model weights are not included. See
+  https://github.com/netdur/qwen-image-cplus#model-files for the files to
+  download; keep them under your home directory (or removable media) so the
+  snap can read them.
+
+  Needs the proprietary NVIDIA driver on the host.
+license: MIT
+grade: stable
+confinement: strict
+website: https://github.com/netdur/qwen-image-cplus
+source-code: https://github.com/netdur/qwen-image-cplus
+issues: https://github.com/netdur/qwen-image-cplus/issues
+icon: snap/gui/qwen-image-cplus.png
+
+platforms:
+  amd64:
+
+apps:
+  qwen-image-cplus:
+    command: bin/qwen-image-cplus
+    plugs: [home, removable-media, opengl]
+
+  gui:
+    command: bin/qwen-image-gui
+    extensions: [gnome]
+    plugs: [home, removable-media, opengl]
+
+parts:
+  # Packs the distribution scripts/build-linux.sh already built and verified;
+  # nothing is compiled here. CUDA 12, cuDNN 8 and libjpeg are bundled in
+  # lib/qwen-image-cplus and found through RUNPATH.
+  qwen-image:
+    plugin: dump
+    source: dist
+    build-packages: [patchelf]
+    override-pull: |
+      craftctl default
+      craftctl set version="$(sed -n 's/^version *= *"\([^"]*\)"$/\1/p' "$CRAFT_PROJECT_DIR/gui/Cplus.toml")"
+    # The host's NVIDIA driver reaches a strict snap through the `opengl`
+    # interface, which snapd exposes under /var/lib/snapd/lib/gl — outside the
+    # base's loader cache. libcudart dlopens libcuda.so.1, so its RUNPATH
+    # names that directory too (an LD_LIBRARY_PATH built from an unset
+    # variable would put the working directory on the search path).
+    override-build: |
+      craftctl default
+      patchelf --set-rpath '$ORIGIN:/var/lib/snapd/lib/gl' \
+        "$CRAFT_PART_INSTALL/lib/qwen-image-cplus/libcudart.so.12"
+    prime:
+      - bin
+      - lib/qwen-image-cplus
+      - share/facet

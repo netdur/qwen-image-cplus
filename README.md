@@ -52,12 +52,16 @@ images run out of memory with model offload and use group offload. Details in
 
 ## Install
 
-Requires macOS 14 or newer on Apple Silicon. Homebrew installs prebuilt
-binaries; users do not need the C+ compiler. This project and its formula live
-in one repository. With Homebrew 7, trust only this formula when prompted:
+Prebuilt binaries: Homebrew on macOS 14 or newer on Apple Silicon (Metal), a
+snap on Ubuntu with an NVIDIA GPU (CUDA). Users do not need the C+ compiler.
+
+### Homebrew (macOS)
+
+This project and its formula live in one repository. With Homebrew 7, trust
+only this formula when prompted:
 
 ```sh
-brew tap netdur/qwen_image_metal_dev https://github.com/netdur/qwen-image-cplus.git
+brew tap netdur/qwen-image-cplus https://github.com/netdur/qwen-image-cplus.git
 brew trust --formula netdur/qwen-image-cplus/qwen-image-cplus
 brew install netdur/qwen-image-cplus/qwen-image-cplus
 ```
@@ -73,11 +77,47 @@ lib/libqwen_image.a
 lib/libqwen_image.dylib
 ```
 
+### Snap (Ubuntu)
+
+Needs x86_64 Ubuntu (or another distribution with snapd) and an NVIDIA GPU,
+Turing (RTX 20xx) or newer, with the proprietary driver. `nvidia-smi` should
+list the GPU. CUDA and cuDNN are bundled in the snap.
+
+Each release attaches the snap to its
+[GitHub release](https://github.com/netdur/qwen-image-cplus/releases). Download
+it and install it; `--dangerous` is needed because the file does not come from
+the Snap Store:
+
+```sh
+VERSION=0.2.3   # the release you want
+curl -LO "https://github.com/netdur/qwen-image-cplus/releases/download/v$VERSION/qwen-image-cplus_${VERSION}_amd64.snap"
+sudo snap install --dangerous "qwen-image-cplus_${VERSION}_amd64.snap"
+```
+
+Then run it:
+
+```sh
+qwen-image-cplus            # the CLI
+qwen-image-cplus.gui        # the app, also listed as "Qwen Image" in the app launcher
+```
+
+The snap is confined: it can read files under your home directory (not hidden
+folders such as `~/.cache`). To keep the model files on an external drive under
+`/media` or `/mnt`, allow that once:
+
+```sh
+sudo snap connect qwen-image-cplus:removable-media
+```
+
+To upgrade, install the newer `.snap` the same way; to uninstall,
+`sudo snap remove qwen-image-cplus`. Snaps installed from a file do not update
+themselves.
+
 ## Model files
 
-Model weights are intentionally not part of the Homebrew archive. The runtime
-expects a QIPACK transformer and its Qwen-Image-2.1 support files at paths
-supplied to the CLI or library request. Keeping models separate makes
+Model weights are intentionally not part of the Homebrew archive or the snap.
+The runtime expects a QIPACK transformer and its Qwen-Image-2.1 support files at
+paths supplied to the CLI or library request. Keeping models separate makes
 application upgrades small and lets applications manage their own model storage.
 
 The QIPACK files are published at

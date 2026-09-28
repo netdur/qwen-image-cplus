@@ -2,6 +2,9 @@
 set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "$(uname -s)" = Linux ]; then
+    exec "$project_root/scripts/build-linux.sh" "$@"
+fi
 cpc_bin=${CPC:-cpc}
 build_mode=${BUILD_MODE:-release}
 export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-14.0}
