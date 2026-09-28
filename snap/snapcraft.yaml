@@ -1,4 +1,5 @@
 name: qwen-image-cplus
+title: Qwen Image
 base: core24
 adopt-info: qwen-image
 summary: Local Qwen-Image text-to-image and image editing on NVIDIA GPUs
