@@ -8553,19 +8553,25 @@ fn benchmark_production_gemm_case(
     input: metal::Buffer,
     output: metal::Buffer,
     reference: metal::Buffer,
+    converted_weight: metal::Buffer,
     tensor_name: str,
     rows: usize,
     output_columns: usize,
     input_columns: usize,
-    expected_scheme: u32,
 ) -> bool {
     guard let option::Option[LinearWeight]::Some(weight) = packed_linear_weight(
         file, storage, tensor_name, output_columns as u64, input_columns as u64,
     ) else { return false; };
-    if weight.scheme != expected_scheme {
+    if weight.scheme != PACKED_SCHEME_BF16 && weight.scheme != PACKED_SCHEME_FP16
+        && weight.scheme != PACKED_SCHEME_INT8_AFFINE {
         io::eprintln("production GEMM benchmark: unexpected scheme for ${tensor_name}");
         return false;
     }
+    let weight_mode: u32 = if weight.scheme == PACKED_SCHEME_FP16 {
+        1 as u32
+    } else {
+        0 as u32
+    };
     let warmup: option::Option[f64] = if weight.scheme == PACKED_SCHEME_INT8_AFFINE {
         dispatch_int8_linear(
             queue, int8_pipeline, input, weight, reference,
@@ -8574,7 +8580,7 @@ fn benchmark_production_gemm_case(
     } else {
         dispatch_linear(
             queue, dense_pipeline, input, weight.storage, reference,
-            output_columns, input_columns, rows, weight.weights_offset,
+            output_columns, input_columns, rows, weight.weights_offset, weight_mode,
         )
     };
     guard let option::Option[f64]::Some(_warmup_ms) = warmup else { return false; };
@@ -8591,7 +8597,7 @@ fn benchmark_production_gemm_case(
         } else {
             dispatch_linear(
                 queue, dense_pipeline, input, weight.storage, reference,
-                output_columns, input_columns, rows, weight.weights_offset,
+                output_columns, input_columns, rows, weight.weights_offset, weight_mode,
             )
         };
         guard let option::Option[f64]::Some(elapsed_ms) = measured else { return false; };
@@ -8605,7 +8611,7 @@ fn benchmark_production_gemm_case(
     let operations: f64 = 2.0f64 * rows as f64
         * output_columns as f64 * input_columns as f64;
     let throughput_tflops: f64 = operations / (average_ms * 1000000000.0f64);
-    let scheme_name: str = if weight.scheme == PACKED_SCHEME_INT8_AFFINE { "q8" } else { "bf16" };
+    let scheme_name: str = if weight.scheme == PACKED_SCHEME_INT8_AFFINE { "q8" } else if weight.scheme == PACKED_SCHEME_FP16 { "fp16" } else { "bf16" };
     io::println(
         "production GEMM: kernel=scalar scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${average_ms} tflops=${throughput_tflops} tensor=${tensor_name}",
     );
@@ -8713,10 +8719,11 @@ fn benchmark_production_gemm_case(
             "production GEMM: kernel=simdgroup-half-128x32 scheme=q8 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${q8_simdgroup_128_average_ms} tflops=${q8_simdgroup_128_tflops} speedup=${average_ms / q8_simdgroup_128_average_ms} nRMSE=${q8_simdgroup_128_error} tensor=${tensor_name}",
         );
     }
-    if weight.scheme == PACKED_SCHEME_BF16 {
+    if weight.scheme == PACKED_SCHEME_BF16 || weight.scheme == PACKED_SCHEME_FP16 {
         guard let option::Option[f64]::Some(_simdgroup_warmup_ms) = dispatch_simdgroup_linear(
             queue, simdgroup_pipeline, input, weight.storage, output,
             output_columns, input_columns, rows, weight.weights_offset,
+            32 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
         ) else { return false; };
         var simdgroup_total_ms: f64 = 0.0f64;
         iteration = 0 as usize;
@@ -8724,6 +8731,7 @@ fn benchmark_production_gemm_case(
             guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
                 queue, simdgroup_pipeline, input, weight.storage, output,
                 output_columns, input_columns, rows, weight.weights_offset,
+                32 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
             ) else { return false; };
             simdgroup_total_ms = simdgroup_total_ms + elapsed_ms;
             iteration = iteration +% (1 as usize);
@@ -8738,13 +8746,14 @@ fn benchmark_production_gemm_case(
         );
         let speedup: f64 = average_ms / simdgroup_average_ms;
         io::println(
-            "production GEMM: kernel=simdgroup scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${simdgroup_average_ms} tflops=${simdgroup_tflops} speedup=${speedup} nRMSE=${error} tensor=${tensor_name}",
+            "production GEMM: kernel=simdgroup scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${simdgroup_average_ms} tflops=${simdgroup_tflops} speedup=${speedup} nRMSE=${error} tensor=${tensor_name}",
         );
         if error > (0.0001f64) { return false; }
 
         guard let option::Option[f64]::Some(_half_warmup_ms) = dispatch_simdgroup_linear(
             queue, simdgroup_half_pipeline, input, weight.storage, output,
             output_columns, input_columns, rows, weight.weights_offset,
+            32 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
         ) else { return false; };
         var half_total_ms: f64 = 0.0f64;
         iteration = 0 as usize;
@@ -8752,6 +8761,7 @@ fn benchmark_production_gemm_case(
             guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
                 queue, simdgroup_half_pipeline, input, weight.storage, output,
                 output_columns, input_columns, rows, weight.weights_offset,
+                32 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
             ) else { return false; };
             half_total_ms = half_total_ms + elapsed_ms;
             iteration = iteration +% (1 as usize);
@@ -8766,19 +8776,21 @@ fn benchmark_production_gemm_case(
         );
         let half_speedup: f64 = average_ms / half_average_ms;
         io::println(
-            "production GEMM: kernel=simdgroup-half scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${half_average_ms} tflops=${half_tflops} speedup=${half_speedup} nRMSE=${half_error} tensor=${tensor_name}",
+            "production GEMM: kernel=simdgroup-half scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${half_average_ms} tflops=${half_tflops} speedup=${half_speedup} nRMSE=${half_error} tensor=${tensor_name}",
         );
 
         guard let option::Option[f64]::Some(_half_64_warmup_ms) = dispatch_simdgroup_linear(
             queue, simdgroup_half_64_pipeline, input, weight.storage, output,
-            output_columns, input_columns, rows, weight.weights_offset, 64 as usize,
+            output_columns, input_columns, rows, weight.weights_offset,
+            64 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
         ) else { return false; };
         var half_64_total_ms: f64 = 0.0f64;
         iteration = 0 as usize;
         while iteration < iterations {
             guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
                 queue, simdgroup_half_64_pipeline, input, weight.storage, output,
-                output_columns, input_columns, rows, weight.weights_offset, 64 as usize,
+                output_columns, input_columns, rows, weight.weights_offset,
+                64 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
             ) else { return false; };
             half_64_total_ms = half_64_total_ms + elapsed_ms;
             iteration = iteration +% (1 as usize);
@@ -8793,13 +8805,13 @@ fn benchmark_production_gemm_case(
         );
         let half_64_speedup: f64 = average_ms / half_64_average_ms;
         io::println(
-            "production GEMM: kernel=simdgroup-half-64x32 scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${half_64_average_ms} tflops=${half_64_tflops} speedup=${half_64_speedup} nRMSE=${half_64_error} tensor=${tensor_name}",
+            "production GEMM: kernel=simdgroup-half-64x32 scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${half_64_average_ms} tflops=${half_64_tflops} speedup=${half_64_speedup} nRMSE=${half_64_error} tensor=${tensor_name}",
         );
-        if rows == (256 as usize) {
+        if rows == (256 as usize) && env::has_var("QI_TINY_TILE_BENCH") {
             guard let option::Option[f64]::Some(_direct_warmup_ms) = dispatch_simdgroup_linear(
                 queue, simdgroup_half_direct_pipeline, input, weight.storage, output,
                 output_columns, input_columns, rows, weight.weights_offset,
-                64 as usize, 256 as usize,
+                64 as usize, 256 as usize, OUTPUT_TILE, weight_mode,
             ) else { return false; };
             var direct_total_ms: f64 = 0.0f64;
             iteration = 0 as usize;
@@ -8807,7 +8819,7 @@ fn benchmark_production_gemm_case(
                 guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
                     queue, simdgroup_half_direct_pipeline, input, weight.storage, output,
                     output_columns, input_columns, rows, weight.weights_offset,
-                    64 as usize, 256 as usize,
+                    64 as usize, 256 as usize, OUTPUT_TILE, weight_mode,
                 ) else { return false; };
                 direct_total_ms = direct_total_ms + elapsed_ms;
                 iteration = iteration +% (1 as usize);
@@ -8817,13 +8829,13 @@ fn benchmark_production_gemm_case(
                 output, 0 as usize, reference, 0 as usize, rows *% output_columns,
             );
             io::println(
-                "production GEMM: kernel=simdgroup-half-64x32-direct scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${direct_average_ms} tflops=${operations / (direct_average_ms * 1000000000.0f64)} speedup=${average_ms / direct_average_ms} nRMSE=${direct_error} tensor=${tensor_name}",
+                "production GEMM: kernel=simdgroup-half-64x32-direct scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${direct_average_ms} tflops=${operations / (direct_average_ms * 1000000000.0f64)} speedup=${average_ms / direct_average_ms} nRMSE=${direct_error} tensor=${tensor_name}",
             );
             guard let option::Option[f64]::Some(_tile_64x64_warmup_ms) =
                 dispatch_simdgroup_linear(
                     queue, simdgroup_half_64x64_pipeline, input, weight.storage, output,
                 output_columns, input_columns, rows, weight.weights_offset,
-                64 as usize, 512 as usize, 64 as usize,
+                64 as usize, 512 as usize, 64 as usize, weight_mode,
             ) else { return false; };
             var tile_64x64_total_ms: f64 = 0.0f64;
             iteration = 0 as usize;
@@ -8831,7 +8843,7 @@ fn benchmark_production_gemm_case(
                 guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
                     queue, simdgroup_half_64x64_pipeline, input, weight.storage, output,
                     output_columns, input_columns, rows, weight.weights_offset,
-                    64 as usize, 512 as usize, 64 as usize,
+                    64 as usize, 512 as usize, 64 as usize, weight_mode,
                 ) else { return false; };
                 tile_64x64_total_ms = tile_64x64_total_ms + elapsed_ms;
                 iteration = iteration +% (1 as usize);
@@ -8841,20 +8853,22 @@ fn benchmark_production_gemm_case(
                 output, 0 as usize, reference, 0 as usize, rows *% output_columns,
             );
             io::println(
-                "production GEMM: kernel=simdgroup-half-64x64-direct scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${tile_64x64_average_ms} tflops=${operations / (tile_64x64_average_ms * 1000000000.0f64)} speedup=${average_ms / tile_64x64_average_ms} nRMSE=${tile_64x64_error} tensor=${tensor_name}",
+                "production GEMM: kernel=simdgroup-half-64x64-direct scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${tile_64x64_average_ms} tflops=${operations / (tile_64x64_average_ms * 1000000000.0f64)} speedup=${average_ms / tile_64x64_average_ms} nRMSE=${tile_64x64_error} tensor=${tensor_name}",
             );
         }
 
         guard let option::Option[f64]::Some(_half_128_warmup_ms) = dispatch_simdgroup_linear(
             queue, simdgroup_half_128_pipeline, input, weight.storage, output,
-            output_columns, input_columns, rows, weight.weights_offset, 128 as usize,
+            output_columns, input_columns, rows, weight.weights_offset,
+            128 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
         ) else { return false; };
         var half_128_total_ms: f64 = 0.0f64;
         iteration = 0 as usize;
         while iteration < iterations {
             guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
                 queue, simdgroup_half_128_pipeline, input, weight.storage, output,
-                output_columns, input_columns, rows, weight.weights_offset, 128 as usize,
+                output_columns, input_columns, rows, weight.weights_offset,
+                128 as usize, 512 as usize, OUTPUT_TILE, weight_mode,
             ) else { return false; };
             half_128_total_ms = half_128_total_ms + elapsed_ms;
             iteration = iteration +% (1 as usize);
@@ -8865,35 +8879,75 @@ fn benchmark_production_gemm_case(
             output, 0 as usize, reference, 0 as usize, rows *% output_columns,
         );
         io::println(
-            "production GEMM: kernel=simdgroup-half-128x32 scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${half_128_average_ms} tflops=${half_128_tflops} speedup=${average_ms / half_128_average_ms} nRMSE=${half_128_error} tensor=${tensor_name}",
+            "production GEMM: kernel=simdgroup-half-128x32 scheme=${scheme_name} rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${half_128_average_ms} tflops=${half_128_tflops} speedup=${average_ms / half_128_average_ms} nRMSE=${half_128_error} tensor=${tensor_name}",
         );
 
-        guard let option::Option[f64]::Some(_bfloat_warmup_ms) = dispatch_simdgroup_linear(
-            queue, simdgroup_bfloat_pipeline, input, weight.storage, output,
-            output_columns, input_columns, rows, weight.weights_offset,
-        ) else { return false; };
-        var bfloat_total_ms: f64 = 0.0f64;
-        iteration = 0 as usize;
-        while iteration < iterations {
-            guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
+        if weight.scheme == PACKED_SCHEME_BF16 {
+            guard let option::Option[f64]::Some(_bfloat_warmup_ms) = dispatch_simdgroup_linear(
                 queue, simdgroup_bfloat_pipeline, input, weight.storage, output,
                 output_columns, input_columns, rows, weight.weights_offset,
             ) else { return false; };
-            bfloat_total_ms = bfloat_total_ms + elapsed_ms;
-            iteration = iteration +% (1 as usize);
+            var bfloat_total_ms: f64 = 0.0f64;
+            iteration = 0 as usize;
+            while iteration < iterations {
+                guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
+                    queue, simdgroup_bfloat_pipeline, input, weight.storage, output,
+                    output_columns, input_columns, rows, weight.weights_offset,
+                ) else { return false; };
+                bfloat_total_ms = bfloat_total_ms + elapsed_ms;
+                iteration = iteration +% (1 as usize);
+            }
+            if !finite("production bfloat SIMD-group GEMM ${tensor_name}", output, rows *% output_columns) {
+                return false;
+            }
+            let bfloat_average_ms: f64 = bfloat_total_ms / iterations as f64;
+            let bfloat_tflops: f64 = operations / (bfloat_average_ms * 1000000000.0f64);
+            let bfloat_error: f64 = normalized_rms_buffers(
+                output, 0 as usize, reference, 0 as usize, rows *% output_columns,
+            );
+            let bfloat_speedup: f64 = average_ms / bfloat_average_ms;
+            io::println(
+                "production GEMM: kernel=simdgroup-bfloat scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${bfloat_average_ms} tflops=${bfloat_tflops} speedup=${bfloat_speedup} nRMSE=${bfloat_error} tensor=${tensor_name}",
+            );
+        } else {
+            // weights_offset is a BYTE offset: add it to a *u8 base, then cast.
+            let source_values: *u16 =
+                ((weight.storage.contents() as *u8) + (weight.weights_offset as usize)) as *u16;
+            let converted_values: *u16 = converted_weight.contents() as *u16;
+            let weight_elements: usize = output_columns *% input_columns;
+            var convert_index: usize = 0 as usize;
+            while convert_index < weight_elements {
+                converted_values[convert_index] =
+                    cpu::f32_to_bf16(cpu::fp16_to_f32(source_values[convert_index]));
+                convert_index = convert_index +% (1 as usize);
+            }
+            guard let option::Option[f64]::Some(_bfloat_warmup_ms) = dispatch_simdgroup_linear(
+                queue, simdgroup_bfloat_pipeline, input, converted_weight, output,
+                output_columns, input_columns, rows,
+            ) else { return false; };
+            var bfloat_total_ms: f64 = 0.0f64;
+            iteration = 0 as usize;
+            while iteration < iterations {
+                guard let option::Option[f64]::Some(elapsed_ms) = dispatch_simdgroup_linear(
+                    queue, simdgroup_bfloat_pipeline, input, converted_weight, output,
+                    output_columns, input_columns, rows,
+                ) else { return false; };
+                bfloat_total_ms = bfloat_total_ms + elapsed_ms;
+                iteration = iteration +% (1 as usize);
+            }
+            if !finite("production bfloat SIMD-group GEMM ${tensor_name}", output, rows *% output_columns) {
+                return false;
+            }
+            let bfloat_average_ms: f64 = bfloat_total_ms / iterations as f64;
+            let bfloat_tflops: f64 = operations / (bfloat_average_ms * 1000000000.0f64);
+            let bfloat_error: f64 = normalized_rms_buffers(
+                output, 0 as usize, reference, 0 as usize, rows *% output_columns,
+            );
+            let bfloat_speedup: f64 = average_ms / bfloat_average_ms;
+            io::println(
+                "production GEMM: kernel=simdgroup-bfloat scheme=fp16->bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${bfloat_average_ms} tflops=${bfloat_tflops} speedup=${bfloat_speedup} nRMSE=${bfloat_error} tensor=${tensor_name}",
+            );
         }
-        if !finite("production bfloat SIMD-group GEMM ${tensor_name}", output, rows *% output_columns) {
-            return false;
-        }
-        let bfloat_average_ms: f64 = bfloat_total_ms / iterations as f64;
-        let bfloat_tflops: f64 = operations / (bfloat_average_ms * 1000000000.0f64);
-        let bfloat_error: f64 = normalized_rms_buffers(
-            output, 0 as usize, reference, 0 as usize, rows *% output_columns,
-        );
-        let bfloat_speedup: f64 = average_ms / bfloat_average_ms;
-        io::println(
-            "production GEMM: kernel=simdgroup-bfloat scheme=bf16 rows=${rows} output=${output_columns} input=${input_columns} gpu_ms=${bfloat_average_ms} tflops=${bfloat_tflops} speedup=${bfloat_speedup} nRMSE=${bfloat_error} tensor=${tensor_name}",
-        );
     }
     return true;
 }
@@ -8988,7 +9042,7 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
     guard let option::Option[metal::Buffer]::Some(storage) =
         packed_storage_buffer(device, weight_file) else { return 1; };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
-    let maximum_elements: usize = (278 as usize) *% MLP_WIDTH;
+    let maximum_elements: usize = (16384 as usize) *% MLP_WIDTH;
     let maximum_bytes: u64 = (maximum_elements *% #size_of::[f32]()) as u64;
     guard let option::Option[metal::Buffer]::Some(input) =
         new_buffer(device, maximum_bytes) else { return 1; };
@@ -8999,6 +9053,9 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
     guard let option::Option[metal::Buffer]::Some(reference) =
         new_buffer(device, maximum_bytes) else { return 1; };
     let reference_owner: OwnedObjc = OwnedObjc::new(reference.raw());
+    guard let option::Option[metal::Buffer]::Some(converted_weight) =
+        new_buffer(device, (MLP_WIDTH *% WIDTH *% #size_of::[u16]()) as u64) else { return 1; };
+    let converted_weight_owner: OwnedObjc = OwnedObjc::new(converted_weight.raw());
     let input_values: *f32 = input.contents() as *f32;
     var index: usize = 0 as usize;
     while index < maximum_elements {
@@ -9006,10 +9063,13 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
         index = index +% (1 as usize);
     }
 
+    let row_cases: [usize; 5] = [
+        256 as usize, 1024 as usize, 3456 as usize, 4096 as usize, 16384 as usize,
+    ];
     var all_ok: bool = true;
-    var rows: usize = 256 as usize;
     var row_case: usize = 0 as usize;
-    while row_case < (2 as usize) {
+    while row_case < (5 as usize) {
+        let rows: usize = row_cases[row_case];
         all_ok = benchmark_production_gemm_case(
             queue, dense_pipeline, int8_pipeline, int8_simdgroup_pipeline,
             int8_simdgroup_direct_pipeline, int8_simdgroup_64x64_pipeline,
@@ -9019,9 +9079,8 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
             simdgroup_half_64x64_pipeline,
             simdgroup_half_128_pipeline,
             simdgroup_bfloat_pipeline,
-            weight_file, storage, input, output, reference,
+            weight_file, storage, input, output, reference, converted_weight,
             "transformer_blocks.0.attn.to_q.weight", rows, WIDTH, WIDTH,
-            PACKED_SCHEME_BF16,
         ) && all_ok;
         all_ok = benchmark_production_gemm_case(
             queue, dense_pipeline, int8_pipeline, int8_simdgroup_pipeline,
@@ -9032,9 +9091,8 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
             simdgroup_half_64x64_pipeline,
             simdgroup_half_128_pipeline,
             simdgroup_bfloat_pipeline,
-            weight_file, storage, input, output, reference,
+            weight_file, storage, input, output, reference, converted_weight,
             "transformer_blocks.0.img_mlp.gate_layer.weight", rows, MLP_WIDTH, WIDTH,
-            PACKED_SCHEME_BF16,
         ) && all_ok;
         all_ok = benchmark_production_gemm_case(
             queue, dense_pipeline, int8_pipeline, int8_simdgroup_pipeline,
@@ -9045,9 +9103,8 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
             simdgroup_half_64x64_pipeline,
             simdgroup_half_128_pipeline,
             simdgroup_bfloat_pipeline,
-            weight_file, storage, input, output, reference,
+            weight_file, storage, input, output, reference, converted_weight,
             "transformer_blocks.0.img_mlp.out.weight", rows, WIDTH, MLP_WIDTH,
-            PACKED_SCHEME_BF16,
         ) && all_ok;
         all_ok = benchmark_production_gemm_case(
             queue, dense_pipeline, int8_pipeline, int8_simdgroup_pipeline,
@@ -9058,9 +9115,8 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
             simdgroup_half_64x64_pipeline,
             simdgroup_half_128_pipeline,
             simdgroup_bfloat_pipeline,
-            weight_file, storage, input, output, reference,
+            weight_file, storage, input, output, reference, converted_weight,
             "transformer_blocks.28.attn.to_q.weight", rows, WIDTH, WIDTH,
-            PACKED_SCHEME_INT8_AFFINE,
         ) && all_ok;
         all_ok = benchmark_production_gemm_case(
             queue, dense_pipeline, int8_pipeline, int8_simdgroup_pipeline,
@@ -9071,9 +9127,8 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
             simdgroup_half_64x64_pipeline,
             simdgroup_half_128_pipeline,
             simdgroup_bfloat_pipeline,
-            weight_file, storage, input, output, reference,
+            weight_file, storage, input, output, reference, converted_weight,
             "transformer_blocks.28.img_mlp.proj.weight", rows, MLP_WIDTH, WIDTH,
-            PACKED_SCHEME_INT8_AFFINE,
         ) && all_ok;
         all_ok = benchmark_production_gemm_case(
             queue, dense_pipeline, int8_pipeline, int8_simdgroup_pipeline,
@@ -9084,11 +9139,9 @@ fn benchmark_production_gemm(packed_path: str) -> i32 {
             simdgroup_half_64x64_pipeline,
             simdgroup_half_128_pipeline,
             simdgroup_bfloat_pipeline,
-            weight_file, storage, input, output, reference,
+            weight_file, storage, input, output, reference, converted_weight,
             "transformer_blocks.28.img_mlp.out.weight", rows, WIDTH, MLP_WIDTH,
-            PACKED_SCHEME_INT8_AFFINE,
         ) && all_ok;
-        rows = 278 as usize;
         row_case = row_case +% (1 as usize);
     }
     io::println("production GEMM benchmark: packed_load_wall_ms=${load_wall_ms} iterations=3");
@@ -9111,10 +9164,10 @@ fn benchmark_mps_gemm_case(
     output: metal::Buffer,
     reference: metal::Buffer,
     tensor_name: str,
+    rows: usize,
     output_columns: usize,
     input_columns: usize,
 ) -> bool {
-    let rows: usize = 256 as usize;
     guard let option::Option[LinearWeight]::Some(weight) = packed_linear_weight(
         file, storage, tensor_name, output_columns as u64, input_columns as u64,
     ) else { return false; };
@@ -9253,8 +9306,8 @@ fn benchmark_mps_gemm(packed_path: str) -> i32 {
     guard let option::Option[metal::Buffer]::Some(storage) =
         packed_storage_buffer(device, weight_file) else { return 1; };
     let storage_owner: OwnedObjc = OwnedObjc::new(storage.raw());
-    let maximum_input_elements: usize = (256 as usize) *% MLP_WIDTH;
-    let maximum_output_elements: usize = (256 as usize) *% MLP_WIDTH;
+    let maximum_input_elements: usize = (16384 as usize) *% MLP_WIDTH;
+    let maximum_output_elements: usize = (16384 as usize) *% MLP_WIDTH;
     let maximum_weight_elements: usize = MLP_WIDTH *% WIDTH;
     guard let option::Option[metal::Buffer]::Some(input) = new_buffer(
         device, (maximum_input_elements *% #size_of::[f32]()) as u64,
@@ -9282,48 +9335,56 @@ fn benchmark_mps_gemm(packed_path: str) -> i32 {
         input_values[index] = ((index % (251 as usize)) as f32 - 125.0f32) / 4096.0f32;
         index = index +% (1 as usize);
     }
+    let row_cases: [usize; 5] = [
+        256 as usize, 1024 as usize, 3456 as usize, 4096 as usize, 16384 as usize,
+    ];
     var all_ok: bool = true;
-    all_ok = benchmark_mps_gemm_case(
-        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
-        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
-        input, half_input, half_weight, output, reference,
-        "transformer_blocks.0.attn.to_q.weight", WIDTH, WIDTH,
-    ) && all_ok;
-    all_ok = benchmark_mps_gemm_case(
-        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
-        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
-        input, half_input, half_weight, output, reference,
-        "transformer_blocks.0.img_mlp.gate_layer.weight",
-        MLP_WIDTH, WIDTH,
-    ) && all_ok;
-    all_ok = benchmark_mps_gemm_case(
-        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
-        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
-        input, half_input, half_weight, output, reference,
-        "transformer_blocks.0.img_mlp.out.weight",
-        WIDTH, MLP_WIDTH,
-    ) && all_ok;
-    all_ok = benchmark_mps_gemm_case(
-        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
-        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
-        input, half_input, half_weight, output, reference,
-        "transformer_blocks.28.attn.to_q.weight",
-        WIDTH, WIDTH,
-    ) && all_ok;
-    all_ok = benchmark_mps_gemm_case(
-        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
-        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
-        input, half_input, half_weight, output, reference,
-        "transformer_blocks.28.img_mlp.proj.weight",
-        MLP_WIDTH, WIDTH,
-    ) && all_ok;
-    all_ok = benchmark_mps_gemm_case(
-        device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
-        bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
-        input, half_input, half_weight, output, reference,
-        "transformer_blocks.28.img_mlp.out.weight",
-        WIDTH, MLP_WIDTH,
-    ) && all_ok;
+    var row_case: usize = 0 as usize;
+    while row_case < (5 as usize) {
+        let rows: usize = row_cases[row_case];
+        all_ok = benchmark_mps_gemm_case(
+            device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+            bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+            input, half_input, half_weight, output, reference,
+            "transformer_blocks.0.attn.to_q.weight", rows, WIDTH, WIDTH,
+        ) && all_ok;
+        all_ok = benchmark_mps_gemm_case(
+            device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+            bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+            input, half_input, half_weight, output, reference,
+            "transformer_blocks.0.img_mlp.gate_layer.weight",
+            rows, MLP_WIDTH, WIDTH,
+        ) && all_ok;
+        all_ok = benchmark_mps_gemm_case(
+            device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+            bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+            input, half_input, half_weight, output, reference,
+            "transformer_blocks.0.img_mlp.out.weight",
+            rows, WIDTH, MLP_WIDTH,
+        ) && all_ok;
+        all_ok = benchmark_mps_gemm_case(
+            device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+            bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+            input, half_input, half_weight, output, reference,
+            "transformer_blocks.28.attn.to_q.weight",
+            rows, WIDTH, WIDTH,
+        ) && all_ok;
+        all_ok = benchmark_mps_gemm_case(
+            device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+            bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+            input, half_input, half_weight, output, reference,
+            "transformer_blocks.28.img_mlp.proj.weight",
+            rows, MLP_WIDTH, WIDTH,
+        ) && all_ok;
+        all_ok = benchmark_mps_gemm_case(
+            device, queue, dense_pipeline, int8_pipeline, input_conversion_pipeline,
+            bf16_conversion_pipeline, q8_conversion_pipeline, weight_file, storage,
+            input, half_input, half_weight, output, reference,
+            "transformer_blocks.28.img_mlp.out.weight",
+            rows, WIDTH, MLP_WIDTH,
+        ) && all_ok;
+        row_case = row_case +% (1 as usize);
+    }
     return if all_ok { 0 } else { 1 };
 }
 
@@ -9680,6 +9741,9 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
     var cached_flash_total_ms: f64 = 0.0f64;
     var cached_graph_total_ms: f64 = 0.0f64;
     var prefill_graph_total_ms: f64 = 0.0f64;
+    var cached_graph_wall_total_ms: i64 = 0 as i64;
+    var prefill_graph_wall_total_ms: i64 = 0 as i64;
+    var cached_flash_wall_total_ms: i64 = 0 as i64;
     index = 0 as usize;
     while index < iterations {
         guard let option::Option[f64]::Some(prefill_ms) = dispatch_attention(
@@ -9707,19 +9771,28 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
             queue, flash_attention_pipeline, full_query, flash_key, full_flash_output,
             flash_value, image_ids, key_valid, full_rows, full_rows, padded_key_rows,
         ) else { return 1; };
+        let cached_flash_wall_start_ms: i64 = time::now_millis();
         guard let option::Option[f64]::Some(cached_flash_ms) = dispatch_flash_attention(
             queue, flash_attention_pipeline, target_query, flash_key, target_flash_output,
             flash_value, image_ids, key_valid, target_rows, full_rows, padded_key_rows,
             prefix_rows,
         ) else { return 1; };
+        cached_flash_wall_total_ms = cached_flash_wall_total_ms +
+            (time::now_millis() - cached_flash_wall_start_ms);
+        let cached_graph_wall_start_ms: i64 = time::now_millis();
         guard let option::Option[f64]::Some(cached_graph_ms) = graph_attention::dispatch(
             #addr_of(graph_cached_attention), queue, target_query, flash_key, flash_value,
             target_graph_output,
         ) else { return 1; };
+        cached_graph_wall_total_ms = cached_graph_wall_total_ms +
+            (time::now_millis() - cached_graph_wall_start_ms);
+        let prefill_graph_wall_start_ms: i64 = time::now_millis();
         guard let option::Option[f64]::Some(prefill_graph_ms) = graph_attention::dispatch_masked(
             #addr_of(graph_prefill_attention), queue, full_query, flash_key, flash_value,
             graph_mask, full_graph_output,
         ) else { return 1; };
+        prefill_graph_wall_total_ms = prefill_graph_wall_total_ms +
+            (time::now_millis() - prefill_graph_wall_start_ms);
         guard let option::Option[f64]::Some(prefill_simdgroup_ms) = dispatch_attention(
             queue, simdgroup_attention_pipeline, full_query, full_key, full_simdgroup_output,
             full_value, image_ids, key_valid, full_rows, full_rows, cache_key, cache_value, 0 as u64,
@@ -9806,7 +9879,7 @@ fn benchmark_production_attention(pixels: str = "256") -> i32 {
         "production attention benchmark: kernel=flash128-fp16-kv prefill_gpu_ms=${prefill_flash_average_ms} speedup_vs_simdgroup4=${prefill_four_query_average_ms / prefill_flash_average_ms} prefill_nRMSE=${flash_prefill_error} cached_gpu_ms=${cached_flash_average_ms} cached_speedup_vs_simdgroup4=${cached_four_query_average_ms / cached_flash_average_ms} cached_nRMSE=${flash_cached_error} projected_40_step_32_block_gpu_ms=${flash_projected_trajectory_ms}",
     );
     io::println(
-        "production attention benchmark: kernel=mpsgraph-fp16 prefill_gpu_ms=${prefill_graph_average_ms} prefill_speedup_vs_flash=${prefill_flash_average_ms / prefill_graph_average_ms} prefill_nRMSE=${graph_prefill_error} cached_gpu_ms=${cached_graph_average_ms} cached_speedup_vs_flash=${cached_flash_average_ms / cached_graph_average_ms} cached_nRMSE=${graph_cached_error}",
+        "production attention benchmark: kernel=mpsgraph-fp16 prefill_gpu_ms=${prefill_graph_average_ms} prefill_speedup_vs_flash=${prefill_flash_average_ms / prefill_graph_average_ms} prefill_nRMSE=${graph_prefill_error} cached_gpu_ms=${cached_graph_average_ms} cached_speedup_vs_flash=${cached_flash_average_ms / cached_graph_average_ms} cached_nRMSE=${graph_cached_error} prefill_wall_ms=${prefill_graph_wall_total_ms / iterations as i64} cached_wall_ms=${cached_graph_wall_total_ms / iterations as i64} flash_cached_wall_ms=${cached_flash_wall_total_ms / iterations as i64}",
     );
     return if prefill_error <= 0.00001f64 && cached_error <= 0.00001f64
         && four_query_prefill_error <= 0.00001f64 && four_query_cached_error <= 0.00001f64
