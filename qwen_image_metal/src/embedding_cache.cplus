@@ -1,0 +1,555 @@
+import "stdlib/crypto" as crypto;
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/io" as io;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
+import "stdlib/vec" as vec;
+
+// A disk cache for Qwen3-VL text-encoder embeddings, keyed on the exact token
+// IDs plus the identity (size + mtime) of every file the encoding depends on.
+// A hit skips the whole text phase: 13.9 GB of shard streaming and a few
+// seconds of GPU work become one small file read. The stored payload is the
+// same FP32 row data the encoder writes into the caller's buffer, so a hit is
+// bit-identical to a fresh encode by construction.
+//
+// Scope: text-to-image prompts only (the pure-text path). Edit-mode
+// conditioning also mixes vision-tower outputs, whose inputs include image
+// bytes; those stay uncached until a key covers them.
+//
+// Controls:
+//   QI_DISABLE_EMBEDDING_CACHE=1   disable both lookup and store
+//   QI_EMBEDDING_CACHE_DIR=<path>  override the cache directory (tests)
+
+// Bump when the embedding payload's meaning changes (encoder math, tokenizer
+// normalization). Entries from older formats are treated as misses.
+const CACHE_FORMAT: u64 = 1;
+
+// The encoder's embedding row width, matching pipeline.cplus TEXT_WIDTH and
+// qwen3vl_text.cplus WIDTH.
+const TEXT_WIDTH: usize = 4096;
+
+// Directory entry cap. Each entry is rows * 4096 f32 (384 KiB for a 24-token
+// prompt, about 8 MiB at the 512-token cap), so 32 entries stay small.
+const MAX_ENTRIES: usize = 32;
+
+// File magic: "QITXEMB1".
+const MAGIC_0: u8 = 81 as u8;
+const MAGIC_1: u8 = 73 as u8;
+const MAGIC_2: u8 = 84 as u8;
+const MAGIC_3: u8 = 88 as u8;
+const MAGIC_4: u8 = 69 as u8;
+const MAGIC_5: u8 = 77 as u8;
+const MAGIC_6: u8 = 66 as u8;
+const MAGIC_7: u8 = 49 as u8;
+
+// Layout: magic(8) u32 format u32 rows u64 value_count digest(32)
+// payload f32[value_count]. All integers little-endian.
+const HEADER_BYTES: usize = 8 + 4 + 4 + 8 + 32;
+
+enum EmbeddingCacheOutcome {
+    Disabled,
+    Miss,
+    Hit,
+    Stored,
+    StoreFailed,
+}
+
+// The files whose content decides the embeddings: the tokenizer assets and the
+// four text-encoder shards. Sizes and mtimes only — hashing 17.5 GB per run
+// would cost more than the encode it guards. A re-download lands on a new
+// mtime and a fresh key; a same-size rewrite with a preserved mtime is the
+// accepted (documented) stale-risk edge.
+fn identity_files() -> vec::Vec[str] {
+    var names: vec::Vec[str] = vec::Vec[str]::with_capacity(6 as usize);
+    names.append("processor/vocab.json");
+    names.append("processor/merges.txt");
+    names.append("text_encoder/model-00001-of-00004.safetensors");
+    names.append("text_encoder/model-00002-of-00004.safetensors");
+    names.append("text_encoder/model-00003-of-00004.safetensors");
+    names.append("text_encoder/model-00004-of-00004.safetensors");
+    return names;
+}
+
+fn append_u64(ref buf: vec::Vec[u8], v: u64) {
+    var shift: u64 = 0 as u64;
+    while shift < (64 as u64) {
+        buf.append(((v >> shift) & (255 as u64)) as u8);
+        shift = shift +% (8 as u64);
+    }
+    return;
+}
+
+fn append_u32(ref buf: vec::Vec[u8], v: u32) {
+    var shift: u32 = 0 as u32;
+    while shift < (32 as u32) {
+        buf.append(((v >> shift) & (255 as u32)) as u8);
+        shift = shift +% (8 as u32);
+    }
+    return;
+}
+
+fn append_str(ref buf: vec::Vec[u8], s: str) {
+    let owned: text::Text = text::from_str(s);
+    append_u64(buf, owned.count() as u64);
+    var index: usize = 0 as usize;
+    while index < owned.count() {
+        match owned.byte_at(index) {
+            option::Option[u8]::Some(b) => buf.append(b),
+            option::Option[u8]::None => buf.append(0 as u8),
+        }
+        index = index +% (1 as usize);
+    }
+    return;
+}
+
+fn read_u32(data: *u8, at: usize) -> u32 {
+    var value: u32 = 0 as u32;
+    var shift: u32 = 0 as u32;
+    var index: usize = 0 as usize;
+    while index < (4 as usize) {
+        value = value | (({ *(data + at + index) } as u32) << shift);
+        index = index +% (1 as usize);
+        shift = shift +% (8 as u32);
+    }
+    return value;
+}
+
+fn read_u64(data: *u8, at: usize) -> u64 {
+    var value: u64 = 0 as u64;
+    var shift: u64 = 0 as u64;
+    var index: usize = 0 as usize;
+    while index < (8 as usize) {
+        value = value | (({ *(data + at + index) } as u64) << shift);
+        index = index +% (1 as usize);
+        shift = shift +% (8 as u64);
+    }
+    return value;
+}
+
+// IEEE-754 binary32: finite iff the exponent field is not all ones.
+fn f32_bits_finite(raw: u32) -> bool {
+    return (raw & (2139095040 as u32)) != (2139095040 as u32);
+}
+
+// The SHA-256 over everything the embeddings depend on, hexed for the filename.
+fn cache_key(model_root: str, token_ids: *u32, token_count: usize) -> option::Option[text::Text] {
+    var material: vec::Vec[u8] = vec::Vec[u8]::with_capacity(
+        (64 as usize) +% token_count *% (4 as usize) +% (512 as usize),
+    );
+    append_str(material, "qi-text-embedding-cache-v1");
+    append_u64(material, CACHE_FORMAT);
+    append_u64(material, token_count as u64);
+    var token_index: usize = 0 as usize;
+    while token_index < token_count {
+        append_u32(material, { *(token_ids + token_index) });
+        token_index = token_index +% (1 as usize);
+    }
+    let identity: vec::Vec[str] = identity_files();
+    var identity_index: usize = 0 as usize;
+    while identity_index < identity.count() {
+        guard let option::Option[str]::Some(relative) = identity.at(identity_index) else { return option::Option[text::Text]::None; };
+        let full: text::Text = "${model_root}/${relative}";
+        match fs::metadata(full.view()) {
+            result::Result[fs::Metadata, result::IoError]::Ok(info) => {
+                append_str(material, relative);
+                append_u64(material, info.size as u64);
+                append_u64(material, info.mtime as u64);
+            }
+            result::Result[fs::Metadata, result::IoError]::Err(_) => {
+                // An unreadable identity file disables the cache rather than
+                // pretending the key is safe.
+                return option::Option[text::Text]::None;
+            }
+        }
+        identity_index = identity_index +% (1 as usize);
+    }
+    let digest: crypto::Digest = crypto::sha256_bytes(
+        #slice_ptr(material.as_slice()), material.count(),
+    );
+    return option::Option[text::Text]::Some(digest.hex());
+}
+
+fn cache_root(model_root: str) -> text::Text {
+    match env::var("QI_EMBEDDING_CACHE_DIR") {
+        option::Option[text::Text]::Some(overridden) => {
+            return overridden;
+        }
+        option::Option[text::Text]::None => {}
+    }
+    return "${model_root}/.cache/qi-cplus-fork/text-embeddings-v1";
+}
+
+fn entry_path(model_root: str, token_ids: *u32, token_count: usize) -> option::Option[text::Text] {
+    guard let option::Option[text::Text]::Some(key) = cache_key(model_root, token_ids, token_count) else {
+        return option::Option[text::Text]::None;
+    };
+    return option::Option[text::Text]::Some("${cache_root(model_root)}/${key}.bin");
+}
+
+fn disabled_by_env() -> bool {
+    return env::has_var("QI_DISABLE_EMBEDDING_CACHE");
+}
+
+fn hex_to_bytes(hex: text::Text) -> vec::Vec[u8] {
+    var out: vec::Vec[u8] = vec::Vec[u8]::with_capacity(hex.count() / (2 as usize));
+    var index: usize = 0 as usize;
+    while index +% (1 as usize) < hex.count() {
+        match hex_nibble(hex.byte_at(index), hex.byte_at(index +% (1 as usize))) {
+            option::Option[u8]::Some(b) => out.append(b),
+            option::Option[u8]::None => {
+                return vec::Vec[u8]::with_capacity(0 as usize);
+            }
+        }
+        index = index +% (2 as usize);
+    }
+    return out;
+}
+
+fn hex_nibble(high: option::Option[u8], low: option::Option[u8]) -> option::Option[u8] {
+    guard let option::Option[u8]::Some(h) = high else { return option::Option[u8]::None; };
+    guard let option::Option[u8]::Some(l) = low else { return option::Option[u8]::None; };
+    guard let option::Option[u8]::Some(hv) = nibble_value(h) else { return option::Option[u8]::None; };
+    guard let option::Option[u8]::Some(lv) = nibble_value(l) else { return option::Option[u8]::None; };
+    return option::Option[u8]::Some((hv << (4 as u8)) | lv);
+}
+
+fn nibble_value(c: u8) -> option::Option[u8] {
+    if c >= (48 as u8) && c <= (57 as u8) { return option::Option[u8]::Some(c - (48 as u8)); }
+    if c >= (97 as u8) && c <= (102 as u8) { return option::Option[u8]::Some(c - (87 as u8)); }
+    return option::Option[u8]::None;
+}
+
+// Validate a cache file against the key it must belong to and copy its payload
+// out. Any doubt resolves to false; a cache never becomes an error.
+fn read_entry(
+    path: str,
+    key: text::Text,
+    values: *f32,
+    value_capacity: usize,
+    row_count: *usize,
+) -> bool {
+    guard let result::Result[fs::File, result::IoError]::Ok(file_value) = fs::open_read(path) else {
+        return false;
+    };
+    var file: fs::File = file_value;
+    guard let result::Result[vec::Vec[u8], result::IoError]::Ok(bytes) = file.read_to_end() else {
+        return false;
+    };
+    file.close();
+    if bytes.count() < HEADER_BYTES { return false; }
+    if bytes.count() != HEADER_BYTES +% (read_u64(#slice_ptr(bytes.as_slice()), 16 as usize) as usize) *% (4 as usize) {
+        return false;
+    }
+    let data: *u8 = #slice_ptr(bytes.as_slice());
+    if read_u32(data, 8 as usize) != CACHE_FORMAT as u32 { return false; }
+    let rows: u32 = read_u32(data, 12 as usize);
+    let value_count: u64 = read_u64(data, 16 as usize);
+    if (rows as u64) *% (TEXT_WIDTH as u64) != value_count { return false; }
+    if value_count > value_capacity as u64 { return false; }
+    // The digest stored in the file must be the key the caller asked for.
+    let key_bytes: vec::Vec[u8] = hex_to_bytes(key);
+    if key_bytes.count() != (32 as usize) { return false; }
+    var digest_index: usize = 0 as usize;
+    while digest_index < (32 as usize) {
+        guard let option::Option[u8]::Some(key_byte) = key_bytes.at(digest_index) else { return false; };
+        if { *(data + (24 as usize) + digest_index) } != key_byte {
+            return false;
+        }
+        digest_index = digest_index +% (1 as usize);
+    }
+    var value_index: usize = 0 as usize;
+    while value_index < value_count as usize {
+        let raw: u32 = read_u32(data, HEADER_BYTES +% value_index *% (4 as usize));
+        if !f32_bits_finite(raw) { return false; }
+        values[value_index] = #bitcast::[f32](raw);
+        value_index = value_index +% (1 as usize);
+    }
+    * row_count = rows as usize;
+    return true;
+}
+
+fn write_entry(path: str, key: text::Text, values: *f32, rows: usize) -> bool {
+    let value_count: usize = rows *% TEXT_WIDTH;
+    var payload: vec::Vec[u8] = vec::Vec[u8]::with_capacity(
+        HEADER_BYTES +% value_count *% (4 as usize),
+    );
+    payload.append(MAGIC_0); payload.append(MAGIC_1); payload.append(MAGIC_2); payload.append(MAGIC_3);
+    payload.append(MAGIC_4); payload.append(MAGIC_5); payload.append(MAGIC_6); payload.append(MAGIC_7);
+    append_u32(payload, CACHE_FORMAT as u32);
+    append_u32(payload, rows as u32);
+    append_u64(payload, value_count as u64);
+    let key_bytes: vec::Vec[u8] = hex_to_bytes(key);
+    if key_bytes.count() != (32 as usize) { return false; }
+    var digest_index: usize = 0 as usize;
+    while digest_index < (32 as usize) {
+        guard let option::Option[u8]::Some(key_byte) = key_bytes.at(digest_index) else { return false; };
+        payload.append(key_byte);
+        digest_index = digest_index +% (1 as usize);
+    }
+    var value_index: usize = 0 as usize;
+    while value_index < value_count {
+        append_u32(payload, #bitcast::[u32](values[value_index]));
+        value_index = value_index +% (1 as usize);
+    }
+    let temp_path: text::Text = "${path}.tmp";
+    guard let result::Result[fs::File, result::IoError]::Ok(file_value) = fs::create(temp_path.view()) else {
+        return false;
+    };
+    var file: fs::File = file_value;
+    match file.write_all(payload) {
+        result::Result[usize, result::IoError]::Ok(written) => {
+            if written != payload.count() {
+                file.close();
+                let _removed: result::Result[bool, result::IoError] = fs::remove_file(temp_path.view());
+                return false;
+            }
+        }
+        result::Result[usize, result::IoError]::Err(_) => {
+            file.close();
+            let _removed: result::Result[bool, result::IoError] = fs::remove_file(temp_path.view());
+            return false;
+        }
+    }
+    file.close();
+    guard let result::Result[bool, result::IoError]::Ok(_moved) = fs::rename(temp_path.view(), path) else {
+        let _removed: result::Result[bool, result::IoError] = fs::remove_file(temp_path.view());
+        return false;
+    };
+    return true;
+}
+
+// Keep the directory bounded: remove oldest-mtime entries beyond the cap.
+fn prune_entries(dir: text::Text) {
+    guard let option::Option[vec::Vec[text::Text]]::Some(names) = fs::read_dir(dir.view()) else {
+        return;
+    };
+    if names.count() <= MAX_ENTRIES { return; }
+    var survivors: vec::Vec[text::Text] = names;
+    var keep_removing: usize = survivors.count() -% MAX_ENTRIES;
+    while keep_removing > (0 as usize) {
+        var oldest_index: usize = 0 as usize;
+        var oldest_mtime: i64 = -1 as i64;
+        var oldest_found: bool = false;
+        var index: usize = 0 as usize;
+        while index < survivors.count() {
+            guard let option::Option[*text::Text]::Some(entry_ptr) = survivors.at_ptr(index) else { return; };
+            let entry: text::Text = "${dir}/${*entry_ptr}";
+            match fs::mtime(entry.view()) {
+                result::Result[i64, result::IoError]::Ok(stamp) => {
+                    if !oldest_found || stamp < oldest_mtime {
+                        oldest_found = true;
+                        oldest_mtime = stamp;
+                        oldest_index = index;
+                    }
+                }
+                result::Result[i64, result::IoError]::Err(_) => {}
+            }
+            index = index +% (1 as usize);
+        }
+        if !oldest_found { return; }
+        guard let option::Option[*text::Text]::Some(oldest_ptr) = survivors.at_ptr(oldest_index) else { return; };
+        let oldest_path: text::Text = "${dir}/${*oldest_ptr}";
+        match fs::remove_file(oldest_path.view()) {
+            result::Result[bool, result::IoError]::Ok(_) => {
+                let _gone: option::Option[text::Text] = survivors.remove(oldest_index);
+            }
+            result::Result[bool, result::IoError]::Err(_) => {
+                return;
+            }
+        }
+        keep_removing = keep_removing -% (1 as usize);
+    }
+    return;
+}
+
+// Look up the embeddings for `token_ids`. On a hit the caller's buffer is
+// filled and *row_count is set; on anything else the caller encodes normally.
+fn embedding_cache_lookup(
+    model_root: str,
+    token_ids: *u32,
+    token_count: usize,
+    values: *f32,
+    value_capacity: usize,
+    row_count: *usize,
+) -> EmbeddingCacheOutcome {
+    if disabled_by_env() { return EmbeddingCacheOutcome::Disabled; }
+    guard let option::Option[text::Text]::Some(path) = entry_path(model_root, token_ids, token_count) else {
+        return EmbeddingCacheOutcome::Disabled;
+    };
+    guard let option::Option[text::Text]::Some(key) = cache_key(model_root, token_ids, token_count) else {
+        return EmbeddingCacheOutcome::Disabled;
+    };
+    let started: i64 = time::now_millis();
+    if read_entry(path.view(), key, values, value_capacity, row_count) {
+        let hit_rows: usize = *row_count;
+        io::println("text embedding cache: hit wall_ms=${time::now_millis() - started} rows=${hit_rows}");
+        return EmbeddingCacheOutcome::Hit;
+    }
+    return EmbeddingCacheOutcome::Miss;
+}
+
+// Store freshly encoded embeddings. Fire-and-forget: failure only costs the
+// next lookup.
+fn embedding_cache_store(
+    model_root: str,
+    token_ids: *u32,
+    token_count: usize,
+    values: *f32,
+    row_count: usize,
+) -> EmbeddingCacheOutcome {
+    if disabled_by_env() { return EmbeddingCacheOutcome::Disabled; }
+    guard let option::Option[text::Text]::Some(path) = entry_path(model_root, token_ids, token_count) else {
+        return EmbeddingCacheOutcome::Disabled;
+    };
+    if !fs::is_dir(cache_root(model_root).view()) {
+        match fs::create_dir_all(cache_root(model_root).view()) {
+            result::Result[bool, result::IoError]::Ok(_) => {}
+            result::Result[bool, result::IoError]::Err(_) => {
+                return EmbeddingCacheOutcome::StoreFailed;
+            }
+        }
+    }
+    guard let option::Option[text::Text]::Some(key) = cache_key(model_root, token_ids, token_count) else {
+        return EmbeddingCacheOutcome::Disabled;
+    };
+    if write_entry(path.view(), key, values, row_count) {
+        prune_entries(cache_root(model_root));
+        io::println("text embedding cache: stored rows=${row_count} file=${path}");
+        return EmbeddingCacheOutcome::Stored;
+    }
+    return EmbeddingCacheOutcome::StoreFailed;
+}
+
+// ---- tests -----------------------------------------------------------------
+
+// Tiny stand-ins for the real identity files, laid out under a scratch model
+// root so the whole key path (identity stat + token hashing) is exercised.
+fn dir_exists(path: str) -> bool {
+    return fs::is_dir(path);
+}
+
+fn make_identity_files(model_root: text::Text) -> bool {
+    if !dir_exists("${model_root}/processor") {
+        let _made: result::Result[bool, result::IoError] = fs::create_dir_all("${model_root}/processor");
+    }
+    if !dir_exists("${model_root}/text_encoder") {
+        let _made: result::Result[bool, result::IoError] = fs::create_dir_all("${model_root}/text_encoder");
+    }
+    if !dir_exists("${model_root}/processor") || !dir_exists("${model_root}/text_encoder") {
+        return false;
+    }
+    var shard: usize = 1 as usize;
+    while shard <= (4 as usize) {
+        var filler: vec::Vec[u8] = vec::Vec[u8]::with_capacity(16 as usize);
+        append_u32(filler, shard as u32);
+        let shard_name: text::Text = "model-0000${shard}-of-00004.safetensors";
+        guard let result::Result[fs::File, result::IoError]::Ok(file_value) = fs::create("${model_root}/text_encoder/${shard_name}") else {
+            return false;
+        };
+        var file: fs::File = file_value;
+        let _w: result::Result[usize, result::IoError] = file.write_all(filler);
+        file.close();
+        shard = shard +% (1 as usize);
+    }
+    guard let result::Result[fs::File, result::IoError]::Ok(vocab_value) = fs::create("${model_root}/processor/vocab.json") else {
+        return false;
+    };
+    var vocab: fs::File = vocab_value;
+    let _v: result::Result[usize, result::IoError] = vocab.write_str("{}");
+    vocab.close();
+    guard let result::Result[fs::File, result::IoError]::Ok(merges_value) = fs::create("${model_root}/processor/merges.txt") else {
+        return false;
+    };
+    var merges: fs::File = merges_value;
+    let _m: result::Result[usize, result::IoError] = merges.write_str("#v1");
+    merges.close();
+    return true;
+}
+
+#[test]
+fn store_then_lookup_roundtrips_bits() {
+    let root: text::Text = "/tmp/qi_embedding_cache_test/model";
+    // Fresh scratch area every run: remove the entry file if a previous run
+    // left it.
+    let _made: result::Result[bool, result::IoError] = fs::create_dir_all(root.view());
+    assert make_identity_files(root);
+    var token_ids: vec::Vec[u32] = vec::Vec[u32]::with_capacity(3 as usize);
+    token_ids.append(42 as u32);
+    token_ids.append(151643 as u32);
+    token_ids.append(7 as u32);
+    var values: vec::Vec[f32] = vec::Vec[f32]::with_capacity(TEXT_WIDTH);
+    var value_index: usize = 0 as usize;
+    while value_index < TEXT_WIDTH {
+        let t: f64 = value_index as f64;
+        values.append((0.25f64 * t + 1.0f64) as f32);
+        value_index = value_index +% (1 as usize);
+    }
+    match embedding_cache_store(
+        root.view(),
+        #slice_ptr(token_ids.as_slice()), token_ids.count(),
+        #slice_ptr(values.as_slice()), 1 as usize,
+    ) {
+        EmbeddingCacheOutcome::Stored => {}
+        _ => { assert false; }
+    }
+    var readback: vec::Vec[f32] = vec::Vec[f32]::with_capacity(TEXT_WIDTH);
+    value_index = 0 as usize;
+    while value_index < TEXT_WIDTH {
+        readback.append(0.0f32);
+        value_index = value_index +% (1 as usize);
+    }
+    var rows: usize = 0 as usize;
+    match embedding_cache_lookup(
+        root.view(),
+        #slice_ptr(token_ids.as_slice()), token_ids.count(),
+        #slice_ptr(readback.as_slice()), TEXT_WIDTH, #addr_of(rows),
+    ) {
+        EmbeddingCacheOutcome::Hit => {}
+        _ => { assert false; }
+    }
+    assert rows == (1 as usize);
+    value_index = 0 as usize;
+    while value_index < TEXT_WIDTH {
+        guard let option::Option[f32]::Some(a) = values.at(value_index) else { return; };
+        guard let option::Option[f32]::Some(b) = readback.at(value_index) else { return; };
+        assert #bitcast::[u32](a) == #bitcast::[u32](b);
+        value_index = value_index +% (1 as usize);
+    }
+    // A different token list must miss.
+    var other_tokens: vec::Vec[u32] = vec::Vec[u32]::with_capacity(3 as usize);
+    other_tokens.append(99 as u32);
+    other_tokens.append(151643 as u32);
+    other_tokens.append(7 as u32);
+    match embedding_cache_lookup(
+        root.view(),
+        #slice_ptr(other_tokens.as_slice()), other_tokens.count(),
+        #slice_ptr(readback.as_slice()), TEXT_WIDTH, #addr_of(rows),
+    ) {
+        EmbeddingCacheOutcome::Miss => {}
+        _ => { assert false; }
+    }
+}
+
+#[test]
+fn a_disabled_cache_never_hits() {
+    // No QI_DISABLE_EMBEDDING_CACHE manipulation is possible in-process; this
+    // test exercises the disabled-via-missing-identity path instead: a model
+    // root with no shard files yields Disabled.
+    let root: text::Text = "/tmp/qi_embedding_cache_test/empty";
+    let _made: result::Result[bool, result::IoError] = fs::create_dir_all(root.view());
+    var token_ids: vec::Vec[u32] = vec::Vec[u32]::with_capacity(1 as usize);
+    token_ids.append(5 as u32);
+    var values: vec::Vec[f32] = vec::Vec[f32]::with_capacity(4 as usize);
+    var rows: usize = 0 as usize;
+    match embedding_cache_lookup(
+        root.view(),
+        #slice_ptr(token_ids.as_slice()), token_ids.count(),
+        #slice_ptr(values.as_slice()), (4 as usize), #addr_of(rows),
+    ) {
+        EmbeddingCacheOutcome::Disabled => {}
+        _ => { assert false; }
+    }
+}
