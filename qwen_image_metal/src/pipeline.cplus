@@ -1,3 +1,4 @@
+import "./embedding_cache" as embedding_cache;
 import "./image_output" as image_output;
 import "qwen_image/generation_control" as control;
 import "./mmap_macos" as mapped;
@@ -397,16 +398,56 @@ fn run_native_tokens_impl(
     if !control::report(observer, control::Phase::EncodingText, 0 as usize, 0 as usize) {
         return 3;
     }
-    if qwen3vl_text::encode_tokens_to_host(
+    // Repeat prompts skip the whole text phase: the embeddings are persisted
+    // under the model root and keyed on the exact token IDs plus the identity
+    // (size + mtime) of every file the encoding depends on. A hit is
+    // bit-identical to a fresh encode by construction. Reference-validation
+    // runs keep the real encoder so correctness gates never read a cache.
+    var embedding_cache_hit: bool = false;
+    let embedding_cache_started_ms: i64 = time::now_millis();
+    if !validate_reference && !embedding_cache::disabled_by_env() {
+        match embedding_cache::embedding_cache_lookup(
+            model_root,
+            #slice_ptr(full_tokens.as_slice()),
+            full_tokens.count(),
+            #slice_ptr(text_embeddings.as_slice()),
+            text_capacity,
+            #addr_of(text_rows),
+        ) {
+            embedding_cache::EmbeddingCacheOutcome::Hit => {
+                embedding_cache_hit = true;
+            }
+            _ => {}
+        }
+    }
+    if embedding_cache_hit {
+        io::println("pipeline: text embedding cache hit wall_ms=${time::now_millis() - embedding_cache_started_ms}");
+    } else {
+        if qwen3vl_text::encode_tokens_to_host(
         model_root,
-        #slice_ptr(full_tokens.as_slice()),
-        full_tokens.count(),
-        #slice_ptr(text_embeddings.as_slice()),
-        text_capacity,
-        #addr_of(text_rows),
-    ) != (0 as i32) {
-        control::diagnose(observer, "The text encoder failed. Check its model shards and available memory.");
-        return 1;
+            #slice_ptr(full_tokens.as_slice()),
+            full_tokens.count(),
+            #slice_ptr(text_embeddings.as_slice()),
+            text_capacity,
+            #addr_of(text_rows),
+        ) != (0 as i32) {
+            control::diagnose(observer, "The text encoder failed. Check its model shards and available memory.");
+            return 1;
+        }
+        if !validate_reference && !embedding_cache::disabled_by_env() {
+            match embedding_cache::embedding_cache_store(
+            model_root,
+                #slice_ptr(full_tokens.as_slice()),
+                full_tokens.count(),
+                #slice_ptr(text_embeddings.as_slice()),
+                text_rows,
+            ) {
+                embedding_cache::EmbeddingCacheOutcome::Stored => {
+                    io::println("pipeline: text embedding cache stored rows=${text_rows} wall_ms=${time::now_millis() - embedding_cache_started_ms}");
+                }
+                _ => {}
+            }
+        }
     }
     if text_rows != expected_text_rows {
         io::eprintln("pipeline: tokenizer/text row disagreement expected=${expected_text_rows} actual=${text_rows}");
