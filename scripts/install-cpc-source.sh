@@ -12,7 +12,7 @@
 # last release, 0.0.29 (which install-cpc.sh installs).
 set -eu
 
-ref=0c48e8011249defe0619600ce4da22a1f0f1ff48
+ref=b30eeb0c1d22108d924a38dee321c37748db95f9
 repository=https://github.com/netdur/cplus
 destination=${1:?usage: install-cpc-source.sh DESTINATION}
 

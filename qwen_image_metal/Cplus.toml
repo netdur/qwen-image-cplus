@@ -1,6 +1,6 @@
 [package]
 name    = "qwen_image_metal"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2026"
 
 # The Metal inference backend. It implements the core's engine seam
