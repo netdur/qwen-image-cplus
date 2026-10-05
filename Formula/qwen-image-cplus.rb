@@ -5,9 +5,9 @@
 class QwenImageCplus < Formula
   desc "Native Qwen-Image-2.1 inference for Apple Silicon"
   homepage "https://github.com/netdur/qwen-image-cplus"
-  url "https://github.com/netdur/qwen-image-cplus/releases/download/v0.2.3/qwen-image-cplus-aarch64-apple-darwin.tar.gz"
-  version "0.2.3"
-  sha256 "9ff3d43f07dbe5273524e1a090dfef18d429e0f24b1b566f4a4f076c119472ed"
+  url "https://github.com/netdur/qwen-image-cplus/releases/download/v0.2.4/qwen-image-cplus-aarch64-apple-darwin.tar.gz"
+  version "0.2.4"
+  sha256 "2584a7eb6b88ab8902b27524f52175e89681f70a654c55f4c0c2b64d8f980718"
   license "MIT"
 
   depends_on arch: :arm64
