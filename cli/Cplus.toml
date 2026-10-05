@@ -1,6 +1,6 @@
 [package]
 name    = "qwen-image-cplus"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2026"
 
 # The public CLI: the same source on every platform, over qwen_image/api.

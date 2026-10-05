@@ -1,6 +1,6 @@
 [package]
 name    = "gui"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2026"
 
 # The Qwen Image desktop app: facet UI over qwen_image/api. The same source on
