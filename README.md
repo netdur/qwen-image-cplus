@@ -53,7 +53,8 @@ images run out of memory with model offload and use group offload. Details in
 ## Install
 
 Prebuilt binaries: Homebrew on macOS 14 or newer on Apple Silicon (Metal), a
-snap on Ubuntu with an NVIDIA GPU (CUDA). Users do not need the C+ compiler.
+snap on Ubuntu with an NVIDIA GPU (CUDA), and an installer for Windows with an
+NVIDIA GPU (CUDA). Users do not need the C+ compiler.
 
 ### Homebrew (macOS)
 
@@ -112,6 +113,30 @@ sudo snap connect qwen-image-cplus:removable-media
 To upgrade, install the newer `.snap` the same way; to uninstall,
 `sudo snap remove qwen-image-cplus`. Snaps installed from a file do not update
 themselves.
+
+### Windows
+
+Needs 64-bit Windows 10 or 11 and an NVIDIA GPU, Turing (RTX 20xx) or newer,
+with the NVIDIA driver. CUDA and cuDNN are bundled.
+
+Each release attaches `qwen-image-cplus-x86_64-pc-windows-msvc-setup.exe` to
+its [GitHub release](https://github.com/netdur/qwen-image-cplus/releases).
+Run it and choose to install for all users (Program Files) or for yourself
+only. It adds **Qwen Image** to the Start menu and, unless you untick the
+option, puts the `qwen-image-cplus` command on PATH. The installation contains:
+
+```text
+bin\qwen-image-cplus.exe
+bin\qwen-image-gui.exe
+bin\qwen_image.dll        (plus the bundled CUDA and cuDNN DLLs)
+include\qwen_image.h
+lib\qwen_image.lib
+lib\qwen_image_static.lib
+```
+
+To upgrade, run the newer installer; to uninstall, use **Settings > Apps**.
+The app keeps its preferences in `%APPDATA%\qwen-image-cplus`, which
+uninstalling leaves in place.
 
 ## Model files
 

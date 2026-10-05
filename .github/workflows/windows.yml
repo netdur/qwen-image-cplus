@@ -109,13 +109,57 @@ jobs:
             | tee "$RUNNER_TEMP/qwen-image-ffi-tests.jsonl"
           tail -n 1 "$RUNNER_TEMP/qwen-image-ffi-tests.jsonl" | jq -e '.failed == 0'
 
-      - name: Package distribution
+      - name: Install Inno Setup 6.7.3
+        shell: pwsh
+        run: |
+          # Pinned by hash rather than taken from the image or Chocolatey, so a
+          # new major version cannot change the installer under the script.
+          $installer = "$env:RUNNER_TEMP\innosetup-6.7.3.exe"
+          Invoke-WebRequest -UseBasicParsing -OutFile $installer `
+            https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe
+          $hash = (Get-FileHash -Algorithm SHA256 $installer).Hash
+          if ($hash -ne "9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732") { throw "innosetup-6.7.3.exe: unexpected SHA256 $hash" }
+          $dir = "$env:RUNNER_TEMP\innosetup"
+          Start-Process -Wait -FilePath $installer -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/DIR=`"$dir`""
+          if (-not (Test-Path "$dir\ISCC.exe")) { throw "Inno Setup did not install" }
+          "ISCC=$dir\ISCC.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Build the installer
         id: package
         shell: pwsh
         run: |
-          $asset = "qwen-image-cplus-x86_64-pc-windows-msvc.zip"
-          Compress-Archive -Path dist\bin, dist\include, dist\lib -DestinationPath $asset
+          & $env:ISCC /Q "/DAppVersion=${{ steps.meta.outputs.version }}" windows\qwen-image-cplus.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+          $asset = "qwen-image-cplus-x86_64-pc-windows-msvc-setup.exe"
+          if (-not (Test-Path $asset)) { throw "iscc did not write $asset" }
           "asset=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Check the installer installs and uninstalls
+        shell: pwsh
+        run: |
+          # A per-user install into a scratch folder, the CLI started from it
+          # with nothing on PATH but the system, and the uninstaller run.
+          # The runner has no NVIDIA driver; /SUPPRESSMSGBOXES answers the
+          # warning with its default, Yes.
+          $dir = "$env:RUNNER_TEMP\qwen-image-install"
+          Start-Process -Wait -FilePath .\${{ steps.package.outputs.asset }} -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/DIR=`"$dir`"", "/TASKS=addtopath"
+          foreach ($file in "bin\qwen-image-cplus.exe", "bin\qwen-image-gui.exe", "bin\qwen_image.dll", "bin\cudnn64_8.dll", "include\qwen_image.h", "lib\qwen_image.lib", "lib\qwen_image_static.lib", "unins000.exe") {
+            if (-not (Test-Path (Join-Path $dir $file))) { throw "the installer did not install $file" }
+          }
+          if ((Get-ItemProperty HKCU:\Environment).Path -notlike "*$dir\bin*") { throw "the installer did not put bin on PATH" }
+          $savedPath = $env:PATH
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          try {
+            $usage = & "$dir\bin\qwen-image-cplus.exe" 2>&1 | Out-String
+            if ($usage -notmatch "usage: qwen-image-cplus") { throw "the installed CLI does not start" }
+          } finally {
+            $env:PATH = $savedPath
+          }
+          Start-Process -Wait -FilePath "$dir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          # The uninstaller copies itself to %TEMP% and finishes from there.
+          for ($i = 0; $i -lt 30 -and (Test-Path "$dir\bin"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$dir\bin") { throw "the uninstaller left $dir\bin" }
+          if ((Get-ItemProperty HKCU:\Environment).Path -like "*$dir\bin*") { throw "the uninstaller left bin on PATH" }
 
       - name: Keep the package as a workflow artifact
         if: env.RELEASE != 'true'
