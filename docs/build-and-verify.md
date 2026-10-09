@@ -362,3 +362,29 @@ Inspect a shard, optionally filtering tensor names:
 ```sh
 ./qwen_image_metal_dev/target/debug/qwen_image_metal_dev inspect /path/to/shard.safetensors proj_out
 ```
+
+## Converting Qwen-Image-2.1-Turbo
+
+The published `qwen-image-2.1-turbo-8step-fp16-v4.qipack` was converted from
+[Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo). Its
+text encoder, processor, and VAE match the base checkpoint (its BF16 VAE is
+the base FP32 VAE, rounded), so only the transformer is converted. To rebuild
+the pack:
+
+```sh
+hf download Qwen/Qwen-Image-2.1-Turbo \
+  transformer/diffusion_pytorch_model-00001-of-00002.safetensors \
+  transformer/diffusion_pytorch_model-00002-of-00002.safetensors \
+  --local-dir models/Qwen-Image-2.1-Turbo
+qwen_image_metal_dev quantize-transformer models/Qwen-Image-2.1-Turbo \
+  models/qwen-image-2.1-turbo-fp16-v4.qipack
+qwen_image_metal_dev pack-metadata models/qwen-image-2.1-turbo-fp16-v4.qipack \
+  base=Qwen/Qwen-Image-2.1@b3179ad355be050328e483a9dfdd9e60cd62adfa \
+  kind=distilled steps=8 shift_terminal=none cache=none \
+  schedule=qwen-2.1-turbo-8 \
+  source=Qwen/Qwen-Image-2.1-Turbo@d65dbc9a7e8f6b5479e33dee6030eaab2a906509
+```
+
+`schedule=qwen-2.1-turbo-8` selects the eight sigmas the checkpoint ships in
+`model_index.json`, used as given at every resolution; the pack runs only
+eight steps.

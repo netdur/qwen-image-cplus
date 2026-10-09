@@ -10,6 +10,7 @@ image editing with up to ten references.
 | --- | ---: |
 | [Four-step Viggle FP16](benchmarks/m1-max-viggle-4step-1024-fixed-cost.json), 1024×1024 poster | **38.18–39.32 s** |
 | Six-step Viggle v0.2.1 FP16 + LoRA, 1024×1024 text-to-image smoke | **75.974 s** |
+| Official eight-step Qwen-Image-2.1-Turbo FP16, 1024×1024 poster | **74.40 s** |
 | [Base FP16](benchmarks/m1-max-native-prompt-pipeline-1024.json), 1024×1024, 40 steps, cache off | **451.12 s** |
 | Base FP16, later optimized build with Cache-DiT 0.16, 27 of 40 steps cached | **126.69 s** |
 
@@ -171,6 +172,26 @@ This still needs roughly 34.5 GB of disk space. Omit the LoRA and choose one
 of the other QIPACK files if you prefer the base or four-step model; see the
 [model card](https://huggingface.co/netdur/Qwen-Image-2.1-QIPACK) for their
 names and defaults.
+
+For Qwen's official eight-step
+[Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo),
+download its pack instead. It uses the same shared files; `hf download` skips
+any you already have in `models/`:
+
+```sh
+hf download netdur/Qwen-Image-2.1-QIPACK \
+  qwen-image-2.1-turbo-8step-fp16-v4.qipack \
+  processor/vocab.json processor/merges.txt \
+  text_encoder/model-00001-of-00004.safetensors \
+  text_encoder/model-00002-of-00004.safetensors \
+  text_encoder/model-00003-of-00004.safetensors \
+  text_encoder/model-00004-of-00004.safetensors \
+  vae/diffusion_pytorch_model.safetensors \
+  --local-dir models
+```
+
+That is about 33.1 GB. The Turbo pack needs v0.2.5 or newer, runs exactly
+eight steps, and needs no LoRA.
 
 Keep the supporting files alongside the pack in this layout; multiple packs
 can share the same supporting files:

@@ -17,6 +17,8 @@
 import "stdlib/time" as time;
 import "qwen_image/file_io" as file_io;
 import "qwen_image/generation_control" as control;
+import "qwen_image/pack_info" as pack_info;
+import "qwen_image/schedule" as fixed_schedule;
 import "./cuda" as cuda;
 import "./int4_pack" as pack;
 import "stdlib/io" as io;
@@ -1041,6 +1043,32 @@ fn sigma(index: usize, steps: usize, image_rows: usize) -> f64 {
     return shift / (shift + (1.0f64 / base - 1.0f64));
 }
 
+// The schedule a pack's `schedule` metadata selects. Packs without one use
+// the shifted linspace above.
+enum Schedule {
+    Shifted,
+    QwenTurbo8,
+}
+
+fn pack_schedule(pack_path: str) -> Schedule {
+    return match pack_info::read(pack_path) {
+        option::Option[pack_info::PackInfo]::Some(info) => match info.get("schedule") {
+            option::Option[str]::Some(value) => {
+                if value == fixed_schedule::QWEN_TURBO_8 { Schedule::QwenTurbo8 } else { Schedule::Shifted }
+            }
+            option::Option[str]::None => Schedule::Shifted,
+        },
+        option::Option[pack_info::PackInfo]::None => Schedule::Shifted,
+    };
+}
+
+fn schedule_sigma(schedule: Schedule, index: usize, steps: usize, image_rows: usize) -> f64 {
+    return match schedule {
+        Schedule::Shifted => sigma(index, steps, image_rows),
+        Schedule::QwenTurbo8 => fixed_schedule::qwen_turbo_8_sigma(index) as f64,
+    };
+}
+
 // Wall-clock seconds for phase timings (stdlib/time, portable).
 fn seconds() -> f64 {
     return (time::now_millis() as f64) * 0.001f64;
@@ -1050,12 +1078,20 @@ fn seconds() -> f64 {
 // reporting each finished step to `observer`. 0 on success, 1 on a GPU
 // failure, 3 when the observer cancels between steps (the pipeline's codes).
 fn denoise(ref model: Model, ref work: Work, ref cache: PrefixCache, latents: *f32, image_rows: usize, steps: usize,
-           rope: *f32, observer: control::Observer) -> i32 {
+           schedule: Schedule, rope: *f32, observer: control::Observer) -> i32 {
+    let fixed_steps: bool = match schedule {
+        Schedule::QwenTurbo8 => true,
+        Schedule::Shifted => false,
+    };
+    if fixed_steps && steps != fixed_schedule::QWEN_TURBO_8_STEPS {
+        control::diagnose(observer, "This Qwen-Image-2.1-Turbo pack runs exactly 8 steps.");
+        return 2;
+    }
     var index: usize = 0 as usize;
     while index < steps {
         let started: f64 = seconds();
-        let current: f64 = sigma(index, steps, image_rows);
-        let next: f64 = sigma(index +% (1 as usize), steps, image_rows);
+        let current: f64 = schedule_sigma(schedule, index, steps, image_rows);
+        let next: f64 = schedule_sigma(schedule, index +% (1 as usize), steps, image_rows);
         if !step_device(model, work, cache, latents, image_rows, (current * 1000.0f64) as f32, rope)
             || !ok(cuda::euler(latents, work.q.pointer as *f32, (next - current) as f32, (image_rows *% LATENT) as u64), "euler")
             || !cuda::synchronize() {
@@ -1076,6 +1112,14 @@ fn distilled_schedule_matches_the_pipeline_at_512() {
     assert (sigma(2 as usize, 4 as usize, 1024 as usize) - 0.6315121650695801f64).abs() < 0.0000001f64;
     assert (sigma(3 as usize, 4 as usize, 1024 as usize) - 0.363569974899292f64).abs() < 0.0000001f64;
     assert sigma(4 as usize, 4 as usize, 1024 as usize) == 0.0f64;
+}
+
+#[test]
+fn turbo_schedule_ignores_the_token_count() {
+    assert schedule_sigma(Schedule::QwenTurbo8, 0 as usize, 8 as usize, 1024 as usize) == 1.0f64;
+    assert schedule_sigma(Schedule::QwenTurbo8, 7 as usize, 8 as usize, 4096 as usize)
+        == schedule_sigma(Schedule::QwenTurbo8, 7 as usize, 8 as usize, 1024 as usize);
+    assert schedule_sigma(Schedule::QwenTurbo8, 8 as usize, 8 as usize, 1024 as usize) == 0.0f64;
 }
 
 // MARK: - Fixture entry point
@@ -1186,8 +1230,8 @@ fn run_oracle_dump(pack_path: str, mode: WeightMode, dump: str, steps: usize, ou
     let _prefix_synced: bool = cuda::synchronize();
     io::println("text prefix (${text_rows} rows): ${seconds() - started} s");
     started = seconds();
-    if denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32,
-               control::none()) != (0 as i32) { return 1; }
+    if denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, pack_schedule(pack_path),
+               rope.pointer as *f32, control::none()) != (0 as i32) { return 1; }
     io::println("denoise (${steps} steps, ${image_rows} image rows): ${seconds() - started} s");
     guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(noise.length) else { return 1; };
     if !latents.download(result.pointer, noise.length as u64) || !write_floats(output_path, result.pointer, result.length) { return 1; }
@@ -1249,8 +1293,8 @@ fn run_edit_dump(pack_path: str, mode: WeightMode, dump: str, steps: usize, outp
     let _prefix_synced: bool = cuda::synchronize();
     io::println("conditioned prefix (${prefix_rows} rows: ${prompt_rows -% pad_rows} text, ${condition_rows} condition): ${seconds() - started} s");
     started = seconds();
-    if denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, rope.pointer as *f32,
-               control::none()) != (0 as i32) { return 1; }
+    if denoise(model, work, cache, latents.pointer as *f32, image_rows, steps, pack_schedule(pack_path),
+               rope.pointer as *f32, control::none()) != (0 as i32) { return 1; }
     io::println("denoise (${steps} steps, ${image_rows} image rows): ${seconds() - started} s");
     guard let option::Option[pack::Buffer]::Some(result) = pack::Buffer::allocate(noise.length) else { return 1; };
     if !latents.download(result.pointer, noise.length as u64) || !write_floats(output_path, result.pointer, result.length) { return 1; }

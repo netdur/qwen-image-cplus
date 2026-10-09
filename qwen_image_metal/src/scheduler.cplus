@@ -1,4 +1,5 @@
 import "./cpu_ops" as cpu;
+import "qwen_image/schedule" as fixed;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/status" as status;
@@ -197,6 +198,21 @@ fn fill_viggle_v021_schedule(
     return true;
 }
 
+// The official Qwen-Image-2.1-Turbo checkpoint's eight sigmas, used as given
+// at every resolution (no shift, no terminal stretch).
+fn fill_qwen_turbo_8_schedule(sigmas: *f32, timesteps: *f32) -> bool {
+    if sigmas.is_null() || timesteps.is_null() { return false; }
+    var index: usize = 0 as usize;
+    while index < fixed::QWEN_TURBO_8_STEPS {
+        let sigma: f32 = fixed::qwen_turbo_8_sigma(index);
+        sigmas[index] = sigma;
+        timesteps[index] = sigma * TRAIN_TIMESTEPS;
+        index = index +% (1 as usize);
+    }
+    sigmas[fixed::QWEN_TURBO_8_STEPS] = 0.0f32;
+    return true;
+}
+
 // Diffusers performs the Euler arithmetic in FP32, then casts the result back
 // to model_output.dtype. Qwen-Image-2.1 runs the transformer in BF16, so every
 // trajectory step must round here before the next model evaluation.
@@ -272,6 +288,18 @@ fn viggle_v021_schedule_matches_pinned_diffusers_at_832x1248() {
         }
         index = index +% (1 as usize);
     }
+}
+
+#[test]
+fn qwen_turbo_8_schedule_ignores_resolution_and_ends_at_zero() {
+    var sigmas: [f32; 9] = [0.0f32; 9];
+    var timesteps: [f32; 8] = [0.0f32; 8];
+    assert fill_qwen_turbo_8_schedule(#addr_of(sigmas[0]), #addr_of(timesteps[0]));
+    assert sigmas[0] == 1.0f32;
+    assert sigmas[5] == 0.845148f32;
+    assert sigmas[7] == 0.414568f32;
+    assert sigmas[8] == 0.0f32;
+    assert close(timesteps[7], 414.568f32, 0.0001f32);
 }
 
 #[test]

@@ -76,6 +76,26 @@
       "verification": "structural validation and native six-step generation passed"
     },
     {
+      "path": "qwen-image-2.1-turbo-8step-fp16-v4.qipack",
+      "local_source": "models/qwen-image-2.1-turbo-fp16-v4.qipack",
+      "bytes": 14230327296,
+      "sha256": "6d38ebf0f025dcd08429832d0b1619b94f9c105a129e07980c96e21013a048cc",
+      "source": {
+        "repository": "Qwen/Qwen-Image-2.1-Turbo",
+        "revision": "d65dbc9a7e8f6b5479e33dee6030eaab2a906509",
+        "component": "transformer",
+        "variant": "official eight-step full fine-tune, not LoRA"
+      },
+      "generation_defaults": {
+        "kind": "distilled",
+        "steps": 8,
+        "shift_terminal": null,
+        "cache": "none",
+        "schedule": "qwen-2.1-turbo-8"
+      },
+      "verification": "structural validation, exact source round-trip, and native eight-step generation passed"
+    },
+    {
       "path": "qwen-image-2.1-viggle-v0.1-4step-w4a4-h256-g64-clip-v6.qipack",
       "local_source": "models/qwen-image-2.1-viggle-v0.1-4step-w4a4-h256-g64-clip-v6.qipack",
       "bytes": 3979448320,

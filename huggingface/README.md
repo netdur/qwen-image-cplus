@@ -4,6 +4,7 @@ license_name: qwen-research
 license_link: LICENSE
 base_model:
   - Qwen/Qwen-Image-2.1
+  - Qwen/Qwen-Image-2.1-Turbo
   - Viggle/Qwen-Image-2.1-viggle-turbo
 pipeline_tag: text-to-image
 tags:
@@ -28,8 +29,9 @@ under Linux.
 This repository contains converted transformer weights (FP16 for Apple
 Silicon, 4-bit for NVIDIA), a Viggle v0.2.1 LoRA, and the unmodified processor,
 text encoder, and VAE files needed by `qwen-image-cplus`. The base weights and shared support files come from the
-pinned upstream Qwen snapshot; the four-step full fine-tune and six-step LoRA
-come from Viggle. The runtime provides the scheduler.
+pinned upstream Qwen snapshot; the eight-step pack is Qwen's official
+Qwen-Image-2.1-Turbo; the four-step full fine-tune and six-step LoRA come from
+Viggle. The runtime provides the scheduler.
 
 ## Files
 
@@ -38,6 +40,7 @@ come from Viggle. The runtime provides the scheduler.
 | `qwen-image-2.1-fp16-v4.qipack` | `Qwen/Qwen-Image-2.1` at `b3179ad355be050328e483a9dfdd9e60cd62adfa` | 40 steps, TaylorSeer | `9fe30bcae5678c6e21618d48d9f058fc150ed5b71b7534e5283bb7a05c163750` |
 | `qwen-image-2.1-viggle-v0.1-4step-fp16-v4.qipack` | `Viggle/Qwen-Image-2.1-viggle-turbo` at `bafc91e4cc934f5fb1406b22496a0bed9b99c548` | 4 steps, no cache, unstretched schedule | `d05edecbf9d3e7b03b0e708ae41da5370d5fe245f1d3b5f6775aef18f18857d1` |
 | `qwen-image-2.1-viggle-v0.2.1-lora-fp16-v4.qipack` | Unchanged Qwen base transformer; requires the Viggle LoRA below | 6 steps, no cache, Viggle v0.2.1 schedule | `be2e72ed75d30234a7f1934502d1d95b10eaedc935de2ce06b926b34e1b7b8b4` |
+| `qwen-image-2.1-turbo-8step-fp16-v4.qipack` | `Qwen/Qwen-Image-2.1-Turbo` at `d65dbc9a7e8f6b5479e33dee6030eaab2a906509` | 8 steps, no cache, the checkpoint's own sigmas | `6d38ebf0f025dcd08429832d0b1619b94f9c105a129e07980c96e21013a048cc` |
 | `Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors` | `Viggle/Qwen-Image-2.1-viggle-turbo` at `139e9492e6b81e85395877a549ec8f0afbb18f8f` | Rank-256 adapter beside the six-step QIPACK | `2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803` |
 | `qwen-image-2.1-viggle-v0.1-4step-w4a4-h256-g64-clip-v6.qipack` | The four-step FP16 pack above, quantized to W4A4 | NVIDIA only: 4 steps, no cache | `6250f581430854d0dde0f11740b8b3644e7ce2ac1dc2f074b538d341f8e582e8` |
 | `qwen-image-2.1-viggle-v0.1-4step-w4a16-g64-v6.qipack` | The four-step FP16 pack above, quantized to W4A16 | NVIDIA only: 4 steps, no cache | `8d837585b3204bc253bd9002d74d8cbf278e93efa50288850fb9f36790104063` |
@@ -52,16 +55,23 @@ LoRA file beside it. One 14.23 GB pack plus the 18.89 GB shared files requires
 about 33.12 GB of local storage, or 34.48 GB with the 1.36 GB LoRA. “7B”
 describes the transformer's parameter count, not the pipeline's size in bytes.
 
+The eight-step file is the transformer of Qwen's official
+Qwen-Image-2.1-Turbo. That checkpoint's text encoder matches the base one, and
+its BF16 VAE is the base FP32 VAE rounded to BF16, so it uses the same shared
+support files. Its metadata selects the eight sampling sigmas the checkpoint
+ships, used unshifted at every resolution; it runs only eight steps.
+
 The four-step file is Viggle v0.1's full transformer, not a LoRA. The six-step
 file contains the original Qwen base transformer with metadata selecting the
 separate Viggle v0.2.1 LoRA and its six-step schedule.
 
-The three FP16 QIPACK files use QIPACK1 version 1 with policy
+The four FP16 QIPACK files use QIPACK1 version 1 with policy
 `transformer:all-matrix-f16-v4`. All 224 transformer-block matrices are stored
 as FP16; vectors and the nine global tensors remain BF16. Each pack contains
 297 tensors and 7,115,124,736 parameters. The format has fixed little-endian
-metadata plus per-tensor and payload checksums. The base and four-step packs
-passed exact round-trip verification against their source tensors.
+metadata plus per-tensor and payload checksums. The base, four-step, and
+eight-step packs passed exact round-trip verification against their source
+tensors.
 
 ### 4-bit packs for NVIDIA GPUs
 
@@ -90,7 +100,8 @@ Apple Silicon (FP16 packs):
 
 - macOS 14 or newer on Apple Silicon
 - [`qwen-image-cplus`](https://github.com/netdur/qwen-image-cplus); the six-step
-  LoRA requires a build with Viggle v0.2.1 support (current `main`)
+  LoRA requires a build with Viggle v0.2.1 support, and the eight-step Turbo
+  pack requires v0.2.5 or newer
 
 NVIDIA (4-bit packs):
 
@@ -116,7 +127,7 @@ hf download netdur/Qwen-Image-2.1-QIPACK --local-dir models \
 ```
 
 For Apple Silicon, name an FP16 pack instead (and, for the six-step pack, its
-LoRA file). Leaving out `--include` downloads everything, about 71 GB.
+LoRA file). Leaving out `--include` downloads everything, about 85 GB.
 
 ## Use
 
@@ -141,6 +152,17 @@ qwen-image-cplus generate \
   models \
   output.png \
   "A vintage travel poster for CASABLANCA reading 'MEET ME AT SUNSET'" \
+  1024 1024 1301
+```
+
+Official eight-step Qwen-Image-2.1-Turbo:
+
+```sh
+qwen-image-cplus generate \
+  models/qwen-image-2.1-turbo-8step-fp16-v4.qipack \
+  models \
+  output.png \
+  'a travel poster with the headline "CASABLANCA" and the tagline "MEET ME AT SUNSET"' \
   1024 1024 1301
 ```
 
@@ -173,7 +195,8 @@ cache policy when those optional CLI arguments are omitted.
 ## Reference performance
 
 On the development M1 Max, the adopted Viggle four-step path generated a
-1024x1024 PNG end to end in roughly 38–39 seconds.
+1024x1024 PNG end to end in roughly 38–39 seconds, and the official eight-step
+Turbo pack in 74.4 seconds with both quoted poster strings rendered exactly.
 
 On an RTX 2060 (6 GB, PCIe gen3 x8), the four-step packs took, end to end with
 a warm file cache:
@@ -201,8 +224,8 @@ The QIPACK files are modified redistributions: their tensor storage layout and
 selected matrix dtypes were converted for the runtime, and the `-v6` packs
 quantize the transformer-block matrices to 4 bits. The model
 architecture and learned values were not retrained by this project. The
-distilled source model and LoRA were created by Viggle and are attributed in
-[`NOTICE`](NOTICE).
+Turbo checkpoint was published by Qwen; the Viggle distilled model and LoRA
+were created by Viggle. Both are attributed in [`NOTICE`](NOTICE).
 
 The runtime source code has its own MIT license; that license does not replace
 or relax the model license.
