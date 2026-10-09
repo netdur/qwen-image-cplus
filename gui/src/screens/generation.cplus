@@ -1,3 +1,4 @@
+import "../system_paths" as system_paths;
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
 import "facet/elements" as ui;
@@ -224,8 +225,8 @@ fn boxed() -> screen::ScreenBox {
 #[test]
 fn save_copy_replaces_destination_without_changing_output() {
     let nonce: text::Text = "${process::current_id()}-${time::now_millis()}";
-    let source: text::Text = "/tmp/qwen-image-gui-save-${nonce}-source.png";
-    let destination: text::Text = "/tmp/qwen-image-gui-save-${nonce}-destination.png";
+    let source: text::Text = "${system_paths::temporary_folder().view()}/qwen-image-gui-save-${nonce}-source.png";
+    let destination: text::Text = "${system_paths::temporary_folder().view()}/qwen-image-gui-save-${nonce}-destination.png";
     let _source_written = fs::write_string(source, "new png bytes");
     let _destination_written = fs::write_string(destination, "old bytes");
     assert files::copy_file(source, destination);

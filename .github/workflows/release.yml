@@ -4,8 +4,9 @@ on:
   push:
     tags:
       - "v*"
-  # A manual run builds and checks the Linux distribution and the snap, keeps
-  # the .snap as a workflow artifact, and publishes nothing.
+  # A manual run builds and checks the macOS, Linux and Windows distributions
+  # and the snap, keeps the Linux and Windows packages as workflow artifacts,
+  # and publishes nothing.
   workflow_dispatch:
 
 permissions:
@@ -13,25 +14,30 @@ permissions:
 
 jobs:
   build-macos-arm64:
-    if: github.event_name == 'push'
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
+      RELEASE: ${{ github.event_name == 'push' }}
     outputs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.publish.outputs.sha }}
     steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
       - name: Resolve and validate version
         id: meta
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
-          version="${tag#v}"
+          if [ "$RELEASE" = true ]; then
+            tag="${{ github.ref_name }}"
+            version="${tag#v}"
+          else
+            # A manual run has no tag; the packages name the version.
+            version=$(sed -n 's/^version *= *"\([^"]*\)"$/\1/p' gui/Cplus.toml)
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Check out tagged source
-        uses: actions/checkout@v5
 
       - name: Require Apple Silicon and matching package versions
         shell: bash
@@ -43,17 +49,17 @@ jobs:
             grep -Eq "^version *= *\"${version}\"$" "$manifest"
           done
 
-      - name: Install pinned C+ compiler
-        run: |
-          scripts/install-cpc.sh "$RUNNER_TEMP/cplus"
-          echo "$RUNNER_TEMP/cplus" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install released C+ packages
+      - name: Build the pinned C+ compiler
         run: |
-          # Third-party packages only: the qwen_image* packages sit side by side
-          # at the repository root and resolve as sibling directories.
-          cpc pm install qwen_image_metal
-          cpc pm install gui
+          # The same pinned commit as Linux and Windows, with its vendor/ as the
+          # package set. The released 0.0.29 toolchain cannot build this source:
+          # its package manager fetches the sibling qwen_image package from the
+          # cplus release, and its facet predates button(symbol:).
+          scripts/install-cpc-source.sh "$RUNNER_TEMP/cplus"
+          echo "$RUNNER_TEMP/cplus/target/release" >> "$GITHUB_PATH"
+          CPLUS_VENDOR="$RUNNER_TEMP/cplus/vendor" scripts/link_vendor.sh
 
       - name: Build and verify distribution
         run: |
@@ -88,6 +94,7 @@ jobs:
 
       - name: Publish immutable release asset
         id: publish
+        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -251,6 +258,11 @@ jobs:
       - name: Publish snap to the Snap Store
         if: env.RELEASE == 'true' && env.SNAPCRAFT_STORE_CREDENTIALS != ''
         run: snapcraft upload --release=stable "${{ steps.snap.outputs.file }}"
+
+  build-windows-x86_64:
+    uses: ./.github/workflows/windows.yml
+    with:
+      release: ${{ github.event_name == 'push' }}
 
   update-formula:
     if: github.event_name == 'push'

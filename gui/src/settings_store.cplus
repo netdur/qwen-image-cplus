@@ -1,10 +1,10 @@
 // Preferences storage: string, integer and boolean values by key, in the
 // shape of Foundation's NSUserDefaults (which settings_store_macos.cplus
-// forwards to). This base keeps `key=value` lines in
-// $XDG_CONFIG_HOME/qwen-image-cplus/<suite>.conf (or ~/.config/...), read on
-// every call, so a Store is a copyable handle like the Foundation one.
+// forwards to). This base keeps `key=value` lines in <suite>.conf in the
+// platform's config folder (system_paths::config_folder), read on every call,
+// so a Store is a copyable handle like the Foundation one.
 
-import "stdlib/env" as env;
+import "./system_paths" as system_paths;
 import "stdlib/fs" as fs;
 import "stdlib/option" as option;
 import "stdlib/result" as result;
@@ -27,16 +27,7 @@ fn new_with_suite_name(suite: str) -> Store {
 }
 
 fn directory() -> text::Text {
-    match env::var("XDG_CONFIG_HOME") {
-        option::Option[text::Text]::Some(base) => {
-            if base.count() > (0 as usize) { return "${base.view()}/qwen-image-cplus"; }
-        }
-        option::Option[text::Text]::None => {}
-    }
-    return match env::var("HOME") {
-        option::Option[text::Text]::Some(home) => "${home.view()}/.config/qwen-image-cplus",
-        option::Option[text::Text]::None => text::from_str("/tmp/qwen-image-cplus"),
-    };
+    return system_paths::config_folder();
 }
 
 impl Store {

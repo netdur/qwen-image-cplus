@@ -91,6 +91,21 @@ to render CASABLANCA and misspelled it (see the
 Pack metadata can set another default. The adopted Viggle distillation pack
 defaults to 4 steps with an unstretched schedule.
 
+The official Qwen-Image-2.1-Turbo checkpoint (revision `d65dbc9a`) ships eight
+`sample_sigmas` in `model_index.json` (1.0, 0.978453, 0.95418, 0.926626,
+0.89508, 0.845148, 0.704534, 0.414568) and a scheduler with dynamic shifting
+off, shift 1.0, and no terminal stretch, so Diffusers uses them unchanged at
+every resolution; timesteps are sigma × 1000 and the Euler endpoint is 0. CFG
+stays at 1. A pack selects this schedule with `schedule=qwen-2.1-turbo-8`
+(which requires `kind=distilled`, `steps=8`, `shift_terminal=none`); both
+engines read the sigmas from `qwen_image/schedule` and refuse other step
+counts. Its text encoder matches the base checkpoint tensor for tensor (750
+names, shapes, and dtypes; 66 sampled tensors byte-identical), and its BF16 VAE
+equals the base FP32 VAE rounded to BF16 in all 238 tensors. On the M1 Max the
+FP16 pack renders both CASABLANCA poster strings exactly at 1024×1024 seed 1301
+in 74.40 s end to end (8 steps of about 8.2 s), and a one-reference 512 edit
+completes in 32.3 s.
+
 ## Multi-image conditioning status
 
 The official Qwen-Image-2.1 pipeline accepts **one to ten reference images**.

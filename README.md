@@ -10,6 +10,7 @@ image editing with up to ten references.
 | --- | ---: |
 | [Four-step Viggle FP16](benchmarks/m1-max-viggle-4step-1024-fixed-cost.json), 1024×1024 poster | **38.18–39.32 s** |
 | Six-step Viggle v0.2.1 FP16 + LoRA, 1024×1024 text-to-image smoke | **75.974 s** |
+| Official eight-step Qwen-Image-2.1-Turbo FP16, 1024×1024 poster | **74.40 s** |
 | [Base FP16](benchmarks/m1-max-native-prompt-pipeline-1024.json), 1024×1024, 40 steps, cache off | **451.12 s** |
 | Base FP16, later optimized build with Cache-DiT 0.16, 27 of 40 steps cached | **126.69 s** |
 
@@ -53,7 +54,8 @@ images run out of memory with model offload and use group offload. Details in
 ## Install
 
 Prebuilt binaries: Homebrew on macOS 14 or newer on Apple Silicon (Metal), a
-snap on Ubuntu with an NVIDIA GPU (CUDA). Users do not need the C+ compiler.
+snap on Ubuntu with an NVIDIA GPU (CUDA), and an installer for Windows with an
+NVIDIA GPU (CUDA). Users do not need the C+ compiler.
 
 ### Homebrew (macOS)
 
@@ -89,7 +91,7 @@ it and install it; `--dangerous` is needed because the file does not come from
 the Snap Store:
 
 ```sh
-VERSION=0.2.3   # the release you want
+VERSION=0.2.5   # the release you want
 curl -LO "https://github.com/netdur/qwen-image-cplus/releases/download/v$VERSION/qwen-image-cplus_${VERSION}_amd64.snap"
 sudo snap install --dangerous "qwen-image-cplus_${VERSION}_amd64.snap"
 ```
@@ -112,6 +114,30 @@ sudo snap connect qwen-image-cplus:removable-media
 To upgrade, install the newer `.snap` the same way; to uninstall,
 `sudo snap remove qwen-image-cplus`. Snaps installed from a file do not update
 themselves.
+
+### Windows
+
+Needs 64-bit Windows 10 or 11 and an NVIDIA GPU, Turing (RTX 20xx) or newer,
+with the NVIDIA driver. CUDA and cuDNN are bundled.
+
+Each release attaches `qwen-image-cplus-x86_64-pc-windows-msvc-setup.exe` to
+its [GitHub release](https://github.com/netdur/qwen-image-cplus/releases).
+Run it and choose to install for all users (Program Files) or for yourself
+only. It adds **Qwen Image** to the Start menu and, unless you untick the
+option, puts the `qwen-image-cplus` command on PATH. The installation contains:
+
+```text
+bin\qwen-image-cplus.exe
+bin\qwen-image-gui.exe
+bin\qwen_image.dll        (plus the bundled CUDA and cuDNN DLLs)
+include\qwen_image.h
+lib\qwen_image.lib
+lib\qwen_image_static.lib
+```
+
+To upgrade, run the newer installer; to uninstall, use **Settings > Apps**.
+The app keeps its preferences in `%APPDATA%\qwen-image-cplus`, which
+uninstalling leaves in place.
 
 ## Model files
 
@@ -146,6 +172,26 @@ This still needs roughly 34.5 GB of disk space. Omit the LoRA and choose one
 of the other QIPACK files if you prefer the base or four-step model; see the
 [model card](https://huggingface.co/netdur/Qwen-Image-2.1-QIPACK) for their
 names and defaults.
+
+For Qwen's official eight-step
+[Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo),
+download its pack instead. It uses the same shared files; `hf download` skips
+any you already have in `models/`:
+
+```sh
+hf download netdur/Qwen-Image-2.1-QIPACK \
+  qwen-image-2.1-turbo-8step-fp16-v4.qipack \
+  processor/vocab.json processor/merges.txt \
+  text_encoder/model-00001-of-00004.safetensors \
+  text_encoder/model-00002-of-00004.safetensors \
+  text_encoder/model-00003-of-00004.safetensors \
+  text_encoder/model-00004-of-00004.safetensors \
+  vae/diffusion_pytorch_model.safetensors \
+  --local-dir models
+```
+
+That is about 33.1 GB. The Turbo pack needs v0.2.5 or newer, runs exactly
+eight steps, and needs no LoRA.
 
 Keep the supporting files alongside the pack in this layout; multiple packs
 can share the same supporting files:

@@ -1,0 +1,64 @@
+// Where the app keeps its files, and how a path splits. macOS and Linux share
+// this POSIX base; Windows shadows it with system_paths_windows.cplus.
+// Joining needs no helper: every platform's file APIs accept `/` between
+// components, including Windows'.
+
+import "stdlib/env" as env;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+
+// Scratch files, and generated PNGs until an output folder is chosen.
+fn temporary_folder() -> text::Text {
+    return text::from_str("/tmp");
+}
+
+// Preferences: $XDG_CONFIG_HOME/qwen-image-cplus, else ~/.config/qwen-image-cplus.
+fn config_folder() -> text::Text {
+    match env::var("XDG_CONFIG_HOME") {
+        option::Option[text::Text]::Some(base) => {
+            if base.count() > (0 as usize) { return "${base.view()}/qwen-image-cplus"; }
+        }
+        option::Option[text::Text]::None => {}
+    }
+    return match env::var("HOME") {
+        option::Option[text::Text]::Some(home) => "${home.view()}/.config/qwen-image-cplus",
+        option::Option[text::Text]::None => text::from_str("/tmp/qwen-image-cplus"),
+    };
+}
+
+fn is_absolute(path: str) -> bool {
+    return path.has_prefix("/");
+}
+
+// The index of the separator before the last path component, or None.
+fn last_separator(path: str) -> option::Option[usize] {
+    return path.rfind("/");
+}
+
+// The folder holding `path`, or None when it names no folder. The folder of a
+// file at the root is the root itself.
+fn parent_folder(path: str) -> option::Option[text::Text] {
+    guard let option::Option[usize]::Some(index) = last_separator(path) else {
+        return option::Option[text::Text]::None;
+    };
+    let end: usize = if index == (0 as usize) { 1 as usize } else { index };
+    return match path.slice(0 as usize, end) {
+        option::Option[str]::Some(folder) => option::Option[text::Text]::Some(text::from_str(folder)),
+        option::Option::None => option::Option[text::Text]::None,
+    };
+}
+
+#[test]
+fn posix_paths_split_on_slash() {
+    assert is_absolute("/tmp/model.qipack");
+    assert !is_absolute("models/model.qipack");
+    match parent_folder("/models/model.qipack") {
+        option::Option[text::Text]::Some(folder) => { assert folder.view() == "/models"; }
+        option::Option::None => { assert false; }
+    }
+    match parent_folder("/model.qipack") {
+        option::Option[text::Text]::Some(folder) => { assert folder.view() == "/"; }
+        option::Option::None => { assert false; }
+    }
+}

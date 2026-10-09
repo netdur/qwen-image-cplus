@@ -1,3 +1,4 @@
+import "./system_paths" as system_paths;
 import "./files" as files;
 import "events/events" as events;
 import "stdlib/option" as option;
@@ -87,7 +88,7 @@ fn capture_edit(path_value: text::Text, raw: *u8) {
 #[test]
 fn current_png_enables_edit_and_delivers_the_path() {
     let path_value: text::Text =
-        "/tmp/qwen-image-gui-current-${process::current_id()}-${time::now_millis()}.png";
+        "${system_paths::temporary_folder().view()}/qwen-image-gui-current-${process::current_id()}-${time::now_millis()}.png";
     let _written = fs::write_string(path_value.view(), "png bytes");
     clear();
     var capture: EditCapture = EditCapture { count: 0 as usize, path: text::new() };

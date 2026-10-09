@@ -9,12 +9,14 @@ import "facet/mount" as mount;
 import "facet/popup" as popup;
 import "facet_runtime/runtime" as runtime;
 import "qwen_image/pack_info" as pack_info;
+import "qwen_image/schedule" as fixed_schedule;
 import "stdlib/option" as option;
 import "stdlib/str" as _;
 import "stdlib/text" as text;
 import "stdlib/vec" as vec;
 import "facet/gestures" as _;
 import "../preferences" as preferences;
+import "../system_paths" as system_paths;
 import "./style" as style;
 
 struct ModelSelection {
@@ -28,17 +30,7 @@ fn has_model_extension(path: str) -> bool {
 }
 
 fn model_root_for_pack(path: str) -> option::Option[text::Text] {
-    guard let option::Option[usize]::Some(index) = path.rfind("/") else {
-        return option::Option[text::Text]::None;
-    };
-    if index == (0 as usize) {
-        return option::Option[text::Text]::Some(text::from_str("/"));
-    }
-    return match path.slice(0 as usize, index) {
-        option::Option[str]::Some(root) =>
-        option::Option[text::Text]::Some(text::from_str(root)),
-        option::Option::None => option::Option[text::Text]::None,
-    };
+    return system_paths::parent_folder(path);
 }
 
 fn has_support_files(root: str) -> bool {
@@ -78,23 +70,32 @@ fn adapter_beside_pack(root: str) -> text::Text {
     return "${root}/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors";
 }
 
-fn is_viggle_v021_pack(path: str) -> bool {
+fn pack_schedule_is(path: str, name: str) -> bool {
     return match pack_info::read(path) {
         option::Option[pack_info::PackInfo]::Some(info) => match info.get("schedule") {
-            option::Option[str]::Some(value) => value == "viggle-v0.2.1-6",
+            option::Option[str]::Some(value) => value == name,
             option::Option::None => false,
         },
         option::Option[pack_info::PackInfo]::None => false,
     };
 }
 
+fn is_viggle_v021_pack(path: str) -> bool {
+    return pack_schedule_is(path, "viggle-v0.2.1-6");
+}
+
+// Packs with a fixed schedule run only its step count.
 fn select_pack_steps(path: str) {
-    if !is_viggle_v021_pack(path) { return; }
-    let _saved: bool = preferences::save_steps(6 as i64);
+    let steps: i64 = if is_viggle_v021_pack(path) {
+        6 as i64
+    } else if pack_schedule_is(path, fixed_schedule::QWEN_TURBO_8) {
+        fixed_schedule::QWEN_TURBO_8_STEPS as i64
+    } else { return; };
+    let _saved: bool = preferences::save_steps(steps);
     match popup::find("settings:steps") {
         option::Option[popup::Popup]::Some(field) => {
             let _field: popup::Popup = field.set_selected_index(
-                preferences::step_index(6 as i64));
+                preferences::step_index(steps));
         }
         option::Option::None => {}
     }
@@ -102,7 +103,7 @@ fn select_pack_steps(path: str) {
 
 fn selected_name(path: str) -> text::Text {
     if path.count() == (0 as usize) { return text::from_str("No file selected"); }
-    match path.rfind("/") {
+    match system_paths::last_separator(path) {
         option::Option[usize]::Some(index) => {
             match path.slice(index +% (1 as usize), path.count()) {
                 option::Option[str]::Some(name) => {

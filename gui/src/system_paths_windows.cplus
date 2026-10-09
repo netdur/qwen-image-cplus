@@ -1,0 +1,104 @@
+// Where the app keeps its files, and how a path splits, on Windows: the
+// user's %TEMP% and %APPDATA% folders, and `\` as well as `/` between
+// components. Joining needs no helper: Windows' file APIs accept `/`.
+
+import "stdlib/env" as env;
+import "stdlib/option" as option;
+import "stdlib/str" as _;
+import "stdlib/text" as text;
+
+fn _env_folder(name: str) -> option::Option[text::Text] {
+    guard let option::Option[text::Text]::Some(value) = env::var(name) else {
+        return option::Option[text::Text]::None;
+    };
+    let trimmed: str = value.view().removing_suffix("\\");
+    if trimmed.count() == (0 as usize) { return option::Option[text::Text]::None; }
+    return option::Option[text::Text]::Some(text::from_str(trimmed));
+}
+
+// Scratch files, and generated PNGs until an output folder is chosen.
+fn temporary_folder() -> text::Text {
+    if let option::Option[text::Text]::Some(folder) = _env_folder("TEMP") { return folder; }
+    if let option::Option[text::Text]::Some(folder) = _env_folder("TMP") { return folder; }
+    return text::from_str("C:\\Windows\\Temp");
+}
+
+// Preferences: %APPDATA%\qwen-image-cplus.
+fn config_folder() -> text::Text {
+    if let option::Option[text::Text]::Some(folder) = _env_folder("APPDATA") {
+        return "${folder.view()}\\qwen-image-cplus";
+    }
+    let temporary: text::Text = temporary_folder();
+    return "${temporary.view()}\\qwen-image-cplus";
+}
+
+fn _is_separator(byte: u8) -> bool {
+    return byte == (92 as u8) || byte == (47 as u8);
+}
+
+// A drive-qualified path (`C:\...` or `C:/...`) or a UNC path (`\\server\share`).
+fn is_absolute(path: str) -> bool {
+    guard let option::Option[u8]::Some(first) = path.byte_at(0 as usize) else { return false; };
+    if _is_separator(first) {
+        guard let option::Option[u8]::Some(second) = path.byte_at(1 as usize) else { return false; };
+        return _is_separator(second);
+    }
+    guard let option::Option[u8]::Some(colon) = path.byte_at(1 as usize) else { return false; };
+    guard let option::Option[u8]::Some(third) = path.byte_at(2 as usize) else { return false; };
+    return colon == (58 as u8) && _is_separator(third);
+}
+
+// The index of the separator before the last path component, or None.
+fn last_separator(path: str) -> option::Option[usize] {
+    let slash: option::Option[usize] = path.rfind("/");
+    let backslash: option::Option[usize] = path.rfind("\\");
+    return match slash {
+        option::Option[usize]::Some(a) => match backslash {
+            option::Option[usize]::Some(b) => option::Option[usize]::Some(if a > b { a } else { b }),
+            option::Option::None => option::Option[usize]::Some(a),
+        },
+        option::Option::None => backslash,
+    };
+}
+
+// The folder holding `path`, or None when it names no folder. The folder of a
+// file at a drive's root is that root (`C:\`), not the drive-relative `C:`.
+fn parent_folder(path: str) -> option::Option[text::Text] {
+    guard let option::Option[usize]::Some(index) = last_separator(path) else {
+        return option::Option[text::Text]::None;
+    };
+    var end: usize = index;
+    if index == (0 as usize) { end = 1 as usize; }
+    if index == (2 as usize) {
+        if let option::Option[u8]::Some(byte) = path.byte_at(1 as usize) {
+            if byte == (58 as u8) { end = 3 as usize; }
+        }
+    }
+    return match path.slice(0 as usize, end) {
+        option::Option[str]::Some(folder) => option::Option[text::Text]::Some(text::from_str(folder)),
+        option::Option::None => option::Option[text::Text]::None,
+    };
+}
+
+#[test]
+fn windows_paths_split_on_either_separator() {
+    assert is_absolute("C:\\models\\model.qipack");
+    assert is_absolute("C:/models/model.qipack");
+    assert is_absolute("\\\\server\\share\\model.qipack");
+    assert !is_absolute("models\\model.qipack");
+    assert !is_absolute("C:model.qipack");
+    match parent_folder("C:\\Users\\me\\models\\model.qipack") {
+        option::Option[text::Text]::Some(folder) => { assert folder.view() == "C:\\Users\\me\\models"; }
+        option::Option::None => { assert false; }
+    }
+    match parent_folder("D:/models/model.qipack") {
+        option::Option[text::Text]::Some(folder) => { assert folder.view() == "D:/models"; }
+        option::Option::None => { assert false; }
+    }
+    match parent_folder("C:\\model.qipack") {
+        option::Option[text::Text]::Some(folder) => { assert folder.view() == "C:\\"; }
+        option::Option::None => { assert false; }
+    }
+    let temporary: text::Text = temporary_folder();
+    assert is_absolute(temporary.view());
+}

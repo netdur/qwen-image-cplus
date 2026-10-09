@@ -1,6 +1,6 @@
 [package]
 name    = "qwen-image-cplus"
-version = "0.2.2"
+version = "0.2.5"
 edition = "2026"
 
 # The public CLI: the same source on every platform, over qwen_image/api.
@@ -20,4 +20,7 @@ metal            = "*"
 foundation       = "*"
 
 [linux.dependencies]
+qwen_image_cuda = "*"
+
+[windows.dependencies]
 qwen_image_cuda = "*"

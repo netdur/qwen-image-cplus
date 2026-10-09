@@ -430,13 +430,11 @@ fn _stub_square(packed: str, model: str, output: str, prompt: str, seed: u64, st
     return if control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) { 1 } else { 3 };
 }
 
-fn _stub_sized(packed: str, model: str, output: str, prompt: str, width: usize, height: usize, seed: u64, steps: str,
-               observer: control::Observer) -> i32 {
+fn _stub_sized(packed: str, model: str, output: str, prompt: str, width: usize, height: usize, seed: u64, steps: str, observer: control::Observer) -> i32 {
     return if control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) { 1 } else { 3 };
 }
 
-fn _stub_multi(packed: str, model: str, images: *str, count: usize, prompt: str, steps: str, output: str, seed: u64,
-               resolution: usize, observer: control::Observer, width: usize, height: usize, benchmark: bool) -> i32 {
+fn _stub_multi(packed: str, model: str, images: *str, count: usize, prompt: str, steps: str, output: str, seed: u64, resolution: usize, observer: control::Observer, width: usize, height: usize, benchmark: bool) -> i32 {
     return if control::report(observer, control::Phase::Preparing, 0 as usize, 0 as usize) { 1 } else { 3 };
 }
 

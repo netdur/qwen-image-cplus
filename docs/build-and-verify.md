@@ -26,6 +26,52 @@ dist/lib/libqwen_image.a
 dist/lib/libqwen_image.dylib
 ```
 
+### Windows
+
+On Windows, `build.sh` (from Git Bash) hands over to
+`scripts/build-windows.ps1`, which can also be run directly from PowerShell.
+It builds the CUDA engine, the CLI, the GUI and the C library, checks that
+every binary finds every DLL it imports, and runs the C ABI smoke test. It
+needs Visual Studio 2022 with the C++ x64 tools, LLVM 19 or newer (`clang`,
+`llvm-ar`, `llvm-readobj`), and three libraries named by environment variable:
+
+- `CUDA_HOME`: a CUDA 12 toolkit.
+- `CUDNN_HOME`: cuDNN 8 for CUDA 12.
+- `JPEG_HOME`: libjpeg-turbo, built static against the static C runtime,
+  because cpc links C+ programs with `/MT`.
+
+`scripts/install-windows-deps.ps1 FOLDER` installs all three from pinned,
+hash-checked downloads (CUDA from NVIDIA's per-component archives, so no
+installer, administrator or driver change) and prints the three variables.
+The release workflow uses the same script.
+
+libjpeg-turbo is required rather than `stb_image` alone, as on Linux: it
+decodes JPEGs to Pillow's exact pixels, and `stb_image` differs by up to three
+levels on ordinary 4:2:0 photos (see `qwen_image_cuda/native/image.c`).
+
+The C+ compiler comes from the commit `scripts/install-cpc-source.sh` pins,
+with each package's `vendor\` pointed at that checkout by
+`scripts/link_vendor.sh` (directory junctions on Windows).
+
+```powershell
+scripts\install-windows-deps.ps1 C:\deps   # once; prints CUDA_HOME, CUDNN_HOME, JPEG_HOME
+$env:CPC = "C:\path\to\cpc.exe"
+$env:CUDA_HOME = "C:\deps\cuda"
+$env:CUDNN_HOME = "C:\deps\cudnn"
+$env:JPEG_HOME = "C:\deps\libjpeg-turbo"
+scripts\build-windows.ps1
+```
+
+```text
+dist\bin\qwen-image-cplus.exe
+dist\bin\qwen-image-gui.exe
+dist\bin\qwen_image.dll
+dist\bin\cudart64_12.dll, cublas*.dll, cudnn*.dll
+dist\include\qwen_image.h
+dist\lib\qwen_image.lib
+dist\lib\qwen_image_static.lib
+```
+
 For development, verify the package boundaries independently:
 
 ```sh
@@ -316,3 +362,29 @@ Inspect a shard, optionally filtering tensor names:
 ```sh
 ./qwen_image_metal_dev/target/debug/qwen_image_metal_dev inspect /path/to/shard.safetensors proj_out
 ```
+
+## Converting Qwen-Image-2.1-Turbo
+
+The published `qwen-image-2.1-turbo-8step-fp16-v4.qipack` was converted from
+[Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo). Its
+text encoder, processor, and VAE match the base checkpoint (its BF16 VAE is
+the base FP32 VAE, rounded), so only the transformer is converted. To rebuild
+the pack:
+
+```sh
+hf download Qwen/Qwen-Image-2.1-Turbo \
+  transformer/diffusion_pytorch_model-00001-of-00002.safetensors \
+  transformer/diffusion_pytorch_model-00002-of-00002.safetensors \
+  --local-dir models/Qwen-Image-2.1-Turbo
+qwen_image_metal_dev quantize-transformer models/Qwen-Image-2.1-Turbo \
+  models/qwen-image-2.1-turbo-fp16-v4.qipack
+qwen_image_metal_dev pack-metadata models/qwen-image-2.1-turbo-fp16-v4.qipack \
+  base=Qwen/Qwen-Image-2.1@b3179ad355be050328e483a9dfdd9e60cd62adfa \
+  kind=distilled steps=8 shift_terminal=none cache=none \
+  schedule=qwen-2.1-turbo-8 \
+  source=Qwen/Qwen-Image-2.1-Turbo@d65dbc9a7e8f6b5479e33dee6030eaab2a906509
+```
+
+`schedule=qwen-2.1-turbo-8` selects the eight sigmas the checkpoint ships in
+`model_index.json`, used as given at every resolution; the pack runs only
+eight steps.

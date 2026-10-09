@@ -1,0 +1,256 @@
+// Positional file access for the engines, Windows half: shadows
+// `file_io.cplus` through the resolver's `_windows` override and presents the
+// same functions.
+//
+// The MSVC runtime has no pread / pwrite / ftruncate / fsync, and its `open`
+// would need `_O_BINARY` on every call to stop text mode rewriting bytes. So
+// this file goes to Win32 directly: CreateFileW, and ReadFile / WriteFile with
+// an OVERLAPPED offset.
+//
+// The descriptor is the file HANDLE truncated to i32. 64-bit Windows keeps
+// kernel handles in 32 bits so they can cross into 32-bit processes, and
+// documents that truncating and sign-extending one is safe;
+// INVALID_HANDLE_VALUE (-1) stays -1, the negative failure value callers test.
+//
+// Files open with FILE_FLAG_OVERLAPPED. On a synchronous handle the I/O
+// manager serialises every request on the file object, which would turn the
+// text encoder's parallel reads into one queue. Each positional call waits on
+// its own event instead, so reads from several threads really overlap.
+
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    opaque event: *u8,
+}
+
+#[link_name = "CreateFileW"]
+extern fn qi_io_create_file(path: *u16, access: u32, share: u32, security: *u8, disposition: u32, attributes: u32, template: *u8) -> *u8;
+#[link_name = "CloseHandle"]
+extern fn qi_io_close_handle(handle: *u8) -> i32;
+#[link_name = "ReadFile"]
+extern fn qi_io_read_file(handle: *u8, buffer: *u8, count: u32, done: *u32, overlapped: *Overlapped) -> i32;
+#[link_name = "WriteFile"]
+extern fn qi_io_write_file(handle: *u8, buffer: *u8, count: u32, done: *u32, overlapped: *Overlapped) -> i32;
+#[link_name = "GetOverlappedResult"]
+extern fn qi_io_overlapped_result(handle: *u8, overlapped: *Overlapped, done: *u32, wait: i32) -> i32;
+#[link_name = "CreateEventW"]
+extern fn qi_io_create_event(security: *u8, manual_reset: i32, initial: i32, name: *u16) -> *u8;
+#[link_name = "GetLastError"]
+extern fn qi_io_last_error() -> u32;
+#[link_name = "GetFileSizeEx"]
+extern fn qi_io_file_size(handle: *u8, size: *i64) -> i32;
+#[link_name = "SetFileInformationByHandle"]
+extern fn qi_io_set_file_info(handle: *u8, class: i32, info: *i64, bytes: u32) -> i32;
+#[link_name = "FlushFileBuffers"]
+extern fn qi_io_flush(handle: *u8) -> i32;
+#[link_name = "MoveFileExW"]
+extern fn qi_io_move_file(source: *u16, destination: *u16, flags: u32) -> i32;
+#[link_name = "DeleteFileW"]
+extern fn qi_io_delete_file(path: *u16) -> i32;
+#[link_name = "MultiByteToWideChar"]
+extern fn qi_io_widen(codepage: u32, flags: u32, source: *u8, source_len: i32, wide: *u16, wide_len: i32) -> i32;
+#[link_name = "malloc"]
+extern fn qi_io_malloc(bytes: usize) -> *u8;
+#[link_name = "free"]
+extern fn qi_io_free(pointer: *u8);
+
+const GENERIC_READ: u32 = 0x80000000u32;
+const GENERIC_WRITE: u32 = 0x40000000u32;
+// Read, write and delete sharing, so a reader never blocks a writer or a
+// rename the way it would not on POSIX.
+const SHARE_ALL: u32 = 7u32;
+const OPEN_EXISTING: u32 = 3u32;
+const CREATE_ALWAYS: u32 = 2u32;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80u32;
+const FILE_FLAG_OVERLAPPED: u32 = 0x40000000u32;
+const ERROR_IO_PENDING: u32 = 997u32;
+const FILE_END_OF_FILE_INFO: i32 = 6;
+const MOVEFILE_REPLACE_EXISTING: u32 = 1u32;
+const CP_UTF8: u32 = 65001u32;
+// ReadFile and WriteFile take a 32-bit count; larger requests are split.
+const CHUNK_BYTES: usize = 1073741824 as usize;
+
+fn _handle(fd: i32) -> *u8 {
+    return ((fd as isize) as usize) as *u8;
+}
+
+fn _descriptor(handle: *u8) -> i32 {
+    return (#addr(handle) as isize) as i32;
+}
+
+// UTF-8 to a malloc'd, NUL-terminated UTF-16 path, or null.
+fn _wide_path(path: str) -> *u16 {
+    let owner: text::Text = text::from_str(path);
+    guard let option::Option[text::CString]::Some(name) = owner.c_str() else { return 0 as *u16; };
+    let need: i32 = qi_io_widen(CP_UTF8, 0u32, name.as_ptr(), 0 -% (1 as i32), 0 as *u16, 0 as i32);
+    if need <= (0 as i32) { return 0 as *u16; }
+    let wide: *u16 = qi_io_malloc((need as usize) *% (2 as usize)) as *u16;
+    if wide.is_null() { return 0 as *u16; }
+    if qi_io_widen(CP_UTF8, 0u32, name.as_ptr(), 0 -% (1 as i32), wide, need) <= (0 as i32) {
+        qi_io_free(wide as *u8);
+        return 0 as *u16;
+    }
+    return wide;
+}
+
+fn _open(path: str, access: u32, disposition: u32) -> i32 {
+    let wide: *u16 = _wide_path(path);
+    if wide.is_null() { return 0 -% (1 as i32); }
+    let attributes: u32 = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
+    let handle: *u8 = qi_io_create_file(wide, access, SHARE_ALL, 0 as *u8, disposition, attributes, 0 as *u8);
+    qi_io_free(wide as *u8);
+    return _descriptor(handle);
+}
+
+// A descriptor for reading, or a negative value.
+fn open_read(path: str) -> i32 {
+    return _open(path, GENERIC_READ, OPEN_EXISTING);
+}
+
+// A read-write descriptor for a new (or truncated) file, or a negative value.
+fn create(path: str) -> i32 {
+    return _open(path, GENERIC_READ | GENERIC_WRITE, CREATE_ALWAYS);
+}
+
+// 0 on success.
+fn close(fd: i32) -> i32 {
+    if fd < (0 as i32) { return 0 -% (1 as i32); }
+    if qi_io_close_handle(_handle(fd)) == (0 as i32) { return 0 -% (1 as i32); }
+    return 0 as i32;
+}
+
+// Sets the file's length; true on success.
+fn truncate(fd: i32, length: u64) -> bool {
+    var end: i64 = length as i64;
+    return qi_io_set_file_info(_handle(fd), FILE_END_OF_FILE_INFO, #addr_of(end), 8u32) != (0 as i32);
+}
+
+// Flushes the file to storage; true on success.
+fn sync(fd: i32) -> bool {
+    return qi_io_flush(_handle(fd)) != (0 as i32);
+}
+
+// Replaces `destination` with `source` in one step; true on success. The C
+// runtime's `rename` refuses an existing destination, MoveFileExW does not.
+fn rename(source: str, destination: str) -> bool {
+    let from: *u16 = _wide_path(source);
+    if from.is_null() { return false; }
+    let to: *u16 = _wide_path(destination);
+    if to.is_null() { qi_io_free(from as *u8); return false; }
+    let ok: bool = qi_io_move_file(from, to, MOVEFILE_REPLACE_EXISTING) != (0 as i32);
+    qi_io_free(from as *u8);
+    qi_io_free(to as *u8);
+    return ok;
+}
+
+// Deletes a file; true on success.
+fn remove(path: str) -> bool {
+    let wide: *u16 = _wide_path(path);
+    if wide.is_null() { return false; }
+    let ok: bool = qi_io_delete_file(wide) != (0 as i32);
+    qi_io_free(wide as *u8);
+    return ok;
+}
+
+// File size in bytes, or a negative value.
+fn size(fd: i32) -> i64 {
+    var bytes: i64 = 0 as i64;
+    if qi_io_file_size(_handle(fd), #addr_of(bytes)) == (0 as i32) { return (0 as i64) -% (1 as i64); }
+    return bytes;
+}
+
+// One ReadFile or WriteFile of at most CHUNK_BYTES at `offset`, waited on its
+// own event. The number of bytes moved, or a negative value.
+fn _transfer(fd: i32, bytes: *u8, count: usize, offset: u64, writing: bool) -> i64 {
+    let event: *u8 = qi_io_create_event(0 as *u8, 1 as i32, 0 as i32, 0 as *u16);
+    if event.is_null() { return (0 as i64) -% (1 as i64); }
+    var overlapped: Overlapped = {
+        internal: 0 as usize,
+        internal_high: 0 as usize,
+        offset: (offset & 0xFFFFFFFFu64) as u32,
+        offset_high: (offset >> 32u64) as u32,
+        event: event,
+    };
+    let handle: *u8 = _handle(fd);
+    let request: u32 = (if count < CHUNK_BYTES { count } else { CHUNK_BYTES }) as u32;
+    var done: u32 = 0u32;
+    let started: i32 = if writing {
+        qi_io_write_file(handle, bytes, request, 0 as *u32, #addr_of(overlapped))
+    } else {
+        qi_io_read_file(handle, bytes, request, 0 as *u32, #addr_of(overlapped))
+    };
+    var ok: bool = started != (0 as i32) || qi_io_last_error() == ERROR_IO_PENDING;
+    if ok {
+        ok = qi_io_overlapped_result(handle, #addr_of(overlapped), #addr_of(done), 1 as i32) != (0 as i32);
+    }
+    let _closed: i32 = qi_io_close_handle(event);
+    if !ok { return (0 as i64) -% (1 as i64); }
+    return done as i64;
+}
+
+// Reads exactly `count` bytes at `offset`; false on error or end of file.
+// Safe to call from several threads on one descriptor.
+fn read_at(fd: i32, bytes: *u8, count: usize, offset: u64) -> bool {
+    var done: usize = 0 as usize;
+    while done < count {
+        let result: i64 = _transfer(fd, bytes + done, count -% done, offset +% done as u64, false);
+        if result <= (0 as i64) { return false; }
+        done = done +% result as usize;
+    }
+    return true;
+}
+
+// Writes exactly `count` bytes at `offset`.
+fn write_at(fd: i32, bytes: *u8, count: usize, offset: u64) -> bool {
+    var done: usize = 0 as usize;
+    while done < count {
+        let result: i64 = _transfer(fd, bytes + done, count -% done, offset +% done as u64, true);
+        if result <= (0 as i64) { return false; }
+        done = done +% result as usize;
+    }
+    return true;
+}
+
+#[test]
+fn positional_io_round_trips_through_win32_handles() {
+    let path: str = "target/file_io_windows_test.bin";
+    let renamed: str = "target/file_io_windows_test_renamed.bin";
+    let _stale: bool = remove(renamed);
+    let fd: i32 = create(path);
+    assert fd >= (0 as i32);
+    var head: [u8; 4] = [1u8, 2u8, 3u8, 4u8];
+    var tail: [u8; 4] = [5u8, 6u8, 7u8, 8u8];
+    // Written out of order and past a gap, the way the pack writer lays out blocks.
+    assert write_at(fd, #addr_of(tail) as *u8, 4 as usize, 12u64);
+    assert write_at(fd, #addr_of(head) as *u8, 4 as usize, 0u64);
+    assert size(fd) == (16 as i64);
+    var back: [u8; 16] = [0u8; 16];
+    assert read_at(fd, #addr_of(back) as *u8, 16 as usize, 0u64);
+    assert back[0] == 1u8 && back[3] == 4u8 && back[4] == 0u8 && back[12] == 5u8 && back[15] == 8u8;
+    assert truncate(fd, 6u64);
+    assert size(fd) == (6 as i64);
+    assert sync(fd);
+    assert close(fd) == (0 as i32);
+    // Rename replaces an existing destination, as rename(2) does.
+    let other: i32 = create(renamed);
+    assert other >= (0 as i32);
+    assert close(other) == (0 as i32);
+    assert rename(path, renamed);
+    assert open_read(path) < (0 as i32);
+    let reader: i32 = open_read(renamed);
+    assert reader >= (0 as i32);
+    assert size(reader) == (6 as i64);
+    // Reading past the end fails instead of returning a short buffer.
+    assert !read_at(reader, #addr_of(back) as *u8, 8 as usize, 0u64);
+    assert read_at(reader, #addr_of(back) as *u8, 2 as usize, 4u64);
+    assert back[0] == 0u8 && back[1] == 0u8;
+    assert close(reader) == (0 as i32);
+    assert remove(renamed);
+    assert open_read(renamed) < (0 as i32);
+}

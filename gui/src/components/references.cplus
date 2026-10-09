@@ -1,3 +1,4 @@
+import "../system_paths" as system_paths;
 import "../files" as files;
 import "flex_layout/flex_layout" as flex;
 import "facet/facet" as core;
@@ -384,7 +385,7 @@ fn image_drop_accepts_supported_extensions_only() {
 #[test]
 fn edit_current_image_adds_it_to_the_reference_strip() {
     let path: text::Text =
-        "/tmp/qwen-image-gui-edit-${process::current_id()}-${time::now_millis()}.png";
+        "${system_paths::temporary_folder().view()}/qwen-image-gui-edit-${process::current_id()}-${time::now_millis()}.png";
     let saved: preferences::GenerationPreferences = preferences::load();
     // A 32 x 32 black PNG.
     let png: *[u8; 100] = #include_bytes("../../testdata/black32.png");
@@ -416,7 +417,7 @@ fn edit_current_image_adds_it_to_the_reference_strip() {
 #[test]
 fn multi_image_drop_keeps_first_ten_and_sizes_from_first() {
     let nonce: text::Text = "${process::current_id()}-${time::now_millis()}";
-    let first: text::Text = "/tmp/qwen-image-gui-drop-${nonce}-first.bmp";
+    let first: text::Text = "${system_paths::temporary_folder().view()}/qwen-image-gui-drop-${nonce}-first.bmp";
     var bmp: [u8; 62] = [0u8; 62];
     bmp[0] = 0x42u8;
     bmp[1] = 0x4du8;
@@ -435,7 +436,7 @@ fn multi_image_drop_keeps_first_ten_and_sizes_from_first() {
     assert dropped.append(first.clone()) == status::Status::Ok;
     var i: usize = 0 as usize;
     while i < (11 as usize) {
-        let path: text::Text = "/tmp/qwen-image-gui-drop-${nonce}-${i}.png";
+        let path: text::Text = "${system_paths::temporary_folder().view()}/qwen-image-gui-drop-${nonce}-${i}.png";
         assert files::write_bytes(path.view(), png as *u8, 100 as usize);
         assert dropped.append(path) == status::Status::Ok;
         i = i +% (1 as usize);

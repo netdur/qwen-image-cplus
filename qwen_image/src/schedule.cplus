@@ -1,0 +1,32 @@
+// Fixed sampling schedules a pack selects with its `schedule` metadata key.
+// Both engines read the sigmas from here so they cannot disagree.
+
+// Qwen/Qwen-Image-2.1-Turbo (revision d65dbc9a7e8f6b5479e33dee6030eaab2a906509)
+// stores eight `sample_sigmas` in model_index.json. Its scheduler config has
+// use_dynamic_shifting=false, shift=1.0 and shift_terminal=null, so Diffusers
+// uses them as given at every resolution: timestep = sigma * 1000, then a
+// zero Euler endpoint.
+const QWEN_TURBO_8: str = "qwen-2.1-turbo-8";
+const QWEN_TURBO_8_STEPS: usize = 8;
+
+// Sigma `index` of the Turbo schedule; 0 for the endpoint and beyond.
+fn qwen_turbo_8_sigma(index: usize) -> f32 {
+    if index >= QWEN_TURBO_8_STEPS { return 0.0f32; }
+    let sigmas: [f32; 8] = [
+        1.0f32, 0.978453f32, 0.95418f32, 0.926626f32,
+        0.89508f32, 0.845148f32, 0.704534f32, 0.414568f32,
+    ];
+    return sigmas[index];
+}
+
+#[test]
+fn qwen_turbo_8_schedule_matches_the_checkpoint() {
+    assert qwen_turbo_8_sigma(0 as usize) == 1.0f32;
+    assert qwen_turbo_8_sigma(7 as usize) == 0.414568f32;
+    assert qwen_turbo_8_sigma(8 as usize) == 0.0f32;
+    var index: usize = 0 as usize;
+    while index < QWEN_TURBO_8_STEPS {
+        assert qwen_turbo_8_sigma(index) > qwen_turbo_8_sigma(index +% (1 as usize));
+        index = index +% (1 as usize);
+    }
+}

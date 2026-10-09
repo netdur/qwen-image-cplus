@@ -1,7 +1,7 @@
 // Neutral runtime: no inference backend exists for this target, so nothing is
 // installed and `qwen_image/api` answers every request with that diagnostic.
-// macOS and Linux resolve `import "qwen_image_runtime/runtime"` to their own
-// file (runtime_macos.cplus, runtime_linux.cplus); a new platform starts by
+// macOS, Linux and Windows resolve `import "qwen_image_runtime/runtime"` to their own
+// file (runtime_macos.cplus, runtime_linux.cplus, runtime_windows.cplus); a new platform starts by
 // copying one of those, not this file.
 
 fn install() {

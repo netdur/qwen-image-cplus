@@ -13,6 +13,11 @@ The base pack was converted from:
   Qwen/Qwen-Image-2.1
   Revision b3179ad355be050328e483a9dfdd9e60cd62adfa
 
+The eight-step Turbo pack was converted from the full transformer in:
+
+  Qwen/Qwen-Image-2.1-Turbo
+  Revision d65dbc9a7e8f6b5479e33dee6030eaab2a906509
+
 The four-step distilled pack was converted from the full transformer in:
 
   Viggle/Qwen-Image-2.1-viggle-turbo

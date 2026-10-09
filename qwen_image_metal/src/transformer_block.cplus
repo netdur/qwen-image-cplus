@@ -1,5 +1,6 @@
 import "./host_buffers" as host_buffers;
 import "qwen_image/generation_control" as control;
+import "qwen_image/schedule" as fixed_schedule;
 import "./cpu_ops" as cpu;
 import "./metal_primitives" as metrics;
 import "./mmap_macos" as mapped;
@@ -6953,14 +6954,18 @@ fn pack_shift_terminal(packed_path: str) -> u32 {
     };
 }
 
-fn pack_viggle_v021_schedule(packed_path: str) -> bool {
+fn pack_schedule_is(packed_path: str, name: str) -> bool {
     return match packed::read_metadata(packed_path) {
         packed::MetadataResult::Ok(metadata) => match metadata.get("schedule") {
-            option::Option[str]::Some(value) => value == "viggle-v0.2.1-6",
+            option::Option[str]::Some(value) => value == name,
             option::Option[str]::None => false,
         },
         packed::MetadataResult::Err(_message) => false,
     };
+}
+
+fn pack_viggle_v021_schedule(packed_path: str) -> bool {
+    return pack_schedule_is(packed_path, "viggle-v0.2.1-6");
 }
 
 // One log line identifying the pack by its metadata, since the fixed header
@@ -7135,6 +7140,12 @@ fn run_trajectory_packed_impl(
         io::eprintln("trajectory: Viggle v0.2.1 requires its exact six-step schedule");
         return 2;
     }
+    let qwen_turbo_schedule: bool = pack_schedule_is(packed_path, fixed_schedule::QWEN_TURBO_8);
+    if qwen_turbo_schedule && step_limit != fixed_schedule::QWEN_TURBO_8_STEPS
+        && !(final_latent.is_null() && step_limit <= (2 as usize)) {
+        io::eprintln("trajectory: Qwen-Image-2.1-Turbo requires its exact eight-step schedule");
+        return 2;
+    }
     let shift_terminal_source: str = if pack_shift != PACK_SHIFT_TERMINAL_UNSET {
         "pack"
     } else if no_shift_override { "env" } else { "default" };
@@ -7188,6 +7199,8 @@ fn run_trajectory_packed_impl(
         flow::fill_viggle_v021_schedule(
             target_rows, #addr_of(sigmas[0]), #addr_of(timesteps[0]),
         )
+    } else if qwen_turbo_schedule {
+        flow::fill_qwen_turbo_8_schedule(#addr_of(sigmas[0]), #addr_of(timesteps[0]))
     } else if bottleneck_shift > 0.0f32 {
         flow::fill_bottleneck_schedule(
             schedule_steps,

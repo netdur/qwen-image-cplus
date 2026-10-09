@@ -1,6 +1,7 @@
 import "./cpu_ops" as cpu;
 import "./mmap_macos" as mapped;
 import "./safetensors" as safetensors;
+import "qwen_image/schedule" as fixed_schedule;
 import "stdlib/env" as env;
 import "stdlib/io" as io;
 import "stdlib/math" as _;
@@ -2367,10 +2368,15 @@ fn validate_known_metadata(metadata: Metadata) -> text::Text {
     }
     match metadata.get("schedule") {
         option::Option[str]::Some(value) => {
-            if value != "viggle-v0.2.1-6" {
-                return "schedule must be viggle-v0.2.1-6, got ${value}";
-            }
-            if !metadata_value_is(metadata, "steps", "6")
+            if value == fixed_schedule::QWEN_TURBO_8 {
+                if !metadata_value_is(metadata, "steps", "8")
+                    || !metadata_value_is(metadata, "shift_terminal", "none")
+                    || !metadata_value_is(metadata, "kind", "distilled") {
+                    return "schedule=${value} requires kind=distilled, steps=8, and shift_terminal=none";
+                }
+            } else if value != "viggle-v0.2.1-6" {
+                return "schedule must be viggle-v0.2.1-6 or ${fixed_schedule::QWEN_TURBO_8}, got ${value}";
+            } else if !metadata_value_is(metadata, "steps", "6")
                 || !metadata_value_is(metadata, "shift_terminal", "none")
                 || !metadata_value_is(metadata, "kind", "distilled")
                 || !metadata_value_is(metadata, "lora", "viggle-v0.2.1-r256") {
@@ -2714,6 +2720,18 @@ fn metadata_rejects_invalid_blocks() {
         MetadataResult::Err(_message) => { assert false; }
     }
     match parse_metadata("kind=distilled\nsteps=6\nshift_terminal=none\nschedule=viggle-v0.2.1-6\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("kind=distilled\nsteps=8\nshift_terminal=none\ncache=none\nschedule=qwen-2.1-turbo-8\n") {
+        MetadataResult::Ok(_m) => {}
+        MetadataResult::Err(_message) => { assert false; }
+    }
+    match parse_metadata("kind=distilled\nsteps=4\nshift_terminal=none\nschedule=qwen-2.1-turbo-8\n") {
+        MetadataResult::Ok(_m) => { assert false; }
+        MetadataResult::Err(_message) => {}
+    }
+    match parse_metadata("kind=distilled\nsteps=8\nshift_terminal=none\nschedule=qwen-2.1-turbo-8\nlora=viggle-v0.2.1-r256\n") {
         MetadataResult::Ok(_m) => { assert false; }
         MetadataResult::Err(_message) => {}
     }

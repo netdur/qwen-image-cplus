@@ -1,6 +1,6 @@
 [package]
 name    = "qwen_image_ffi"
-version = "0.2.2"
+version = "0.2.5"
 edition = "2026"
 
 [library]
@@ -24,4 +24,7 @@ metal            = "*"
 foundation       = "*"
 
 [linux.dependencies]
+qwen_image_cuda = "*"
+
+[windows.dependencies]
 qwen_image_cuda = "*"

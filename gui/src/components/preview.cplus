@@ -14,6 +14,18 @@ import "../current_image" as current_image;
 import "../generation_session" as generation_session;
 import "./style" as style;
 
+// Sets a label's text unless it already reads `value`.
+fn set_label_text(key: str, value: str) {
+    match label::find(key) {
+        option::Option[label::Label]::Some(found) => {
+            if found.text() != value {
+                let _found: label::Label = found.set_text(value);
+            }
+        }
+        option::Option::None => {}
+    }
+}
+
 struct Preview {
     output_sub: events::SignalSubscription[current_image::Change],
     session_sub: events::SignalSubscription[generation_session::Change],
@@ -100,38 +112,30 @@ impl Preview {
         this.refresh();
     }
 
+    // Runs on every session change, which while a generation is in flight is
+    // every poll (ten a second). A label is written only when its text differs
+    // and the failure line is shown or hidden only when that changes: every
+    // write marks the node dirty, and on Win32 each one repaints the whole
+    // double-buffered window, preview image included, which read as flashing.
     fn refresh_status(this) {
         let state = generation_session::status_text();
-        match label::find("preview:state") {
-            option::Option[label::Label]::Some(found) => {
-                let _found: label::Label = found.set_text(state.view());
-            }
-            option::Option::None => {}
-        }
+        set_label_text("preview:state", state.view());
         let failure: text::Text = generation_session::failure_text();
-        match label::find("preview:failure") {
-            option::Option[label::Label]::Some(found) => {
-                let _found: label::Label = found.set_text(failure.view());
-            }
-            option::Option::None => {}
-        }
+        set_label_text("preview:failure", failure.view());
         match mount::find("preview:failure") {
             option::Option[*core::Node]::Some(found) => {
                 let visible: bool = failure.count() > (0 as usize);
-                core::set_shown(found, visible);
-                if visible { core::relayout(found); }
+                if core::is_visible(found) != visible {
+                    core::set_shown(found, visible);
+                    if visible { core::relayout(found); }
+                }
             }
             option::Option::None => {}
         }
         let elapsed: i64 = generation_session::elapsed_seconds();
         let elapsed_label: text::Text = if elapsed == (0 as i64)
             && !generation_session::busy() { "—".to_text() } else { "${elapsed} s" };
-        match label::find("preview:elapsed") {
-            option::Option[label::Label]::Some(found) => {
-                let _found: label::Label = found.set_text(elapsed_label.view());
-            }
-            option::Option::None => {}
-        }
+        set_label_text("preview:elapsed", elapsed_label.view());
     }
 
     fn on_session(ref this, _change: generation_session::Change) {

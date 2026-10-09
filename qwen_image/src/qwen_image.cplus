@@ -6,5 +6,6 @@ import "./api" as _;
 import "./engine" as _;
 import "./file_io" as _;
 import "./pack_info" as _;
+import "./schedule" as _;
 import "./generation_control" as _;
 import "./generation_worker" as _;
