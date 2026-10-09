@@ -1,6 +1,6 @@
 [package]
 name    = "qwen_image_ffi"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2026"
 
 [library]

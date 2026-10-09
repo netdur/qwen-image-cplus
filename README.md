@@ -91,7 +91,7 @@ it and install it; `--dangerous` is needed because the file does not come from
 the Snap Store:
 
 ```sh
-VERSION=0.2.4   # the release you want
+VERSION=0.2.5   # the release you want
 curl -LO "https://github.com/netdur/qwen-image-cplus/releases/download/v$VERSION/qwen-image-cplus_${VERSION}_amd64.snap"
 sudo snap install --dangerous "qwen-image-cplus_${VERSION}_amd64.snap"
 ```

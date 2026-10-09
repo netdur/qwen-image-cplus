@@ -1,6 +1,6 @@
 [package]
 name    = "qwen_image_metal_dev"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2026"
 
 # Development commands for the Metal backend: probes, kernel and stage
