@@ -53,6 +53,9 @@ images run out of memory with model offload and use group offload. Details in
 
 ## Install
 
+To build on Apple Silicon with Nix and Xcode, see the
+[Nix development setup](docs/build-and-verify.md#nix-on-apple-silicon).
+
 Prebuilt binaries: Homebrew on macOS 14 or newer on Apple Silicon (Metal), a
 snap on Ubuntu with an NVIDIA GPU (CUDA), and an installer for Windows with an
 NVIDIA GPU (CUDA). Users do not need the C+ compiler.

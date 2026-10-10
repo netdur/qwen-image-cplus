@@ -3,6 +3,45 @@
 Run the commands below from the repository root unless a command changes
 directories explicitly.
 
+## Nix on Apple Silicon
+
+Install Xcode (including the Metal toolchain) and Nix, then enter `nix-shell`
+from the repository root. The shell supplies Rust, Cargo, Git, curl, uv, jq,
+Nix formatting, and ShellCheck. Apple clang, SDKs, frameworks, code signing,
+and Metal compilation come from the selected Xcode installation; they cannot
+be replaced by a portable Nix compiler. Check `xcode-select -p` first.
+
+```sh
+nix-shell
+scripts/install-cpc-source.sh ../cplus
+scripts/link_vendor.sh
+./build.sh
+scripts/verify-dist.sh
+```
+
+The shell sets `CPC` and `CPLUS_VENDOR` to the sibling `../cplus` checkout
+built at the commit pinned by `install-cpc-source.sh`. Use another destination
+by overriding both variables after entering the shell. The shell does not
+download models or execute repository scripts on entry. On macOS 27, it keeps
+debug information in Rust build dependencies to avoid the proc-macro dylib
+alignment failure tracked in
+[rust-lang/rust#157750](https://github.com/rust-lang/rust/issues/157750).
+
+Download and SHA-256-check the eight-step model at a pinned Hugging Face
+revision with `./scripts/download-turbo.sh` (about 33.1 GB), then run:
+
+```sh
+mkdir -p assets/turbo-smoke
+dist/bin/qwen-image-cplus info models/qwen-image-2.1-turbo-8step-fp16-v4.qipack
+dist/bin/qwen-image-cplus generate \
+  models/qwen-image-2.1-turbo-8step-fp16-v4.qipack models assets/turbo-smoke/turbo.png \
+  'a travel poster with the headline "CASABLANCA" and the tagline "MEET ME AT SUNSET"' \
+  1024 1024 1301 8
+```
+
+The explicit final `8` requests eight steps; the pack also selects its own
+fixed Turbo schedule. `models/` and `assets/` are ignored by Git.
+
 ## Distribution build
 
 `build.sh` is the distribution build. It builds the engine, CLI, generated C
