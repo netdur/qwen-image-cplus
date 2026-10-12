@@ -1,0 +1,161 @@
+// Native caption hit regions keep window movement outside XAML's pointer
+// dispatch. Entering a Win32 move loop from PointerPressed delays movement
+// until XAML releases the pointer, even when SendMessage is synchronous.
+import "facet_winui/facet_winui" as host;
+import "facet_winui/native" as native;
+import "facet/facet" as core;
+import "facet/window_chrome" as chrome;
+import "flex_layout/flex_layout" as flex;
+import "winui/winui" as ui;
+import "winrt/runtime" as rt;
+import "stdlib/vec" as vec;
+import "stdlib/option" as option;
+import "stdlib/status" as status;
+
+// Windows App SDK's Microsoft.UI.Input metadata (SDK 1.4+). These two
+// interfaces are not selected by the toolchain's generated WinUI package.
+// ABI: IInputNonClientPointerSourceStatics.GetForWindowId is slot 6;
+// IInputNonClientPointerSource.SetRegionRects is slot 10.
+#[repr(C)]
+struct Region { x: i32, y: i32, width: i32, height: i32 }
+
+static WATCHED: vec::Vec[*u8] = #zero::[vec::Vec[*u8]]();
+static LAST_WINDOW: *u8 = 0 as *u8;
+static LAST_CAPTIONS: vec::Vec[Region] = #zero::[vec::Vec[Region]]();
+static LAST_CONTROLS: vec::Vec[Region] = #zero::[vec::Vec[Region]]();
+
+fn same(a: vec::Vec[Region], b: vec::Vec[Region]) -> bool {
+    if a.count() != b.count() { return false; }
+    var i: usize = 0;
+    while i < a.count() {
+        if let option::Option::Some(left) = a.at(i) {
+            if let option::Option::Some(right) = b.at(i) {
+                if left.x != right.x || left.y != right.y ||
+                    left.width != right.width || left.height != right.height { return false; }
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn source(window: ui::WindowId) -> rt::Object {
+    let iid = rt::Guid {
+        a: 0x7d0b775c as u32, b: 0x1903 as u16, c: 0x5dc7 as u16,
+        d: [0xbd as u8, 0x2f as u8, 0x7a as u8, 0x4b as u8,
+            0x31 as u8, 0xf0 as u8, 0xcf as u8, 0xf2 as u8],
+    };
+    let factory = native::must::[rt::Object](rt::activation_factory(
+        "Microsoft.UI.Input.InputNonClientPointerSource", iid));
+    var pointer: usize = 0;
+    let call = rt::slot(factory.raw(), 6) as fn(*u8, ui::WindowId, *usize) -> i32;
+    native::check(rt::Status { code: call(factory.raw(), window, #addr_of(pointer)) });
+    return rt::Object::adopt(pointer as *u8);
+}
+
+fn set_regions(input: rt::Object, kind: i32, regions: vec::Vec[Region]) {
+    let pointer = match regions.at_ptr(0) {
+        option::Option::Some(value) => value,
+        option::Option::None => 0 as *Region,
+    };
+    let call = rt::slot(input.raw(), 10) as fn(*u8, i32, u32, *Region) -> i32;
+    native::check(rt::Status { code: call(input.raw(), kind,
+        regions.count() as u32, pointer) });
+}
+
+fn collect(n: *core::Node, scale: f64, strip: f64,
+    ref captions: vec::Vec[Region], ref controls: vec::Vec[Region]) {
+    if core::display_of(n) == flex::Display::None ||
+        !(*core::node_data(n)).common.is_visible { return; }
+    let f = (*n).frame();
+    if f.width <= 0.0f64 || f.height <= 0.0f64 { return; }
+    let left = (f.left * scale + 0.5f64) as i32;
+    let top = ((f.top + strip) * scale + 0.5f64) as i32;
+    let right = ((f.left + f.width) * scale + 0.5f64) as i32;
+    let bottom = ((f.top + strip + f.height) * scale + 0.5f64) as i32;
+    let r = Region { x: left, y: top, width: right - left, height: bottom - top };
+    if chrome::drags_window(n) {
+        assert captions.append(r) == status::Status::Ok;
+    }
+    if core::kind_of(n) == chrome::K_WINDOW_BUTTONS {
+        assert controls.append(r) == status::Status::Ok;
+    }
+    var i: usize = 0;
+    while i < core::child_count_of(n) {
+        if let option::Option::Some(child) = core::child_of(n, i) {
+            collect(child, scale, strip, captions, controls);
+        }
+        i = i + 1;
+    }
+}
+
+fn refresh(_ctx: *u8) {
+    let h = host::active_host() as *host::Host;
+    if h.is_null() || (*h).closing || !(*h).captionless { return; }
+    var captions = vec::new::[Region]();
+    var controls = vec::new::[Region]();
+    // A modal scrim receives all content input until it closes.
+    if (*h).layer_root.is_null() {
+        collect((*h).root, host::scale_of(h), (*h).strip, captions, controls);
+    }
+    if LAST_WINDOW == (*h).hwnd && same(captions, LAST_CAPTIONS) &&
+        same(controls, LAST_CONTROLS) { return; }
+    let input = source(ui::WindowId { value: (*h).hwnd as usize as u64 });
+    set_regions(input, 4, captions); // NonClientRegionKind.Caption
+    set_regions(input, 9, controls); // NonClientRegionKind.Passthrough
+    LAST_WINDOW = (*h).hwnd;
+    LAST_CAPTIONS = captions;
+    LAST_CONTROLS = controls;
+}
+
+fn layout_updated(_sender: rt::Object, _args: rt::Object, _ctx: *u8) -> rt::Status {
+    refresh(0 as *u8);
+    return rt::Status { code: 0 };
+}
+
+fn closed(_sender: rt::Object, _args: rt::Object, window: *u8) -> rt::Status {
+    if LAST_WINDOW == window {
+        LAST_WINDOW = 0 as *u8;
+        LAST_CAPTIONS.remove_all();
+        LAST_CONTROLS.remove_all();
+    }
+    var i: usize = 0;
+    while i < WATCHED.count() {
+        if let option::Option::Some(found) = WATCHED.at(i) {
+            if found == window {
+                let _removed = WATCHED.remove(i);
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    return rt::Status { code: 0 };
+}
+
+fn activated(_ctx: *u8) {
+    let h = host::active_host() as *host::Host;
+    if h.is_null() || (*h).closing || !(*h).captionless { return; }
+    var i: usize = 0;
+    while i < WATCHED.count() {
+        if let option::Option::Some(window) = WATCHED.at(i) {
+            if window == (*h).hwnd { refresh(0 as *u8); return; }
+        }
+        i = i + 1;
+    }
+    let element = native::must::[ui::IFrameworkElement](ui::IFrameworkElement::query((*h).shell));
+    let handler = native::must::[ui::EventHandler_Object](ui::EventHandler_Object::new(layout_updated));
+    // XAML owns this delegate until its shell is destroyed. It captures no
+    // Host or Node pointer and remains safe during window teardown.
+    let _token = native::must::[ui::EventRegistrationToken](element.add_layout_updated(handler.object()));
+    let window = native::must::[ui::IWindow](ui::IWindow::query((*h).window));
+    let closing = native::must::[ui::TypedEventHandler_Object_Microsoft_UI_Xaml_WindowEventArgs](
+        ui::TypedEventHandler_Object_Microsoft_UI_Xaml_WindowEventArgs::new(closed, (*h).hwnd));
+    let _closed = native::must::[ui::EventRegistrationToken](window.add_closed(closing.object()));
+    assert WATCHED.append((*h).hwnd) == status::Status::Ok;
+    refresh(0 as *u8);
+}
+
+fn install() {
+    let _active = host::observe(host::OBS_ACTIVE, activated);
+    let _size = host::observe(host::OBS_SIZE, refresh);
+}

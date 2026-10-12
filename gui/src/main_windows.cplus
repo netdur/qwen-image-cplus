@@ -1,0 +1,15 @@
+// The Windows entry installs WinUI and native caption drag regions.
+// `winui::select()` must come before `app.run`, and only an app that imports
+// facet_runtime/winui lists facet_winui, winui and winrt (Cplus.toml).
+import "./app" as app;
+import "facet_runtime/winui" as winui;
+import "qwen_image_runtime/runtime" as runtime;
+import "./window_drag_windows" as window_drag;
+
+fn main() -> i32 {
+    // Install the platform's inference backend before the first request.
+    runtime::install();
+    winui::select();
+    window_drag::install();
+    return app::run();
+}
